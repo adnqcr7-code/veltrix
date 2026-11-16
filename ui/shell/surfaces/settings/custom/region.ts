@@ -1,0 +1,291 @@
+import Gtk from "gi://Gtk?version=4.0"
+import GLib from "gi://GLib"
+import GObject from "gi://GObject"
+import Gio from "gi://Gio"
+import { execAsync, spawn } from "../../../../lib/process"
+import { createRow, staticLabel, bindWhileRealized } from "../SettingsHelpers"
+import regionConfig from "../../../core/RegionConfig"
+import { t } from "../../../core/i18n"
+import { safeDisconnect } from "../../../core/signals"
+import { VeltrixButton, VeltrixDropDown } from "../../../../lib/veltrix-kit"
+import { languageName } from "../../../../lib/locale-names"
+import type { PageCtx, ItemBuilder } from "../PreferencePage"
+
+export const build = (ctx: PageCtx) => {
+    // ── Timezone active & change ──────────────────────────────────────────────
+    const tzDetected = regionConfig.timezone || regionConfig.detectTimezone() || "UTC"
+    const tzCurrentLabel = staticLabel(tzDetected)
+
+    const tzEntry = new Gtk.Entry({
+        text: tzDetected,
+        placeholder_text: t("settings.region.tz.placeholder"),
+        valign: Gtk.Align.CENTER,
+        width_chars: 24,
+    })
+
+    const completion = new Gtk.EntryCompletion()
+    const tzModel = new Gtk.ListStore()
+    // @ts-ignore
+    tzModel.set_column_types([GObject.TYPE_STRING])
+    completion.set_model(tzModel)
+    completion.set_text_column(0)
+    completion.set_minimum_key_length(2)
+    completion.set_inline_completion(true)
+    tzEntry.set_completion(completion)
+
+    execAsync(["timedatectl", "list-timezones"]).then(output => {
+        output.trim().split("\n").forEach(tz => {
+            if (!tz) return
+            const iter = tzModel.append()
+            // @ts-ignore
+            tzModel.set(iter, [0], [tz])
+        })
+    }).catch(() => {})
+
+    let tzStatusTimerId = 0
+
+    const tzApplyBtn = VeltrixButton({
+        label: t("settings.region.tz.apply"),
+        variant: "primary",
+        pill: true,
+        valign: Gtk.Align.CENTER,
+    })
+
+    const applyTimezone = () => {
+        const tz = tzEntry.text.trim()
+        if (!tz) return
+
+        tzApplyBtn.sensitive = false
+        tzApplyBtn.label = "…"
+
+        regionConfig.setTimezone(tz)
+
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
+            const success = regionConfig.timezone === tz
+            tzApplyBtn.label = success ? "✓" : "✗"
+            if (success) tzCurrentLabel.label = tz
+
+            if (tzStatusTimerId) GLib.source_remove(tzStatusTimerId)
+            tzStatusTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
+                tzApplyBtn.label = t("settings.region.tz.apply")
+                tzApplyBtn.sensitive = true
+                tzStatusTimerId = 0
+                return GLib.SOURCE_REMOVE
+            })
+            return GLib.SOURCE_REMOVE
+        })
+    }
+
+    tzApplyBtn.connect("clicked", applyTimezone)
+    tzEntry.connect("activate", applyTimezone)
+
+    const tzEntryRow = new Gtk.Box({ spacing: 8, valign: Gtk.Align.CENTER })
+    tzEntryRow.append(tzEntry)
+    tzEntryRow.append(tzApplyBtn)
+
+    // ── Language & Regional Formats ───────────────────────────────────────────
+    // --- 1. Locale (LANG) ---
+    // A dropdown, not a text entry: `localectl list-locales` is the closed set of
+    // locales this system can actually switch to (the GENERATED ones — 13 on a stock
+    // install, not the ~800 of the full glibc catalogue), so there is nothing to type
+    // that the list cannot offer. `langValues` shadows the model because the model is
+    // the only thing the widget knows and we need the string back on selection.
+    //
+    // The Apply button stays — unlike the regional-format dropdown below (our own JSON
+    // config, instant), this one shells out to `pkexec localectl`, and a control that
+    // raises a polkit password prompt the moment the selection moves is a trap. Same
+    // rule as the timezone row above: root gets an Apply, our own config does not.
+    const langValues: string[] = []
+    const langModel = new Gtk.StringList({ strings: [] })
+    const langDrp = VeltrixDropDown({ model: langModel, valign: Gtk.Align.CENTER })
+
+    const applyLangBtn = VeltrixButton({ label: t("settings.region.tz.apply"), variant: "primary", pill: true, valign: Gtk.Align.CENTER })
+    const langRow = new Gtk.Box({ spacing: 8, valign: Gtk.Align.CENTER })
+    langRow.append(langDrp)
+    langRow.append(applyLangBtn)
+
+    // The keyboard layout used to have a second control right here — an entry whose
+    // Apply called `inputConfig.setKbLayout(kb)` with ONE argument, so `variant`
+    // defaulted back to "" and silently dropped a Dvorak/Colemak choice made in
+    // Devices. Settings → Devices is the single owner now (its dropdown carries the
+    // variant), which is also where GNOME puts it.
+
+    // --- 2. Regional Format (LC_TIME, LC_NUMERIC, etc.) ---
+    // A single locale choice that sets all "format" LC_* variables at once.
+    // Populated from `locale -a`; "" means "same as LANG".
+    //
+    // ⚠️ This group holds TWO DIFFERENT SCOPES, which is why its title is neutral
+    // ("Language & formats") and each row states its own reach in the subtitle:
+    // Language writes /etc/locale.conf (system-wide), Regional format writes
+    // ~/.config/environment.d/veltrix-locale.conf (THIS user only, re-read by the
+    // systemd user manager at each login). A group title that named either scope
+    // would be a lie about the other row.
+    //
+    // 🔑 "System-wide" deliberately does NOT promise the login screen. The greeter
+    // has its OWN language picker (`ui/greeter/widget/LocaleBar.ts` → `greeter-prefs
+    // .json`), and `detectLocale()` in `ui/greeter/lib/i18n.ts` reads that FIRST —
+    // /etc/locale.conf is only its fallback, for a machine nobody has picked on yet.
+    // So this row governs the greeter until someone touches that picker, and never
+    // again after. The first draft of this subtitle said "login screen included"
+    // and was wrong for every machine whose greeter had been used once.
+    const regionalValues: string[] = [""]
+    const regionalModel = new Gtk.StringList({ strings: [t("settings.region.locale.regional.same")] })
+    const regionalDrp = VeltrixDropDown({ model: regionalModel, valign: Gtk.Align.CENTER })
+
+    // Set while the dropdown is being told what the config ALREADY says. Without
+    // it, showing the current value writes it: `selected = idx` emits
+    // `notify::selected`, the handler calls setRegionalLocale, and that rewrites
+    // ~/.config/environment.d/veltrix-locale.conf. Settings builds all 21 top-level
+    // pages eagerly, so this ran on every OPEN of the window, whatever page the
+    // user actually wanted. (Same shape as the profile sync in Power.tsx.)
+    let syncingRegional = false
+
+    execAsync(["locale", "-a"]).then(output => {
+        const locales = output.trim().split("\n")
+            .map(l => l.trim())
+            .filter(l => l.includes(".") && l !== "C.utf8" && l !== "POSIX")
+            .map(l => l.replace(/\.utf8$/i, ".UTF-8"))
+            .sort()
+        locales.forEach(l => {
+            regionalValues.push(l)
+            // Display the ENDONYM ("العربية"), not the raw locale string —
+            // macOS Language & Region shows endonyms, and the greeter picker
+            // already does (ui/lib/locale-names.ts: languageName, derived from
+            // ICU via Intl.DisplayNames — no hand table). The VALUES array
+            // keeps the raw locale: selection is by index into it, and the
+            // raw string is what the config files and veltrix-language take.
+            // languageName returns the input unchanged when ICU has no name
+            // for it, so an unnamed locale still shows its honest code.
+            regionalModel.append(languageName(l))
+        })
+        // A saved locale the system no longer lists is SHOWN, not silently dropped.
+        // `indexOf` returns -1 for it and the fallback was index 0 — "same as LANG"
+        // — so the row REPORTED a setting the config did not hold, for a locale that
+        // `locale -a` merely stopped listing (dropped from locale.gen, or spelled
+        // differently before the .utf8 → .UTF-8 normalisation above). Measured: the
+        // file is not rewritten in that state, because index 0 is where the dropdown
+        // already was and GObject emits no notify for an unchanged property — so it
+        // is a display lie rather than data loss. Which is only luck: the same
+        // fallback with any other saved value writes.
+        const current = regionConfig.regionalLocale
+        if (current && !regionalValues.includes(current)) {
+            regionalValues.push(current)
+            regionalModel.append(languageName(current))
+        }
+        const idx = current ? regionalValues.indexOf(current) : 0
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            syncingRegional = true
+            regionalDrp.selected = idx >= 0 ? idx : 0
+            syncingRegional = false
+            return GLib.SOURCE_REMOVE
+        })
+    }).catch(console.error)
+
+    regionalDrp.connect("notify::selected", () => {
+        if (syncingRegional) return
+        const idx = regionalDrp.selected
+        if (idx < regionalValues.length)
+            regionConfig.setRegionalLocale(regionalValues[idx])
+    })
+
+    // Initialization: fill the locale list, THEN select the live LANG in it.
+    // Nested on purpose — the selection is only meaningful once the model has rows,
+    // and `localectl status` is what knows which row is the current one.
+    execAsync(["localectl", "list-locales"]).then(list => {
+        list.trim().split("\n").forEach(l => {
+            const v = l.trim()
+            if (!v) return
+            // Drop the C/POSIX family. `localectl list-locales` lists C.UTF-8 FIRST,
+            // so without this it is the top entry of a control labelled "Language" —
+            // and it is not a language: it is the POSIX "no localization" locale
+            // (untranslated messages, byte-order collation, C date format, no
+            // currency). Regional format below has always filtered it; this list
+            // did not, which is the inconsistency this filter closes.
+            // Not the same as hiding it if it is already ACTIVE — a LANG the list
+            // does not contain gets appended below, so a machine really running
+            // C.UTF-8 still shows the truth instead of a neighbouring row.
+            if (/^(C|POSIX)(\.|$)/.test(v)) return
+            langValues.push(v)
+            // Endonym display, raw value — same split as the regional dropdown
+            // above (languageName, ui/lib/locale-names.ts): "العربية" in the
+            // list, "ar_SA.UTF-8" as the value Apply passes to veltrix-language.
+            langModel.append(languageName(v))
+        })
+
+        return execAsync(["localectl", "status"]).then(out => {
+            const current = out.match(/System Locale:\s*LANG=(\S+)/)?.[1]
+            if (!current) return
+            // A LANG that is set but not generated (someone edited /etc/locale.conf by
+            // hand) is not in list-locales. Show the truth rather than a neighbouring
+            // row that would silently become the value on the next Apply.
+            let idx = langValues.indexOf(current)
+            if (idx < 0) { langValues.push(current); langModel.append(languageName(current)); idx = langValues.length - 1 }
+            // idle_add for the same reason as the regional dropdown below: setting
+            // `selected` in the same tick the model grew does not stick.
+            GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                langDrp.selected = idx
+                return GLib.SOURCE_REMOVE
+            })
+        })
+    }).catch(console.error)
+
+    // Through `veltrix-language set`, not `localectl` directly (#703): a language
+    // that needs an input engine — Chinese — gets it installed FIRST, under the
+    // same single password prompt, and if that fails the language is not changed.
+    // A desktop in Chinese with no way to type Chinese is #500 again. Installing
+    // the engine is a download of ~540 MiB, so the row says what it is doing.
+    const langStatus = new Gtk.Label({ valign: Gtk.Align.CENTER, visible: false, css_classes: ["dimmed"] })
+    langRow.prepend(langStatus)
+
+    // Which engine a language needs is asked of veltrix-language too, so the map
+    // stays in one file; "" = none, or it is already installed.
+    const engineToInstall = (lang: string): Promise<string> =>
+        execAsync(["veltrix-language", "engine", lang]).then(pkg => !pkg ? ""
+            : execAsync(["pacman", "-Qq", pkg]).then(() => "", () => pkg))
+
+    const applyLang = () => {
+        const lang = langValues[langDrp.selected]
+        if (!lang) return
+        applyLangBtn.sensitive = false
+        langDrp.sensitive = false
+        langStatus.visible = false
+        engineToInstall(lang).catch(() => "").then(pkg => {
+            if (pkg) {
+                langStatus.label = t("settings.region.locale.lang.installing")
+                langStatus.visible = true
+            }
+            const proc = spawn(["pkexec", "veltrix-language", "set", lang], Gio.SubprocessFlags.STDERR_PIPE)
+            proc.communicate_utf8_async(null, null, (_: any, res: any) => {
+                let ok = false, err = ""
+                try { [, , err] = proc.communicate_utf8_finish(res); ok = proc.get_successful() }
+                catch (e) { console.error("[region] veltrix-language set:", e) }
+                // 126 = the password prompt was dismissed: nothing failed, nothing changed.
+                const cancelled = !ok && proc.get_if_exited() && proc.get_exit_status() === 126
+                if (!ok && !cancelled) console.error("[region] veltrix-language set:", (err ?? "").trim())
+                langStatus.label = ok || cancelled ? "" : t("settings.region.locale.lang.failed")
+                langStatus.visible = !ok && !cancelled
+                applyLangBtn.sensitive = true
+                langDrp.sensitive = true
+            })
+        })
+    }
+
+    applyLangBtn.connect("clicked", applyLang)
+
+    // Armed on ctx.page so it re-runs on every visit — created in the builder
+    // closure without bindWhileRealized it would survive exactly one visit.
+    bindWhileRealized(ctx.page, () => {
+        return () => {
+            // Transient "✓ / ✗" button reset; it also self-clears (SOURCE_REMOVE),
+            // so null it here or leaving twice removes an id that is already gone.
+            if (tzStatusTimerId) { GLib.source_remove(tzStatusTimerId); tzStatusTimerId = 0 }
+        }
+    })
+
+    return {
+        timezoneActive: (slot) => createRow(slot.title, slot.subtitle, tzCurrentLabel),
+        timezoneChange: (slot) => createRow(slot.title, slot.subtitle, tzEntryRow),
+        systemLanguage: (slot) => createRow(slot.title, slot.subtitle, langRow),
+        regionalFormat: (slot) => createRow(slot.title, slot.subtitle, regionalDrp),
+    } satisfies Record<string, ItemBuilder>
+}

@@ -1,0 +1,714 @@
+@use 'base' as *;
+
+@keyframes rec-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.3; }
+}
+
+/* CC and NC live inside the BAR window (Gtk.Overlay children, commandment 5).
+   The @keyframes above stays global: CSS keyframes are not scopable, and SCSS
+   would emit an invalid nested at-rule. */
+#veltrix-bar, .veltrix-bar-window {
+    /* ==========================================================================
+       CONTROL CENTER - CLEAN GTK4 ARCHITECTURE
+       ========================================================================== */
+
+    /* Keyboard: the CC is driven by keys since 2026-09-27 (Super+C, Tab/arrows,
+       Enter/Space, Esc). Every ring here is GTK's own `:focus-visible` outline —
+       the tiles' and their buttons', in `.cc-island` below. */
+
+    /* --- Status notices (AI control) above the widgets --- */
+    /* One PILL per active indicator (dot + name + a compact Stop button), centred,
+       as wide as its content (StatusIndicators.tsx; owner, 2026-09-30). Collapsed to nothing by the widget when no indicator is active.
+
+       THE PILL ITSELF IS CAIRO — a SquircleContainer, exactly like the tiles below it.
+       No border and no padding here: both belong to the painter, and the background
+       must stay transparent so nothing paints a rectangle behind the capsule. It is
+       deliberately NOT given `.cc-island` (that class resets Adwaita defaults on any
+       descendant button and would flatten the VeltrixButton — see the note there).
+
+       MARGIN 4: the notice sits right on the content it belongs to (owner, 2026-09-30). 24 until then ("12 inside a block, 24 between blocks"). The
+       Edit pill below the grid is 16 away (IslandGrid.tsx), and the panel's own margin
+       is 16 (ControlCenter.tsx, CC_PANEL_PAD). */
+    .cc-status-notices {
+        // From the last pill's glass to the tiles' (4 between the boxes until #762, whose
+        // glass was painted 2 px in).
+        margin-bottom: 8px;
+    }
+    .cc-status-banner {
+        background-color: transparent;
+    }
+    /* The last pulsing dot in the shell, and deliberately so: it marks the agent
+       having JUST acted (a few seconds, ~pulseComputerAction) inside a surface that
+       only paints while open — not a minutes-long condition on an always-visible
+       layer, which is why the bar badge and the island dot are steady. Keyframe
+       defined here, next to its only user. */
+    .cc-status-dot {
+        border-radius: var(--veltrix-radius-pill);
+        background: var(--veltrix-danger);
+        opacity: 0.7;
+
+        &.is-active {
+            opacity: 1;
+            animation: rec-pulse 1.4s ease-in-out infinite;
+        }
+    }
+
+    /* --- Island Body --- */
+    .cc-island {
+        background-color: transparent;
+
+        // Strip the base layer's button paint inside CC islands — the tiles paint themselves
+        button {
+            @include veltrix-reset;
+            // …but not the keyboard ring: the reset clears `outline` too, which left a
+            // focused toggle inside a tile with no sign of it (2026-09-27).
+            &:focus-visible { @include veltrix-focus-ring; }
+        }
+
+        // The tile as a keyboard stop (IslandGrid → SquircleContainer.keyboardStop):
+        // GTK's own ring, round the tile's box — its glass — at the design system's 2px gap:
+        // drawn outside the tile, where the Cairo ring this replaced could not reach
+        // (it sat on the glass edge and melted into the volume tile's fill).
+        // The radius has to be the SHAPE's, on the base rule (an outline follows it, grown by
+        // its offset): a pill is exact for the circle (1×1) and the capsules (2×1, 1×2, the
+        // 4×1 dock-profile pill, a hair off);
+        // the 2×2 is a square with the same circular corner, half a cell — UNIT / 2 in
+        // CCLayoutManager.ts, which CSS cannot read, so it is restated here.
+        border-radius: $veltrix-radius-pill;
+        &.cc-size-2x2 { border-radius: 38px; }
+        &:focus-visible { @include veltrix-focus-ring; }
+    }
+
+    .veltrix-atomic-slider-box-horizontal {
+        background: transparent;
+    }
+
+
+    /* --- Media Widget: NOT here. It spans two windows — see the block at the
+       bottom of this file, outside the bar's scope. --- */
+
+    /* --- Connectivity Toggles (Capsule & Round) --- */
+    .cc-island {
+        /* Wrapper button for 2x1 capsules */
+        .cc-capsule-btn {
+            background-color: transparent;
+            border-radius: var(--veltrix-radius-lg);
+            color: var(--veltrix-text);
+            padding: 0;
+        }
+
+        /* 1x1 Round Toggles */
+        .veltrix-atomic-round-btn {
+            border-radius: var(--veltrix-radius-pill);
+            color: var(--veltrix-text);
+
+        }
+
+        /* Icon-only toggle nested inside a split capsule (see buildSplitCapsuleContent):
+           the surrounding .veltrix-atomic-icon-circle-bg box still paints the resting badge;
+           this button only needs the round clip + hover/press feedback so the icon
+           reads as its own tap target, distinct from the rest of the capsule (which
+           opens the detail panel). Two classes outrank the `.cc-island button` reset
+           above regardless of source order. */
+        .cc-split-icon-btn {
+            border-radius: var(--veltrix-radius-pill);
+            color: var(--veltrix-text);
+            // No box of its own: it FILLS the circle it sits in. With the base layer's
+            // button padding (9px a side) a 28px icon asked for 46px, which was hidden
+            // while the circle was 48 and widened it to 46×44 — an oval — the moment the
+            // circle went to 44 (2026-09-30, CAPSULE_ICON_SIZE).
+            padding: 0;
+            min-width: 0;
+            min-height: 0;
+            @include veltrix-tile-states;
+        }
+    }
+
+    /* The circular badge inside capsules (CAPSULE_ICON_SIZE, widget-kit/tile.ts; no
+       override needed, it is a box not a button) */
+    .veltrix-atomic-icon-circle-bg {
+        background-color: var(--veltrix-surface);
+        border-radius: var(--veltrix-radius-pill);
+        color: var(--veltrix-text);
+    }
+
+    /* A tile that is ON (BaseIsland adds `active`): its icon circle WHITE, the icon in the
+       accent — the rest of the tile stays glass, its text white (owner, 2026-10-12, after
+       the reference). A 1×1 is its circle: Cairo fills the whole tile with the same white
+       (`ON_WHITE`), and only its icon is left to colour here. */
+    .cc-island.active {
+        .veltrix-atomic-icon-circle-bg { background-color: var(--veltrix-on); }
+        .veltrix-atomic-icon-circle-bg image.nd-icon,
+        &.cc-size-1x1 image.nd-icon { color: var(--veltrix-accent); }
+    }
+
+    /* --- Typographical Utilities for Toggles --- */
+    // A tile's title — 14 since 2026-09-30 (13 before), the reference proportions at our
+    // scale (design-system.md, "The Control Center is a PANEL"). ⚠️ Only because the 2×1 capsule's text column went
+    // 88 → 96 in the same change (widget-kit/tile.ts, CAPSULE_ICON_SIZE/GAP): at 88,
+    // "Luz nocturna" (91px at 14 bold) was cut to "Luz noctur…". The NC's card summaries
+    // share the class.
+    .veltrix-atomic-label-bold {
+        font-size: $fs-body;
+        font-weight: $fw-bold;
+        color: var(--veltrix-text);
+    }
+
+    // A tile's SUBTITLE — its state ("Activo", "Sin conexión"): information, so the
+    // SECONDARY ink tier (80 %), not the dim one.
+    // Same size as the title and only lighter in weight and ink (owner, 2026-09-30, over 12px / 400 / dim, which read "very thin next to the
+    // title"). It shares the title's 96px column (widget-kit/tile.ts), so a long
+    // network name ellipsizes sooner than it did at 12.
+    .veltrix-atomic-label-sub {
+        font-size: $fs-body;
+        font-weight: $fw-regular;   // pinned, like the one below and for the same reason
+        color: var(--veltrix-text-secondary);
+    }
+    // Metadata beside a control (the CC context menu's "full row" note).
+    .veltrix-atomic-label-dim {
+        font-size: $fs-caption;
+        // Pin the weight: without it the label inherits its parent's, so capsules
+        // wrapped in a cc-capsule-btn (bt, focus, dark_mode, night_light) rendered the
+        // subtitle heavier than the plain-box tiles (wifi, ethernet, …). 400 everywhere.
+        font-weight: $fw-regular;
+        color: var(--veltrix-text-dim);
+    }
+
+    /* CPU/Memory metric: % inside the ring + CPU/RAM caption below */
+    .resource-value {
+        font-size: $fs-small;
+        font-weight: $fw-bold;
+        color: var(--veltrix-text);
+    }
+
+    .resource-caption {
+        font-size: $fs-caption;
+        font-weight: $fw-semibold;
+        letter-spacing: 0.04em;
+        color: var(--veltrix-text-dim);
+    }
+
+
+    // (.vpn-active-bg deleted — VPN's connected state now fills the whole capsule via
+    // BaseIsland's getActive/watchActive, same as dark_mode/night_light/focus/bt.)
+
+    // (.rec-active-bg/.rec-stop-icon/.rec-label/@keyframes rec-pulse-cc deleted —
+    // recording's pulsing danger-red fill now paints the WHOLE capsule via
+    // BaseIsland's getActive/activeColorHex/activeAlpha, same mechanism as
+    // dark_mode/night_light/focus/bt/vpn. .rec-stop-icon was dead CSS anyway —
+    // `color` never recolors a Gtk.Image icon, see design-system.md.)
+
+    // Elapsed-timer subtitle while recording — tabular-nums so the digits don't
+    // jitter as they tick up. (color is redundant with the label's own default dim,
+    // kept explicit for clarity.)
+    .rec-elapsed {
+        font-size: $fs-caption;
+        color: var(--veltrix-text-dim);
+        font-variant-numeric: tabular-nums;
+    }
+
+    // The same clock as the hero of the detail page, where it is the whole content
+    // above Stop rather than a subtitle. Plain text colour: the page is REACHED from
+    // a tile that already says "recording", and a red number is just a number in a
+    // colour that means danger — nothing here is dangerous. Red in this shell is for
+    // the small status marks (island dot, CC badge) and for revocation, nowhere else.
+    .rec-elapsed-big {
+        font-size: $fs-title-2;
+        font-weight: $fw-semibold;
+        color: var(--veltrix-text);
+        font-variant-numeric: tabular-nums;
+        margin-top: 6px;
+        margin-bottom: 2px;
+    }
+
+    /* --- Edit Mode Controls --- */
+    .cc-edit-pill {
+        // Keyboard ring: GTK's, round the pill's glass at the 2px gap, pill radius on the
+        // base rule.
+        border-radius: $veltrix-radius-pill;
+        &:focus-visible { @include veltrix-focus-ring; }
+
+        label {
+            font-size: $fs-small;
+            font-weight: $fw-bold;
+            color: var(--veltrix-text-dim);
+        }
+
+        &:hover label {
+            color: var(--veltrix-text);
+        }
+    }
+
+    /* (.veltrix-circle-btn, .slider-fill-value and .veltrix-atomic-scale-native left this
+       file on 2026-08-07 — they are rendered by SHARED components (common/IconButton.ts,
+       the slider) and by Settings pages, so scoping this file to the bar's window would
+       have silently unstyled them there. A class used outside one window belongs in the
+       global layer, not in a surface sheet. Where they ended up has moved on since:
+       .slider-fill-value went to the KIT's sheet with the slider (2026-08-15), and
+       .veltrix-atomic-scale-native was deleted (2026-08-16) — it suppressed a Gtk.Scale
+       background and there has been no Gtk.Scale for months.) */
+
+    .cc-slot-placeholder {
+        background: var(--veltrix-surface-strong);
+        border-radius: var(--veltrix-radius-pill);
+    }
+
+    .cc-drag-source {
+        opacity: 0;
+        transition: opacity 0.15s ease;
+    }
+
+    /* (.cc-drop-ghost deleted — the drag-ghost is now Cairo-painted in IslandGrid.tsx's
+       makeDropGhost, shaped per-widget via resolveIslandShape, not a generic CSS box.) */
+
+    /* (.cc-resize-btn deleted — dead CSS from the pre-context-menu resize approach;
+       tile resizing lives in CCContextMenu.tsx since the 3-tier menu landed.) */
+
+    /* --- Notifications: Steel Symmetry --- */
+    .nc-capsule-item {
+        min-height: 76px;
+    }
+
+    .nc-stack-card {
+        /* Overlap the ghost strip by 2px, so its first band starts under the card's glass and
+           no gap shows (4px until #762, when the card's glass was painted 2 px inside its box). */
+        margin-bottom: -2px;
+    }
+
+    .nc-group-with-ghost {
+        /* The ghost strip's height is already accounted for; claw back just a little so the
+           gap to the next notification stays comfortable for both 1- and 2-layer stacks.
+           min-height matches the negative margin: when the swipe/clear-all collapse animates
+           the group's content below 2px, the box would report a NEGATIVE min height (content
+           + margin) and GTK warns "sizes must be >= 0" once per group. The floor keeps the
+           reported size at exactly 0 on those last frames — visually identical. */
+        margin-bottom: -4px;
+        min-height: 4px;
+    }
+
+    .nc-badge-header {
+        background: var(--veltrix-surface-raised);
+        color: var(--veltrix-text);
+        font-size: $fs-mini;
+        font-weight: $fw-bold;
+        padding: 1px 6px;
+        // ~17px tall (11px glyph + 1px padding): the old 12 was already past half the
+        // height, i.e. a pill wearing a ladder value. Say what it is.
+        border-radius: var(--veltrix-radius-pill);
+        margin-left: $space-2;
+    }
+
+    /* Notification body — a touch more opaque than the shared dim token, since the glass
+       background washes out 0.6-alpha text. */
+    .nc-notif-body {
+        font-size: $fs-caption;
+        font-weight: $fw-regular;
+        color: var(--veltrix-text-secondary);
+    }
+
+    .nc-group-ctrl-header {
+        /* Background/border/radius now painted by SquircleContainer (shellOpacity, Cairo);
+           only the outer margins remain here. Padding moved to the inner box (margin_*). */
+        // Binds DOWN to the group it labels: 8px is the shell-wide attachment gap
+        // (same as .veltrix-list-title's margin-bottom), the 12px above is the
+        // group↔group gap. See design-system.md "Section headers bind DOWN".
+        margin-top: $space-3;
+        margin-bottom: $space-2;
+        margin-left: $space-2;
+        margin-right: $space-2;
+    }
+
+    .nc-group-header-name {
+        font-size: $fs-caption;
+        font-weight: $fw-bold;
+        color: var(--veltrix-text);
+    }
+
+    /* Calendar Cleanup */
+    .nc-calendar-island {
+        calendar {
+            // color binds to --veltrix-text via the base layer's `calendar` rule
+            // (ui/lib/veltrix-kit/styles/_base-layer.scss) → day numbers AND the month/year header follow the pin.
+            background: none;
+            background-color: transparent;
+            border: none;
+            box-shadow: none;
+
+            &.view, & header, & button {
+                background: none;
+                background-color: transparent;
+                border: none;
+            }
+
+            // Day cells: Veltrix accent on selection + today (GtkCalendar paints these
+            // with Adwaita's default blue otherwise). Column headers (.day-name) and week
+            // numbers (.week-number) are left to the normal text tokens.
+            grid label.day-name {
+                color: var(--veltrix-text-dim);
+                font-weight: $fw-semibold;
+            }
+            // Kill Adwaita's blue focus ring on every day cell. GTK4 has NO `outline`
+            // shorthand — must use the longhand props or the ring survives.
+            grid label:not(.day-name):not(.week-number) {
+                border-radius: $veltrix-radius-xs;
+                border: 1px solid transparent;
+                outline-style: none;
+                outline-width: 0;
+                outline-color: transparent;
+                box-shadow: none;
+                transition: background 0.12s ease, color 0.12s ease;
+            }
+            grid label:focus,
+            grid label:focus-visible,
+            grid label:focus-within,
+            grid label:selected {
+                outline-style: none;
+                outline-width: 0;
+                outline-color: transparent;
+                box-shadow: none;
+                border-color: transparent;
+            }
+            grid label.other-month { color: var(--veltrix-text-disabled); }
+            // "Today" (when not selected): faint accent-tinted cell, theme-coloured
+            // bold number (never accent on text).
+            grid label.today:not(:selected) {
+                background-color: var(--veltrix-accent-10);
+                color: var(--veltrix-text);
+                font-weight: $fw-bold;
+            }
+            grid label:selected {
+                background-color: var(--veltrix-accent);
+                background-image: none;
+                color: var(--veltrix-accent-fg);
+                font-weight: $fw-bold;
+            }
+        }
+    }
+
+    .nc-item-time {
+        font-size: $fs-caption;
+        font-weight: $fw-semibold;
+        color: var(--veltrix-text-secondary);
+    }
+
+    .nc-action-row {
+        margin-right: 4px;
+    }
+
+    /* (.nc-right-col / .nc-badge-stacked deleted — controls moved onto the title line;
+       the dedicated right column shortened every text line, not just the title.) */
+
+    /* Hover-revealed banner action capsules (background/border painted by SquircleContainer). */
+    .nc-banner-action-label {
+        font-size: $fs-caption;
+        font-weight: $fw-semibold;
+        color: var(--veltrix-text);
+    }
+
+    .nc-action-btn {
+        padding: 2px 8px;
+        min-height: 0;
+        min-width: 0;
+        background: transparent;
+        border: none;
+        border-radius: var(--veltrix-radius-xs);
+        /* Solid text instead of accent — accent on glass reads poorly with some palettes. */
+        color: var(--veltrix-text);
+        font-size: $fs-caption;
+        font-weight: $fw-semibold;
+        transition: background-color 0.15s #{$ease}, color 0.15s #{$ease};
+
+        label { padding: 0; margin: 0; }
+
+        &:hover {
+            background: var(--veltrix-accent-10);
+        }
+
+        &:active {
+            background: var(--veltrix-accent-30);
+        }
+    }
+
+    /* --- NC Global Layout --- */
+    .nc-content-box {
+        padding: 0;
+        /* The scroll viewport is GRID_WIDTH + 8 (LANE in NotificationCenter.tsx). This padding
+           keeps the cards at GRID_WIDTH (no reflow/stretch) and frees the lane on the right
+           for the scroll indicator. */
+        padding-right: 8px;
+    }
+
+    /* The reserved LANE now hosts VeltrixScrolled's indicator (.veltrix-scroll-thumb in
+       _components.scss), not a GTK scrollbar — the view runs vscrollbar_policy EXTERNAL,
+       so no scrollbar node exists here to style. This retired tech-debt #15: the old
+       overlay slider widened on pointer PROXIMITY (GTK sets .hovering itself and
+       Adwaita's rule beat every override we could write) and ate the right edge of each
+       card's close ✕. Pinning it flush to the wall was mitigation; removing the widget
+       is the fix. Do NOT reintroduce `scrollbar` rules here. */
+
+    .nc-empty {
+        /* Sits inside the same glass capsule as the clear-all pill — match its type. */
+        font-size: $fs-small;
+        font-weight: $fw-bold;
+        color: var(--veltrix-text-dim);
+    }
+
+    .nc-clear-all-pill {
+        label {
+            font-size: $fs-small;
+            font-weight: $fw-bold;
+            color: var(--veltrix-text-dim);
+        }
+
+        &:hover label { color: var(--veltrix-text); }
+    }
+
+
+    /* --- CC Detail Strip --- */
+    // The detail's back button: the Settings window's back chevron (kit
+    // `button.veltrix-icon-btn`) in a capsule of one with the navigation capsule's fill and
+    // hairline — that capsule reduced to one button, by the same rule (owner, 2026-10-06):
+    // the hover a 24 px circle 4 from the capsule's edge, so 1 + 3 + 24 + 3 + 1 = 32.
+    .cc-detail-back-capsule {
+        background: var(--veltrix-surface);
+        border: 1px solid var(--veltrix-border);
+        border-radius: $veltrix-radius-pill;
+        padding: 3px;
+    }
+    button.veltrix-icon-btn.cc-detail-back-btn { padding: 5px; }
+
+    .cc-detail-sep {
+        background: var(--veltrix-border);
+        min-height: 1px;
+        margin-left: 12px;
+        margin-right: 12px;
+    }
+
+    .cc-detail-title {
+        font-size: $fs-small;
+        font-weight: $fw-bold;
+        color: var(--veltrix-text);
+        letter-spacing: 0.04em;
+    }
+
+    .veltrix-detail-section-label {
+        font-size: $fs-caption;
+        font-weight: $fw-bold;
+        color: var(--veltrix-text-dim);
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        opacity: 0.7;
+    }
+
+    /* --- CC Detail Panel — styles for content inside the squircle island --------- */
+    .veltrix-detail-panel {
+
+        // Strip the boxed-card look: inside the detail panel a veltrix-list sits flat
+        // on the island, not as a frosted card.
+        list.veltrix-list,
+        list.boxed-list {
+            background: transparent;
+            background-image: none;
+            border: none;
+            box-shadow: none;
+            margin-bottom: 4px;
+            padding: 0;
+
+            row {
+                @include veltrix-reset;
+                border-radius: $veltrix-radius-sm;
+                margin: 1px 0;
+                @include veltrix-row-states;
+                &:selected { background: transparent; }   // list rows aren't selectable
+            }
+        }
+
+        // Full-row click buttons (clipboard items)
+        button.settings-action-row {
+            @include veltrix-reset;
+            border-radius: $veltrix-radius-sm;
+            @include veltrix-row-states;
+        }
+
+        // Primary action (VPN connect, screenshot save, start recording)
+        // The 6px vertical is NOT a gap: these carry `border: none`, so 6 lands on the same
+        // 32px control height as VeltrixButton's 5px + 1px border. Keep them in step.
+        button.suggested-action {
+            background: var(--veltrix-accent);
+            background-image: none;
+            color: var(--veltrix-accent-fg);
+            border: none;
+            box-shadow: none;
+            border-radius: $veltrix-radius-sm;
+            padding: 6px 14px;
+            font-size: $fs-small;
+            font-weight: $fw-semibold;
+
+            &:hover  { background: rgba(var(--veltrix-accent-rgb), 0.82); }
+            &:active { background: rgba(var(--veltrix-accent-rgb), 0.65); }
+        }
+
+        // Destructive action (VPN disconnect, stop recording)
+        button.destructive-action {
+            background: var(--veltrix-danger);
+            background-image: none;
+            color: var(--veltrix-accent-fg);
+            border: none;
+            box-shadow: none;
+            border-radius: $veltrix-radius-sm;
+            padding: 6px 14px;
+            font-size: $fs-small;
+            font-weight: $fw-semibold;
+
+            &:hover  { background: rgba(var(--veltrix-danger-rgb), 0.82); }
+            &:active { background: rgba(var(--veltrix-danger-rgb), 0.65); }
+        }
+
+        // Flat button — NO author-side consumers left (the screenshot copy button and
+        // the set-default text link are both VeltrixButtons now; the latter is
+        // ghost + compact). Kept as a defensive normalizer: GTK's own composite
+        // widgets can carry `.flat` internally (e.g. night-light's SpinButton), and
+        // without this they'd fall through to Adwaita's look inside the panel.
+        // Do not add `.flat` from page code — use VeltrixButton({ variant: "ghost" }).
+        button.flat {
+            background: transparent;
+            background-image: none;
+            border: none;
+            box-shadow: none;
+            color: var(--veltrix-text);
+            border-radius: $veltrix-radius-sm;
+            padding: 4px 10px;
+            font-weight: $fw-medium;
+
+            &:hover  { background: var(--veltrix-accent-10); }
+            &:active { background: rgba(var(--veltrix-accent-rgb), 0.18); }
+        }
+
+        // (button.compact-btn deleted — its one consumer, the audio "set as default"
+        //  link, is now VeltrixButton({ variant: "ghost", size: "compact" }); the size
+        //  lives in the kit, not in whatever panel the button happens to render in.)
+
+        // Mute toggles use the global button.settings-icon-btn (_components.scss).
+
+        // Linked mode-selector button groups (screenshot / screenrecord)
+        .linked {
+            > button {
+                background: var(--veltrix-surface-back);
+                background-image: none;
+                border: 1px solid var(--veltrix-border);
+                border-radius: $veltrix-radius-sm;
+                box-shadow: none;
+                color: var(--veltrix-text-dim);
+                font-size: $fs-small;
+                padding: 6px 0;
+
+                // Unselected: deepen neutrally on hover; accent stays for the selected
+                // (.suggested-action) segment only.
+                &:hover { background: var(--veltrix-surface-hover); color: var(--veltrix-text); }
+
+                &.suggested-action {
+                    background: rgba(var(--veltrix-accent-rgb), 0.18);
+                    background-image: none;
+                    border-color: rgba(var(--veltrix-accent-rgb), 0.45);
+                    color: var(--veltrix-text);
+                    font-weight: $fw-bold;
+
+                    &:hover  { background: rgba(var(--veltrix-accent-rgb), 0.26); }
+                    &:active { background: rgba(var(--veltrix-accent-rgb), 0.35); }
+                }
+            }
+        }
+
+        // Audio enable switch
+        switch {
+            &:checked slider { background: var(--veltrix-thumb); }
+            &:checked       { background: var(--veltrix-accent); }
+        }
+
+        // (The "Default" speaker badge, label.accent-label, moved to _components.scss
+        //  2026-08-10 — the audio detail page and Settings → Audio both wear it.)
+
+        .veltrix-row-title    { font-size: $fs-small; color: var(--veltrix-text); }
+        .veltrix-row-subtitle { font-size: $fs-small; color: var(--veltrix-text-dim); }
+        // (.slider-value-label moved to _components.scss 2026-08-10 — nine consumers
+        //  across the CC, the atomic widgets and three Settings pages.)
+
+        separator { background: var(--veltrix-border); margin: 4px 0; min-height: 1px; }
+    }
+}
+
+/* ==========================================================================
+   MEDIA WIDGET — TWO WINDOWS
+   ==========================================================================
+
+   `widgets/media.ts` builds ONE panel (`buildMediaDetailPanel`: artwork,
+   title/artist, transport row, source selector) and three surfaces show it: the
+   bar pill expansion, the Control Center detail page and the Activity Island's
+   PLAYER mode (`PlayerIsland.tsx`) — all three inside the bar's window again since
+   #708 point 3. Between 2026-07-26 and then the island was a window of its own,
+   and while these rules sat inside this file's `#veltrix-bar` block the island's
+   transport buttons and source selector rendered with raw GTK defaults
+   (user-caught 2026-08-10; the scope had moved out from under the sheet months
+   earlier, in silence). That is the trap to remember whenever a panel changes
+   window.
+
+   Kept window-scoped, not global: whatever wins against these rules must win in
+   every surface that shows the panel.
+
+   ⚠️ A `veltrix-*` name in a SURFACE sheet is deliberate here, and the only place
+   in the shell where the two do not coincide. `veltrix-*` says who OWNS the class
+   (the kit — `widgets/media.ts` places this panel, no surface does); the sheet it
+   sits in is a separate question, settled by the specificity argument above. The
+   class was `cc-media-*` until 2026-08-10, which said the Control Center owned a
+   panel three surfaces wear — the exact misreading that let the island bug sit
+   for months.
+   ========================================================================== */
+#veltrix-bar,
+.veltrix-bar-window {
+    // The track's title: 14 bold, like every tile's title (`.veltrix-atomic-label-bold`;
+    // owner, 2026-09-30 — it was 13, the one title left behind).
+    .veltrix-media-title {
+        font-size: $fs-body;
+        font-weight: $fw-bold;
+        color: var(--veltrix-text);
+    }
+
+    // The artist is the track title's subtitle, and follows the tiles' rule
+    // (`.veltrix-atomic-label-sub`, owner 2026-09-30): the title's size, regular weight,
+    // SECONDARY ink (80 %, held to 4.5:1) — not 12 px in the dim tier, which read far
+    // thinner than the title above it.
+    .veltrix-media-artist {
+        font-size: $fs-body;
+        font-weight: $fw-regular;
+        color: var(--veltrix-text-secondary);
+    }
+
+    .veltrix-media-btn {
+        color: var(--veltrix-text);
+        background: transparent;
+        border: none;
+        // The theme inflates buttons well past the icon, leaving dead space above/below
+        // each glyph (the "space around the controls"). Hug the 18px icon with a tight
+        // 24px box so the transport row reads as one compact unit.
+        min-width: 24px;
+        min-height: 24px;
+        padding: 0;
+    }
+
+    .veltrix-media-play-btn {
+        background-color: var(--veltrix-accent);
+        border-radius: var(--veltrix-radius-pill);
+        color: var(--veltrix-accent-fg);
+    }
+
+    .veltrix-media-time {
+        font-size: $fs-caption;
+        font-weight: $fw-medium;
+        color: var(--veltrix-text-dim);
+        opacity: 0.7;
+    }
+
+    // (Removed dead .veltrix-media-progress GTK-scale rules — the media progress bar is a
+    // Cairo-drawn slider via makeHSlider, so these never applied.)
+}

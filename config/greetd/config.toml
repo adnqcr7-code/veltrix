@@ -1,0 +1,9 @@
+# greetd configuration for Veltrix
+# Installed to /etc/greetd/config.toml
+
+[terminal]
+vt = 1
+
+[default_session]
+command = "veltrix-greeter-session"
+user = "greeter"

@@ -1,0 +1,311 @@
+#!/usr/bin/env node
+// Migrations mutate a user's config, once, on a machine nobody can inspect
+// afterwards. There is no undo and no second chance, so the properties that
+// make one safe are worth asserting rather than remembering:
+//
+//   1. every unit is valid bash (a syntax error stops the CHAIN, not just itself);
+//   2. the runner is a NO-OP on a fresh install — a machine with no config to
+//      migrate must come out with the same empty state it went in with;
+//   3. every unit is IDEMPOTENT — running it twice must equal running it once,
+//      because a marker that fails to be written is a retry, not a corruption;
+//   4. the marker actually stops the second run.
+//
+// ⚠️ Property 3 is checked by DELETING the marker between runs, not by trusting
+// it. The marker is what makes a migration run once in production; the unit
+// being idempotent underneath is what makes a lost marker survivable, and only
+// one of those two is a property of the code.
+//
+// This carries its own positive control at the end: a deliberately non-idempotent
+// unit must be caught, or the checks above prove nothing.
+
+import { execFileSync, spawnSync } from "node:child_process"
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+const ROOT = new URL("../..", import.meta.url).pathname
+const UNITS_DIR = join(ROOT, "migrations")
+const RUNNER = join(ROOT, "bin", "veltrix-migrate")
+
+let failures = 0
+const ok = (n) => console.log(`  ok    ${n}`)
+const fail = (n, d) => { failures++; console.log(`  FAIL  ${n}${d ? `\n        ${d}` : ""}`) }
+
+if (!existsSync(UNITS_DIR)) { console.log("migrations-check: no migrations/ directory — nothing to check."); process.exit(0) }
+for (const bin of ["jq", "bash", "gsettings", "glib-compile-schemas", "gjs"]) {
+    if (spawnSync("sh", ["-c", `command -v ${bin}`]).status !== 0) {
+        console.error(`migrations-check: ${bin} is missing`); process.exit(1)
+    }
+}
+
+// The schemas the settings migrations write into, compiled from the tree.
+const SCHEMA_DIR = mkdtempSync(join(tmpdir(), "veltrix-mig-schemas-"))
+for (const f of readdirSync(join(ROOT, "config", "gsettings"))) {
+    if (f.endsWith(".gschema.xml")) writeFileSync(join(SCHEMA_DIR, f), readFileSync(join(ROOT, "config", "gsettings", f)))
+}
+execFileSync("glib-compile-schemas", ["--strict", SCHEMA_DIR])
+
+const units = readdirSync(UNITS_DIR).filter(f => f.endsWith(".sh")).sort()
+console.log(`migrations-check: ${units.length} unit(s)`)
+
+// The chain as it stood BEFORE the glass material (#674): 2026-09-30 turns the four
+// opacities that 2026-09-14c imports into one material and resets them, so what 14c
+// imported can only be seen in a chain that stops before it.
+const GLASS_UNIT = "2026-09-30-glass-material-from-opacities.sh"
+const BEFORE_GLASS = mkdtempSync(join(tmpdir(), "veltrix-mig-before-glass-"))
+for (const u of units) if (u < GLASS_UNIT) writeFileSync(join(BEFORE_GLASS, u), readFileSync(join(UNITS_DIR, u)))
+
+// ── 1. syntax ────────────────────────────────────────────────────────────────
+for (const u of units) {
+    const r = spawnSync("bash", ["-n", join(UNITS_DIR, u)], { encoding: "utf8" })
+    if (r.status !== 0) fail(`${u} is valid bash`, r.stderr.trim())
+}
+if (failures === 0) ok("every unit is valid bash")
+
+// ── the harness ──────────────────────────────────────────────────────────────
+/** Run the runner against a scratch HOME seeded with `files`, `times` times,
+ *  clearing the marker between runs when `clearMarkers`. Returns the config dir
+ *  contents afterwards. */
+function run(files, { times = 1, clearMarkers = false, unitsDir = UNITS_DIR } = {}) {
+    const home = mkdtempSync(join(tmpdir(), "veltrix-mig-"))
+    const cfg = join(home, ".config", "veltrix")
+    const state = join(home, ".local", "state", "veltrix", "migrations")
+    mkdirSync(cfg, { recursive: true })
+    for (const [name, body] of Object.entries(files)) {
+        writeFileSync(join(cfg, name), (typeof body === "string" ? body : JSON.stringify(body, null, 2)).replaceAll("SCRATCH_HOME", home))
+    }
+    for (let i = 0; i < times; i++) {
+        if (clearMarkers && i > 0) rmSync(state, { recursive: true, force: true })
+        const r = spawnSync("bash", [RUNNER], {
+            encoding: "utf8",
+            env: { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"),
+                   XDG_STATE_HOME: join(home, ".local", "state"), VELTRIX_MIGRATIONS_DIR: unitsDir,
+                   // Settings migrations write GSettings. CI has no session bus and
+                   // no dconf, so they run against the keyfile backend, which lands
+                   // in the scratch HOME and is read back below.
+                   GSETTINGS_BACKEND: "keyfile", GSETTINGS_SCHEMA_DIR: SCHEMA_DIR },
+        })
+        if (r.status !== 0) throw new Error(`runner exited ${r.status}: ${r.stderr}`)
+    }
+    const out = {}
+    // Every run has its own scratch HOME, and a fixture that names it would make
+    // two identical runs look different — so it goes back to its placeholder.
+    const unscratch = (text) => text.replaceAll(home, "SCRATCH_HOME")
+    for (const f of readdirSync(cfg)) out[f] = unscratch(readFileSync(join(cfg, f), "utf8"))
+    const keyfile = join(home, ".config", "glib-2.0", "settings", "keyfile")
+    if (existsSync(keyfile)) out["<gsettings keyfile>"] = unscratch(readFileSync(keyfile, "utf8"))
+    const markers = existsSync(state) ? readdirSync(state).sort() : []
+    rmSync(home, { recursive: true, force: true })
+    return { out, markers }
+}
+
+// ── 2. a fresh install comes out untouched ───────────────────────────────────
+try {
+    const { out, markers } = run({})
+    if (Object.keys(out).length !== 0) fail("a fresh install is left alone", JSON.stringify(out))
+    else if (markers.length !== units.length) fail("a fresh install still marks every unit as taken", JSON.stringify(markers))
+    else ok("a fresh install is left alone, and every unit is marked")
+} catch (e) { fail("a fresh install is left alone", e.message) }
+
+// ── 3. idempotence, with the marker DELETED between runs ─────────────────────
+// The fixture carries every legacy key any unit knows about, so each one has
+// something to bite on. Add to it when you add a migration.
+const LEGACY_FIXTURE = {
+    "appearance.json": { transparency: 0.15, accent: "blue", iconTheme: "Papirus" },
+    // settings-to-gsettings: a chosen value, a default, a retired field, a value
+    // the schema refuses, a fractional integer, a map, and a string with quotes.
+    "dock_settings.json": { iconSize: 72, magnification: true, position: "diagonal", hideDelay: 250.4, retiredThing: 1 },
+    "workspaces.json": { defaultMode: "tiling", workspaces: { "2": "floating" } },
+    "bar-settings.json": { showAppTitle: true, launcherIcon: "/home/u/it's \"mine\".png" },
+    "night-light.json": { temperature: 99999, scheduleFrom: "21:30" },
+    // Computed defaults: the scratch HOME has no user-dirs.dirs, so the shell would
+    // compute $HOME/Videos; `hardware` is whatever this machine has. `SCRATCH_HOME`
+    // is replaced by the harness with the run's HOME.
+    "recording.json": { framerate: 60, saveDir: "SCRATCH_HOME/Videos", hardware: existsSync("/dev/dri/renderD128") },
+    // ai-and-gaming: a gate turned on, a default gate, a per-provider map.
+    // (VELTRIX fork: gaming.json is NOT in the fixture — Game Mode is deleted
+    // and its migration import was removed; see the migration unit.)
+    // (VELTRIX fork, Phase 0 fix: allowMcp is false here, not true — the
+    // fork flipped the allow-mcp schema default to false (fail-closed), so
+    // `true` is now a user choice that IS imported, and only `false` exercises
+    // the "a gate left at its default is not [imported]" expectation below.
+    // allowComputerUse: true still covers the turned-on gate.)
+    "ai.json": { allowComputerUse: true, allowMcp: false, brainModels: { ollama: "llama3.1" } },
+}
+try {
+    const once = run(LEGACY_FIXTURE, { times: 1 })
+    const twice = run(LEGACY_FIXTURE, { times: 2, clearMarkers: true })
+    if (JSON.stringify(once.out) !== JSON.stringify(twice.out)) {
+        fail("running twice equals running once (marker cleared between)",
+             `1×: ${JSON.stringify(once.out)}\n        2×: ${JSON.stringify(twice.out)}`)
+    } else ok("running twice equals running once, even with the marker cleared")
+} catch (e) { fail("idempotence", e.message) }
+
+// ── 4. the marker stops the second run ───────────────────────────────────────
+try {
+    const kept = run(LEGACY_FIXTURE, { times: 2, clearMarkers: false })
+    const single = run(LEGACY_FIXTURE, { times: 1 })
+    if (JSON.stringify(kept.out) !== JSON.stringify(single.out)) fail("the marker stops the second run", JSON.stringify(kept.out))
+    else ok("the marker stops the second run")
+} catch (e) { fail("the marker stops the second run", e.message) }
+
+// ── 4b. settings-to-gsettings imported what it should, and only that ──────────
+// Each expectation is a line the keyfile must (or must not) contain. Groups are
+// /org/veltrix/<schema>/ and values are GVariant text.
+try {
+    const { out } = run(LEGACY_FIXTURE, { times: 1 })
+    const kf = out["<gsettings keyfile>"] ?? ""
+    const expect = [
+        ["a chosen value is imported",               /\[org\/veltrix\/dock\][^[]*\nicon-size=72/, true],
+        ["a fractional integer is rounded",          /\nhide-delay=250\n/, true],
+        ["a default is NOT imported as a user value", /\nmagnification=/, false],
+        ["a value outside the choices is dropped",    /\nposition=/, false],
+        ["a retired field is dropped",                /retired/, false],
+        ["a value outside the range is dropped",      /\ntemperature=/, false],
+        ["a map is imported",                         /\nworkspaces=\{'2': 'floating'\}/, true],
+        ["a string with quotes survives",             /launcher-icon=.*it's \\?"mine\\?"\.png/, true],
+        ["a chosen recording setting is imported",    /\[org\/veltrix\/recording\][^[]*framerate=60/, true],
+        ["a COMPUTED default (videos folder) is not imported", /save-dir=/, false],
+        ["a COMPUTED default (hardware) is not imported",      /\nhardware=/, false],
+        ["a gate the user turned on is imported",      /\[org\/veltrix\/ai\][^[]*allow-computer-use=true/, true],
+        ["a gate left at its default is not",          /allow-mcp=/, false],
+        ["the per-provider model map is imported",     /brain-models=\{'ollama': 'llama3.1'\}/, true],
+    ]
+    for (const [label, re, present] of expect) {
+        if (re.test(kf) === present) ok(`settings import: ${label}`)
+        else fail(`settings import: ${label}`, `keyfile:\n${kf}`)
+    }
+    // appearance: the fixture's `transparency: 0.15` becomes windowOpacity 0.85
+    // (2026-09-02), has no glassModel, so it is rescaled to 0.88 and clamped to 0.8 —
+    // and then retired by the glass material (2026-09-30): the window alone picks no
+    // material, and the key is reset. (The 0.8 itself is checked in 4b', below.)
+    if (/opacity=|glass-material=/.test(kf)) fail("settings import: a window opacity alone is retired, and picks no material", `keyfile:\n${kf}`)
+    else ok("settings import: a window opacity alone is retired, and picks no material")
+    if (/accent|icon-theme|isDark/i.test(kf.slice(kf.indexOf("[org/veltrix/appearance]")))) fail("settings import: GNOME-homed appearance keys are not imported", kf)
+    else ok("settings import: GNOME-homed appearance keys are not imported")
+    for (const f of ["appearance.json", "dock_settings.json", "workspaces.json", "bar-settings.json", "night-light.json", "recording.json", "ai.json"]) {
+        if (out[f] !== undefined || out[`${f}.migrated`] === undefined) fail(`settings import: ${f} renamed to .migrated`, Object.keys(out).join(", "))
+    }
+} catch (e) { fail("settings import", e.message) }
+
+// ── 4b'. the same import, in the chain before the glass material ─────────────
+try {
+    const kf = run(LEGACY_FIXTURE, { times: 1, unitsDir: BEFORE_GLASS }).out["<gsettings keyfile>"] ?? ""
+    if (/\[org\/veltrix\/appearance\][^[]*window-opacity=0\.(8\b|80000)/.test(kf)) ok("settings import: a pre-rescale opacity is rescaled and clamped")
+    else fail("settings import: a pre-rescale opacity is rescaled and clamped", `keyfile:\n${kf}`)
+} catch (e) { fail("settings import (before glass)", e.message) }
+
+// ── 4c. appearance: a CURRENT-model file, not rescaled ───────────────────────
+try {
+    const { out } = run({ "appearance.json": { glassModel: 2, barOpacity: 0.6, dockOpacity: 0.1, overlayOpacity: 0.48, shellAppearance: "dark", accent: "red" } }, { unitsDir: BEFORE_GLASS })
+    const kf = out["<gsettings keyfile>"] ?? ""
+    const expect = [
+        ["a current-model opacity is imported as is",            /bar-opacity=0\.(6\b|59999)/, true],
+        ["an opacity under the floor is clamped (= default, not stored)", /dock-opacity=/, false],
+        ["an opacity equal to the default is not stored",        /overlay-opacity=/, false],
+        // The pin was removed with its schema key (#676): importing it would write a
+        // key that no longer exists, i.e. fail the whole migration on an old install.
+        ["the removed shell pin is NOT imported",                 /shell-appearance/, false],
+    ]
+    for (const [label, re, present] of expect) {
+        if (re.test(kf) === present) ok(`appearance import: ${label}`)
+        else fail(`appearance import: ${label}`, `keyfile:\n${kf}`)
+    }
+} catch (e) { fail("appearance import", e.message) }
+
+// ── 4e. widgets, CC layout, pins, region: reshaped into the schema's types ───
+try {
+    const { out } = run({
+        "widgets.json": { battery: { bar: true, cc: false }, focus: { bar: false, cc: true } },
+        "cc_layout.json": { positions: { media: { x: 0, y: 0 }, volume: { x: 2, y: 1 } }, sizes: { volume: "1x2" } },
+        // Order is the dock's order; the dock strips these prefixes; duplicates go.
+        "dock_pinned.json": ["zed", "pinned-firefox", "kitty", "zed", "/abs/path.desktop"],
+        // The clock format here must NOT be the schema default ("12h" since
+        // Phase 1, macOS-style): a value equal to the default is correctly NOT
+        // imported as a user value, so "12h" would make this check vacuous.
+        // "24h" is the chosen non-default value the import is proven with.
+        "region.json": { timeFormat: "24h", dateFormat: "short", timezone: "Europe/Madrid", regionalLocale: "es_ES.UTF-8", showSeconds: false },
+    })
+    const kf = out["<gsettings keyfile>"] ?? ""
+    const expect = [
+        ["widget placement becomes id → (bar, cc)",           /placement=\{'battery': \(true, false\), 'focus': \(false, true\)\}/, true],
+        ["CC positions become id → (x, y)",                   /positions=\{'media': \(0, 0\), 'volume': \(2, 1\)\}/, true],
+        ["CC sizes are kept",                                  /sizes=\{'volume': '1x2'\}/, true],
+        ["pins keep their ORDER, lose prefixes and duplicates", /pinned=\['zed', 'firefox', 'kitty'\]/, true],
+        ["the clock format is imported",                       /time-format='24h'/, true],
+        ["a date format equal to the default is not",          /date-format=/, false],
+        ["the timezone is not imported (the system's)",         /timezone|Madrid/, false],
+        ["the regional locale is not imported (environment.d)", /locale|es_ES/i, false],
+    ]
+    for (const [label, re, present] of expect) {
+        if (re.test(kf) === present) ok(`widgets/pins/region import: ${label}`)
+        else fail(`widgets/pins/region import: ${label}`, `keyfile:\n${kf}`)
+    }
+    for (const f of ["widgets.json", "cc_layout.json", "dock_pinned.json", "region.json"]) {
+        if (out[f] !== undefined || out[`${f}.migrated`] === undefined) fail(`widgets/pins/region import: ${f} renamed to .migrated`, Object.keys(out).join(", "))
+    }
+    if (Object.keys(out).some(f => f.includes(".import.json"))) fail("widgets/pins/region import: no reshaped temp file is left behind", Object.keys(out).join(", "))
+    else ok("widgets/pins/region import: no reshaped temp file is left behind")
+    if (!out["dock_pinned.json.migrated"]?.includes("pinned-firefox")) fail("widgets/pins/region import: the user's original file is what stays", out["dock_pinned.json.migrated"])
+    else ok("widgets/pins/region import: the user's original file is what stays")
+} catch (e) { fail("widgets/pins/region import", e.message) }
+
+// ── 4f. a CC layout in the pre-2026-06-09 `order` format is set aside ────────
+try {
+    const { out } = run({ "cc_layout.json": { order: ["media", "volume"], sizes: {} } })
+    const kf = out["<gsettings keyfile>"] ?? ""
+    if (/positions=/.test(kf) || out["cc_layout.json.migrated"] === undefined) fail("an `order` CC layout is set aside, not half-imported", `${kf}\n${Object.keys(out)}`)
+    else ok("an `order` CC layout is set aside, not half-imported")
+} catch (e) { fail("cc order format", e.message) }
+
+// ── 4d. appearance: a PRE-rescale file, where the rescale changes the answer ─
+// 0.3 → 0.2 + 0.8·0.3 = 0.44 (and the legacy shellOpacity seeds overlay: 0.5 → 0.6).
+// The fixture in 4b cannot tell a missing rescale apart — its value clamps to 0.8
+// either way.
+try {
+    const { out } = run({ "appearance.json": { barOpacity: 0.3, shellOpacity: 0.5 } }, { unitsDir: BEFORE_GLASS })
+    const kf = out["<gsettings keyfile>"] ?? ""
+    if (/bar-opacity=0\.(44\b|44000|43999)/.test(kf)) ok("appearance import: a pre-rescale opacity becomes 0.2 + 0.8·α")
+    else fail("appearance import: a pre-rescale opacity becomes 0.2 + 0.8·α", `keyfile:\n${kf}`)
+    if (/overlay-opacity=0\.(6\b|60000|59999)/.test(kf)) ok("appearance import: the legacy shellOpacity seeds a missing overlay opacity")
+    else fail("appearance import: the legacy shellOpacity seeds a missing overlay opacity", `keyfile:\n${kf}`)
+} catch (e) { fail("appearance rescale", e.message) }
+
+// ── 4g. the four opacities become ONE glass material (#674) ──────────────────
+// Through the whole chain: 14c imports the file, 09-30 reads the bar and the panels.
+// The mean decides: < 0.29 clear, ≥ 0.40 frosted, otherwise the default stays.
+try {
+    const cases = [
+        ["hand-thinned glass becomes clear",  { barOpacity: 0.24, overlayOpacity: 0.24, dockOpacity: 0.24, windowOpacity: 0.8 }, "clear"],
+        ["thick glass becomes frosted",       { barOpacity: 0.6, overlayOpacity: 0.6 }, "frosted"],
+        ["one surface set: the other counts at its old default", { barOpacity: 0.36 }, "frosted"],   // (0.36 + 0.48) / 2
+        ["the middle keeps the default",      { barOpacity: 0.36, overlayOpacity: 0.32 }, null],
+    ]
+    for (const [label, file, want] of cases) {
+        const kf = run({ "appearance.json": { glassModel: 2, ...file } }).out["<gsettings keyfile>"] ?? ""
+        const got = kf.match(/glass-material='(\w+)'/)?.[1] ?? null
+        if (got !== want) fail(`glass material: ${label}`, `want ${want}, got ${got}\nkeyfile:\n${kf}`)
+        else if (/opacity=/.test(kf)) fail(`glass material: ${label} — the four keys are reset`, `keyfile:\n${kf}`)
+        else ok(`glass material: ${label}`)
+    }
+} catch (e) { fail("glass material", e.message) }
+
+// ── 5. POSITIVE CONTROL ──────────────────────────────────────────────────────
+// A unit that appends on every run. Check 3 MUST catch it; if it does not, the
+// three greens above mean nothing.
+const controlDir = mkdtempSync(join(tmpdir(), "veltrix-mig-ctl-"))
+writeFileSync(join(controlDir, "9999-01-01-not-idempotent.sh"),
+    `json_edit "$CONFIG_DIR/appearance.json" '.accent = (.accent + "!")'\n`)
+try {
+    const a = run(LEGACY_FIXTURE, { times: 1, unitsDir: controlDir })
+    const b = run(LEGACY_FIXTURE, { times: 2, clearMarkers: true, unitsDir: controlDir })
+    if (JSON.stringify(a.out) === JSON.stringify(b.out)) {
+        fail("[control] a non-idempotent unit is caught",
+             "the harness could not tell one run from two — checks 3 and 4 above prove nothing")
+    } else ok("[control] a non-idempotent unit IS caught")
+} catch (e) { fail("[control] a non-idempotent unit is caught", e.message) }
+rmSync(controlDir, { recursive: true, force: true })
+rmSync(BEFORE_GLASS, { recursive: true, force: true })
+
+if (failures > 0) { console.error(`\nmigrations-check: ${failures} failure(s)`); process.exit(1) }
+console.log("migrations-check: every unit is valid, no-ops on a fresh install, and idempotent.")

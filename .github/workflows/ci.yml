@@ -1,0 +1,1842 @@
+# CI — automated checks that run on every push and pull request.
+#
+# What this is: a robot on GitHub that, every time code is pushed, verifies the
+# project still assembles correctly. A green check = safe; a red check = something
+# to look at, caught BEFORE it reaches the running shell.
+#
+# Gates here:
+#   - styles: the SCSS stylesheet compiles (catches CSS syntax errors). Pure JS,
+#     no system libraries needed.
+#   - typecheck: `tsc --noEmit` over ui/shell, ui/installer, ui/greeter and ui/lockscreen. The GI typings it needs (@girs/,
+#     ~58 MB generated, git-ignored) can't be produced on a runner —
+#     scripts/gen-types.sh reads the system's .gir files, which means a machine
+#     with the whole GI stack installed. Instead a maintainer publishes a ~4 MB
+#     compressed snapshot as an asset on the `ci-assets` release
+#     (scripts/dev/publish-ci-typings.sh) and this job downloads it. tsc needs no
+#     node_modules at all. If this job fails on a type that exists locally, the
+#     snapshot is stale → re-run the publish script.
+#   - widgets-gen: the committed widgets.gen.ts (widget auto-registration) is
+#     fresh — regenerates it with scripts/gen-widget-index.mjs and fails if it
+#     differs. Pure node; also surfaces the codegen's own validation errors
+#     (stray non-widget file in widgets/, duplicate widget id).
+#   - skill-docs: two pure-node checks on things a reader cannot hold in their head.
+#     (1) The in-repo skill does not say the same thing twice: `design-system.md`
+#     once held 1157 duplicated lines — half the file, twice — and edits then landed
+#     in DIFFERENT COPIES, so the reference contradicted itself for weeks. Nobody
+#     sees that by reading, because a long reference is read by search. Logic in
+#     scripts/ci/skill-docs-check.mjs. (2) Every wrapping GtkLabel fills its column
+#     rather than picking its own break point — a rule design-system.md already
+#     stated and six labels violated anyway, because it only shows once a string is
+#     long enough to wrap, i.e. in a locale or text size that is not yours. Logic in
+#     scripts/ci/wrapping-prose-check.mjs. (3) The blur threshold from BOTH sides:
+#     every layer's `ignore_alpha` is still BELOW the glass that layer actually paints
+#     (the shell's GLASS_RANGE.min or, for the login surfaces, LOCK_GLASS.fill.a), AND
+#     the login surfaces' un-blurred paint — the scrim plus the hero text-shadow that
+#     composites over it — stays under that same threshold. Those live in TypeScript
+#     and SCSS, the thresholds live in Lua, and crossing either way is silent: too high
+#     and a surface stops blurring outright, too low and the wallpaper grows a frosted
+#     band with a hard edge. Both have shipped. Logic in
+#     scripts/ci/blur-threshold-check.mjs.
+#     (4) Every layer-shell surface of the shell is inside the Appearance pin
+#     (CHROME_SCOPE_WINDOWS) or explicitly exempt, and its GTK window name equals its
+#     Wayland namespace — the pin selects by `window#<name>`. A surface that leaves the
+#     bar's window leaves the pin with it, and only a user who pinned the shell AGAINST
+#     their system mode ever sees the result. Logic in scripts/ci/chrome-scope-check.mjs.
+#   - nightly (schedule, 03:17 UTC): the whole workflow on main, gates included; a failure
+#     opens or updates the issue "Nightly CI failed" (`nightly-report`), success closes it.
+#   - scope: decides whether the change needs the four long jobs (smoke, hyalo,
+#     toolkit, sessiond). A change of `.md` files only does not: no long job reads
+#     one, and the Hyalo job alone is ~47 min, run twice (PR + queue). Those jobs
+#     still exist and report — skipped by their `if:`, which GitHub counts as a
+#     pass for a required check — they are NOT filtered out by `paths:`, which
+#     would leave the queue waiting for a check that never reports. Any doubt
+#     (no base, failed fetch, empty diff, scope itself failing) runs everything.
+#     It also decides `gates`: the Hyalo job's real fcitx5/Orca matrices (~35 of its
+#     ~45 min) run only when the change touches something they use (a list of what RUNS
+#     them: typing, focus, a11y, layers, the toolkit), and `full`: their controls and
+#     scale 1.25 only when the checks or their faults change. The nightly run has all.
+#     Logic and its self-test in scripts/ci/ci-scope.sh.
+#   - smoke: the REAL thing — load the kernel's vkms (virtual KMS) on the
+#     runner, then in a privileged Arch container install ONLY official Arch
+#     packages, bundle the shell with scripts/bundle.sh (esbuild), boot Hyprland
+#     on the virtual display (llvmpipe software GL), boot
+#     the bundle on it, and require: process stays alive, IPC answers
+#     (listActions/dumpState), no JS errors in the boot log. Screenshots are
+#     uploaded as artifacts for HUMAN review — deliberately not a pixel diff.
+#     All logic lives in scripts/ci/headless-smoke.sh.
+#   - hyalo: Hyalo, the compositor of our own (#681) — cargo build --locked, clippy -D
+#     warnings, unit tests, then a boot on vkms through its tty backend with the real
+#     shell on it; screenshots via Hyalo's IPC. Not required while Hyalo is a preview.
+#     All logic lives in scripts/ci/hyalo-smoke.sh.
+#   - toolkit: nk-text's corpus on Parley (the engine phase 0 chose, #824), timing/RSS
+#     and a char-backspace negative control. Not a required check yet.
+#   - sessiond: locked Rust build, clippy and tests; a real private-bus notification
+#     round-trip and GJS client reconnect, preceded by a broken-replaces_id control.
+#   - agent-loop: drive the real Assistant daemon (bin/veltrix-agent) through one
+#     tool-use turn against a mock OpenAI-compatible provider — asserts the stream
+#     parsing (tool call, split args, final text) AND both halves of the 5xx retry
+#     policy (a 503 is retried past, a 4xx surfaces without retry). Hermetic: no
+#     network, key, or running shell — only gjs. Logic in
+#     scripts/ci/agent-loop-test.py.
+#   - installer-logic: the layout the installer hands archinstall, and the layouts
+#     it must REFUSE, checked as pure functions — no disk, no window, no GTK.
+#     `manual_partitioning` has no "the rest of the disk": every partition is an
+#     absolute start and length, and archinstall rejects four kinds of arithmetic
+#     wrong at the worst possible moment (after every question is answered, on the
+#     medium). The refusal half is the one that had no instrument at all: each rule
+#     in `manualProblems` was added after an install had already finished and
+#     produced a machine that does not boot or does not install. It ran only when a
+#     human remembered until 2026-09-05. Logic in scripts/dev/disk-config-probe.ts
+#     and scripts/dev/account-rules-probe.ts — the second covers the account form,
+#     whose rules decide whether a name reaches `useradd` INSIDE THE CHROOT, which
+#     is the worst place to be told no. scripts/dev/bootloader-rules-probe.ts covers
+#     what we may edit on an ESP that is not ours, and scripts/dev/mirror-probe.ts
+#     the two pure halves of the mirror measurement — the reflector invocation, and
+#     the parse whose output is prepended to a pacman mirrorlist. Each probe gets a
+#     positive control ahead of it: a probe that has only ever printed "ok" has been
+#     run, not tested.
+
+name: CI
+
+on:
+  # ⚠️ There is deliberately NO `push: branches: [main]`, and adding one back is how
+  # this workflow came to run three times per change. Removed 2026-08-23.
+  #
+  # Every merge here goes through the merge queue, and the queue's `merge_group` run
+  # below tests the EXACT commit that becomes main — PR grafted onto the current base,
+  # which is what a post-merge run would test a minute later. Measured over the last
+  # nine merges: nine `merge_group` runs and nine `push` runs, one for one, the push
+  # starting seconds after the queue's had gone green on the same tree. A third of all
+  # CI was re-proving a result that already existed.
+  #
+  # It is not free to leave in, either: the smoke installs Arch packages, and a mirror
+  # 404 there is enough to kick a PR out of the queue — three shots at that per change
+  # instead of two.
+  #
+  # ⚠️ PUT IT BACK if the merge queue is ever turned off. Without the queue nothing
+  # tests the merged result, only the PR in isolation, and two PRs that are each green
+  # can break main together. The queue is what makes this safe; they move as a pair.
+  pull_request:
+  # ⚠️ REQUIRED BY THE MERGE QUEUE, and the way it fails is a stall, not an error.
+  # A queued PR waits for the four required checks (styles / typecheck / smoke /
+  # widgets-gen) to report against the QUEUE's temporary merge_group ref. Without
+  # this trigger those checks simply never start there, so the entry sits in the
+  # queue until it times out and gets kicked — with the PR itself still showing
+  # eight green checks from its `pull_request` run. Nothing anywhere says "you
+  # forgot a trigger".
+  #
+  # This is also why the trigger has to be on main BEFORE the queue is turned on:
+  # the queue runs the workflow as it exists on the base branch.
+  merge_group:
+  # Every night, everything, on main: no base to diff against, so scope runs every job and
+  # every gate (the real fcitx5/Orca matrices a PR skips when it touches nothing they use,
+  # scripts/ci/ci-scope.sh). What a skip let through, or two queued changes that only break
+  # them together, shows here the next morning — and `nightly-report` says so in an issue.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# A new push to a PR cancels that PR's run still in progress: only the newest commit
+# is ever merged. Never in the queue — each merge_group entry has its own ref anyway.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  scope:
+    name: Change scope (docs only?)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.scope.outputs.code }}
+      gates: ${{ steps.scope.outputs.gates }}
+      full: ${{ steps.scope.outputs.full }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The classifier's own controls
+        run: scripts/ci/ci-scope.sh --self-test
+      - id: scope
+        name: Classify the change
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: scripts/ci/ci-scope.sh "$BASE" >> "$GITHUB_OUTPUT"
+
+  styles:
+    name: Build styles (SCSS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Compile SCSS (must succeed)
+        working-directory: ui/shell
+        run: npx --yes sass@1.97.3 --no-charset style.scss /tmp/style.css
+
+      - name: Settings SCSS compiles (must succeed)
+        run: npx --yes sass@1.97.3 --no-charset ui/settings/style.scss /tmp/settings.css
+
+      # The git-ignored Settings stylesheet (F1, fix pass #3): the tree copy
+      # is what a dev reload paints without rebuilding, so it must match a
+      # fresh compile of the SCSS — it went stale silently once (Amiri in
+      # the verse stack) because nothing pinned it. Compiling above is not
+      # the same as the tree copy matching.
+      - name: Settings CSS matches its SCSS (must succeed)
+        run: node scripts/ci/settings-css-check.mjs
+      # The tokens the native Settings paints with (toolkit/PHASE1.md D4), computed by the
+      # same engine and sheets as this desktop: every token the Settings/kit sheets use must
+      # exist in every one of the engine's input sets; a copy with one dropped must fail. The
+      # glass (D7) the same: a copy with `panel` dropped from one variant must fail, and one with
+      # a control step's `states` dropped (toolkit/tokens/control.json, #889).
+      - name: Settings token export is complete (must succeed)
+        run: |
+          node --experimental-strip-types scripts/export-tokens.mjs build/settings-data
+          python3 scripts/ci/settings-tokens-check.py build/settings-data
+          cp -r build/settings-data build/settings-tokens-control
+          python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['sets'][0]['tokens'].pop('--veltrix-surface'); json.dump(d, open(p, 'w'))" build/settings-tokens-control/tokens/colors.json
+          if python3 scripts/ci/settings-tokens-check.py build/settings-tokens-control; then
+            echo "::error::settings-tokens-check passed an export with a used token missing"; exit 1
+          fi
+          rm -rf build/settings-glass-control && cp -r build/settings-data build/settings-glass-control
+          python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['variants'][0]['pieces'].pop('panel'); json.dump(d, open(p, 'w'))" build/settings-glass-control/tokens/glass.json
+          if python3 scripts/ci/settings-tokens-check.py build/settings-glass-control; then
+            echo "::error::settings-tokens-check passed a glass export with no panel"; exit 1
+          fi
+          rm -rf build/settings-control-control && cp -r build/settings-data build/settings-control-control
+          python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['variants'][0]['pieces']['control'][0].pop('states'); json.dump(d, open(p, 'w'))" build/settings-control-control/tokens/glass.json
+          if python3 scripts/ci/settings-tokens-check.py build/settings-control-control; then
+            echo "::error::settings-tokens-check passed a control step with no states"; exit 1
+          fi
+          rm -rf build/settings-list-control && cp -r build/settings-data build/settings-list-control
+          python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['variants'][0]['list'].pop('highlight'); json.dump(d, open(p, 'w'))" build/settings-list-control/tokens/components.json
+          if python3 scripts/ci/settings-tokens-check.py build/settings-list-control; then
+            echo "::error::settings-tokens-check passed a components variant with no list highlight"; exit 1
+          fi
+          rm -rf build/settings-choices-control && cp -r build/settings-data build/settings-choices-control
+          python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['variants'][0]['choices'].pop('swatch'); json.dump(d, open(p, 'w'))" build/settings-choices-control/tokens/components.json
+          if python3 scripts/ci/settings-tokens-check.py build/settings-choices-control; then
+            echo "::error::settings-tokens-check passed a components variant with no swatch choice"; exit 1
+          fi
+          rm -rf build/settings-range-control && cp -r build/settings-data build/settings-range-control
+          python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['variants'][0]['range'].pop('slider'); json.dump(d, open(p, 'w'))" build/settings-range-control/tokens/components.json
+          if python3 scripts/ci/settings-tokens-check.py build/settings-range-control; then
+            echo "::error::settings-tokens-check passed a components variant with no slider"; exit 1
+          fi
+          rm -rf build/settings-switch-control && cp -r build/settings-data build/settings-switch-control
+          python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['variants'][0]['switch'].pop('thumbColor'); json.dump(d, open(p, 'w'))" build/settings-switch-control/tokens/components.json
+          if python3 scripts/ci/settings-tokens-check.py build/settings-switch-control; then
+            echo "::error::settings-tokens-check passed a components variant with no switch thumb colour"; exit 1
+          fi
+          for key in edge gap; do
+            rm -rf build/settings-capsule-control && cp -r build/settings-data build/settings-capsule-control
+            python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['variants'][0]['capsule'].pop(sys.argv[2]); json.dump(d, open(p, 'w'))" build/settings-capsule-control/tokens/components.json "$key"
+            if python3 scripts/ci/settings-tokens-check.py build/settings-capsule-control; then
+              echo "::error::settings-tokens-check passed missing capsule $key"; exit 1
+            fi
+          done
+      # The kit's ONE sheet (tech-debt #108 phase 2): the shell, greeter and lock
+      # load it at runtime ahead of their own, so it is no longer compiled as part
+      # of any of them — a break in it would otherwise reach nobody's compile.
+      - name: Compile the kit's sheet (must succeed)
+        working-directory: ui/shell
+        run: npx --yes sass@1.97.3 --no-charset ../lib/veltrix-kit/styles/kit.scss /tmp/kit.css
+
+      # The greeter/lockscreen sheet (one file, both bundles) was compiled by
+      # nothing here until 2026-08-10, and it is the one that could least afford
+      # it: those two surfaces have NO dev mode — they load a fixed
+      # /usr/share path, so a break shows up only when someone boots a VM.
+      # It now `@use`s ui/lib/veltrix-kit/styles/, which the shell's compile above already
+      # gates for syntax, but not for what the GREETER needs from it (its own
+      # `radius-vars`, its own token contract). Cheap, and it closes the gap the
+      # kit import opened.
+      - name: Compile the greeter/lock SCSS (must succeed)
+        working-directory: ui/shell
+        run: npx --yes sass@1.97.3 --no-charset ../greeter/style.scss /tmp/greeter.css
+
+      # The installer's sheet, for the same reason as the greeter's: that bundle
+      # ships only on the live medium, so a break in it is invisible until an ISO
+      # is booted — the longest feedback loop in the project.
+      - name: Compile the installer SCSS (must succeed)
+        working-directory: ui/shell
+        run: npx --yes sass@1.97.3 --no-charset ../installer/style.scss /tmp/installer.css
+
+      # Compiling is not the same as being PAINTABLE. A bundle that borrows a kit
+      # widget also borrows the `--veltrix-*` tokens its rules name, and an
+      # undefined custom property is not an error in GTK4 — the declaration is
+      # silently dropped, so the control ships with a hover that does nothing.
+      # That is exactly how the installer's close button shipped (2026-08-26).
+      # Deliberately a STEP of this job, not a job of its own: a new REQUIRED
+      # check has to be added to the merge queue's list too, and one that is not
+      # stalls every entry with nothing reporting an error.
+      - name: Every bundle defines the tokens it paints with
+        run: node scripts/ci/token-contract-check.mjs
+
+      # ...and the MIRROR IMAGE of that, which nothing caught for months. A token
+      # that is defined, computed by the engine and written into every process's
+      # stylesheet, and that no rule reads, is not tidiness debt: it is a value that
+      # DRIFTS from the one on screen. `--veltrix-edge` (the rim of light) was retuned
+      # in #600 to fix a white hairline on window chrome and changed nothing, because
+      # its last reader had been deleted in the same commit (tech-debt #106). The
+      # check that was supposed to notice was satisfied — painting with a token you
+      # do not define is the other direction.
+      - name: Every token a bundle defines is read by something
+        run: node scripts/ci/token-orphan-check.mjs
+
+      # ⚠️ And the control, because a check that has only ever printed "ok" has been
+      # run, not tested. This declares a token nothing can possibly read and requires
+      # the check to come back non-zero. It proves the mechanism (defined AND unread
+      # ⇒ fail); it does not prove the comment-stripping, which is what stops a token
+      # NAMED in prose from counting as a reader — that half is exercised by the repo
+      # itself, which names tokens in comments on nearly every page.
+      - name: The orphan check can fail (control, must be caught)
+        run: |
+          cp ui/shell/styles/_base.scss /tmp/base.bak
+          sed -i 's|^    --veltrix-border: |    --veltrix-dead-canary: #ff00ff;\n    --veltrix-border: |' \
+            ui/shell/styles/_base.scss
+          if git diff --quiet ui/shell/styles/_base.scss; then
+            echo "::error::the control patched nothing — the anchor declaration has moved or been reworded"
+            exit 1
+          fi
+          if node scripts/ci/token-orphan-check.mjs; then
+            echo "::error::the check passed with a token nothing reads — it is not checking what it prints"
+            cp /tmp/base.bak ui/shell/styles/_base.scss
+            exit 1
+          fi
+          cp /tmp/base.bak ui/shell/styles/_base.scss
+          git diff --quiet ui/shell/styles/_base.scss
+
+      # ...and one level up again. `token-contract-check` asks whether a bundle
+      # defines the tokens it paints with. Nothing asked whether the KIT draws what
+      # the KIT builds — and it did not: every rule giving a `switch` its track and
+      # thumb stayed in the shell's half when the kit's stylesheet was extracted
+      # (tech-debt #59), so `VeltrixToggleRow` shipped without them and the
+      # installer's NVIDIA toggle was drawn by ADWAITA while the shell's switches wore
+      # Veltrix's. ⚠️ Measured, after this comment first said "invisible": only the
+      # greeter and the lock force the blank theme we ship, so invisible is what
+      # happens THERE; the shell and the installer fall back to the user's GTK theme,
+      # which is its own bug — a kit component must not depend on it to be drawn.
+      - name: We use GTK with our styles — nothing by default
+        run: node scripts/ci/style-ownership-check.mjs
+
+      # ⚠️ TWO controls, because the first version of this check passed one and
+      # failed the other. It only complained when the SHELL styled a class, which
+      # leaves the rules already living in the kit unprotected: rename one there and
+      # the class becomes "styled nowhere", which that draft accepted. Control A is
+      # that exact case; control B is the original bug, a rule back in the shell's
+      # half.
+      - name: The style-ownership check can fail (controls, must be caught)
+        run: |
+          cp ui/lib/veltrix-kit/styles/_components.scss /tmp/kit.bak
+          cp ui/shell/styles/_components.scss /tmp/shell.bak
+
+          python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path("ui/lib/veltrix-kit/styles/_components.scss")
+          s = p.read_text()
+          out = re.sub(r"^\.veltrix-menu \{", ".veltrix-menu-DELIBERATELY-BROKEN {", s, count=1, flags=re.M)
+          assert out != s, "control A patched nothing - the .veltrix-menu rule moved or was reworded"
+          p.write_text(out)
+          PY
+          if node scripts/ci/style-ownership-check.mjs; then
+            echo "::error::control A passed — a kit rule can be deleted from the kit's sheet unnoticed"
+            cp /tmp/kit.bak ui/lib/veltrix-kit/styles/_components.scss
+            exit 1
+          fi
+          cp /tmp/kit.bak ui/lib/veltrix-kit/styles/_components.scss
+
+          python3 - <<'PY'
+          import pathlib, re
+          k = pathlib.Path("ui/lib/veltrix-kit/styles/_components.scss")
+          s = k.read_text()
+          m = re.search(r"^\.veltrix-menu \{.*?^\}\n", s, flags=re.M | re.S)
+          assert m, "control B patched nothing - the .veltrix-menu rule moved or was reworded"
+          k.write_text(s.replace(m.group(0), ""))
+          sh = pathlib.Path("ui/shell/styles/_components.scss")
+          sh.write_text(sh.read_text() + "\n" + m.group(0))
+          PY
+          if node scripts/ci/style-ownership-check.mjs; then
+            echo "::error::control B passed — a kit rule can live in the shell's half unnoticed"
+            cp /tmp/kit.bak ui/lib/veltrix-kit/styles/_components.scss
+            cp /tmp/shell.bak ui/shell/styles/_components.scss
+            exit 1
+          fi
+          cp /tmp/kit.bak ui/lib/veltrix-kit/styles/_components.scss
+          cp /tmp/shell.bak ui/shell/styles/_components.scss
+
+          # Control C — the BUNDLE half, which is the one that binds for work that
+          # does not exist yet: a widget a bundle builds and nothing it compiles
+          # draws. `calendar` is the subject because the shell really does build one.
+          #
+          # ⚠️ It patches EVERY sheet of the bundle, not one. The first version of
+          # this control renamed `calendar` in `_reset.scss` alone and the check went
+          # on passing, because `_control-center.scss` styles it too — so the control
+          # reported "control C passed" and failed the build for the right reason:
+          # it was not producing the defect it claimed to produce.
+          # ⚠️ And EVERY sheet includes `ui/lib/veltrix-kit/styles/`: since the shell went themeless
+          # (#107 step 5) the base layer draws `calendar` too, so a control that broke
+          # only the shell's half would leave the node drawn and pass for the wrong reason.
+          cp -r ui/shell/styles /tmp/shell-styles.bak
+          cp -r ui/lib/veltrix-kit/styles /tmp/lib-styles.bak
+          python3 - <<'PY'
+          import pathlib, re
+          hit = 0
+          for f in [*pathlib.Path("ui/shell/styles").glob("*.scss"), *pathlib.Path("ui/lib/veltrix-kit/styles").glob("*.scss")]:
+              s = f.read_text()
+              out = re.sub(r"(^|[\s,])calendar([\s,{])", r"\1cal-DELIBERATELY-BROKEN\2", s, flags=re.M)
+              if out != s:
+                  f.write_text(out)
+                  hit += 1
+          assert hit, "control C patched nothing - the calendar rules moved or were reworded"
+          PY
+          if node scripts/ci/style-ownership-check.mjs; then
+            echo "::error::control C passed — a widget a bundle builds can go undrawn unnoticed"
+            rm -rf ui/shell/styles && cp -r /tmp/shell-styles.bak ui/shell/styles
+            rm -rf ui/lib/veltrix-kit/styles && cp -r /tmp/lib-styles.bak ui/lib/veltrix-kit/styles
+            exit 1
+          fi
+          rm -rf ui/shell/styles && cp -r /tmp/shell-styles.bak ui/shell/styles
+          rm -rf ui/lib/veltrix-kit/styles && cp -r /tmp/lib-styles.bak ui/lib/veltrix-kit/styles
+
+          git diff --quiet ui/lib/veltrix-kit/styles/_components.scss ui/shell/styles/_components.scss ui/shell/styles/_reset.scss
+
+      # A row's height lives in CSS, and the code that reasons about rows — a list
+      # asking for six WHOLE rows, a window whose natural height follows from that —
+      # cannot read CSS. Same mirror, same silence as the blur thresholds.
+      - name: Row heights agree between tokens and the stylesheet
+        run: node scripts/ci/row-height-check.mjs
+
+      # Settings rows contract (#332, #341): every declarative setting row must use
+      # settingRow() backed by config-entries.ts or manifest.ts or be in allowlist.
+      - name: Settings rows contract (declarative rows match config registry)
+        run: node --experimental-strip-types scripts/ci/settings-config-contract.mjs
+
+      # The client-painted glass's model: whether text on a piece of glass is legible over a
+      # backdrop — what the tooltips' floors are held to. Pure arithmetic in the kit, so it is
+      # checked here with the rest of the design system rather than on a live screen.
+      - name: The glass legibility model holds its numbers
+        run: |
+          npx --yes esbuild@0.28.2 scripts/dev/glass-legibility-probe.ts --bundle \
+            --platform=node --format=esm --log-level=warning --outfile=/tmp/glass-probe.mjs
+          node /tmp/glass-probe.mjs
+
+      # ⚠️ And the control: a tooltip floor one step thicker is no longer the LEAST that reads
+      # 4.5:1, and the probe must say so.
+      - name: The glass legibility probe can fail (control, must be caught)
+        run: |
+          f=ui/lib/veltrix-kit/platform/glass-legibility.ts
+          cp "$f" /tmp/glass-legibility.bak
+          sed -i 's|TOOLTIP_GLASS_FLOOR = { dark: 0.59,|TOOLTIP_GLASS_FLOOR = { dark: 0.60,|' "$f"
+          if git diff --quiet "$f"; then
+            echo "::error::the control patched nothing — TOOLTIP_GLASS_FLOOR has moved or been reworded"
+            exit 1
+          fi
+          npx --yes esbuild@0.28.2 scripts/dev/glass-legibility-probe.ts --bundle \
+            --platform=node --format=esm --log-level=warning --outfile=/tmp/glass-probe-defect.mjs
+          if node /tmp/glass-probe-defect.mjs; then
+            echo "::error::the probe passed with a tooltip floor moved — it is not checking what it prints"
+            cp /tmp/glass-legibility.bak "$f"
+            exit 1
+          fi
+          cp /tmp/glass-legibility.bak "$f"
+          git diff --quiet "$f"
+
+  pkgbuild:
+    name: PKGBUILD parses
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # `bash -n` only, not a full makepkg: this catches the class that actually
+      # bit (v0.6.0, an unquoted `hyprland>=0.56` — bash read `>` as a
+      # redirection, the depends=() array never closed and the file stopped
+      # sourcing), and it needs no Arch container. A broken PKGBUILD breaks the
+      # LOCAL package build for every user, which is the path install.sh takes
+      # whenever veltrix-repo does not yet serve the release — i.e. the first
+      # minutes of every release.
+      - name: bash -n packaging/veltrix/PKGBUILD (must parse)
+        run: bash -n packaging/veltrix/PKGBUILD
+      # Both arrays must survive sourcing as real arrays — a syntax error can
+      # truncate one silently rather than fail loudly. This stopped being only a
+      # packaging concern on 2026-09-02: install.sh DERIVES its install list from
+      # these two (#379), so a collapsed array is now also every user's install
+      # asking pacman for two packages instead of seventy-six.
+      #
+      # The `/^)/` end anchor is load-bearing and both arrays are written to close
+      # that way: `depends=()` holds a comment line ending in `)`, and a looser
+      # pattern ends the range there and sources an unterminated array.
+      - name: depends=() and makedepends=() source as non-empty arrays
+        run: |
+          source <(sed -n '/^depends=(/,/^)/p' packaging/veltrix/PKGBUILD)
+          source <(sed -n '/^makedepends=(/,/^)/p' packaging/veltrix/PKGBUILD)
+          echo "depends: ${#depends[@]}  makedepends: ${#makedepends[@]}"
+          [ "${#depends[@]}" -ge 40 ] || { echo "::error::depends=() collapsed to ${#depends[@]}"; exit 1; }
+          [ "${#makedepends[@]}" -ge 5 ] || { echo "::error::makedepends=() collapsed to ${#makedepends[@]}"; exit 1; }
+      # veltrix-kit's API version lives twice (#108 phase 4): in its package.json,
+      # which is the kit's own statement, and as a literal in the PKGBUILD, because
+      # makepkg reads `provides` before anything runs. Drift would publish a kit
+      # whose `veltrix-kit-api` says one version and whose files say another — and
+      # apps outside this repo resolve their dependency by the first.
+      - name: veltrix-kit's API version matches in PKGBUILD and package.json
+        run: |
+          pk="$(sed -n 's/^_kitapi=//p' packaging/veltrix/PKGBUILD)"
+          js="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' ui/lib/veltrix-kit/package.json)"
+          echo "PKGBUILD _kitapi=$pk  package.json version=$js"
+          [ -n "$pk" ] && [ "$pk" = "$js" ] || { echo "::error::veltrix-kit API version: PKGBUILD says '$pk', package.json says '$js'"; exit 1; }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      # Every helper the UI invokes must actually be installed by BOTH the
+      # PKGBUILD and install.sh: Content Safety shipped with its helper in
+      # install.sh only, so the packaged install had no
+      # /usr/bin/veltrix-content-safety at all and every pkexec call failed
+      # (exit 127) — while the build report claimed it was "in the loop".
+      - name: Referenced helpers are installed by both paths (must succeed)
+        run: node scripts/ci/package-contents-check.mjs
+      # Config migrations mutate a user's files once, on a machine nobody can
+      # inspect afterwards — there is no undo. This asserts the properties that
+      # make one survivable (valid bash, a no-op on a fresh install, idempotent
+      # with the marker cleared) instead of leaving them to be remembered, and it
+      # carries its own positive control. A step in THIS job rather than a job of
+      # its own: it is shell-side correctness like the rest of it, and a required
+      # check that a path filter can skip is one that stalls the merge queue.
+      # The settings migrations write GSettings (#573); the check compiles the
+      # tree's schemas and runs them against the keyfile backend, so it needs
+      # glib's two tools — and gjs, which computes the videos folder exactly the
+      # way the shell does, so a computed default is recognised and not imported.
+      - name: glib tools and gjs for the settings migrations
+        run: command -v gsettings >/dev/null && command -v glib-compile-schemas >/dev/null && command -v gjs >/dev/null || scripts/ci/apt.sh install libglib2.0-bin libglib2.0-dev-bin gjs
+      - name: Config migrations are valid and idempotent (must succeed)
+        run: node scripts/ci/migrations-check.mjs
+
+  typecheck:
+    name: Typecheck (tsc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Download @girs snapshot (ci-assets release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release download ci-assets --repo "$GITHUB_REPOSITORY" \
+               --pattern girs-snapshot.tar.zst --output /tmp/girs-snapshot.tar.zst; then
+            echo "::error::No @girs snapshot found on the 'ci-assets' release."
+            echo "A maintainer must publish it once: scripts/dev/publish-ci-typings.sh"
+            exit 1
+          fi
+          tar --zstd -xf /tmp/girs-snapshot.tar.zst -C ui/shell
+          echo "Extracted @girs: $(du -sh ui/shell/@girs | cut -f1)"
+      - name: tsc --noEmit (must succeed)
+        working-directory: ui/shell
+        run: npx --yes -p typescript@5.7.3 tsc --noEmit -p tsconfig.json
+      # A GJS cairo.Context lives until JS GC, which does not feel native memory: an
+      # undisposed draw function filled the shell's native heap 140 → 874 MB in three passes
+      # over the dock (#100). Not a type error, not a visible glitch — hence a check.
+      - name: Cairo contexts are disposed (cairoDraw / append_cairo)
+        working-directory: .
+        run: node scripts/ci/cairo-dispose-check.mjs
+
+      # The installer, the greeter and the lock screen are typechecked in FULL,
+      # against the same snapshot: each tsconfig includes ../shell/@girs, and the
+      # only shim left is ui/lib/veltrix-kit/gi-cairo.d.ts (ts-for-gir types `gi://cairo` from
+      # the cairo GIR, not GJS's own module — see that file, and why it must be
+      # listed first). Until 2026-09-22 these three were NAMES ONLY (TS2304/TS2552)
+      # with GLib, Gio and GObject declared `any`, and `GLib.strdup_printf` —
+      # varargs, so absent in GJS — threw on the installer's System and Summary
+      # pages on every machine with a Turing-or-newer NVIDIA GPU (#623). These are
+      # the bundles with no dev mode: one erases a disk from a live medium, two
+      # stand between the user and their session. The compiler is the cheapest
+      # reader they have. (The names-only pass had earned its place: on 2026-08-10
+      # the greeter's LoginCard still called `syncCaps()`, deleted the day before,
+      # as the first statement of its `map` handler — every login threw, the card
+      # stayed at opacity 0 and the password field never took focus. A full check
+      # catches that class too.)
+      - name: tsc --noEmit on independent Settings (must succeed)
+        run: npx --yes -p typescript@5.7.3 tsc --noEmit -p ui/settings/tsconfig.json
+      - name: tsc --noEmit on installer / greeter / lockscreen (must succeed)
+        run: |
+          fail=0
+          for b in installer greeter lockscreen; do
+            echo "── ui/$b"
+            (cd "ui/$b" && npx --yes -p typescript@5.7.3 tsc --noEmit -p tsconfig.json) || fail=1
+          done
+          exit $fail
+
+  smoke:
+    name: Headless boot smoke
+    needs: scope
+    if: ${{ !cancelled() && needs.scope.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # Hyprland cannot boot with zero DRM devices (aquamarine's allocator
+      # needs a node — see the header of headless-smoke.sh), so give the
+      # runner a VIRTUAL one: the kernel's vkms module. The Arch container
+      # then gets /dev/dri via --privileged.
+      - name: Load vkms (virtual KMS device)
+        run: scripts/ci/load-vkms.sh
+      # No dependency cache any more (2026-08-18): the smoke used to build the
+      # pinned Astal/AGS stack from source and cache the result as a tarball.
+      # Nothing is built from source here now — every package comes from Arch's
+      # own repos — so the cache, its month stamp and its two-file hash key are
+      # gone with it. (That key was itself a trap worth remembering: it hashed
+      # BOTH install.sh and headless-smoke.sh because the pins live in one and
+      # the library list in the other, and keying on just one would have restored
+      # a tarball proving a removal that never happened.)
+      - name: Bundle + headless boot (Arch container on vkms)
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/repo" \
+            archlinux:latest bash /repo/scripts/ci/headless-smoke.sh
+      - name: Upload screenshots + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts
+          path: smoke-out/
+          if-no-files-found: ignore
+
+  # Hyalo, the compositor of our own (hyalo/, #681): build with the committed lock file,
+  # clippy with warnings as errors, unit tests, and a boot on the SAME vkms the smoke uses —
+  # through the tty backend a real session takes (libseat, udev, DRM/KMS), with the real
+  # shell on it. Screenshots come from Hyalo's own IPC; grim, the clipboard and wf-recorder are
+  # tested by scripts/ci/hyalo-screen-capture-check.sh inside the smoke.
+  # NOT a required check while Hyalo is a preview (#680): it must never hold the merge queue
+  # for the desktop that ships. All logic in scripts/ci/hyalo-smoke.sh.
+  hyalo:
+    name: Hyalo (build, clippy, tests, boot on vkms)
+    needs: scope
+    if: ${{ !cancelled() && needs.scope.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load vkms (virtual KMS device)
+        run: scripts/ci/load-vkms.sh
+      # The Rust build is most of this job (≈ 6 of its 9 minutes on 2026-10-05: release 3m43s,
+      # clippy 52s, tests 1m15s) and it was cold every time. Cargo's registry and target dir
+      # live under hyalo/target (git-ignored) and are cached between runs. A PR can only
+      # restore a cache of its own branch or of main, and this workflow has no push trigger
+      # (see `on:`), so main's is warmed by hyalo-cache.yml. A stale cache is still correct:
+      # cargo rebuilds whatever its fingerprints say changed (a new Arch rustc: all of it).
+      - name: Restore the Rust build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            hyalo/target
+            session/target
+          key: hyalo-build-${{ runner.os }}-${{ hashFiles('hyalo/Cargo.lock', 'session/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            hyalo-build-${{ runner.os }}-${{ hashFiles('hyalo/Cargo.lock', 'session/Cargo.lock') }}-
+            hyalo-build-${{ runner.os }}-
+      # The toolkit's release build (the test windows and the package's display selector),
+      # saved by every run and warmed on main by hyalo-cache.yml, as the one above. Until
+      # 2026-11-04 its key had no run id: saved once per Cargo.lock, never again, and no run on
+      # main saved one at all, so every PR rebuilt it almost from nothing.
+      - name: Restore toolkit test-window build cache
+        uses: actions/cache@v4
+        with:
+          path: toolkit/target
+          key: nk-phase0-arch-${{ hashFiles('toolkit/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            nk-phase0-arch-${{ hashFiles('toolkit/Cargo.lock') }}-
+            nk-phase0-arch-
+      - name: Build + boot (Arch container on vkms)
+        env:
+          # The real fcitx5/Orca matrices (~35 min) only when the change touches what they
+          # use; empty (scope failed) counts as true. See scripts/ci/ci-scope.sh.
+          NK_REAL_GATES: ${{ needs.scope.outputs.gates || 'true' }}
+          # Their controls and second scale only when the checks or their faults change.
+          NK_REAL_FULL: ${{ needs.scope.outputs.full || 'true' }}
+          # The checks that watch an animation on screen race the runner's software GL: the
+          # nightly run (and a manual one) has them, a PR does not (scripts/ci/hyalo-smoke.sh).
+          HYALO_ANIMATION_CHECKS: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          # CARGO_HOME inside the cached dir; no incremental state and no debuginfo in the
+          # dev/test profiles (CI never debugs them): a cache several times smaller.
+          docker run --rm --privileged \
+            -v "$PWD:/repo" \
+            -e CARGO_HOME=/repo/hyalo/target/cargo-home -e CARGO_INCREMENTAL=0 \
+            -e CARGO_PROFILE_DEV_DEBUG=0 -e CARGO_PROFILE_TEST_DEBUG=0 \
+            -e NK_REAL_GATES -e NK_REAL_FULL -e HYALO_ANIMATION_CHECKS \
+            archlinux:latest bash /repo/scripts/ci/hyalo-smoke.sh
+      - name: Upload screenshots + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyalo-artifacts
+          path: hyalo-out/
+          if-no-files-found: ignore
+      - name: Real fcitx5 and Orca assertion tables
+        if: always()
+        run: |
+          for report in hyalo-out/real-gates-skipped.md hyalo-out/toolkit-fcitx5/fcitx5-preflight/summary.md hyalo-out/toolkit-orca/orca-summary.md hyalo-out/toolkit-choices-orca/choices-orca/summary.md; do
+            if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
+
+  widgets-gen:
+    name: Widget registry freshness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Regenerate widgets.gen.ts (must succeed)
+        run: node scripts/gen-widget-index.mjs
+      - name: Verify committed file is fresh
+        run: |
+          if ! git diff --exit-code -- ui/shell/widgets/widgets.gen.ts; then
+            echo "::error::ui/shell/widgets/widgets.gen.ts is STALE."
+            echo "Fix: run 'node scripts/gen-widget-index.mjs' and commit the updated widgets.gen.ts alongside your widget change."
+            exit 1
+          fi
+      # The zero-layout contract. Neither rule is a compile error: 28 widget→surface
+      # imports type-checked happily, and a kit module that imports CCLayoutManager
+      # crashes the shell at BOOT, which tsc cannot see.
+      - name: Widget boundary (no surface imports, kit stays a leaf)
+        run: node scripts/ci/widget-boundary-check.mjs
+      # Settings is becoming its own process (#571), and a process runs the top level
+      # of everything it imports. On 2026-09-14 Settings.tsx alone reached 192 of the
+      # shell's 216 modules. A ratchet: a forbidden module reached and not in the
+      # allowlist fails, and so does a listed one that is no longer reached.
+      - name: Display preview rolls back on timeout and client loss
+        run: |
+          npx --yes esbuild@0.28.2 scripts/dev/display-lease-probe.ts --bundle --platform=node --format=esm --outfile=/tmp/display-lease-probe.mjs
+          node /tmp/display-lease-probe.mjs
+          node - /tmp/display-lease-probe.mjs <<'JS'
+          const fs = require("fs"), file = process.argv[2], src = fs.readFileSync(file, "utf8")
+          const rule = "world.apply(lease.name, lease.before);"
+          if (src.split(rule).length !== 2) throw Error("Display rollback control rule missing or ambiguous")
+          fs.writeFileSync(file, src.replace(rule, ""))
+          JS
+          if node /tmp/display-lease-probe.mjs > /tmp/display-lease-control.log 2>&1; then
+            echo "::error::the display probe passed without restoring the original display"
+            exit 1
+          fi
+          grep -q 'client death restores the display' /tmp/display-lease-control.log
+      - name: Settings import closure (no shell surfaces, ratcheted)
+        run: node scripts/ci/settings-closure-check.mjs
+      - name: Widget catalogue over private D-Bus (restart and refusals)
+        run: |
+          command -v gjs >/dev/null && command -v dbus-run-session >/dev/null || scripts/ci/apt.sh install gjs dbus
+          npx --yes esbuild@0.28.2 scripts/dev/widget-catalog-ipc-probe.ts --bundle \
+            --format=esm --platform=neutral --target=es2022 --external:gi://* --external:system \
+            --outfile=/tmp/widget-catalog-ipc-probe.js
+          CATALOG_PROBE_JS=/tmp/widget-catalog-ipc-probe.js scripts/dev/widget-catalog-ipc-probe.sh
+          if CONTROL=1 CATALOG_PROBE_JS=/tmp/widget-catalog-ipc-probe.js scripts/dev/widget-catalog-ipc-probe.sh > /tmp/catalog-control.log 2>&1; then
+            cat /tmp/catalog-control.log
+            echo "::error::the catalogue probe accepted removal of the fixed-widget refusal"
+            exit 1
+          fi
+          cat /tmp/catalog-control.log
+          grep -q 'Error: refused cc fixed false' /tmp/catalog-control.log
+      # The shell runs on Hyprland and on Hyalo through ONE interface (#682): a surface
+      # that imports HyprlandState or spawns hyprctl compiles, and does nothing on the
+      # other session. No exceptions since #682 emptied its allowlist.
+      - name: Compositor boundary (one interface for Hyprland and Hyalo)
+        run: node scripts/ci/compositor-boundary-check.mjs
+      - name: The compositor boundary check can fail (control, must be caught)
+        run: |
+          cp ui/shell/surfaces/bar/Bar.tsx /tmp/Bar.bak
+          sed -i '1i import hs from "../../core/HyprlandState"' ui/shell/surfaces/bar/Bar.tsx
+          if node scripts/ci/compositor-boundary-check.mjs; then
+            echo "::error::the check passed with the bar importing HyprlandState — it is not checking what it prints"
+            cp /tmp/Bar.bak ui/shell/surfaces/bar/Bar.tsx
+            exit 1
+          fi
+          cp /tmp/Bar.bak ui/shell/surfaces/bar/Bar.tsx
+          git diff --quiet ui/shell/surfaces/bar/Bar.tsx
+          # …and a script in bin/ that runs hyprctl instead of asking veltrix-wm.
+          cp bin/veltrix-act /tmp/veltrix-act.bak
+          echo 'GLib.spawn_command_line_sync("hyprctl clients -j")' >> bin/veltrix-act
+          if node scripts/ci/compositor-boundary-check.mjs; then
+            echo "::error::the check passed with bin/veltrix-act running hyprctl"
+            cp /tmp/veltrix-act.bak bin/veltrix-act
+            exit 1
+          fi
+          cp /tmp/veltrix-act.bak bin/veltrix-act
+          git diff --quiet bin/veltrix-act
+      # The kit is a package (tech-debt #108): an app outside this repo has
+      # veltrix-kit and nothing else of this tree, while the four bundles here can
+      # always resolve a path the kit should not have reached for.
+      - name: veltrix-kit imports nothing from outside itself, and every file is LGPL-headed
+        run: node scripts/ci/kit-boundary-check.mjs
+      - name: The kit boundary check can fail (control, must be caught)
+        run: |
+          cp ui/lib/veltrix-kit/badge.ts /tmp/badge.bak
+          # Line 2, not 1: line 1 is the licence line, and breaking it would make
+          # the check fail for the other rule.
+          sed -i '2i import { execAsync } from "../process"' ui/lib/veltrix-kit/badge.ts
+          if node scripts/ci/kit-boundary-check.mjs; then
+            echo "::error::the check passed with the kit importing ui/lib/process — it is not checking what it prints"
+            cp /tmp/badge.bak ui/lib/veltrix-kit/badge.ts
+            exit 1
+          fi
+          cp /tmp/badge.bak ui/lib/veltrix-kit/badge.ts
+          sed -i '1d' ui/lib/veltrix-kit/badge.ts
+          if node scripts/ci/kit-boundary-check.mjs; then
+            echo "::error::the check passed with a kit file that lost its LGPL line"
+            cp /tmp/badge.bak ui/lib/veltrix-kit/badge.ts
+            exit 1
+          fi
+          cp /tmp/badge.bak ui/lib/veltrix-kit/badge.ts
+          git diff --quiet ui/lib/veltrix-kit/badge.ts
+      # Our processes carry GTK_THEME=Empty (commandment 11) and a child inherits it:
+      # every app the dock launched came up with no GTK theme (2026-09-27). One door
+      # for child processes, spawn() in ui/lib/process.ts, which leaves it behind.
+      - name: Child processes start through spawn() (no GTK_THEME=Empty for apps)
+        run: node scripts/ci/child-env-check.mjs
+      - name: The child-env check can fail (control, must be caught)
+        run: |
+          cp ui/shell/widgets/clipboard.ts /tmp/clipboard.bak
+          sed -i '1a const _probe = Gio.Subprocess.new(["true"], 0)' ui/shell/widgets/clipboard.ts
+          if node scripts/ci/child-env-check.mjs; then
+            echo "::error::the check passed with a Gio.Subprocess.new in the shell — it is not checking what it prints"
+            cp /tmp/clipboard.bak ui/shell/widgets/clipboard.ts
+            exit 1
+          fi
+          cp /tmp/clipboard.bak ui/shell/widgets/clipboard.ts
+          git diff --quiet ui/shell/widgets/clipboard.ts
+
+  hypr-config:
+    name: Compositor config (parses + rules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lua
+        run: scripts/ci/apt.sh install lua5.4
+      # The session's whole config is one Lua chunk: a syntax error anywhere in it
+      # means Hyprland starts with NO Veltrix config at all — no keybinds, no rules.
+      # `luac -p` needs none of the `hl` API to catch that.
+      - name: luac -p config/hypr/hyprland.lua (must parse)
+        run: luac5.4 -p config/hypr/hyprland.lua
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      # A rule matches a string a GTK window announces, and nothing in the repo
+      # connects the two: rename one and the rule stops matching, with no error
+      # anywhere. Worse, the direction of the trap depends on the EFFECT — a static
+      # one (float, size, workspace) only ever sees the class the window was BORN
+      # with, so a rule on the app-id we stamp at MAP never fires at all; a dynamic
+      # one (rounding, no_blur) only sees the current class, so a rule on the birth
+      # class stops applying the moment the window is up. Both had been written down
+      # and the prose still had the shell's birth class wrong.
+      - name: Window rules match identifiers the source declares (must succeed)
+        run: node scripts/ci/hypr-rule-check.mjs
+      # Hyalo's rules (config/hyalo/hyalo.toml) go through a TOML reader of its own in
+      # that script; a reader that finds nothing would pass every rule, so: a misspelt
+      # app id must be caught.
+      - name: The Hyalo rule check can fail (control, must be caught)
+        run: |
+          cp config/hyalo/hyalo.toml /tmp/hyalo.toml.bak
+          sed -i 's/app_id = "^veltrix-about\$"/app_id = "^veltrix-abuot$"/' config/hyalo/hyalo.toml
+          grep -q 'veltrix-abuot' config/hyalo/hyalo.toml || { echo "::error::the control's edit did not apply"; exit 1; }
+          if node scripts/ci/hypr-rule-check.mjs; then
+            echo "::error::a Hyalo rule naming an app id nothing declares passed the check"
+            cp /tmp/hyalo.toml.bak config/hyalo/hyalo.toml
+            exit 1
+          fi
+          cp /tmp/hyalo.toml.bak config/hyalo/hyalo.toml
+          git diff --quiet config/hyalo/hyalo.toml
+      # The shell GENERATES Lua too — veltrix-settings.lua and veltrix-monitor.lua,
+      # both required by hyprland.lua at every login. `tsc` sees the generator's
+      # strings and luac never sees what they produced, so this renders the real
+      # thing and parses it. A step in THIS job rather than a job of its own:
+      # lua and node are already here, and a required check that can be skipped
+      # is a required check that stalls the queue.
+      - name: The Lua the shell generates parses (must succeed)
+        run: node scripts/ci/hypr-lua-check.mjs
+      # VELTRIX fork (Phase 0): Game Mode's session probe + control lived here
+      # and were deleted with it (game-session-logic.ts, game-session-probe.ts).
+
+  skill-docs:
+    name: Docs + prose shape
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: No repeated headings in .claude/skills, and one copy of the skill (must succeed)
+        run: node scripts/ci/skill-docs-check.mjs
+      # A wrapping GtkLabel must FILL its column. The rule was written in
+      # design-system.md and violated six times anyway, because the failure only
+      # shows once a string is long enough to wrap — which depends on the locale and
+      # the text-size setting, i.e. on someone else's machine.
+      - name: Wrapping prose fills its column (must succeed)
+        run: node scripts/ci/wrapping-prose-check.mjs
+      # Verify that sameApp/nameTokens logic across bin/ helpers and app-search remain identical
+      - name: sameApp helper consistency (must succeed)
+        run: node scripts/ci/same-app-check.mjs
+      # The glass floor (TS) and every layer's ignore_alpha (Lua) are ONE decision in
+      # two languages. Cross it and the surface stops being blurred entirely — and it
+      # fails SILENTLY: the config parses, the shell boots, the smoke passes.
+      - name: Blur thresholds under the glass, un-blurred paint under them (must succeed)
+        run: node scripts/ci/blur-threshold-check.mjs
+      # Every shell-skin surface must be inside the Appearance pin. A surface that
+      # moves OUT of the bar's window silently leaves everything scoped to it — this
+      # already cost the island and the app grid their pinned dark/light, and only a
+      # user who pinned AGAINST their system mode ever sees it.
+      - name: Shell surfaces stay inside the appearance pin (must succeed)
+        run: node scripts/ci/chrome-scope-check.mjs
+      # The user-hook event table is a promise to people outside this repo. Both
+      # ways of breaking it are silent: an event fired but not declared is refused
+      # by the runner and never reaches a hook, and one declared but never fired
+      # gives the user a documented directory that can only stay empty.
+      - name: User-hook events declared == events fired (must succeed)
+        run: node scripts/ci/hook-events-check.mjs
+      # The interface-icon chain must never end in a gap. A name whose drawing is
+      # gone costs a glyph with no error anywhere — GTK hands back image-missing and
+      # the surface just draws a hole. It also keeps the icon spec (SPEC.md), the
+      # code's ICON_NAMES and the theme's declared version saying the same thing.
+      - name: Every interface-icon concept can be drawn (must succeed)
+        run: node scripts/ci/icon-registry-check.mjs
+
+  icons:
+    name: Veltrix icon theme is complete and in sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      # The theme is COMMITTED, once: ui/shell/assets/icons/veltrix is both what the
+      # shell draws and the spec's reference theme (#587). Its 16x16 variant is
+      # derived from the scalable drawings — a drawing changed in one size and
+      # forgotten in the other must not land.
+      - name: The 16x16 variant matches the scalable drawings (must succeed)
+        run: python3 scripts/icons/veltrix-icons.py sync --check
+      - name: Every name resolves in the theme, in both sizes, and it declares the spec (must succeed)
+        run: node scripts/ci/icon-registry-check.mjs --theme ui/shell/assets/icons/veltrix
+
+  i18n:
+    name: Translations (parity + ledger)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      # Two releases shipped with 82 keys missing from ten locales and nobody noticed
+      # the number move to 84, because no artifact recorded it. This fails when the
+      # committed ledger no longer matches the catalogs — so untranslated and stale
+      # keys land in the PR's own diff — and on the parity rules that must always be
+      # zero (es out of sync with en, orphan keys, greeter/lock mini-catalogs).
+      - name: Translation ledger is fresh + parity holds (must succeed)
+        run: node scripts/ci/i18n-check.mjs --check
+      # The Arabic fontconfig rule and the five locale detection chains are
+      # load-bearing and drift silently: the rule is the only thing standing
+      # between Arabic text and DejaVu Sans, and the chains are the agreement
+      # that the installer and the desktop it installs mean the same thing by
+      # "pt". Security review v1 recommendation #3 (bilingual feature).
+      - name: Arabic fontconfig rule is minimal + locale chains agree (must succeed)
+        run: node scripts/ci/locale-fontconfig-check.mjs
+      # Control for the check above: a probe that has only ever printed "ok"
+      # has been run, not tested. A mutated copy must fail — three times for
+      # the fontconfig half (mode="assign", mode="append", single-quoted
+      # mode='assign'), once for the chains half (shell chain with its ar
+      # branch deleted).
+      - name: Locale/fontconfig guard catches a drift (control — must fail)
+        run: |
+          rm -rf /tmp/locale-control
+          mkdir -p /tmp/locale-control/config/fontconfig /tmp/locale-control/ui/shell/core/i18n /tmp/locale-control/ui/greeter/lib /tmp/locale-control/ui/lockscreen/lib /tmp/locale-control/ui/installer/lib /tmp/locale-control/toolkit/crates/nk-platform/src
+          cp config/fontconfig/65-0-veltrix-noto-arabic.conf /tmp/locale-control/config/fontconfig/
+          cp ui/shell/core/i18n/index.ts /tmp/locale-control/ui/shell/core/i18n/
+          cp ui/greeter/lib/i18n.ts /tmp/locale-control/ui/greeter/lib/
+          cp ui/lockscreen/lib/i18n.ts /tmp/locale-control/ui/lockscreen/lib/
+          cp ui/installer/lib/i18n.ts ui/installer/lib/languages.ts /tmp/locale-control/ui/installer/lib/
+          cp toolkit/crates/nk-platform/src/exports.rs /tmp/locale-control/toolkit/crates/nk-platform/src/
+          node scripts/ci/locale-fontconfig-check.mjs --root /tmp/locale-control
+          sed -i 's/mode="prepend"/mode="assign"/' /tmp/locale-control/config/fontconfig/65-0-veltrix-noto-arabic.conf
+          if node scripts/ci/locale-fontconfig-check.mjs --root /tmp/locale-control; then
+            echo "::error::locale-fontconfig-check passed a fontconfig rule with mode=\"assign\""; exit 1
+          fi
+          cp config/fontconfig/65-0-veltrix-noto-arabic.conf /tmp/locale-control/config/fontconfig/
+          sed -i 's/mode="prepend"/mode="append"/' /tmp/locale-control/config/fontconfig/65-0-veltrix-noto-arabic.conf
+          if node scripts/ci/locale-fontconfig-check.mjs --root /tmp/locale-control; then
+            echo "::error::locale-fontconfig-check passed a fontconfig rule with mode=\"append\""; exit 1
+          fi
+          cp config/fontconfig/65-0-veltrix-noto-arabic.conf /tmp/locale-control/config/fontconfig/
+          sed -i "s/mode=\"prepend\"/mode='assign'/" /tmp/locale-control/config/fontconfig/65-0-veltrix-noto-arabic.conf
+          if node scripts/ci/locale-fontconfig-check.mjs --root /tmp/locale-control; then
+            echo "::error::locale-fontconfig-check passed a fontconfig rule with single-quoted mode='assign'"; exit 1
+          fi
+          cp config/fontconfig/65-0-veltrix-noto-arabic.conf /tmp/locale-control/config/fontconfig/
+          sed -i '/startsWith("ar")/d' /tmp/locale-control/ui/shell/core/i18n/index.ts
+          if node scripts/ci/locale-fontconfig-check.mjs --root /tmp/locale-control; then
+            echo "::error::locale-fontconfig-check passed a shell chain with no ar branch"; exit 1
+          fi
+      # What the native Settings reads of the current one (toolkit/PHASE1.md D2/D4): the page
+      # manifest and every locale, exported from the same files. Checked against a reading
+      # of the sources that does not import them; a copy with one key dropped must fail.
+      - name: Settings data export is complete (must succeed)
+        run: |
+          node --experimental-strip-types scripts/export-settings-data.mjs /tmp/settings-data
+          python3 scripts/ci/settings-data-check.py /tmp/settings-data
+          cp -r /tmp/settings-data /tmp/settings-data-control
+          python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d.pop(next(iter(d))); json.dump(d, open(p, 'w'))" /tmp/settings-data-control/i18n/en.json
+          if python3 scripts/ci/settings-data-check.py /tmp/settings-data-control; then
+            echo "::error::settings-data-check passed an export with a key missing"; exit 1
+          fi
+          # A value changed and an Appearance predicate dropped must fail too (#852 [A7]).
+          rm -rf /tmp/settings-data-control && cp -r /tmp/settings-data /tmp/settings-data-control
+          python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['settings.appearance.title'] += '!'; json.dump(d, open(p, 'w'))" /tmp/settings-data-control/i18n/es.json
+          if python3 scripts/ci/settings-data-check.py /tmp/settings-data-control; then
+            echo "::error::settings-data-check passed an export with a value changed"; exit 1
+          fi
+          rm -rf /tmp/settings-data-control && cp -r /tmp/settings-data /tmp/settings-data-control
+          python3 - /tmp/settings-data-control/manifest.json <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          page = next(p for p in m if p['id'] == 'appearance')
+          item = next(i for g in page['groups'] for i in g.get('items', []) if isinstance(i, dict) and 'sensitiveWhen' in i)
+          del item['sensitiveWhen']
+          json.dump(m, open(sys.argv[1], 'w'))
+          PY
+          if python3 scripts/ci/settings-data-check.py /tmp/settings-data-control; then
+            echo "::error::settings-data-check passed an export with an Appearance predicate dropped"; exit 1
+          fi
+          rm -rf /tmp/settings-data-control && cp -r /tmp/settings-data /tmp/settings-data-control
+          rm /tmp/settings-data-control/version
+          if python3 scripts/ci/settings-data-check.py /tmp/settings-data-control; then
+            echo "::error::settings-data-check passed an export with no version file"; exit 1
+          fi
+
+  agent-loop:
+    name: Assistant loop (veltrix-agent)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # The daemon is plain GJS (no Node) and imports gi://Secret, so the runner
+      # needs the gjs interpreter and the libsecret typelib. curl + python3 are
+      # already on ubuntu-latest. gjs pulls the GLib/Gio/GioUnix typelibs it needs;
+      # glib's tools compile the settings schemas the daemon reads (#573).
+      - name: Install gjs + libsecret typelib
+        run: |
+          scripts/ci/apt.sh install gjs gir1.2-secret-1 libglib2.0-bin libglib2.0-dev-bin
+      - name: Drive veltrix-agent against a mock provider (must succeed)
+        run: python3 scripts/ci/agent-loop-test.py
+
+  # Not a required branch-protection check while the kit is experimental.
+  toolkit:
+    name: Toolkit (Rust build, text, CPU render and a11y)
+    needs: scope
+    if: ${{ !cancelled() && needs.scope.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            toolkit/target
+          key: toolkit-${{ runner.os }}-${{ hashFiles('toolkit/Cargo.lock') }}
+      # libglib2.0-dev: the shell's gio crate (the dock's GSettings preferences and Trash monitor).
+      - name: Install the corpus fonts
+        run: |
+          scripts/ci/apt.sh install fontconfig fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji fonts-inter-variable libwayland-dev libxkbcommon-dev pkg-config dbus-daemon libdav1d-dev libglib2.0-dev
+      # The native Settings' tests read the real exports (its manifest parser refuses a field it
+      # does not know, so a manifest.ts change it cannot draw fails here, not at start-up) and
+      # talk to a Config1 on a private dbus-daemon of their own (toolkit/settings/tests/bus.rs).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: The Settings exports the native Settings reads
+        run: |
+          node --experimental-strip-types scripts/export-settings-data.mjs
+          node --experimental-strip-types scripts/export-tokens.mjs
+      - name: Required-font preflight (no silent substitutions)
+        run: cargo run --manifest-path toolkit/Cargo.toml --locked --example corpus-report -- --check-fonts
+      - name: Locked build and lint
+        run: |
+          cargo fmt --manifest-path toolkit/Cargo.toml --all --check
+          cargo build --manifest-path toolkit/Cargo.toml --locked --workspace
+          cargo clippy --manifest-path toolkit/Cargo.toml --locked --workspace --all-targets -- -D warnings
+      - name: Accessibility feature isolation and password leak control
+        run: |
+          cargo test --manifest-path toolkit/Cargo.toml --locked -p nk-a11y --no-default-features
+          cargo test --manifest-path toolkit/Cargo.toml --locked -p nk-a11y --no-default-features --features atspi
+          python3 scripts/ci/nk-a11y-control.py
+      - name: Corpus catches char backspace (must fail at combining-marks)
+        run: |
+          python3 scripts/ci/nk-text-control.py
+          git diff --exit-code -- toolkit/crates/nk-text/src/editor.rs
+      - name: Pixel corpus catches a renderer that drops glyph runs (must fail)
+        run: |
+          python3 scripts/ci/nk-render-control.py
+          git diff --exit-code -- toolkit/crates/nk-render/src/lib.rs
+      - name: Unit tests and the complete corpus
+        env:
+          NK_REQUIRE_EXPORT: "1"
+          NK_SETTINGS_DATA: ${{ github.workspace }}/build/settings-data
+        run: cargo test --manifest-path toolkit/Cargo.toml --locked --workspace -- --nocapture
+      - name: Case table, layout timing and isolated peak RSS
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          status=0
+          cargo run --release --manifest-path toolkit/Cargo.toml --locked --example corpus-report > /tmp/nk-text-report.md || status=$?
+          cat /tmp/nk-text-report.md
+          cat /tmp/nk-text-report.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: nk-text-corpus-report
+          path: /tmp/nk-text-report.md
+
+  sessiond:
+    name: Session daemon (Rust + private D-Bus integration)
+    needs: scope
+    if: ${{ !cancelled() && needs.scope.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            session/target
+          key: sessiond-${{ runner.os }}-${{ hashFiles('session/Cargo.lock') }}
+      - name: Install private-bus and GJS client test dependencies
+        run: |
+          # libglib2.0-dev: the gio crate (Config1's GSettings); gsettings-desktop-schemas:
+          # the GNOME keys its integration test compiles with ours.
+          scripts/ci/apt.sh install dbus-daemon libnotify-bin python3-gi gjs libglib2.0-dev gsettings-desktop-schemas
+          npm install -g esbuild@0.28.2
+      - name: Build the real shell client probe
+        run: scripts/bundle.sh --js scripts/dev/notifd-probe.ts /tmp/notifd-client.js
+      - name: Integration test catches broken replaces_id (must fail)
+        shell: bash
+        run: |
+          cp session/daemon/src/model.rs /tmp/sessiond-model.rs
+          trap 'cp /tmp/sessiond-model.rs session/daemon/src/model.rs' EXIT
+          python3 - <<'PYCONTROL'
+          from pathlib import Path
+          path = Path('session/daemon/src/model.rs')
+          text = path.read_text()
+          rule = 'replaces_id > 0 && replaces_id <= MAX_ID'
+          assert text.count(rule) == 1, 'control edit did not apply exactly once'
+          path.write_text(text.replace(rule, 'false /* control: ignore replaces_id */'))
+          PYCONTROL
+          cargo build --manifest-path session/Cargo.toml --locked
+          if /usr/bin/python3 scripts/ci/sessiond-test.py session/target/debug/veltrix-sessiond --client /tmp/notifd-client.js > /tmp/sessiond-control.log 2>&1; then
+            cat /tmp/sessiond-control.log
+            echo '::error::integration accepted broken replaces_id'
+            exit 1
+          fi
+          cat /tmp/sessiond-control.log
+          grep -q 'FAIL: replaces_id replaces the live entry' /tmp/sessiond-control.log
+          cp /tmp/sessiond-model.rs session/daemon/src/model.rs
+          git diff --exit-code -- session/daemon/src/model.rs
+      - name: Locked build, lint and unit tests (must succeed)
+        run: |
+          cargo fmt --manifest-path session/Cargo.toml --all --check
+          cargo build --manifest-path session/Cargo.toml --locked
+          cargo clippy --manifest-path session/Cargo.toml --locked --all-targets -- -D warnings
+          cargo test --manifest-path session/Cargo.toml --locked
+      - name: Notification server and shell reconnection (must succeed)
+        run: /usr/bin/python3 scripts/ci/sessiond-test.py session/target/debug/veltrix-sessiond --client /tmp/notifd-client.js
+
+  installer-logic:
+    name: Installer logic (no disk)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      # The probe is TypeScript that imports `gi://GLib`, so it is bundled with
+      # our own esbuild wrapper and run by gjs — the same two tools the bundle
+      # itself is built with, rather than a Node reimplementation of them. gjs
+      # pulls the GLib typelib it needs; nothing else is required, because the
+      # probe touches no disk, opens no window and reads nothing about the
+      # machine it runs on.
+      - name: Install gjs + esbuild
+        run: |
+          scripts/ci/apt.sh install gjs
+          npm install -g esbuild@0.28.2
+
+      # ⚠️ THE POSITIVE CONTROL COMES FIRST, and it is not ceremony. Until
+      # 2026-09-05 the probe printed "N FAILURE(S)" and exited 0 — as a tool a
+      # person runs and reads, that was survivable; as a CI step it would have
+      # been a gate that can only pass. So this step breaks a rule on purpose and
+      # requires the probe to NOTICE: if a deliberately deleted refusal still
+      # comes back green, the run below proves nothing and this job says so
+      # instead of reporting a pass.
+      - name: The probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/manual-problems.ts /tmp/manual-problems.bak
+          sed -i 's|^  if (root && !root.format) problems.push({ message: t("diskErrRootNotFormatted"), entry: root })|  // deliberately removed|' \
+            ui/installer/lib/manual-problems.ts
+          if ! git diff --quiet ui/installer/lib/manual-problems.ts; then
+            echo "control: the root-format rule was removed"
+          else
+            echo "::error::the control patched nothing — the rule it deletes has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/disk-config-probe.ts /tmp/probe-defect.js
+          if gjs -m /tmp/probe-defect.js; then
+            echo "::error::the probe passed with a refusal rule deleted — it is not checking what it prints"
+            cp /tmp/manual-problems.bak ui/installer/lib/manual-problems.ts
+            exit 1
+          fi
+          cp /tmp/manual-problems.bak ui/installer/lib/manual-problems.ts
+          git diff --quiet ui/installer/lib/manual-problems.ts
+
+      - name: The disk encryption probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/disk-config.ts /tmp/disk-config.bak
+          sed -i 's|if (answer.encryption?.enabled) {|if (false \&\& answer.encryption?.enabled) {|' \
+            ui/installer/lib/disk-config.ts
+          if ! git diff --quiet ui/installer/lib/disk-config.ts; then
+            echo "control: encryption block emission was disabled"
+          else
+            echo "::error::the control patched nothing — the rule it disables has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/disk-config-probe.ts /tmp/probe-defect-enc.js
+          if gjs -m /tmp/probe-defect-enc.js; then
+            echo "::error::the probe passed with encryption emission disabled — it is not checking encryption"
+            cp /tmp/disk-config.bak ui/installer/lib/disk-config.ts
+            exit 1
+          fi
+          cp /tmp/disk-config.bak ui/installer/lib/disk-config.ts
+          git diff --quiet ui/installer/lib/disk-config.ts
+
+      # A disk too small for the layout used to be offered, carried through the
+      # summary and refused only after Install was pressed; a manual `/` had no
+      # floor at all. Both refusals now happen on the disk page, and each control
+      # below deletes one of them.
+      - name: The disk size probe can fail (controls, must be caught)
+        run: |
+          cp ui/installer/lib/disk-config.ts /tmp/disk-config.bak
+          sed -i 's|^  return entireDiskRootMib(disk.size) >= MIN_ROOT_MIB$|  return true // deliberately removed|' \
+            ui/installer/lib/disk-config.ts
+          if git diff --quiet ui/installer/lib/disk-config.ts; then
+            echo "::error::the control patched nothing — entireDiskFits has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/disk-config-probe.ts /tmp/probe-defect-fits.js
+          if gjs -m /tmp/probe-defect-fits.js; then
+            echo "::error::the probe passed with entireDiskFits accepting every disk"
+            cp /tmp/disk-config.bak ui/installer/lib/disk-config.ts
+            exit 1
+          fi
+          cp /tmp/disk-config.bak ui/installer/lib/disk-config.ts
+          git diff --quiet ui/installer/lib/disk-config.ts
+
+          cp ui/installer/lib/manual-problems.ts /tmp/manual-problems.bak
+          sed -i 's|^  if (root && root.size < MIN_ROOT_MIB \* 1024 \* 1024) {$|  if (false) { // deliberately removed|' \
+            ui/installer/lib/manual-problems.ts
+          if git diff --quiet ui/installer/lib/manual-problems.ts; then
+            echo "::error::the control patched nothing — the manual root-size rule has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/disk-config-probe.ts /tmp/probe-defect-rootsize.js
+          if gjs -m /tmp/probe-defect-rootsize.js; then
+            echo "::error::the probe passed with the manual root-size rule deleted"
+            cp /tmp/manual-problems.bak ui/installer/lib/manual-problems.ts
+            exit 1
+          fi
+          cp /tmp/manual-problems.bak ui/installer/lib/manual-problems.ts
+          git diff --quiet ui/installer/lib/manual-problems.ts
+
+      # A mount point of the installed system has to hold a filesystem Linux can
+      # live on, and nothing said so until 2026-09-22: the dropdown offers vfat on
+      # every row, so a FAT `/` took the repartitioning and died inside pacstrap,
+      # and a FAT `/home` installed fine and handed somebody a home with no owner.
+      - name: The Linux-filesystem probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/manual-problems.ts /tmp/manual-problems.bak
+          sed -i 's|^    } else if (!LINUX_FILESYSTEMS.has(fs)) {$|    } else if (false) { // deliberately removed|' \
+            ui/installer/lib/manual-problems.ts
+          if git diff --quiet ui/installer/lib/manual-problems.ts; then
+            echo "::error::the control patched nothing — the Linux-filesystem rule has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/disk-config-probe.ts /tmp/probe-defect-fs.js
+          if gjs -m /tmp/probe-defect-fs.js; then
+            echo "::error::the probe passed with the Linux-filesystem rule deleted — a FAT root is installable again"
+            cp /tmp/manual-problems.bak ui/installer/lib/manual-problems.ts
+            exit 1
+          fi
+          cp /tmp/manual-problems.bak ui/installer/lib/manual-problems.ts
+          git diff --quiet ui/installer/lib/manual-problems.ts
+
+      # The medium's own disk must not be offered as a target. This rule is the
+      # one no VM run can check — the harness boots the ISO as a CD-ROM, which
+      # lsblk calls `rom`; on real hardware it is a `disk` — so the control is
+      # the only thing standing behind it.
+      - name: The live-medium probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/live-medium.ts /tmp/live-medium.bak
+          sed -i 's|^    if (carries(top) \&\& top.path) return top.path$|    if (false) return "" // deliberately removed|' \
+            ui/installer/lib/live-medium.ts
+          if git diff --quiet ui/installer/lib/live-medium.ts; then
+            echo "::error::the control patched nothing — the live-medium detection has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/disk-config-probe.ts /tmp/probe-defect-live.js
+          if gjs -m /tmp/probe-defect-live.js; then
+            echo "::error::the probe passed with the live-medium detection broken — the stick is installable again"
+            cp /tmp/live-medium.bak ui/installer/lib/live-medium.ts
+            exit 1
+          fi
+          cp /tmp/live-medium.bak ui/installer/lib/live-medium.ts
+          git diff --quiet ui/installer/lib/live-medium.ts
+
+      # The retry release (lib/release-target.ts) runs swapoff/umount/cryptsetup
+      # close as root on a live medium. Its worst possible defect is reaching past
+      # the target disks — somebody's mounted USB stick — so that is the rule this
+      # control deletes.
+      - name: The retry-release probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/release-target.ts /tmp/release-target.bak
+          sed -i 's|if (targets.includes(disk.path)) walk(disk, 0)|walk(disk, 0)|' \
+            ui/installer/lib/release-target.ts
+          if ! git diff --quiet ui/installer/lib/release-target.ts; then
+            echo "control: the target-disk scope was removed"
+          else
+            echo "::error::the control patched nothing — the rule it deletes has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/disk-config-probe.ts /tmp/probe-defect-release.js
+          if gjs -m /tmp/probe-defect-release.js; then
+            echo "::error::the probe passed with the disk scope removed — it is not checking what it releases"
+            cp /tmp/release-target.bak ui/installer/lib/release-target.ts
+            exit 1
+          fi
+          cp /tmp/release-target.bak ui/installer/lib/release-target.ts
+          git diff --quiet ui/installer/lib/release-target.ts
+
+      - name: The layouts we emit and the ones we refuse (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/disk-config-probe.ts /tmp/probe.js
+          gjs -m /tmp/probe.js
+
+      # Same shape, same reason: `accountProblems` is the only thing standing
+      # between a capitalised username and a `useradd` failure inside the chroot,
+      # after pacstrap, with the log folded shut.
+      - name: The account probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/account-problems.ts /tmp/account-problems.bak
+          sed -i 's|^    && f.password === f.confirm$|    \&\& true // deliberately removed|' \
+            ui/installer/lib/account-problems.ts
+          if ! git diff --quiet ui/installer/lib/account-problems.ts; then
+            echo "control: valid no longer checks that the passwords match"
+          else
+            echo "::error::the control patched nothing — the term it deletes has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/account-rules-probe.ts /tmp/account-defect.js
+          if gjs -m /tmp/account-defect.js; then
+            echo "::error::the probe passed with a completeness term deleted — it is not checking what it prints"
+            cp /tmp/account-problems.bak ui/installer/lib/account-problems.ts
+            exit 1
+          fi
+          cp /tmp/account-problems.bak ui/installer/lib/account-problems.ts
+          git diff --quiet ui/installer/lib/account-problems.ts
+
+      # A second control, for the rule the page shipped for months: a machine name
+      # that is the same string on every install. A table of expected strings would
+      # still pass a function that ignored its argument, so the probe checks the
+      # DISTINCTNESS property as well — and this is what proves that check is live.
+      - name: The hostname suggestion cannot be a constant (control, must be caught)
+        run: |
+          cp ui/installer/lib/account-problems.ts /tmp/account-problems-host.bak
+          sed -i 's|^  return stem ?.*|  return "veltrix" // deliberately constant|' \
+            ui/installer/lib/account-problems.ts
+          if ! git diff --quiet ui/installer/lib/account-problems.ts; then
+            echo "control: deriveHostname now hands every account the same machine name"
+          else
+            echo "::error::the control patched nothing — deriveHostname's return has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/account-rules-probe.ts /tmp/account-host-defect.js
+          if gjs -m /tmp/account-host-defect.js; then
+            echo "::error::the probe passed with the hostname suggestion turned back into a constant"
+            cp /tmp/account-problems-host.bak ui/installer/lib/account-problems.ts
+            exit 1
+          fi
+          cp /tmp/account-problems-host.bak ui/installer/lib/account-problems.ts
+          git diff --quiet ui/installer/lib/account-problems.ts
+
+      # A third control, for the seam with nidara-iso (#523): base.json leaves a
+      # placeholder SUDO_USER token, and assemblePlan rewrites it to the chosen
+      # username. Delete the rewrite and first-boot setup runs against a user
+      # that does not exist.
+      - name: The SUDO_USER rewrite can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/plan.ts /tmp/plan.bak
+          sed -i 's|return cmd.replace(/\\bSUDO_USER=.*|return cmd // deliberately removed|' ui/installer/lib/plan.ts
+          if ! git diff --quiet ui/installer/lib/plan.ts; then
+            echo "control: the SUDO_USER rewrite was removed"
+          else
+            echo "::error::the control patched nothing — the rewrite in plan.ts has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/account-rules-probe.ts /tmp/account-sudo-defect.js
+          if gjs -m /tmp/account-sudo-defect.js; then
+            echo "::error::the probe passed with the SUDO_USER rewrite deleted"
+            cp /tmp/plan.bak ui/installer/lib/plan.ts
+            exit 1
+          fi
+          cp /tmp/plan.bak ui/installer/lib/plan.ts
+          git diff --quiet ui/installer/lib/plan.ts
+
+      # A fourth, for tech-debt #101: archinstall discards what a successful custom
+      # command prints, and the wrap in lib/command-log.ts is the only reason any of
+      # veltrix-setup's warnings survive an install. Losing it is silent by nature —
+      # nothing fails, the output just goes back to going nowhere.
+      - name: The custom-command output wrap can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/plan.ts /tmp/plan.bak
+          sed -i 's|}).map(wrapCommandForLog)|}) // wrap deliberately removed|' ui/installer/lib/plan.ts
+          if ! git diff --quiet ui/installer/lib/plan.ts; then
+            echo "control: the output wrap was removed"
+          else
+            echo "::error::the control patched nothing — the wrap in plan.ts has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/account-rules-probe.ts /tmp/account-wrap-defect.js
+          if gjs -m /tmp/account-wrap-defect.js; then
+            echo "::error::the probe passed with the custom-command output wrap deleted"
+            cp /tmp/plan.bak ui/installer/lib/plan.ts
+            exit 1
+          fi
+          cp /tmp/plan.bak ui/installer/lib/plan.ts
+          git diff --quiet ui/installer/lib/plan.ts
+
+      - name: What the account form accepts and refuses (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/account-rules-probe.ts /tmp/account-probe.js
+          gjs -m /tmp/account-probe.js
+
+      # The run page's numbers (lib/run-progress.ts), fed lines excerpted from a
+      # real install. The control removes the guard that keeps pacstrap's later,
+      # smaller passes (zram-generator 1/1…) from dragging the base count back to
+      # the start — a bar that ran to 100 % and fell to 5 % reads as the install
+      # starting over, and nothing but this probe would notice before a person did.
+      - name: The run-progress probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/run-progress.ts /tmp/run-progress.bak
+          sed -i 's|      if (of === this.total) { this.installed = n; this.downloaded = this.total }|      { this.installed = n; this.downloaded = this.total }|' \
+            ui/installer/lib/run-progress.ts
+          if ! git diff --quiet ui/installer/lib/run-progress.ts; then
+            echo "control: the first-transaction guard was removed"
+          else
+            echo "::error::the control patched nothing — the guard it deletes has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/run-progress-probe.ts /tmp/run-progress-defect.js
+          if gjs -m /tmp/run-progress-defect.js; then
+            echo "::error::the probe passed with the guard deleted — it is not checking what it prints"
+            cp /tmp/run-progress.bak ui/installer/lib/run-progress.ts
+            exit 1
+          fi
+          cp /tmp/run-progress.bak ui/installer/lib/run-progress.ts
+          git diff --quiet ui/installer/lib/run-progress.ts
+
+      - name: What the run page counts (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/run-progress-probe.ts /tmp/run-progress.js
+          gjs -m /tmp/run-progress.js
+
+      # Third of the same shape, and the one whose damage lands OUTSIDE the
+      # machine we installed: an EFI system partition can be shared, and every
+      # edit `lib/bootloader.ts` makes to it used to run over `*.conf` and over
+      # `loader.conf` flat — retitling a neighbouring Arch's entry, appending our
+      # kernel command line to somebody else's, and overwriting the `loader.conf`
+      # that belonged to whoever installed first (#443, #444, #445). None of that
+      # is reachable from this repo: it needs a machine with another system
+      # already on it, and the person who finds out is the one whose Windows or
+      # Ubuntu has gone from the menu.
+      - name: The bootloader probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/bootloader.ts /tmp/bootloader.bak
+          sed -i 's|^  return stamp >= startedAt$|  return true // deliberately removed|' \
+            ui/installer/lib/bootloader.ts
+          if ! git diff --quiet ui/installer/lib/bootloader.ts; then
+            echo "control: an entry is no longer dated against the run that wrote it"
+          else
+            echo "::error::the control patched nothing — the rule it deletes has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/bootloader-rules-probe.ts /tmp/bootloader-defect.js
+          if gjs -m /tmp/bootloader-defect.js; then
+            echo "::error::the probe passed while every foreign entry counted as ours — it is not checking what it prints"
+            cp /tmp/bootloader.bak ui/installer/lib/bootloader.ts
+            exit 1
+          fi
+          cp /tmp/bootloader.bak ui/installer/lib/bootloader.ts
+          git diff --quiet ui/installer/lib/bootloader.ts
+
+      # The stale-entry rule HIDES loader entries. Its worst defect is hiding one
+      # that is not an earlier Veltrix — a neighbouring Arch carries archinstall's
+      # header too — so the title condition is the one this control deletes.
+      - name: The stale-entry rule can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/bootloader.ts /tmp/bootloader-stale.bak
+          sed -i 's|^  if (!/^title\\s+Veltrix\\b/m.test(text)) return false$|  // deliberately removed|' \
+            ui/installer/lib/bootloader.ts
+          if ! git diff --quiet ui/installer/lib/bootloader.ts; then
+            echo "control: any archinstall entry whose root is absent now counts as an earlier Veltrix"
+          else
+            echo "::error::the control patched nothing — the rule it deletes has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/bootloader-rules-probe.ts /tmp/bootloader-stale-defect.js
+          if gjs -m /tmp/bootloader-stale-defect.js; then
+            echo "::error::the probe passed while another Arch's entry could be hidden — it is not checking what it prints"
+            cp /tmp/bootloader-stale.bak ui/installer/lib/bootloader.ts
+            exit 1
+          fi
+          cp /tmp/bootloader-stale.bak ui/installer/lib/bootloader.ts
+          git diff --quiet ui/installer/lib/bootloader.ts
+
+      # A saved network carried into the installed system (lib/network-connections.ts)
+      # is a copy with ONE edit: the live user becomes the new account. The defect
+      # worth a control is that edit reaching the rest of the file — an SSID, a
+      # password — so the control turns it into a blind replace over the whole text.
+      - name: The network-connections probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/network-connections.ts /tmp/network-connections.bak
+          sed -i 's|^  let section = ""$|  return text.split(liveUser).join(newUser) // deliberately blind\n  let section = ""|' \
+            ui/installer/lib/network-connections.ts
+          if ! git diff --quiet ui/installer/lib/network-connections.ts; then
+            echo "control: the owner rewrite now replaces the user name anywhere in the file"
+          else
+            echo "::error::the control patched nothing — the line it rewrites has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/network-connections-probe.ts /tmp/network-defect.js
+          if gjs -m /tmp/network-defect.js; then
+            echo "::error::the probe passed while a password could be rewritten — it is not checking what it prints"
+            cp /tmp/network-connections.bak ui/installer/lib/network-connections.ts
+            exit 1
+          fi
+          cp /tmp/network-connections.bak ui/installer/lib/network-connections.ts
+          git diff --quiet ui/installer/lib/network-connections.ts
+
+      - name: Saved networks carried into the installed system (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/network-connections-probe.ts /tmp/network-probe.js
+          gjs -m /tmp/network-probe.js
+      # The battery warning on the welcome page (lib/power.ts). Its costly defect is
+      # firing on a machine that is plugged in — above all a desktop, whose UPower
+      # DisplayDevice exists and reports is_present = false — so that is the rule
+      # the control deletes.
+      - name: The battery rule can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/power.ts /tmp/power.bak
+          sed -i 's|^  if (!device \|\| !device.present) return false$|  if (!device) return false // deliberately removed|' \
+            ui/installer/lib/power.ts
+          if ! git diff --quiet ui/installer/lib/power.ts; then
+            echo "control: a desktop with no battery now counts as on battery"
+          else
+            echo "::error::the control patched nothing — the rule it deletes has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/power-probe.ts /tmp/power-defect.js
+          if gjs -m /tmp/power-defect.js; then
+            echo "::error::the probe passed with is_present ignored — it is not checking what it prints"
+            cp /tmp/power.bak ui/installer/lib/power.ts
+            exit 1
+          fi
+          cp /tmp/power.bak ui/installer/lib/power.ts
+          git diff --quiet ui/installer/lib/power.ts
+
+      - name: When the welcome page warns about the battery (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/power-probe.ts /tmp/power-probe.js
+          gjs -m /tmp/power-probe.js
+
+      # The install page's network-stall warning and its download-failure text
+      # (lib/stall.ts). Two defects cost the most: warning during the desktop
+      # download, which prints nothing for minutes while it moves gigabytes — the
+      # first control drops the traffic half of the rule — and blaming the network
+      # for a failure that was not the network, which the second one does.
+      - name: The stall rules can fail (controls, must be caught)
+        run: |
+          cp ui/installer/lib/stall.ts /tmp/stall.bak
+          sed -i 's|^  return s.sinceLastLineMs >= STALL_QUIET_MS && s.downloadedInWindow < STALL_IDLE_BYTES$|  return s.sinceLastLineMs >= STALL_QUIET_MS // deliberately removed|' \
+            ui/installer/lib/stall.ts
+          if git diff --quiet ui/installer/lib/stall.ts; then
+            echo "::error::the control patched nothing — looksStalled has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/stall-probe.ts /tmp/stall-defect-1.js
+          if gjs -m /tmp/stall-defect-1.js; then
+            echo "::error::the probe passed with download progress ignored"
+            cp /tmp/stall.bak ui/installer/lib/stall.ts
+            exit 1
+          fi
+          cp /tmp/stall.bak ui/installer/lib/stall.ts
+
+          sed -i 's|^  return lines.some(l => DOWNLOAD_FAILURE.some(re => re.test(l)))$|  return lines.length > 0 // deliberately removed|' \
+            ui/installer/lib/stall.ts
+          if git diff --quiet ui/installer/lib/stall.ts; then
+            echo "::error::the control patched nothing — failedDownloading has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/stall-probe.ts /tmp/stall-defect-2.js
+          if gjs -m /tmp/stall-defect-2.js; then
+            echo "::error::the probe passed with every failure blamed on the network"
+            cp /tmp/stall.bak ui/installer/lib/stall.ts
+            exit 1
+          fi
+          cp /tmp/stall.bak ui/installer/lib/stall.ts
+
+          # And a full disk or a full live overlay is not the network (2026-10-13):
+          # without the write rule the probe must catch the page blaming the network.
+          sed -i 's|^  return lines.some(l => WRITE_FAILURE.some(re => re.test(l)))$|  return false // deliberately removed|' \
+            ui/installer/lib/stall.ts
+          if git diff --quiet ui/installer/lib/stall.ts; then
+            echo "::error::the control patched nothing — failedWriting has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/stall-probe.ts /tmp/stall-defect-3.js
+          if gjs -m /tmp/stall-defect-3.js; then
+            echo "::error::the probe passed with a full disk blamed on the network"
+            cp /tmp/stall.bak ui/installer/lib/stall.ts
+            exit 1
+          fi
+          cp /tmp/stall.bak ui/installer/lib/stall.ts
+          git diff --quiet ui/installer/lib/stall.ts
+
+      - name: When the install page says the network is the problem (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/stall-probe.ts /tmp/stall-probe.js
+          gjs -m /tmp/stall-probe.js
+
+      - name: What we may touch on somebody else's ESP (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/bootloader-rules-probe.ts /tmp/bootloader-probe.js
+          gjs -m /tmp/bootloader-probe.js
+
+      # Fourth of the same shape. `lib/mirrors.ts` decides what gets prepended to
+      # `/etc/pacman.d/mirrorlist` on the machine being installed, and its parse
+      # is the half that fails silently: a regex that also matched commented
+      # lines would read a stock `pacman-mirrorlist` — every server present,
+      # every one commented out — as four hundred measured servers. That looks
+      # exactly like a successful measurement and is the opposite of one.
+      - name: The mirror probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/mirrors.ts /tmp/mirrors.bak
+          sed -i 's|const m = /\^\\s\*Server|const m = /^\\s*#?\\s*Server|' ui/installer/lib/mirrors.ts
+          if ! git diff --quiet ui/installer/lib/mirrors.ts; then
+            echo "control: the parse now accepts commented-out servers"
+          else
+            echo "::error::the control patched nothing — the expression it loosens has moved or been rewritten"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/mirror-probe.ts /tmp/mirror-defect.js
+          if gjs -m /tmp/mirror-defect.js; then
+            echo "::error::the probe passed while a commented mirrorlist parsed as servers — it is not checking what it prints"
+            cp /tmp/mirrors.bak ui/installer/lib/mirrors.ts
+            exit 1
+          fi
+          cp /tmp/mirrors.bak ui/installer/lib/mirrors.ts
+          git diff --quiet ui/installer/lib/mirrors.ts
+
+      # archinstall prepends the measured servers to the LIVE mirrorlist every run
+      # and never takes them out, so each retry stacked another block (and pacstrap
+      # copied the stack into the installed system). This control makes the cleanup
+      # a no-op and requires the probe to notice.
+      - name: The mirrorlist cleanup can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/mirrors.ts /tmp/mirrors.bak
+          sed -i 's|^  return i === 0 ? text : lines.slice(i).join("\\n")$|  return text // deliberately removed|' ui/installer/lib/mirrors.ts
+          if git diff --quiet ui/installer/lib/mirrors.ts; then
+            echo "::error::the control patched nothing — withoutCustomServers has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/mirror-probe.ts /tmp/mirror-defect-cleanup.js
+          if gjs -m /tmp/mirror-defect-cleanup.js; then
+            echo "::error::the probe passed with the stacked Custom Servers blocks left in place"
+            cp /tmp/mirrors.bak ui/installer/lib/mirrors.ts
+            exit 1
+          fi
+          cp /tmp/mirrors.bak ui/installer/lib/mirrors.ts
+          git diff --quiet ui/installer/lib/mirrors.ts
+
+      # The fallback cap is a DEADLINE: the medium ships 431 servers and pacman
+      # tries them one at a time, which is why a stalled download took past 20
+      # minutes to fail. This control makes the cap a no-op.
+      - name: The mirrorlist cap can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/mirrors.ts /tmp/mirrors.bak
+          sed -i 's|^  if (servers.length <= max) return text$|  return text // deliberately removed|' \
+            ui/installer/lib/mirrors.ts
+          if git diff --quiet ui/installer/lib/mirrors.ts; then
+            echo "::error::the control patched nothing — cappedMirrorlist has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/mirror-probe.ts /tmp/mirror-defect-cap.js
+          if gjs -m /tmp/mirror-defect-cap.js; then
+            echo "::error::the probe passed with the fallback never shortened"
+            cp /tmp/mirrors.bak ui/installer/lib/mirrors.ts
+            exit 1
+          fi
+          cp /tmp/mirrors.bak ui/installer/lib/mirrors.ts
+          git diff --quiet ui/installer/lib/mirrors.ts
+
+      - name: The reflector call, and what its answer means (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/mirror-probe.ts /tmp/mirror-probe.js
+          gjs -m /tmp/mirror-probe.js
+
+      # Fifth of the same shape (#311, #495). `lib/graphics.ts` detects GPU
+      # hardware and maps the kernel to the correct NVIDIA driver packages.
+      # `lib/plan.ts` injects the chosen kernel and packages while stripping
+      # archinstall's inert `profile_config.gfx_driver`.
+      - name: The graphics and kernel probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/plan.ts /tmp/plan.bak
+          sed -i 's|config.kernels = \[kernel\]|config.kernels = ["linux"]|' ui/installer/lib/plan.ts
+          if ! git diff --quiet ui/installer/lib/plan.ts; then
+            echo "control: plan assembly now forces linux kernel regardless of choice"
+          else
+            echo "::error::the control patched nothing — the kernel assignment has moved or been rewritten"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/graphics-kernel-probe.ts /tmp/graphics-kernel-defect.js
+          if gjs -m /tmp/graphics-kernel-defect.js; then
+            echo "::error::the probe passed while kernel choice was ignored — it is not checking what it prints"
+            cp /tmp/plan.bak ui/installer/lib/plan.ts
+            exit 1
+          fi
+          cp /tmp/plan.bak ui/installer/lib/plan.ts
+          git diff --quiet ui/installer/lib/plan.ts
+
+      - name: Kernel and graphics package resolution (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/graphics-kernel-probe.ts /tmp/graphics-kernel-probe.js
+          gjs -m /tmp/graphics-kernel-probe.js
+
+      # GeoIP timezone mapping (#491). The probe checks that IANA timezones map
+      # to the ISO country code. A broken lookup or deleted countryForTimezone
+      # mapping must fail the probe.
+      - name: The geoip probe can fail (control, must be caught)
+        run: |
+          cp ui/installer/lib/region.ts /tmp/region.bak
+          sed -i 's|return row.codes\[0\]|return null // deliberately broken|' ui/installer/lib/region.ts
+          if ! git diff --quiet ui/installer/lib/region.ts; then
+            echo "control: countryForTimezone fallback removed"
+          else
+            echo "::error::the control patched nothing — the return statement has moved or been rewritten"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/geoip-probe.ts /tmp/geoip-defect.js
+          if gjs -m /tmp/geoip-defect.js; then
+            echo "::error::the probe passed while countryForTimezone returned null — it is not checking what it prints"
+            cp /tmp/region.bak ui/installer/lib/region.ts
+            exit 1
+          fi
+          cp /tmp/region.bak ui/installer/lib/region.ts
+          git diff --quiet ui/installer/lib/region.ts
+
+      - name: GeoIP timezone suggestion and IANA mapping (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/geoip-probe.ts /tmp/geoip-probe.js
+          gjs -m /tmp/geoip-probe.js
+
+      # The welcome page's low-RAM advisory (#604). Two halves, one control each:
+      # the READ (/proc/meminfo is in kB and the rule is in MiB — a unit mixup here
+      # warns every machine or none, and both look calm on the developer's box) and
+      # the THRESHOLD. The probe shipped with the feature and nothing ran it; a
+      # sonda nobody runs is a file, not a test.
+      - name: The low-RAM rules can fail (controls, must be caught)
+        run: |
+          cp ui/installer/lib/memory.ts /tmp/memory.bak
+          sed -i 's|^    return Math.round(kib / 1024)$|    return kib // deliberately broken|' \
+            ui/installer/lib/memory.ts
+          if git diff --quiet ui/installer/lib/memory.ts; then
+            echo "::error::the control patched nothing — the kB→MiB conversion has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/memory-probe.ts /tmp/memory-defect-unit.js
+          if gjs -m /tmp/memory-defect-unit.js; then
+            echo "::error::the probe passed while MemTotal was read in kB as MiB — it is not checking the unit"
+            cp /tmp/memory.bak ui/installer/lib/memory.ts
+            exit 1
+          fi
+          cp /tmp/memory.bak ui/installer/lib/memory.ts
+
+          sed -i 's|^  return memMib < thresholdMib$|  return false // deliberately removed|' \
+            ui/installer/lib/memory.ts
+          if git diff --quiet ui/installer/lib/memory.ts; then
+            echo "::error::the control patched nothing — the isLowMemory comparison has moved or been reworded"
+            exit 1
+          fi
+          ./scripts/bundle.sh --js scripts/dev/memory-probe.ts /tmp/memory-defect-threshold.js
+          if gjs -m /tmp/memory-defect-threshold.js; then
+            echo "::error::the probe passed with the threshold deleted — it is not checking what it prints"
+            cp /tmp/memory.bak ui/installer/lib/memory.ts
+            exit 1
+          fi
+          cp /tmp/memory.bak ui/installer/lib/memory.ts
+          git diff --quiet ui/installer/lib/memory.ts
+
+      - name: Total RAM is read and judged against the floor (must succeed)
+        run: |
+          ./scripts/bundle.sh --js scripts/dev/memory-probe.ts /tmp/memory-probe.js
+          gjs -m /tmp/memory-probe.js
+
+      # ⚠️ And the bundle itself, which nothing was building. The probes above
+      # reach `lib/`, so a syntax error THERE has always been caught on the way
+      # in — but `steps/` and `app.ts` are in no job at all, and the installer is
+      # a bundle whose `tsconfig` cannot be fully typechecked (the names-only
+      # step in the Typecheck job greps for TS2304/TS2552, and a parse error is
+      # neither). A stray quote inside a translated string would have shipped a
+      # medium whose installer does not start, with every check green. Twelve
+      # seconds, and it is the cheapest gate in this file.
+      - name: The installer bundle builds (must succeed)
+        run: ./scripts/bundle.sh ui/installer/app.ts /tmp/veltrix-installer
+
+  # The nightly run's result, where the owner sees it: one issue, opened (or commented on)
+  # when the night fails, closed when it is green again. Only on the schedule.
+  nightly-report:
+    name: Nightly report
+    needs: [scope, styles, pkgbuild, typecheck, smoke, hyalo, widgets-gen, hypr-config, skill-docs, icons, agent-loop, toolkit, sessiond, installer-logic]
+    if: ${{ always() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+          SHA: ${{ github.sha }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly CI failed"
+          open=$(gh issue list --state open --search "\"$title\" in:title" --json number -q '.[0].number')
+          if [ "$FAILED" = true ]; then
+            body="The nightly run on main (${SHA:0:8}) failed: $RUN"
+            if [ -n "$open" ]; then gh issue comment "$open" --body "$body"
+            else gh issue create --title "$title" --body "$body"; fi
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --comment "Green again: $RUN"
+          fi

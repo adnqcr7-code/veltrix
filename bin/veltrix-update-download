@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""veltrix-update-download — the unprivileged half of the background updater.
+
+Downloads a new VELTRIX release (full tarball, or the delta when one exists
+for the installed version) into a staging dir, with progress in status.json
+so the shell can show it while the user keeps playing. This script never
+runs as root, never asks for a password, and never installs anything — it
+only fetches and verifies. Installing is the privileged helper's job
+(bin/veltrix-update-helper), which re-verifies the staged file itself
+against GitHub before it touches the system, so a compromised or buggy
+downloader can at most waste bandwidth: it cannot make the helper install
+a tarball GitHub did not publish.
+
+Usage:
+    veltrix-update-download check      # print the latest release vs installed
+    veltrix-update-download download   # fetch + verify the update (or delta)
+    veltrix-update-download status     # print the current status.json
+    veltrix-update-download cancel     # drop the staged download, back to idle
+
+Layout (all under ~/.local/share/veltrix-update/):
+    staged/<filename>   the verified tarball or delta
+    staged/release.json version, kind, filename, sha256, size, downloaded_at
+    status.json         the shared state file (see STATUS_SCHEMA below)
+    update.lock         flock: held by whichever side is working (download
+                        or apply) so the two never run at once
+    cancel              written by `cancel` (or the shell's Cancel action);
+                        the downloader checks it between chunks and stops.
+                        A flag left by a killed download is stale — a new
+                        download removes it at start.
+
+STATUS_SCHEMA — one file, two writers (this script writes the download
+states, the helper writes the apply states; they never overlap because the
+helper refuses to run while a download is in flight, and vice versa):
+    state: idle | checking | downloading | verifying | ready | failed |
+           applying | applied | needs-interactive
+    current / latest: installed / newest published version
+    kind: full | delta (only once a file is staged)
+    filename, sha256, size: the staged file
+    downloaded, percent: progress while downloading
+    reason: human-readable failure reason (state failed / needs-interactive)
+    updated_at: UTC ISO timestamp of the last write
+
+Test-only environment override (same convention as bin/veltrix-update):
+    VELTRIX_UPDATE_API_URL — replace the pinned releases/latest URL, so the
+    probe can point it at a local fixture server. Never set by the shell.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+REPO = "adnqcr7-code/veltrix"
+API_URL = "https://api.github.com/repos/%s/releases/latest" % REPO
+# The release tarball lives at this URL once published; the .sha256 sidecar
+# next to it is the fallback when the API does not carry a digest.
+DOWNLOAD_BASE = "https://github.com/%s/releases/download" % REPO
+
+
+def _test_override(name):
+    """A test-only environment override, honoured only when NOT running
+    under pkexec (the real path sets PKEXEC_UID, and the override is
+    ignored there). The shell never sets these; the probes do, to point
+    the script at a local fixture server."""
+    if os.environ.get("PKEXEC_UID") is not None:
+        return None
+    return os.environ.get(name)
+
+VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+)*(-v[0-9]+)?$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# Filenames the downloader will ever stage. The version part is validated
+# separately, so a smuggled path or junk string can never become a filename.
+FILENAME_RE = re.compile(r"^veltrix-[0-9][0-9A-Za-z.\-]*\.tar\.gz$")
+
+UPDATE_DIR_NAME = ".local/share/veltrix-update"
+STAGED_DIR_NAME = "staged"
+STATUS_FILE_NAME = "status.json"
+RELEASE_FILE_NAME = "release.json"
+LOCK_FILE_NAME = "update.lock"
+# Written by `cancel` (or by the shell's Cancel action): the downloader
+# checks it between chunks and stops. A flag left behind by a killed
+# download is stale — a new download removes it at start, so it can
+# never abort a download the user did not cancel.
+CANCEL_FILE_NAME = "cancel"
+
+USER_AGENT = "veltrix-update-download/1.0"
+REQUEST_TIMEOUT_S = 30
+# Progress writes are throttled: a status.json rewrite per chunk would
+# churn the disk for the whole download.
+PROGRESS_MIN_INTERVAL_S = 0.25
+PROGRESS_MIN_BYTES = 1 << 20
+
+
+class UpdateError(Exception):
+    """A failure the caller should see as a status, not a traceback."""
+
+
+class Cancelled(Exception):
+    """The user cancelled the download (the cancel flag file appeared)."""
+
+
+# ── Version comparison ────────────────────────────────────────────────────
+# Twin of veltrix_release_newer in bin/veltrix-update, isNewerVersion in
+# ui/shell/core/UpdateCheck.ts and About.tsx, and the helper's copy.
+# Keep the four in step: a plain dotted compare, with the old -vN packaging
+# suffix split off first (0.13.0-v7's dotted part is 0.13.0; a missing
+# suffix counts as release 0).
+
+def _split_version(v):
+    clean = v.strip()
+    if clean.startswith("v"):
+        clean = clean[1:]
+    m = re.match(r"^(.*?)-v([0-9]+)$", clean)
+    base = m.group(1) if m else clean
+    rel = int(m.group(2)) if m else 0
+    parts = [int(x) if x.isdigit() else 0 for x in base.split(".")]
+    return parts, rel
+
+
+def is_newer(latest, current):
+    a, a_rel = _split_version(latest)
+    b, b_rel = _split_version(current)
+    for i in range(max(len(a), len(b))):
+        x = a[i] if i < len(a) else 0
+        y = b[i] if i < len(b) else 0
+        if x != y:
+            return x > y
+    return a_rel > b_rel
+
+
+def valid_version(v):
+    return isinstance(v, str) and bool(VERSION_RE.match(v))
+
+
+# ── Paths ─────────────────────────────────────────────────────────────────
+
+def update_dir(home=None):
+    return os.path.join(home or os.path.expanduser("~"), UPDATE_DIR_NAME)
+
+
+def staged_dir(home=None):
+    return os.path.join(update_dir(home), STAGED_DIR_NAME)
+
+
+def status_path(home=None):
+    return os.path.join(update_dir(home), STATUS_FILE_NAME)
+
+
+def release_path(home=None):
+    return os.path.join(staged_dir(home), RELEASE_FILE_NAME)
+
+
+def lock_path(home=None):
+    return os.path.join(update_dir(home), LOCK_FILE_NAME)
+
+
+def cancel_path(home=None):
+    return os.path.join(update_dir(home), CANCEL_FILE_NAME)
+
+
+def installed_version(home=None):
+    """The installed release: .release first (a release install), else the
+    registered tree's VERSION (a dev install). Raises UpdateError when
+    neither can be read — without a known installed version there is
+    nothing to compare against, so the update refuses."""
+    home = home or os.path.expanduser("~")
+    marker = os.path.join(home, ".config/veltrix/.release")
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+        if valid_version(v):
+            return v
+    except OSError:
+        pass
+    dev_marker = os.path.join(home, ".config/veltrix/.dev")
+    try:
+        with open(dev_marker, "r", encoding="utf-8") as f:
+            tree = f.read().strip()
+        with open(os.path.join(tree, "VERSION"), "r", encoding="utf-8") as f:
+            v = f.read().strip()
+        if valid_version(v):
+            return v
+    except OSError:
+        pass
+    raise UpdateError("cannot determine the installed version "
+                      "(no .release marker and no readable dev tree)")
+
+
+# ── Status file ───────────────────────────────────────────────────────────
+# Atomic (write temp + rename) so a reader never sees a half-written file.
+
+def _utcnow():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_status(home=None):
+    try:
+        with open(status_path(home), "r", encoding="utf-8") as f:
+            st = json.load(f)
+        if isinstance(st, dict) and isinstance(st.get("state"), str):
+            return st
+    except (OSError, ValueError):
+        pass
+    return {"state": "idle", "updated_at": _utcnow()}
+
+
+def write_status(state, home=None, **fields):
+    st = {"state": state, "updated_at": _utcnow()}
+    st.update(fields)
+    path = status_path(home)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+    return st
+
+
+# ── Lock ──────────────────────────────────────────────────────────────────
+# One lock file for both sides of the updater: the downloader holds it for
+# the whole download, the helper for the whole apply. A second invocation
+# that cannot take it is not an error — it prints the current status and
+# exits 0, because the shell polls status.json anyway.
+
+def try_lock(home=None):
+    import fcntl
+    path = lock_path(home)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+# ── GitHub API ────────────────────────────────────────────────────────────
+
+def api_url():
+    # Test-only override, same convention as bin/veltrix-update. The shell
+    # never sets it; a production run always hits the pinned URL.
+    return _test_override("VELTRIX_UPDATE_API_URL") or API_URL
+
+
+def download_base():
+    return _test_override("VELTRIX_UPDATE_DOWNLOAD_BASE") or DOWNLOAD_BASE
+
+
+def _get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
+                                              "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise UpdateError("GitHub API %s: HTTP %d" % (url, e.code))
+    except urllib.error.URLError as e:
+        raise UpdateError("cannot reach GitHub (%s) — offline?" % e.reason)
+    except (ValueError, TimeoutError, OSError) as e:
+        raise UpdateError("GitHub API %s failed: %s" % (url, e))
+
+
+def _get_text(url):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as r:
+            return r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise UpdateError("sidecar %s: HTTP %d" % (url, e.code))
+    except urllib.error.URLError as e:
+        raise UpdateError("cannot fetch sidecar (%s)" % e.reason)
+    except (TimeoutError, OSError) as e:
+        raise UpdateError("sidecar fetch failed: %s" % e)
+
+
+def fetch_latest_release():
+    rel = _get_json(api_url())
+    if not isinstance(rel, dict) or not rel.get("tag_name"):
+        raise UpdateError("GitHub releases/latest returned no tag_name")
+    tag = rel["tag_name"]
+    version = tag[1:] if tag.startswith("v") else tag
+    if not valid_version(version):
+        raise UpdateError("published tag %r is not a version" % tag)
+    assets = rel.get("assets") or []
+    if not isinstance(assets, list):
+        raise UpdateError("GitHub releases/latest returned no assets list")
+    return version, tag, {a.get("name"): a for a in assets if isinstance(a, dict)}
+
+
+def asset_digest(asset):
+    """The published SHA-256 for an asset: the API digest first, else the
+    .sha256 sidecar. Returns None when neither is available."""
+    digest = (asset or {}).get("digest") or ""
+    if digest.startswith("sha256:") and SHA256_RE.match(digest[7:]):
+        return digest[7:]
+    return None
+
+
+def sidecar_digest(tag, asset_name):
+    """Fetch <asset>.sha256 from the release's download page. The sidecar
+    is a one-line file: "<sha256>  <filename>"."""
+    url = "%s/%s/%s.sha256" % (download_base(), tag, asset_name)
+    text = _get_text(url)
+    first = text.strip().split()[0] if text.strip() else ""
+    if SHA256_RE.match(first):
+        return first
+    raise UpdateError("sidecar %s has no valid SHA-256" % url)
+
+
+def pick_assets(version, tag, assets, current):
+    """The full tarball is always the release's veltrix-<version>.tar.gz.
+    The delta is veltrix-<version>-delta-from-<current>.tar.gz when the
+    publisher shipped one for this exact installed version. Returns
+    (full_asset, delta_asset_or_None)."""
+    full_name = "veltrix-%s.tar.gz" % version
+    full = assets.get(full_name)
+    if not full:
+        raise UpdateError("release %s has no %s asset" % (tag, full_name))
+    delta_name = "veltrix-%s-delta-from-%s.tar.gz" % (version, current)
+    delta = assets.get(delta_name)
+    return full, delta
+
+
+# ── Download ──────────────────────────────────────────────────────────────
+
+def download_file(url, dest, expected_size, on_progress, cancel_file=None):
+    """Stream to dest (a .tmp path), reporting (downloaded, total) through
+    on_progress. Verifies the byte count at the end. If cancel_file is
+    given and appears mid-download, raises Cancelled (the caller cleans
+    up and reports idle, not failed)."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        resp = urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S)
+    except urllib.error.HTTPError as e:
+        raise UpdateError("download %s: HTTP %d" % (url, e.code))
+    except urllib.error.URLError as e:
+        raise UpdateError("download failed (%s) — offline?" % e.reason)
+    except (TimeoutError, OSError) as e:
+        raise UpdateError("download failed: %s" % e)
+    sha = hashlib.sha256()
+    downloaded = 0
+    with resp, open(dest, "wb") as f:
+        while True:
+            if cancel_file is not None and os.path.exists(cancel_file):
+                raise Cancelled("cancelled by the user")
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            sha.update(chunk)
+            downloaded += len(chunk)
+            on_progress(downloaded, expected_size)
+    if expected_size is not None and downloaded != expected_size:
+        raise UpdateError("downloaded %d bytes, expected %d — truncated?"
+                          % (downloaded, expected_size))
+    return sha.hexdigest(), downloaded
+
+
+def _asset_size(asset):
+    size = asset.get("size")
+    return size if isinstance(size, int) and size > 0 else None
+
+
+def _asset_url(asset, tag, name):
+    # Prefer the API's own download URL; fall back to the release page URL.
+    url = asset.get("browser_download_url") or asset.get("url")
+    if url and url.startswith("http"):
+        return url
+    return "%s/%s/%s" % (download_base(), tag, name)
+
+
+def cmd_check(home):
+    current = installed_version(home)
+    version, tag, assets = fetch_latest_release()
+    full, delta = pick_assets(version, tag, assets, current)
+    print(json.dumps({
+        "current": current,
+        "latest": version,
+        "tag": tag,
+        "newer": is_newer(version, current),
+        "full": {"name": full.get("name"), "size": _asset_size(full)},
+        "delta": ({"name": delta.get("name"), "size": _asset_size(delta)}
+                  if delta else None),
+        "rsync": shutil.which("rsync") is not None,
+    }, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_download(home):
+    lock = try_lock(home)
+    if lock is None:
+        # A download (or an apply) is already running — not an error. The
+        # shell polls status.json; this invocation just reports it.
+        print(json.dumps(read_status(home), indent=2, sort_keys=True))
+        return 0
+    try:
+        return _download_locked(home)
+    finally:
+        os.close(lock)
+
+
+def _download_locked(home):
+    current = installed_version(home)
+    # A cancel flag left behind by a killed download is stale: it was
+    # meant for the previous download, and must not abort this one.
+    try:
+        os.remove(cancel_path(home))
+    except OSError:
+        pass
+    write_status("checking", home, current=current)
+    try:
+        version, tag, assets = fetch_latest_release()
+    except UpdateError as e:
+        write_status("failed", home, current=current, reason=str(e))
+        print("download failed: %s" % e, file=sys.stderr)
+        return 1
+    if not is_newer(version, current):
+        write_status("idle", home, current=current, latest=version,
+                     reason="already up to date")
+        print("already up to date (%s)" % current)
+        return 0
+    full, delta = pick_assets(version, tag, assets, current)
+    # Delta first, exactly like bin/veltrix-update: only when rsync is
+    # here to apply it and the publisher shipped one for this version.
+    # The helper re-checks all of this before applying.
+    kind = "full"
+    asset = full
+    if delta and shutil.which("rsync"):
+        kind = "delta"
+        asset = delta
+    name = asset.get("name")
+    if not FILENAME_RE.match(name or ""):
+        write_status("failed", home, current=current, latest=version,
+                     reason="release asset name %r is not a veltrix tarball" % name)
+        print("refusing asset %r" % name, file=sys.stderr)
+        return 1
+    size = _asset_size(asset)
+    digest = asset_digest(asset)
+    if digest is None:
+        try:
+            digest = sidecar_digest(tag, name)
+        except UpdateError as e:
+            write_status("failed", home, current=current, latest=version,
+                         reason="no published hash for %s (%s)" % (name, e))
+            print("no published hash for %s" % name, file=sys.stderr)
+            return 1
+    url = _asset_url(asset, tag, name)
+    staged = staged_dir(home)
+    os.makedirs(staged, exist_ok=True)
+    # Drop any previous staged file: a stale tarball from an older
+    # version must never be mistaken for this one.
+    for old in os.listdir(staged):
+        path = os.path.join(staged, old)
+        if os.path.isfile(path):
+            os.remove(path)
+    tmp_path = os.path.join(staged, name + ".tmp")
+    final_path = os.path.join(staged, name)
+    last_write = [0.0, 0]
+
+    def on_progress(downloaded, total):
+        now = time.monotonic()
+        if now - last_write[0] < PROGRESS_MIN_INTERVAL_S and downloaded - last_write[1] < PROGRESS_MIN_BYTES:
+            return
+        last_write[0] = now
+        last_write[1] = downloaded
+        pct = int(downloaded * 100 / total) if total else 0
+        write_status("downloading", home, current=current, latest=version,
+                     kind=kind, filename=name, sha256=digest, size=size,
+                     downloaded=downloaded, percent=pct)
+
+    write_status("downloading", home, current=current, latest=version,
+                 kind=kind, filename=name, sha256=digest, size=size,
+                 downloaded=0, percent=0)
+    try:
+        actual_sha, downloaded = download_file(
+            url, tmp_path, size, on_progress, cancel_path(home))
+    except Cancelled:
+        # The user cancelled: not a failure. Drop the partial file and
+        # the flag, and go back to idle.
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        try:
+            os.remove(cancel_path(home))
+        except OSError:
+            pass
+        write_status("idle", home, current=current, latest=version,
+                     reason="cancelled by the user")
+        print("cancelled")
+        return 0
+    except UpdateError as e:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        write_status("failed", home, current=current, latest=version,
+                     kind=kind, filename=name, reason=str(e))
+        print("download failed: %s" % e, file=sys.stderr)
+        return 1
+    write_status("verifying", home, current=current, latest=version,
+                 kind=kind, filename=name, sha256=digest, size=size,
+                 downloaded=downloaded, percent=100)
+    if actual_sha != digest:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        write_status("failed", home, current=current, latest=version,
+                     kind=kind, filename=name,
+                     reason="SHA-256 mismatch: downloaded %s, published %s"
+                            % (actual_sha, digest))
+        print("SHA-256 mismatch — refusing the download", file=sys.stderr)
+        return 1
+    os.replace(tmp_path, final_path)
+    release = {
+        "version": version,
+        "tag": tag,
+        "kind": kind,
+        "filename": name,
+        "sha256": digest,
+        "size": downloaded,
+        "downloaded_at": _utcnow(),
+    }
+    with open(release_path(home), "w", encoding="utf-8") as f:
+        json.dump(release, f, indent=2, sort_keys=True)
+        f.write("\n")
+    write_status("ready", home, current=current, latest=version,
+                 kind=kind, filename=name, sha256=digest, size=downloaded)
+    print("ready: %s (%s, %d bytes)" % (name, kind, downloaded))
+    return 0
+
+
+def cmd_status(home):
+    print(json.dumps(read_status(home), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_cancel(home):
+    # Write the cancel flag FIRST: if a download is in flight, it sees
+    # the flag between chunks and stops itself. Then, if no download is
+    # running (the lock is free), clean up the staged dir directly.
+    # Either way the flag is removed afterwards, so it can never abort a
+    # later download.
+    os.makedirs(update_dir(home), exist_ok=True)
+    with open(cancel_path(home), "w", encoding="utf-8") as f:
+        f.write("cancel\n")
+    lock = try_lock(home)
+    if lock is None:
+        print("cancelling the running download…")
+        return 0
+    try:
+        staged = staged_dir(home)
+        if os.path.isdir(staged):
+            shutil.rmtree(staged)
+        try:
+            os.remove(cancel_path(home))
+        except OSError:
+            pass
+        write_status("idle", home, reason="cancelled by the user")
+        print("cancelled")
+        return 0
+    finally:
+        os.close(lock)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="veltrix-update-download",
+        description="Download a VELTRIX release (or delta) in the background.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("check", help="show the latest release vs the installed one")
+    sub.add_parser("download", help="fetch + verify the update (or delta)")
+    sub.add_parser("status", help="print the current status.json")
+    sub.add_parser("cancel", help="drop the staged download")
+    args = parser.parse_args(argv)
+    home = os.path.expanduser("~")
+    try:
+        if args.command == "check":
+            return cmd_check(home)
+        if args.command == "download":
+            return cmd_download(home)
+        if args.command == "status":
+            return cmd_status(home)
+        if args.command == "cancel":
+            return cmd_cancel(home)
+    except UpdateError as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

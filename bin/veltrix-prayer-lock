@@ -1,0 +1,1070 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-prayer-lock — the prayer-time "Go pray" overlay + 60-second lock.
+#
+#   veltrix-prayer-lock --prayer Fajr [--duration 60] [--ends-at <epoch>]
+#                      [--headless] [--state-dir DIR]
+#
+# SAFETY — READ THIS BEFORE CHANGING ANYTHING. A forced lock that can strand
+# the user is unacceptable, so the unlock is guaranteed BY CONSTRUCTION, in
+# three independent layers, and NONE of them is "the shell will call unlock":
+#
+#   1. THIS PROCESS owns the timer. It is spawned by the shell but immediately
+#      calls os.setsid() (own session, own process group), so killing the
+#      shell — or the shell crashing — cannot signal or reap it. The shell
+#      has no handle on the lock's lifetime at all: it fires and forgets.
+#      The lock ends when the deadline passes, full stop. The deadline is
+#      tracked TWO ways and the lock ends at whichever comes FIRST: the
+#      wall-clock instant (--ends-at epoch, or now + --duration) AND a
+#      monotonic deadline (time.monotonic() + the same span). A backward
+#      clock jump therefore cannot stretch the lock — the monotonic leg
+#      ends it on time (fix pass #1, M1). A machine that SLEEPS through the
+#      deadline wakes to a lock that is already past its end: the process
+#      exits at once, no overlay. (Monotonic advances across suspend on
+#      Linux, so the sleep-through behaviour is preserved.)
+#
+#   2. A WATCHDOG child (fork()ed at start) watches the parent every 0.5 s
+#      and enforces the same two deadlines: at the earlier one it SIGTERMs
+#      this process, waits 2 s (monotonic), and SIGKILLs it if it is still
+#      alive. If the main loop ever hangs (a stuck GTK frame, a deadlocked
+#      timeout), the watchdog still ends the lock on time; if the parent dies
+#      first (clean unlock, SIGKILL → fail-open, crash), the watchdog removes
+#      any stale state file and exits. The watchdog verifies /proc/<pid>/
+#      cmdline still names this program AND /proc/<pid>/stat start time
+#      still matches the recorded one before it signals anything, so a
+#      reused PID — or an `exec -a` argv spoof — can never get a wrong
+#      process killed (fix pass #1, A7).
+#
+#   3. The deadline is an INSTANT re-checked every 250 ms — never a counted
+#      number of ticks, so a stalled clock or a suspended machine cannot
+#      stretch the lock.
+#
+# LOCK LENGTH IS CAPPED (fix pass #1, M2): --duration > 300 s, or --ends-at
+# more than 300 s in the future, is refused (exit 2). The "60 s bound" is
+# true of THIS program, not just of its caller: the shell passes 60, but a
+# bad or malicious caller cannot lock the screen for an hour.
+#
+# EMERGENCY OVERRIDE (fix pass #1, halal + security ruling — the opt-out
+# question from the v1 report §4 is CLOSED by this): holding Escape for 3
+# continuous seconds exits the lock early. A single press does nothing; a
+# 1-second hold does nothing; the hold must be deliberate and is hard to hit
+# by accident. The hint is printed ON the overlay so the escape is
+# discoverable in the moment it matters ("Hold Esc for 3 seconds to exit in
+# an emergency"). The no-skip default is unchanged — Adnan asked for a lock,
+# not a reminder — the override is recourse for a wrong-time or emergency
+# lock only, and every early exit is logged to stderr. There is still no
+# button, no click handler, no D-Bus method, no IPC. The ONLY other exits
+# are the deadline, the watchdog, SIGTERM/SIGINT (fail-open: a kill always
+# frees the desktop), or SIGKILL.
+#
+# STUCK-OVERLAY RECOVERY (for the user, in plain words — also in
+# docs/prayer-lock-fix-report-1.md): if the overlay is somehow stuck, press
+# Ctrl+Alt+F2 to switch to a text console, log in, and run
+# `killall veltrix-prayer-lock` — the desktop returns at once (the lock
+# fail-opens on SIGTERM). Then Ctrl+Alt+F1 (or F7) returns to the desktop.
+# If even that is unavailable, the lock still ends by itself: the monotonic
+# deadline cannot be stretched by a clock change, and the watchdog kills
+# the process at the deadline.
+#
+# Input blocking, best-effort ladder (Wayland cannot be grabbed from a plain
+# client the way X11 could; the compositor decides). Tried in order:
+#   a. ext-session-lock-v1 via Gtk4SessionLock — the compositor enforces the
+#      lock: no keybind, no Alt-Tab, no other surface can take input. This
+#      is the intended path on the Dell (veltrix-lock already uses it).
+#      DELL-GATED: the typelib is not present in this dev VM, so this path
+#      has never run here — verify on the Dell before calling it done.
+#   b. gtk4-layer-shell OVERLAY layer + exclusive keyboard mode.
+#   c. A plain fullscreen window (keep-above + focus). Still shows the
+#      overlay and still exits on time, but a determined keybind could
+#      switch away — the timer still ends the lock, nothing is stranded.
+#   d. Headless (no display at all, or --headless): no window, the timer +
+#      watchdog + state file still run. Used by the test harness and as a
+#      last resort; it does not block input, and says so on stderr.
+# Only ONE rung is ever active: _build_session_lock's on_failed destroys
+# its windows before falling back to fullscreen, and the builders refuse to
+# run while another rung's windows exist (fix pass #1, code #12).
+#
+# One lock at a time: the state file $XDG_RUNTIME_DIR/veltrix-prayer-lock.json
+# (or --state-dir) records {prayer, ends_at, pid, pid_start_time}. A second
+# invocation while a live lock's deadline is still in the future exits 2
+# without touching anything — a lock can never be extended by re-spawning.
+# A stale file is removed, not fatal: a corrupt/unparseable file, a dead
+# pid, or a pid that is alive but is NOT a lock process (cmdline AND start
+# time checked) all count as stale (fix pass #1, A6). The claim is taken
+# atomically (O_CREAT|O_EXCL), so two simultaneous invocations cannot both
+# become live locks.
+#
+# Visuals: full-screen, the REAL wallpaper dimmed and blurred behind the
+# text (following ui/lockscreen/widget/Lock.ts — resolve the wallpaper,
+# paint it, scrim it for legibility), cyan-only accent (#00E5FF), large
+# prayer name leading in the locale's own language (Arabic leads in the ar
+# locale, Latin leads in en/es) plus the other language beneath it, a large
+# 0:59-style countdown numeral with the sentence under it, and the note
+# "The screen unlocks automatically." No blue/purple, no music-player
+# styling, no imagery of people (halal rubric §1). Arabic in Noto Naskh
+# Arabic; Latin in Inter (Space Grotesk for the hero name). The cursor is
+# hidden over the overlay. Strings are GENERATED from the shell locale keys
+# `prayerlock.*` by scripts/dev/gen-prayer-lock-strings.py — do not
+# hand-edit the tables below; the harness (T7) fails on drift.
+#
+# Prayer times come from bin/veltrix-prayer-times (ISNA default, mosque
+# calibration Dhuhr −1 / Asr +2 — see that file's header for the diagnosis).
+# The shell passes --duration 60 only (NOT --ends-at): the lock runs
+# [spawn, spawn+60], up to ~6 min after the prayer time if the poll lands
+# at the tail of the 5-minute grace window.
+#
+# Exit codes: 0 = locked for the full duration and unlocked on time (or the
+# deadline was already past, so nothing was shown); 1 = could not start
+# (bad state dir, unparseable args handled by argparse as 2); 2 = a live lock
+# is already running / bad --prayer / bad --duration / lock too long.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import argparse
+import json
+import os
+import signal
+import sys
+import time
+
+DEFAULT_DURATION = 60
+MAX_LOCK_SECONDS = 300  # absolute cap: no lock may run longer than this (M2)
+ESC_HOLD_SECONDS = 3.0  # hold Escape this long to exit early (deliberate)
+STATE_FILENAME = "veltrix-prayer-lock.json"
+
+# BEGIN GENERATED PRAYER-LOCK STRINGS
+# Generated from ui/shell/core/i18n/locales/{en,ar,es}.ts by
+# scripts/dev/gen-prayer-lock-strings.py — DO NOT HAND-EDIT.
+# Run the script with --check to verify; the harness (T7) does.
+
+PRAYERS = {"Fajr": "الفجر", "Dhuhr": "الظهر", "Asr": "العصر", "Maghrib": "المغرب", "Isha": "العشاء"}
+
+# Prayer name as shown in each locale (Latin in en/es, Arabic in ar).
+PRAYER_NAMES = {
+    "en": {
+        "Fajr": "Fajr",
+        "Dhuhr": "Dhuhr",
+        "Asr": "Asr",
+        "Maghrib": "Maghrib",
+        "Isha": "Isha"
+    },
+    "ar": {
+        "Fajr": "الفجر",
+        "Dhuhr": "الظهر",
+        "Asr": "العصر",
+        "Maghrib": "المغرب",
+        "Isha": "العشاء"
+    },
+    "es": {
+        "Fajr": "Fajr",
+        "Dhuhr": "Dhuhr",
+        "Asr": "Asr",
+        "Maghrib": "Maghrib",
+        "Isha": "Isha"
+    }
+}
+
+STRINGS = {
+    "en": {
+        "escape-hint": "Hold Esc for 3 seconds to exit in an emergency",
+        "go-pray": "Go pray",
+        "note": "The screen unlocks automatically.",
+        "unlocks-in": "Unlocks in {seconds} seconds",
+        "unlocks-in-few": "Unlocks in {seconds} seconds",
+        "unlocks-in-one": "Unlocks in 1 second",
+        "unlocks-in-two": "Unlocks in 2 seconds"
+    },
+    "ar": {
+        "escape-hint": "اضغط مطوّلًا على مفتاح Esc لمدّة 3 ثوانٍ للخروج في حالة الطوارئ",
+        "go-pray": "اذهب للصلاة",
+        "note": "سيُفتح القفل تلقائياً.",
+        "unlocks-in": "يُفتح القفل خلال {seconds} ثانية",
+        "unlocks-in-few": "يُفتح القفل خلال {seconds} ثوانٍ",
+        "unlocks-in-one": "يُفتح القفل خلال ثانية واحدة",
+        "unlocks-in-two": "يُفتح القفل خلال ثانيتين"
+    },
+    "es": {
+        "escape-hint": "Mantén pulsada Esc durante 3 segundos para salir en caso de emergencia",
+        "go-pray": "Ve a rezar",
+        "note": "La pantalla se desbloqueará automáticamente.",
+        "unlocks-in": "Se desbloquea en {seconds} segundos",
+        "unlocks-in-few": "Se desbloquea en {seconds} segundos",
+        "unlocks-in-one": "Se desbloquea en 1 segundo",
+        "unlocks-in-two": "Se desbloquea en 2 segundos"
+    }
+}
+# END GENERATED PRAYER-LOCK STRINGS
+
+CSS = """
+.veltrix-prayer-lock {
+    background-color: rgba(8, 10, 14, 0.97);
+    color: #ffffff;
+}
+.veltrix-prayer-lock .prayer-scrim {
+    background-color: rgba(8, 10, 14, 0.55);
+}
+.veltrix-prayer-lock .prayer-title {
+    font-family: "Inter", "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans", sans-serif;
+    font-size: 44px;
+    font-weight: 700;
+    color: #ffffff;
+}
+.veltrix-prayer-lock .prayer-name-primary {
+    font-size: 96px;
+    font-weight: 800;
+    color: #00e5ff;
+}
+.veltrix-prayer-lock .prayer-name-secondary {
+    font-size: 84px;
+    font-weight: 700;
+    color: #ffffff;
+}
+.veltrix-prayer-lock .prayer-name-latin {
+    font-family: "Space Grotesk", "Inter", "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans", sans-serif;
+}
+.veltrix-prayer-lock .prayer-name-arabic {
+    font-family: "Noto Naskh Arabic", "Noto Sans Arabic", sans-serif;
+}
+.veltrix-prayer-lock .prayer-countdown-big {
+    font-family: "Inter", "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans", sans-serif;
+    font-size: 72px;
+    font-weight: 800;
+    color: #00e5ff;
+}
+.veltrix-prayer-lock .prayer-countdown {
+    font-family: "Inter", "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans", sans-serif;
+    font-size: 36px;
+    font-weight: 700;
+    color: #00e5ff;
+}
+.veltrix-prayer-lock .prayer-note {
+    font-family: "Inter", "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans", sans-serif;
+    font-size: 20px;
+    color: rgba(255, 255, 255, 0.65);
+}
+.veltrix-prayer-lock .prayer-escape-hint {
+    font-family: "Inter", "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans", sans-serif;
+    font-size: 18px;
+    color: rgba(255, 255, 255, 0.55);
+}
+"""
+
+
+def pick_locale():
+    lang = (os.environ.get("LANG") or "en").lower()
+    if lang.startswith("ar"):
+        return "ar"
+    if lang.startswith("es"):
+        return "es"
+    return "en"
+
+
+def format_unlocks(locale, seconds):
+    """Plural-correct "Unlocks in N seconds" for the lock's sentence.
+
+    en/es: 1 → singular key, otherwise the plural key. ar: 1 → one,
+    2 → dual, 3–10 → few (ثوانٍ), 11+ → many (ثانية). Keys come from the
+    generated STRINGS tables; a missing key falls back to the plural form.
+    """
+    strings = STRINGS[locale]
+    if locale == "ar":
+        if seconds == 1:
+            return strings.get("unlocks-in-one",
+                               strings["unlocks-in"]).format(seconds=seconds)
+        if seconds == 2:
+            return strings.get("unlocks-in-two",
+                               strings["unlocks-in"]).format(seconds=seconds)
+        if 3 <= seconds <= 10:
+            return strings.get("unlocks-in-few",
+                               strings["unlocks-in"]).format(seconds=seconds)
+        return strings["unlocks-in"].format(seconds=seconds)
+    if seconds == 1:
+        return strings.get("unlocks-in-one",
+                           strings["unlocks-in"]).format(seconds=seconds)
+    return strings["unlocks-in"].format(seconds=seconds)
+
+
+def state_path(state_dir):
+    return os.path.join(state_dir, STATE_FILENAME)
+
+
+def read_state(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def proc_start_time(pid):
+    """Start time of a process: field 22 of /proc/<pid>/stat (clock ticks
+    since boot). The comm field is in parens and may itself contain spaces
+    or parens, so split after the LAST ')'. Returns None if unreadable."""
+    if not pid:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+        fields = data[data.rfind(b")") + 2:].split()
+        return int(fields[19])  # fields[0] is field 3; field 22 is [19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def pid_is_live_lock(pid, expected_start=None):
+    """True if pid is a running veltrix-prayer-lock process — not just any
+    process that reused the number, and not an `exec -a` argv spoof.
+
+    Checks /proc/<pid>/cmdline AND, when expected_start is given, the
+    /proc/<pid>/stat start time. A reused PID naming a new generation of
+    the lock fails the start-time check; a spoofed argv fails the cmdline
+    check (it would also have to match the start time to pass both).
+
+    A pid we cannot signal (PermissionError — pid 1, any root-owned or
+    other-user process) is NOT trusted on that alone: a planted state
+    file naming pid 1 would otherwise block every lock (security v2,
+    N1 — fix pass #2). On PermissionError we fall through to the /proc
+    checks below, which are world-readable even for pid 1; only if
+    /proc is ALSO unreadable do we conservatively treat it as live.
+    """
+    if not pid:
+        return False
+    cannot_signal = False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Owned by someone else — fall through to the /proc checks.
+        cannot_signal = True
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            if b"veltrix-prayer-lock" not in fh.read():
+                return False
+    except OSError:
+        return cannot_signal
+    if expected_start is not None:
+        actual = proc_start_time(pid)
+        if actual is None:
+            return cannot_signal
+        if actual != expected_start:
+            return False
+    return True
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        description="Show the prayer-time overlay and lock for 60 seconds.")
+    p.add_argument("--prayer", required=True, choices=sorted(PRAYERS),
+                   help="which prayer is due (never a generic message)")
+    p.add_argument("--duration", type=int, default=DEFAULT_DURATION,
+                   help="lock length in seconds (default: 60, max: 300)")
+    p.add_argument("--ends-at", type=float, default=None,
+                   help="absolute deadline as a Unix epoch (overrides "
+                        "--duration)")
+    p.add_argument("--headless", action="store_true",
+                   help="no window: timer + watchdog + state file only")
+    p.add_argument("--state-dir", default=None,
+                   help="directory for the state file (default: "
+                        "$XDG_RUNTIME_DIR, else /tmp)")
+    args = p.parse_args(argv)
+    if args.duration <= 0:
+        p.error("--duration must be positive")
+    # M2: hard cap — no lock may run longer than 300 s, whatever the caller
+    # asks. The 60 s bound is true of this program, not just of the shell.
+    if args.duration > MAX_LOCK_SECONDS:
+        p.error(f"--duration must be at most {MAX_LOCK_SECONDS} seconds")
+    if args.ends_at is not None and args.ends_at - time.time() > MAX_LOCK_SECONDS:
+        p.error(f"--ends-at must be at most {MAX_LOCK_SECONDS} seconds "
+                f"in the future")
+    if args.state_dir is None:
+        args.state_dir = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    return args
+
+
+class EscHoldTracker:
+    """Pure logic for the hold-Esc-3s emergency override (unit-testable
+    without GTK): press() starts the hold, release() cancels it,
+    should_exit(now) is True only after 3 continuous seconds. A tap or a
+    1-second hold never exits. `now` is a monotonic clock value."""
+
+    def __init__(self, hold_seconds=ESC_HOLD_SECONDS, clock=time.monotonic):
+        self.hold_seconds = hold_seconds
+        self.clock = clock
+        self.pressed_at = None
+
+    def press(self):
+        if self.pressed_at is None:
+            self.pressed_at = self.clock()
+
+    def release(self):
+        self.pressed_at = None
+
+    @property
+    def is_holding(self):
+        return self.pressed_at is not None
+
+    def held_seconds(self, now=None):
+        if self.pressed_at is None:
+            return 0.0
+        return max(0.0, (self.clock() if now is None else now)
+                   - self.pressed_at)
+
+    def should_exit(self, now=None):
+        return self.held_seconds(now) >= self.hold_seconds
+
+
+def resolve_wallpaper_path():
+    """The real wallpaper, following ui/lockscreen/widget/Lock.ts via
+    ui/lib/wallpaper.ts: the user's global wallpaper from
+    ~/.config/veltrix/wallpaper, else the system default, else the repo's
+    dev default. Returns None when nothing usable exists on disk."""
+    candidates = []
+    try:
+        with open(os.path.expanduser("~/.config/veltrix/wallpaper"),
+                  "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        if isinstance(cfg, dict) and cfg.get("path"):
+            candidates.append(cfg["path"])
+    except (OSError, ValueError):
+        pass
+    candidates.append("/usr/share/veltrix/wallpaper.jpg")
+    repo_default = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "defaults", "wallpaper", "wallpaper.jpg")
+    candidates.append(repo_default)
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def blurred_wallpaper_pixbuf(path, width, height):
+    """A blurred copy of the wallpaper as a GdkPixbuf, for the overlay
+    backdrop: downscale to ~1/32 then upscale with bilinear filtering —
+    a real blur, not a tint. Returns None if the image cannot be read."""
+    try:
+        import gi
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+        src = GdkPixbuf.Pixbuf.new_from_file(path)
+        small_w = max(2, src.get_width() // 32)
+        small_h = max(2, src.get_height() // 32)
+        small = src.scale_simple(small_w, small_h,
+                                 GdkPixbuf.InterpType.BILINEAR)
+        return small.scale_simple(max(1, width), max(1, height),
+                                  GdkPixbuf.InterpType.BILINEAR)
+    except Exception as exc:
+        print(f"veltrix-prayer-lock: wallpaper blur failed ({exc}) — "
+              f"flat backdrop", file=sys.stderr)
+        return None
+
+
+def watchdog_main(parent_pid, ends_at, ends_at_mono, path, parent_start):
+    """Two jobs, both deadline-shaped (either deadline ends the lock):
+
+    1. Liveness watch: every 0.5 s, check the parent is still a live lock.
+       If it died (clean unlock, SIGKILL → fail-open, crash), remove a
+       stale state file naming it and exit — a dead lock must never leave
+       a claim behind that blocks the next lock. The state file is only
+       removed when it names this parent pid AND (when recorded) the same
+       start time, so a new generation's claim is never deleted.
+    2. Deadline enforcement: at the earlier deadline, SIGTERM the parent,
+       wait 2 s (monotonic), SIGKILL if still alive. This is what ends a
+       lock whose main loop ever hangs. Verifies the PID still names this
+       program (cmdline AND start time) before signalling, so a reused PID
+       is never killed.
+    """
+    def remaining():
+        return min(ends_at - time.time(),
+                   ends_at_mono - time.monotonic())
+
+    def remove_stale_state():
+        st = read_state(path)
+        if st and st.get("pid") == parent_pid:
+            recorded = st.get("pid_start_time")
+            if recorded is not None and recorded != parent_start:
+                return  # a new generation's claim — leave it alone
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    try:
+        while True:
+            left = remaining()
+            if left <= 0:
+                break
+            if not pid_is_live_lock(parent_pid, parent_start):
+                # Parent gone early: clean up and leave.
+                remove_stale_state()
+                os._exit(0)
+            time.sleep(min(left, 0.5))
+        if pid_is_live_lock(parent_pid, parent_start):
+            try:
+                os.kill(parent_pid, signal.SIGTERM)
+            except OSError:
+                pass
+            grace_end = time.monotonic() + 2.0
+            while time.monotonic() < grace_end:
+                if not pid_is_live_lock(parent_pid, parent_start):
+                    break
+                time.sleep(0.1)
+            if pid_is_live_lock(parent_pid, parent_start):
+                try:
+                    os.kill(parent_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        # Parent gone (or just killed): a state file naming it is stale.
+        remove_stale_state()
+    except Exception:
+        pass  # a watchdog must never crash loudly; its job is a deadline
+    os._exit(0)
+
+
+class PrayerLock:
+    def __init__(self, args):
+        self.args = args
+        self.ends_at = args.ends_at if args.ends_at is not None \
+            else time.time() + args.duration
+        # M1: the monotonic deadline — the same span on time.monotonic().
+        # The lock ends at whichever deadline comes first.
+        self.ends_at_mono = time.monotonic() + max(
+            0.0, self.ends_at - time.time())
+        self.path = state_path(args.state_dir)
+        self.watchdog_pid = None
+        self.exited = False
+        self.main_loop = None
+        self.countdown_labels = []
+        self.countdown_big_labels = []
+        self.windows = []  # every window of the ONE active rung
+        self.rung = None
+        self.esc_tracker = EscHoldTracker()
+        self._esc_check_source = None
+
+    # ── lifecycle ────────────────────────────────────────────────────
+
+    def claim_state(self):
+        """Refuse to start if a live lock already holds the state file.
+
+        A corrupt/unparseable file, a dead pid, or a pid that is alive but
+        is NOT a lock process (cmdline AND start time) all count as STALE:
+        the file is removed and the lock proceeds (A6). The claim itself
+        is taken atomically with O_CREAT|O_EXCL (0600), so two simultaneous
+        invocations cannot both become live locks.
+        """
+        st = read_state(self.path)
+        if st:
+            ends_at = st.get("ends_at") or 0
+            pid = st.get("pid")
+            if ends_at > time.time() and pid_is_live_lock(
+                    pid, st.get("pid_start_time")):
+                print(f"veltrix-prayer-lock: a lock is already running "
+                      f"(prayer {st.get('prayer')}, pid {pid}, "
+                      f"ends in {ends_at - time.time():.0f}s) — refusing "
+                      f"to extend it", file=sys.stderr)
+                return False
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+        payload = json.dumps({
+            "prayer": self.args.prayer, "ends_at": self.ends_at,
+            "started_at": time.time(), "pid": os.getpid(),
+            "pid_start_time": proc_start_time(os.getpid()),
+        })
+        for _ in range(5):
+            try:
+                fd = os.open(self.path,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                # Someone else claimed it (or a stale file reappeared):
+                # re-validate, then retry once it is gone.
+                st = read_state(self.path)
+                if st:
+                    ends_at = st.get("ends_at") or 0
+                    if ends_at > time.time() and pid_is_live_lock(
+                            st.get("pid"), st.get("pid_start_time")):
+                        print("veltrix-prayer-lock: a lock is already "
+                              "running — refusing to extend it",
+                              file=sys.stderr)
+                        return False
+                try:
+                    os.unlink(self.path)
+                except OSError:
+                    pass
+                continue
+            except OSError as exc:
+                print(f"veltrix-prayer-lock: cannot claim state file "
+                      f"({exc})", file=sys.stderr)
+                return False
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            return True
+        print("veltrix-prayer-lock: could not claim the state file — "
+              "refusing to start", file=sys.stderr)
+        return False
+
+    def start_watchdog(self):
+        parent_start = proc_start_time(os.getpid())
+        pid = os.fork()
+        if pid == 0:
+            # Child: never returns. os._exit inside watchdog_main.
+            watchdog_main(os.getppid(), self.ends_at, self.ends_at_mono,
+                          self.path, parent_start)
+        self.watchdog_pid = pid
+
+    def stop_watchdog(self):
+        if self.watchdog_pid:
+            try:
+                os.kill(self.watchdog_pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                os.waitpid(self.watchdog_pid, 0)
+            except OSError:
+                pass
+            self.watchdog_pid = None
+
+    def finish(self, early=False):
+        """Clean unlock: stop the watchdog, drop the state, exit 0."""
+        if self.exited:
+            return
+        self.exited = True
+        if early:
+            print("veltrix-prayer-lock: emergency override — held Esc for "
+                  f"{ESC_HOLD_SECONDS:.0f}s, exiting early",
+                  file=sys.stderr)
+        self.stop_watchdog()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        if self.main_loop is not None:
+            try:
+                self.main_loop.quit()
+            except Exception:
+                pass
+
+    def remaining(self):
+        # M1: the earlier of the wall-clock and monotonic deadlines.
+        return max(0.0, min(self.ends_at - time.time(),
+                            self.ends_at_mono - time.monotonic()))
+
+    # ── emergency override (hold Esc 3 s) ───────────────────────────
+
+    def _on_key_pressed(self, _controller, keyval, _keycode, _state):
+        try:
+            from gi.repository import Gdk
+            if keyval == Gdk.KEY_Escape:
+                self.esc_tracker.press()
+                if self._esc_check_source is None:
+                    from gi.repository import GLib
+                    self._esc_check_source = GLib.timeout_add(
+                        100, self._check_esc_hold)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _on_key_released(self, _controller, keyval, _keycode, _state):
+        try:
+            from gi.repository import Gdk
+            if keyval == Gdk.KEY_Escape:
+                self.esc_tracker.release()
+        except Exception:
+            pass
+        return False
+
+    def _check_esc_hold(self):
+        if self.esc_tracker.should_exit():
+            self._esc_check_source = None
+            self.finish(early=True)
+            return False
+        if not self.esc_tracker.is_holding:
+            self._esc_check_source = None
+            return False
+        return True
+
+    # ── GUI ──────────────────────────────────────────────────────────
+
+    def build_windows(self):
+        """Best-effort ladder: session-lock → layer-shell → fullscreen.
+        Returns True if any window was shown. Raises nothing — callers fall
+        back to headless on False. Exactly ONE rung is ever active."""
+        try:
+            import gi
+            gi.require_version("Gtk", "4.0")
+            from gi.repository import Gtk, Gdk, GLib
+        except Exception as exc:
+            print(f"veltrix-prayer-lock: no GTK available ({exc}) — "
+                  f"headless timer only", file=sys.stderr)
+            return False
+        try:
+            provider = Gtk.CssProvider()
+            provider.load_from_string(CSS)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        except Exception as exc:
+            print(f"veltrix-prayer-lock: CSS failed ({exc})", file=sys.stderr)
+        # Session-lock first: the compositor enforces it. Import is guarded
+        # — the typelib is absent outside a Veltrix install (and in this VM).
+        try:
+            gi.require_version("Gtk4SessionLock", "1.0")
+            from gi.repository import Gtk4SessionLock
+            if Gtk4SessionLock.is_supported():
+                if self._build_session_lock(Gtk4SessionLock):
+                    return True
+        except Exception:
+            pass
+        try:
+            gi.require_version("Gtk4LayerShell", "1.0")
+            from gi.repository import Gtk4LayerShell
+            if self._build_layer_shell(Gtk4LayerShell):
+                return True
+        except Exception:
+            pass
+        try:
+            return self._build_fullscreen()
+        except Exception as exc:
+            print(f"veltrix-prayer-lock: no window could be shown ({exc}) — "
+                  f"headless timer only", file=sys.stderr)
+            return False
+
+    def _overlay_content(self, Gtk):
+        """The one overlay body, shared by every window path. No buttons,
+        no entries — nothing on it can dismiss the lock except the deliberate
+        hold-Esc-3s override (a key controller on the window, not a widget).
+        The prayer name leads in the locale's own language: Arabic first in
+        the ar locale, Latin first in en/es; the other language follows."""
+        locale = pick_locale()
+        strings = STRINGS[locale]
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_hexpand(True)
+        box.set_vexpand(True)
+        title = Gtk.Label(label=strings["go-pray"])
+        title.add_css_class("prayer-title")
+        # Primary name: the locale's own name, 96px cyan. Secondary: the
+        # other language, 84px white.
+        primary_text = PRAYER_NAMES[locale][self.args.prayer]
+        secondary_text = (PRAYERS[self.args.prayer]
+                          if locale != "ar" else self.args.prayer)
+        primary = Gtk.Label(label=primary_text)
+        primary.add_css_class("prayer-name-primary")
+        primary.add_css_class("prayer-name-arabic"
+                              if locale == "ar" else "prayer-name-latin")
+        secondary = Gtk.Label(label=secondary_text)
+        secondary.add_css_class("prayer-name-secondary")
+        secondary.add_css_class("prayer-name-latin"
+                                if locale == "ar" else "prayer-name-arabic")
+        countdown_big = Gtk.Label(label="")
+        countdown_big.add_css_class("prayer-countdown-big")
+        self.countdown_big_labels.append(countdown_big)
+        countdown = Gtk.Label(label="")
+        countdown.add_css_class("prayer-countdown")
+        self.countdown_labels.append(countdown)
+        note = Gtk.Label(label=strings["note"])
+        note.add_css_class("prayer-note")
+        hint = Gtk.Label(label=strings["escape-hint"])
+        hint.add_css_class("prayer-escape-hint")
+        for widget in (title, primary, secondary, countdown_big,
+                       countdown, note, hint):
+            box.append(widget)
+        self._tick_countdown()
+        return box
+
+    def _tick_countdown(self):
+        locale = pick_locale()
+        secs = int(self.remaining() + 0.999)
+        big = f"{secs // 60}:{secs % 60:02d}"
+        text = format_unlocks(locale, secs)
+        for label in self.countdown_big_labels:
+            try:
+                label.set_label(big)
+            except Exception:
+                pass
+        for label in self.countdown_labels:
+            try:
+                label.set_label(text)
+            except Exception:
+                pass
+
+    def _finish_window(self, Gtk, win, monitor=None):
+        win.add_css_class("veltrix-prayer-lock")
+        # Backdrop: the real wallpaper, blurred, with a dark scrim over it
+        # for legibility (Lock.ts pattern). Flat dark when no wallpaper
+        # exists on disk — the window's own background colour, not glass.
+        backdrop = None
+        wall = resolve_wallpaper_path()
+        if wall and monitor is not None:
+            try:
+                geo = monitor.get_geometry()
+                backdrop = blurred_wallpaper_pixbuf(wall, geo.width,
+                                                    geo.height)
+            except Exception:
+                backdrop = None
+        if backdrop is not None:
+            try:
+                from gi.repository import Gdk
+                pic = Gtk.Picture.new_for_paintable(
+                    Gdk.Texture.new_for_pixbuf(backdrop))
+                pic.set_content_fit(Gtk.ContentFit.COVER)
+                pic.set_hexpand(True)
+                pic.set_vexpand(True)
+                overlay = Gtk.Overlay()
+                overlay.set_child(pic)
+                scrim = Gtk.Box()
+                scrim.add_css_class("prayer-scrim")
+                scrim.set_can_target(False)
+                scrim.set_hexpand(True)
+                scrim.set_vexpand(True)
+                overlay.add_overlay(scrim)
+                content = self._overlay_content(Gtk)
+                overlay.add_overlay(content)
+                win.set_child(overlay)
+            except Exception as exc:
+                print(f"veltrix-prayer-lock: backdrop failed ({exc}) — "
+                      f"flat backdrop", file=sys.stderr)
+                win.set_child(self._overlay_content(Gtk))
+        else:
+            win.set_child(self._overlay_content(Gtk))
+        # The window must never be closed by the user or the compositor
+        # while the lock runs: ignore close requests. Only the deadline,
+        # the watchdog, the Esc hold, or a signal ends this process.
+        try:
+            win.connect("close-request", lambda *_a: True)
+        except Exception:
+            pass
+        # No cursor over the overlay: there is nothing to point at.
+        try:
+            from gi.repository import Gdk
+            win.set_cursor(Gdk.Cursor.new_from_name("none", None))
+        except Exception:
+            pass
+        # Emergency override: hold Escape for 3 s (see _on_key_pressed).
+        try:
+            controller = Gtk.EventControllerKey.new()
+            controller.connect("key-pressed", self._on_key_pressed)
+            controller.connect("key-released", self._on_key_released)
+            win.add_controller(controller)
+        except Exception:
+            pass
+        self.windows.append(win)
+        return win
+
+    def _destroy_windows(self):
+        for win in list(self.windows):
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self.windows.clear()
+        self.rung = None
+
+    def _build_session_lock(self, Gtk4SessionLock):
+        if self.windows:
+            return False  # another rung is already active
+        import gi
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk, Gdk, GLib  # noqa: F401
+        print("veltrix-prayer-lock: using ext-session-lock-v1",
+              file=sys.stderr)
+        lock = Gtk4SessionLock.Instance()
+        self.rung = "session-lock"
+
+        def on_monitor(_inst, monitor):
+            if self.rung != "session-lock":
+                # on_failed already ran (it destroys this rung's windows
+                # and clears rung before falling back to fullscreen): a
+                # late monitor signal must not append a session-lock
+                # window on top of the fullscreen rung (fix pass #2,
+                # code #5). Two overlays again, otherwise.
+                return
+            # Plain Gtk.Window: this process has no Gtk.Application, and a
+            # session-lock window does not need one.
+            win = Gtk.Window()
+            self._finish_window(Gtk, win, monitor)
+            try:
+                lock.assign_window_to_monitor(win, monitor)
+            except Exception as exc:
+                print(f"veltrix-prayer-lock: assign window failed ({exc})",
+                      file=sys.stderr)
+
+        def on_unlocked(_inst):
+            self.finish()
+
+        def on_failed(_inst):
+            # One rung only: destroy the session-lock windows FIRST, then
+            # fall back to fullscreen — never two overlays at once.
+            print("veltrix-prayer-lock: session lock failed — falling back "
+                  "to fullscreen", file=sys.stderr)
+            self._destroy_windows()
+            try:
+                self._build_fullscreen()
+            except Exception as exc:
+                print(f"veltrix-prayer-lock: fullscreen fallback failed "
+                      f"({exc})", file=sys.stderr)
+        lock.connect("monitor", on_monitor)
+        lock.connect("unlocked", on_unlocked)
+        lock.connect("failed", on_failed)
+        lock.lock()
+        # Windowless guard (fix pass #2, code #5): lock.lock() only means
+        # the compositor acked — if it never emits `monitor`, the process
+        # would otherwise run its 60 s with rung="session-lock" and zero
+        # windows, an invisible run. The timer still ends the lock; this
+        # only makes the failure LOUD so it is diagnosable instead of
+        # silent. (The other two builders return False on zero windows;
+        # this rung cannot know at lock() time, hence the timeout.)
+        def _check_session_lock_window():
+            if self.rung == "session-lock" and not self.windows:
+                print("veltrix-prayer-lock: WARNING: session lock acked but "
+                      "no monitor/window arrived after 5 s — running "
+                      "windowless; the timer still ends the lock",
+                      file=sys.stderr)
+            return False  # one-shot
+        try:
+            GLib.timeout_add_seconds(5, _check_session_lock_window)
+        except Exception:
+            pass
+        return True
+
+    def _build_layer_shell(self, Gtk4LayerShell):
+        if self.windows:
+            return False  # another rung is already active
+        import gi
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk, Gdk
+        print("veltrix-prayer-lock: using gtk4-layer-shell OVERLAY",
+              file=sys.stderr)
+        display = Gdk.Display.get_default()
+        monitors = display.get_monitors()
+        built = 0
+        for i in range(monitors.get_n_items()):
+            monitor = monitors.get_item(i)
+            win = Gtk.Window()
+            Gtk4LayerShell.init_for_window(win)
+            Gtk4LayerShell.set_layer(win, Gtk4LayerShell.Layer.OVERLAY)
+            Gtk4LayerShell.set_keyboard_mode(
+                win, Gtk4LayerShell.KeyboardMode.EXCLUSIVE)
+            for edge in (Gtk4LayerShell.Edge.LEFT, Gtk4LayerShell.Edge.RIGHT,
+                         Gtk4LayerShell.Edge.TOP, Gtk4LayerShell.Edge.BOTTOM):
+                Gtk4LayerShell.set_anchor(win, edge, True)
+            Gtk4LayerShell.set_exclusive_zone(win, -1)
+            self._finish_window(Gtk, win, monitor)
+            win.present()
+            built += 1
+        if built == 0:
+            return False  # no window was created — do not run invisibly
+        self.rung = "layer-shell"
+        return True
+
+    def _build_fullscreen(self):
+        if self.windows:
+            return False  # another rung is already active
+        import gi
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk, Gdk
+        print("veltrix-prayer-lock: using plain fullscreen window "
+              "(best effort — a keybind may switch away, the timer still "
+              "ends the lock)", file=sys.stderr)
+        display = Gdk.Display.get_default()
+        monitors = display.get_monitors()
+        built = 0
+        for i in range(monitors.get_n_items()):
+            monitor = monitors.get_item(i)
+            win = Gtk.Window()
+            self._finish_window(Gtk, win, monitor)
+            try:
+                geo = monitor.get_geometry()
+                # If the compositor/WM ignores fullscreen (bare Xvfb has
+                # no WM at all), the window still covers the screen.
+                win.set_default_size(geo.width, geo.height)
+            except Exception:
+                pass
+            win.fullscreen()
+            win.present()
+            built += 1
+        if built == 0:
+            return False  # no window was created — do not run invisibly
+        self.rung = "fullscreen"
+        return True
+
+    # ── run ──────────────────────────────────────────────────────────
+
+    def run(self):
+        if self.remaining() <= 0:
+            # Deadline already past (slept through it, or a late spawn):
+            # show nothing, exit at once.
+            print("veltrix-prayer-lock: deadline already past — nothing to "
+                  "lock", file=sys.stderr)
+            return 0
+        if not self.claim_state():
+            return 2
+        self.start_watchdog()
+
+        def on_signal(_signum, _frame):
+            # SIGTERM/SIGINT: fail-open. A kill always frees the desktop.
+            self.finish()
+            os._exit(0)
+
+        signal.signal(signal.SIGTERM, on_signal)
+        signal.signal(signal.SIGINT, on_signal)
+
+        headless = self.args.headless or not (
+            os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
+        shown = False
+        if not headless:
+            shown = self.build_windows()
+        if not shown and not headless:
+            print("veltrix-prayer-lock: no window shown — timer still "
+                  "enforces the lock window", file=sys.stderr)
+
+        if shown:
+            from gi.repository import GLib
+            self.main_loop = GLib.MainLoop()
+
+            def tick():
+                self._tick_countdown()
+                if self.remaining() <= 0:
+                    self.finish()
+                    return False
+                return True
+
+            def countdown_tick():
+                self._tick_countdown()
+                return True
+
+            GLib.timeout_add(250, tick)
+            GLib.timeout_add_seconds(1, countdown_tick)
+            try:
+                self.main_loop.run()
+            except KeyboardInterrupt:
+                pass
+        else:
+            # Headless: a plain sleep loop. The deadline is re-checked
+            # (wall AND monotonic), never counted down in ticks.
+            try:
+                while self.remaining() > 0:
+                    time.sleep(min(self.remaining(), 0.1))
+            except KeyboardInterrupt:
+                pass
+        self.finish()
+        return 0
+
+
+def main(argv):
+    # Own session FIRST: from here on, killing the shell (or the shell
+    # crashing) cannot signal this process, and it is reparented to init.
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    args = parse_args(argv)
+    lock = PrayerLock(args)
+    return lock.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

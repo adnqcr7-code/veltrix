@@ -1,0 +1,4126 @@
+# Veltrix — Known tech debt
+
+Read this before a refactor or before "fixing" something that feels weird — many odd
+patterns are known tradeoffs with reasons. **Keep this file honest:** when you create or find
+debt, add it; when you resolve an item, move it to `tech-debt-resolved.md` (keeping its number)
+and leave its line in the index at the bottom of this file. It must match reality.
+
+**This file is what is still OWED.** It holds three genres, and they are not the same thing:
+
+- **Open debt** — work still to do (#2, #62, #63, #80, #82, #85…).
+- **Partial** — one half shipped, the other did not; the heading says which (#43, #64, #68).
+- **Standing decisions** — *not* debt: things that are deliberately this way, or upstream bugs
+  we will not chase. #3 ("NOT a bug"), #13, #17, #34, #38 (retracted — a measurement error),
+  #42, #46 ("a DEAD END"), #52 (an idea, not a plan). **These exist to stop work, not to
+  start it.** Do not "fix" one without reopening the decision with the owner.
+
+⚠️ **Three numbers are shared** (#37 and #38 each appear twice, from a numbering slip that
+predates the split; #102 was reused on 2026-09-04, both now resolved). Cite them by title, not by
+number alone.
+
+## Rust IPC capture boundary and pending consumers (#959 A, 2026-10-30)
+
+The shared access policy covers Rust Config1 writes and Hyalo JSON socket effects.
+Wayland screencopy/image-copy-capture is explicitly declared outside A by the owner;
+no general capture isolation is claimed. Existing Display1 bus transaction rules
+are not replaced. Same-UID hostile code is outside cooperative consent's boundary.
+B adds typed CLI/Shell1, C only OSD; Applications1 and the bar are separate blocks.
+Checkout executables require consent or an exact root-owned access.d grant;
+install.sh's dev path writes the grant on an explicit install/update. Installed
+session acceptance remains unverified by the private user/mount namespace tests. See `crates/veltrix-access/README.md`.
+
+## Applications1 A2/A3 acceptance boundaries (#959, 2026-10-31)
+
+The opt-in A2 implementation has private-service launch/autostart coverage, not
+installed-session acceptance. Real user-manager cgroups, portal attribution,
+physical activation serials, terminal appearance and login autostart remain to
+be checked in an explicitly authorized session. D-Bus/Terminal/Flatpak/Snap
+autostart stays unavailable until its runner/portal integration is established.
+H1/A3 provide opt-in launch/window correlation, usage and new markers, but the
+A3 fixture uses fake H1/systemd and real private Unity signals; it does not prove
+installed/visual/Orca acceptance or the actual compositor transport together.
+Dispatch must never stand in for observed focus/window success. See
+`session/daemon/src/applications/A2.md` and `A3.md`. No second autostart loop or TS bridge.
+
+## Native Display1 consumers and hardware limits (#959, 2026-10-28)
+
+The first Display1 cut publishes primary and serves confirmed profiles, extended layouts,
+Identify and the Power1 lid effect. The TS bar/dock do not consume primary; the CC still uses
+brightnessctl. There is no TS bridge. Mirroring is compositor-owned on the primary GPU
+with VRR off and a bounded source-canvas budget; cross-GPU/VRR mirror support and physical
+DRM acceptance remain outstanding. The source is drawn directly and each follower also
+composes a retained canvas with damage tracking. Sharing a source canvas with direct output
+is an optimization candidate if measured frame cost warrants it; no performance win is
+claimed or measured here. DisplayBrightness1/DDC/Fn now uses exact GPU-port/EDID
+association and shared Power1 logind authority. Physical backlight/DDC/USB-C/dock acceptance
+remain outstanding; do not infer them from the private fixtures. The unique
+firmware/platform fallback is supported only with one internal globally, no associated
+raw and one candidate. Multiple/unknown platform associations remain unsupported.
+Native Settings has an isolated Rust-session consumer; the standalone Super+P
+selector is packaged and floating/centered in factory configuration, with pseudo
+on Super+Shift+P. Native Settings packaging/installation remains separate. Real
+Orca speech and physical display acceptance remain outstanding. Legacy output persistence is refused once a
+Display1 profile owns that output set. Connector names duplicated across GPUs are refused
+before mutation until backend addressing is unambiguous. Private-bus/nested evidence does
+not establish physical multimonitor, EDID, dock, lid or installed-package acceptance.
+Lid closure does not enable a user-disabled external; with none enabled, Display1 leaves
+the internal configuration alone and existing Power1/logind lid policy remains in charge.
+See `hyalo/DISPLAY1.md` before changing output mutation or recovery paths.
+
+## Native Power1 consumers and accepted legacy limits (#959, 2026-10-27)
+
+Power1 is the backend; Rust bar/island/menu consumers remain in the queued Rust shell work.
+Until a Rust menu consumer registers, the factory menu preference has effective action suspend.
+A registered consumer failure never falls back destructively. The legacy TS 5% island can appear
+alongside the backup critical notification. Legacy game powerprofilesctl sets cancel automatic
+PPD holds and can restore power-saver as a manual profile that AC does not undo. Future Rust game
+code must use sender-owned holds. These are explicit boundaries, not authorization to extend TS.
+The power-key inhibitor also covers logind software long press; firmware cutoff remains outside.
+
+## Where this file stops and the issue tracker starts (2026-08-31)
+
+**This file is not the queue any more, and it never was a good one.** Since 2026-08-31 the open
+items also exist as GitHub issues (`adnqcr7-code/veltrix`, plus `nidara-iso` for anything
+whose fix lives there), and the split is by *kind*, not by convenience:
+
+| | the issue | this file |
+|---|---|---|
+| answers | what is next, in what order | what is true, and what not to do |
+| lifetime | dies when the PR merges | outlives it — several RESOLVED items still carry a binding rule |
+| lives in | GitHub | the checkout, so a contributor's agent gets it without asking |
+
+🔑 **The reason it is issues and not a third numbered list**: issues and PRs share ONE number space.
+`#302` is a PR and can never mean anything else, so `#305` names one thing in every conversation,
+commit message and document, forever. Three private numbering schemes — this file's `#1…#101`, a
+work-order artifact's `0…4`, a review artifact's `01…10` — collided on 2026-08-31 and cost a whole
+exchange to untangle, which is what prompted this.
+
+**The one rule that keeps it from becoming a graveyard**: a PR closing a queue item says
+`Closes #<n>` in its body. Nobody has to remember to tidy up; the merge does it. A repo with 300
+PRs and one issue in seven months is what happens otherwise.
+
+Numbers here are NOT renumbered to match issue numbers and never will be: the `#N` in a commit
+message from July still has to resolve. Each open item carries its queue entry in a line under its
+heading.
+
+## Active debt
+
+### Native popup parent servicing (#915/#939, 2026-10-25)
+
+Opening the standard dropdown enters nk-wayland's nested run_inner on the same
+connection. It suspends the parent's application loop: parent repaint/configure,
+scale and appearance servicing wait for the popup to finish; input/focus at the
+popup is serviced. A large parent update can therefore be delayed for as long as
+the menu stays open. Fixing this requires one shared dispatcher that services the
+parent and popup with explicit modal input routing, plus a native test changing
+parent size/appearance while the popup is held open and a control that freezes
+the parent again. Compiling or closing the menu is not acceptance of that behavior.
+
+
+### Toolkit capsule demo adaptive scheduling (#889, 2026-10-25)
+
+The foundations widgets demo polls/syncs every 16 ms even after the D5 capsule
+wash settles. It does not consume `CapsuleComposition::is_animating()`. Settled
+paint invalidation tests do not establish idle scheduling, CPU or frame counts.
+To close: connect the real demo caller to fast frame opportunities only while
+`is_animating()` is true, return to idle when settled, and prove the transition
+with a discriminating caller test that fails if constant 16 ms polling returns.
+Preserve input, portal and accessibility wakeups. Lab-specific scheduling is not
+acceptance of the foundations demo or native Settings host.
+
+### Native Settings first executable — remaining integration/gates (#915, 2026-10-24)
+
+The local main/application composition exists, with a real private-bus full-page
+Apply test and CPU parent-mask/snapshot/retirement checks. Native diagnostic
+windows have reached CONTENT_READY but subsequently disconnected, including the
+opaque D5 preview after pointer entry; opening/resize is not live acceptance.
+A source defect causing unchanged activation to republish semantics per pointer
+sample is corrected locally with a compiled old-source control; native closure
+cause remains unlogged; an optimized D5 run with both no-op fixes has handled
+2245 real pointer motions and presented afterwards without disconnecting. Owner
+visual confirmation, normal D7 and long-run responsiveness remain pending. This is not
+an installed replacement. Tokenized native Raise now submits xdg_activation_v1 after the first buffer;
+compositor focus and real launch/modal ordering remain unverified. Missing tokens
+are explicit. queryUI still requires existing agent-view policy/serialization. Sidebar search/results remain absent. Undrawn
+Router calls forward directly to ENTRY and are not staged in the nested-modal
+queue yet. Parent servicing while a font/popup borrows Tree remains limited.
+Polling is still16ms, including settled state: adaptive caller/causal test and
+idle/performance proofs remain open. Provisional loose glyph controls/panel
+header differ from final #921/graded-titlebar work; do not edit that scope here.
+Initial height is exported minHeight, not GTK's760; font list geometry and
+1/1024pt step/range are explicit initial caller policy, not accepted GTK parity.
+Image budgets are not a codec hard allocation bound. Native parent/focus, agent
+policy, Orca SPEECH OUTPUT, installed startup/PSS/frame gates and owner live
+acceptance must be recorded separately. Do not install or publish from this cut.
+
+### Native Settings wallpaper picker — local host/visual acceptance pending (#915, 2026-10-24)
+
+The local wallpaper_picker builder uses the shared native Button; exact legacy
+secondary/pill appearance remains unvalidated. Its Config1/decision checks and the
+separate portal transport fixture do not establish native Window parenting, dialog
+focus return, AT-SPI/Orca or owner live acceptance. The actual application caller
+must consume Rendered::idle's returned notices for non-row dependencies, stage its
+external changes, and use external_modal_active to reject parent accessibility
+actions/publish inactivity during the portal request. The local nk-settings application now provides that caller and has CPU causal
+checks for suspension/retirement; native acceptance remains pending. The flag alone is neither working parent modality nor
+an adaptive polling/idle-CPU proof. Preserve these gaps until actual caller and
+causal/native evidence close them; local clean cuts are not shipped acceptance.
+
+
+### 1. `@mixin glass()` underused — audited 2026-06-09, mostly NOT migratable
+Defined in `_base.scss` (levels `surface`, `raised`, `floating`) with few call sites. A
+sweep audit found the manual glass-ish blocks **diverge deliberately** (different radii,
+inset shadows, transitions, extra colors) — force-migrating them would change pixels, so
+they stay. The actionable parts of that sweep were done instead: Adwaita named colors
+eradicated (`@accent_bg_color` in `_workspace.scss`/`_app-grid.scss` — those DID track the
+accent, but only via a fragile accidental chain: our gsettings `accent-color` → the
+libadwaita that AGS force-loaded defines the named color → GNOME's palette flavor of the
+accent, not our exact token; on an Adwaita-free system it breaks silently — and since the AGS host
+went (#9) EVERY system is Adwaita-free in-process, so that chain is now simply dead. Now they use
+`--veltrix-accent` directly), `--veltrix-accent-10` unified (5 sites), orphaned
+`.bar-ws-dot` and `.cc-resize-btn` CSS deleted (the latter was the pre-context-menu tile
+resize UI). For dark badges over imagery, don't hardcode rgba blacks — add scrim tokens
+when a real user appears (a `--veltrix-scrim` trio existed briefly; removed as speculative
+once its only consumer turned out to be dead CSS). Rules that stand: **new code uses the
+mixins/tokens**
+(`glass()`, `material-*`, `veltrix-row-states`/`-tile-states`, scrims); two accent-button
+hover conventions coexist (`rgba(accent, .82/.85)` translucent vs `color-mix(… white 15%)`
+lightened) — they look intentional per-material, don't blind-unify without a visual pass.
+Sweep-verification recipe: compile `style.scss` before/after and diff — a pure refactor
+must produce an identical (or fully-accounted) CSS diff.
+**Systematic orphan purge done 2026-06-10:** a detector script (extract every `.class` from
+`styles/*.scss`, `grep -rF` each against `surfaces/ widgets/ common/ core/ app.ts ../lib`) found and removed
+~45 dead classes (−459 compiled lines, −13%) — remnants of the dock pre-DockCore, the
+pre-commandment-5 separate overlay windows, the old sidebar variant, deleted Resources.tsx,
+and the pre-context-menu CC edit chrome. **False-positive traps for the next run:** classes
+built dynamically (`accent-${key}` in Appearance.tsx, `veltrix-btn--${variant}` in
+veltrix-kit/button.ts), GTK-internal node classes (`day-name`/`other-month`/`week-number` =
+Gtk.Calendar, `combo`), and live names that look stale (`notif-win`).
+
+#### The four "kit classes with zero consumers" are TWO different things, not one bucket
+
+This list read as one open question for months — *"should these be deleted?"* — and that framing was
+the problem, not the classes. Settled 2026-08-10 by reading the history instead of the counts.
+**Nothing in the kit was declared upfront; every one of these came out of a real need.**
+
+**(a) Three are the OPT-IN HALF of a rule that is fully live**, and were never meant to have
+consumers. They are escape hatches shipped alongside an element rule that does the actual work:
+
+| Class | The live half | Reach |
+|---|---|---|
+| `.veltrix-input` | `entry, .veltrix-input { … }` | ~20 real `Gtk.Entry`/`PasswordEntry` (Settings Ai/Users/Region/Autostart/Network, the kit's `alert-dialog`, greeter + lock) |
+| `.veltrix-switch` | `switch, .veltrix-switch { … }` | 10+ real `Gtk.Switch` |
+| `.is-selected` | `&:selected, &.is-selected` inside `veltrix-row-states` / `veltrix-tile-states` | every include of those two mixins |
+
+The class exists to say *"this thing is not a `Gtk.Entry` but should look like one"*. Deleting it
+removes zero declarations from any existing widget — the body stays either way — and `.is-selected`
+is not even a standalone rule, it lives inside two mixins next to GTK's own `:selected` (which only
+appears on `GtkListBox` rows, so the alias is the only route for widgets we paint ourselves).
+**Zero consumers is the expected state for an alias. Stop re-triaging these.**
+
+**(b) `.veltrix-tile` is the one genuine finding, and it is UNFINISHED, not unused.** It came from
+`69cce101 refactor(ui): universal CrystalRow/CrystalList`, whose own message says: *"Floating tiles
+already share one model (`crystal-tile-states`); a `.crystal-tile` class + CrystalSidebar/
+CrystalMenu/CrystalWindow are **Increments 2-3**."* Every sibling in that plan shipped and is used
+(`.veltrix-row` 23 consumers, `.veltrix-menu` 4, `.veltrix-window-glass` 3, `.veltrix-list` 4,
+`.veltrix-sidebar` 1). Only the tile migration never happened.
+
+The reusable part was never the problem: the **mixin** `veltrix-tile-states` is well adopted, by
+`.app-grid-button`, `.cc-split-icon-btn` and `.bar-popover-icon-btn`. What
+stalled is visible in those three — they take **different radii (`md` / `sm` / `xs`) and their
+own padding**, so absorbing them needs size variants, which is a design decision. Rows all share one
+geometry and sailed through; tiles do not and did not.
+
+✅ **DROPPED 2026-08-10 (owner's call).** The options were finish it or delete it — "leave it sitting
+there" was the only one that kept lying, same shape as the `cc-*` prefix in §56. The class is gone;
+the mixin stays. **Bring it back WITH variants if the migration is ever attempted, never bare.**
+
+🔑 **It was never used, not used-then-dropped, and the distinction took one command.** `git log -S`
+across the whole history — under both this name and the pre-rename `.crystal-tile`, since #22 hides
+the origin of every kit class — finds no commit that ever applied it from code. Its comment named
+"CC icon tiles" among the intended wearers, which is exactly why it read like CC chrome that had
+fallen out of use; the history says otherwise. **A class's comment describes the plan, the history
+describes what happened.**
+
+⚠️ Two traps met while establishing that, both of which nearly produced a wrong answer:
+`git log -S'.crystal-tile'` also matches `.crystal-tile-states`, so it appears to point at the mixin's
+commit — search the declaration (`'.crystal-tile {'`) when a name is a prefix of another. And `-S`
+over `ui/` hits the **committed generated `style.css`** as well as the source, so a "consumer" can be
+the compiled output of the very rule you are investigating.
+**Re-run 2026-06-23 (271 classes):** removed 2 newly-confirmed dead blocks —
+`.settings-icon-btn--danger` (`_components.scss`, a never-wired "danger tint" modifier; the base
+`.settings-icon-btn` is only ever added plain/`+flat`) and `.is-danger` (`_control-center.scss`, the
+only live `is-*` toggle is `.is-active` in `StatusIndicators.tsx`). The other 24 candidates are all
+accounted-for traps: the 9 dynamic `.accent-*` swatches, `.veltrix-btn--ghost` (variant `"ghost"` IS
+used, Audio.tsx), the 4 GTK-internal nodes (`combo`/`day-name`/`other-month`/`week-number`), the 4 kept aliases above, and 4
+tombstone *comments* the extractor matches inside `/* … */` (`bar-ws-dot`/`cc-resize-btn`/
+`veltrix-media-progress`/`settings-page-title` — the CSS is already gone, the comment documents why the
+live class is named differently). **Next-run trap:** the extractor matches `.name` inside comments, so
+a tombstone comment reads as an orphan — check whether the only hit is a comment before acting.
+
+### 2. Resets still dense in two files — and since 2026-09-23 they fight the BASE LAYER, not Adwaita
+`_control-center.scss` (~33 reset rules) and `_settings.scss` (~24). They were written against
+Adwaita; with no theme loaded (#107) most of them now strip the base layer's paint (a `button`'s
+`--veltrix-surface` fill), which is live work, not dead weight — so they are NOT step-6 deletions.
+What they still signal is widgets built bare and then undressed. **Don't add more resets** —
+use `@mixin veltrix-reset` or a kit component (`ui/lib/veltrix-kit/`) that is born dressed.
+
+### 3. CC row typography intentionally uses fixed px ramp ($fs-small) — NOT a bug (2026-06-09 → 2026-08-20)
+`_control-center.scss` sets `.veltrix-row-title` / `.veltrix-row-subtitle` to `$fs-small` **px**,
+rather than the relative `$fse-*` **em** ramp. **This is intentional for shell chrome:** the Control
+Center has fixed tile/panel geometry (`GRID_WIDTH = 380`), and allowing row text to expand with the
+user's font-size picker would overflow cards or break tile alignment. The design system rule
+(`_tokens.scss`) explicitly mandates: *SHELL CHROME uses the fixed `$fs-*` px ramp; body copy in
+windows uses `$fse-*`.*
+
+### 4. Effective-config re-sync exists at the service layer, not the page layer
+`HyprlandState` now emits **`config-reloaded`** (caught from Hyprland's `configreloaded` IPC
+event — `hyprctl reload` / a `hyprland-user.lua` edit) and refreshes its `availableModesByName`
+cache. The effective-config services subscribe and re-read: `InputConfig.sync()`
+and `MonitorConfig._vrr` (on either compositor since #682: Hyalo sends `config_reloaded` too). This protects against the **clobber bug** — both services rewrite
+their whole `.lua` override from in-memory state on the next `setX()`, so without re-sync an
+external edit would be overwritten.
+**Mostly closed now.** The shared helpers `toggleRow` / `dropdownRow` (in `SettingsHelpers.ts`)
+take an optional `onExt?: (apply) => (() => void)` and `sliderRow` takes `opts.onExtChange` —
+each registers a live external-sync callback that updates the control through a **guarded**
+setter (no `setX`, so no feedback loop) and disconnects on `unrealize`. `Input.tsx` wires every
+control to `inputConfig.connect("changed")` via a local `onCfg(read)` factory, so an external
+`hyprctl reload` (→ `config-reloaded` → `syncFromHyprland` → `"changed"`) now live-updates the
+sliders/switches/dropdowns. The old no-op `"changed"` stub is gone.
+**Pattern for any future reactive control:** prefer the helper's `onExt`/`onExtChange` over a
+hand-rolled signal — the guard against the cb→setX→`"changed"`→cb loop lives inside the helper.
+**Still missing:** the *monitor* (Display) page reflects topology live (#8-style) but not external
+geometry/scale edits; and the generic per-page rebuild convenience for arbitrary content still
+doesn't exist (you wire per-control or per-signature, as Input/Display do).
+**Page-level precedent now exists** (`Display.tsx`): it subscribes to `hs.connect("changed")`
+and rebuilds its monitor sections, but **only when a stable signature changes** — there, the
+sorted set of monitor *names* (topology), so monitor hot-plug/unplug is reflected live. It
+deliberately does NOT rebuild on geometry/scale `"changed"` churn: `hs."changed"` fires on every
+window/workspace event, and resolution/rotation are user-driven through that page's own
+dropdowns, so a mid-interaction rebuild would clobber the in-flight revert-dialog closure state.
+Any future reactive page should copy this **"subscribe broadly, rebuild on a narrow signature"**
+shape rather than rebuilding on raw `"changed"`.
+NB: the dock's bottom *screen* gap and rounding are its OWN (`DOCK_SCREEN_GAP`, 4 = Hyalo's `gaps_out` since 2026-10-13 — a Settings slider until then; fixed
+Cairo `DOCK_CONSTANTS` rounding) — independent of Hyprland's `gaps_out`/`rounding`. So
+`config-reloaded` as shipped exists for the input/monitor/vrr clobber fix, not for layout.
+**BUT effective `gaps_out` does have a real (not-yet-built) consumer:** the vertical dock's
+length bounds. `DockAxis.ts` (vertical adapter) currently hardcodes `BAR_HEIGHT = 40` and sets
+`WIN_H = monMain - BAR_HEIGHT`, centering the dock in that span with **no `gaps_out` inset**.
+The intended model (deferred, undefined): top limit = the bar's *actual* exclusive zone +
+`gaps_out`, bottom limit = `gaps_out`; and later the horizontal dock's max width = monitor
+width − `gaps_out` each side. When that's built it should read effective `gaps_out` via
+`HyprlandState.getOptionInt("general:gaps_out")` and refresh on `config-reloaded`, and replace
+the hardcoded `BAR_HEIGHT = 40` with the bar's real exclusive zone.
+
+### 5. i18n has no hot-reload
+`detectLanguage()` runs once at startup; a locale change needs `Super+Shift+R`. Out of scope
+for most PRs, but know it when testing locale changes.
+
+### 6. Where architectural decisions get recorded — ⚠️ this item was STALE, corrected 2026-08-23
+It used to say "architecture/skill docs are intentionally git-ignored", naming
+`VELTRIX_SHELL_ARCHITECTURE.md` and `docs/veltrix-skill-brief.md` as local-only. **That is no
+longer the shape of this project.** The skill SHIPS — `.gitignore` carries an explicit
+`!.claude/skills/` exception with a comment saying so — and `CLAUDE.md` stopped being ignored on
+2026-08-23 for the same reason: it is what points a contributor's agent at the skill before it
+starts editing.
+
+**So: record architectural decisions in this skill's `references/`, which is tracked and
+reviewed like code.** Personal scratch (`MEMORY.md`, `memory/`, `HEARTBEAT.md`, `AGENTS.md`)
+stays ignored — that is the line, and it is about whose notes they are, not about whether they
+are architectural.
+
+### 8. Settings subpages: the framework still builds them once
+A subpage pushed via `SettingsNav.pushSubpage` is built once (fresh on each push, but static
+after) — `pushSubpage` itself has no live-rebuild story, so a subpage that needs reactivity
+must wire its own signals. The Wi-Fi AP detail page now does exactly that (it subscribes via
+`NetworkService.watchWifi` + the AP's `notify::strength` and updates its labels in place, with
+the IPv4 group shown only while that AP is the active connection). So the *pattern* for a
+reactive subpage exists; the generic framework convenience does not.
+
+### 13. Lockscreen GTK4 segfault when a wl_output vanishes — upstream, mitigated by watchdog
+On wake-from-suspend the DP link re-trains and the wl_output disappears for ~1 s; GTK
+destroys the session-lock window bound to that output and segfaults inside
+`gtk_window_destroy` (stack is pure libgtk-4/libwayland — our JS is not in it; coredump
+2026-06-10 11:53). With the lock client dead, Hyprland showed its red "lock app crashed"
+screen. Mitigation shipped: `bin/veltrix-lock` relaunches the bundle on abnormal exit
+(≤5 attempts) and `misc.allow_session_lock_restore = true` lets the new instance take the
+lock over. Real fix is upstream (GTK4 / gtk4-layer-shell `Gtk4SessionLock`); if a clean
+reproducer emerges, file it there. Don't try to "handle" output removal in lockscreen JS —
+the crash happens below us, during Wayland event dispatch.
+
+### 17. Status-indicator subsystem: extension points deliberately not wired (2026-06-19)
+`surfaces/bar/StatusIndicators.tsx` is a declarative registry (`INDICATORS`, three states
+hidden/armed/active) rendered as a **status banner inside the CC** above the widgets
+(`ccStatusBanner`, where the Stop/kill-switch lives). The small red **badge on the bar's
+Control-Center button** (`ccBadge`) was removed by the owner on 2026-09-27 — still OWED: what the
+bar shows while AI control is granted (no prior art; nothing does until decided), and the CC
+button's small second icon for privacy (one mark, macOS-style — state-and-ipc.md). It currently hosts only recording + AI-control but is the intended home for
+**privacy/activity indicators** (mic, camera, screen-share, location). Those are **not wired** (no
+source detection yet); adding one = a new `INDICATORS` entry with `state()` + `subscribe()` + `onClick`.
+The banner is a **Cairo island** since 2026-08-02 (user call), not a CSS `material-card`: same
+painter/gloss/border/inset as the tiles below it, transparent CSS background, `margin-bottom: 24px`
+(the CC's BLOCK rhythm — the air the Edit pill gets; 12px is the WITHIN-block tile gap, and using it
+made the card look stuck to the grid). It also lost its danger tint on background AND border: four
+reds on one row — tint, border, dot, Adwaita-red button — read as "something has gone wrong"
+instead of "AI control is on". It states a fact and offers the switch; the red left is the dot. Its
+button is `VeltrixButton({variant:"secondary"})` — revoking a permission is reversible, and `danger`
+means destructive.
+**Recording left the registry entirely** on 2026-08-02 (badge-only from 08-01, then gone): the island
+owns the live capture end to end, and the badge must never point at a CC that has nothing to show —
+the screenrecord tile is opt-in and can be bar-only. The `banner?: boolean` opt-out that existed for
+one day went with it (no consumer left). The boundary that settled it: **the CC says what is GRANTED
+(permissions, and the kill switch), the island says what is RUNNING.** A privacy indicator with no
+island activity behind it (mic, camera) gets a full entry here; anything the island already shows
+live gets none.
+**Bar reorder** was deferred here by product decision until 2026-09-26; the owner then asked for it:
+one ordered list for widgets + tray icons + search (`core/BarOrder.ts`), edited in the bar itself
+(`Status.bar_edit_mode`, drag or ← →), and Settings → Top bar rebuilt after macOS's Menu Bar pane.
+Still owed: the same row format for the Activity Island (owner, 2026-09-27: "later"), and a
+right-click entry into edit mode from the bar itself (today only from Settings). The AI "active" signal depends on the tools pinging
+`notifyComputerAction` — an action path that bypasses `veltrix-act/type/click` would stay "armed", not
+"active"; fine today (those are the only action tools), re-check if a new path is added.
+
+### 21. `veltrix-repo` — install.sh consumes it (DONE); signed (DONE); residual = permanent pin lockstep
+`github.com/adnqcr7-code/veltrix-repo` (public, 2026-06-21) is a pacman binary repo serving the 18
+deps (appmenu + 16 Astal + ags; down to **1** — `libastal-auth` — by 2026-08-18, see the Astal
+absorption below), GitHub Pages (`https://adnqcr7-code.github.io/veltrix-repo/$arch`,
+repo name `veltrix`, **GPG-signed since 2026-07-05**: CI signs packages + db, clients use
+`SigLevel = Required DatabaseOptional`, key bundled at `packaging/veltrix-repo.gpg`, imported/lsigned
+by install.sh which also migrates unsigned-era `Optional TrustAll` entries). **`install.sh` now consumes it**
+(validated E2E in a clean VM 2026-06-21): §1 registers `[veltrix]` + `pacman -S`'s them explicitly
+(the `libastal-*` declare `depends=()`, so they must be listed — resolution won't pull them), §2
+skips the source build when `DEPS_FROM_REPO=yes`; **the from-source build stays as the fallback** on any
+repo failure (installer still succeeds, slower). A **lockstep guard** after `pacman -S` verifies the
+installed versions encode this script's pins (pkgver carries `r<sha7>`/the tag) and only then sets
+`DEPS_FROM_REPO=yes` — otherwise a repo lagging a pin bump would `pacman -S` "successfully" with stale
+versions and the fallback would never fire (both branches VM-validated 2026-06-22). ~~Because of that fallback (and the update pin-skip record), `install.sh` keeps its own `*_REF`
+pins → **pins still live in two places** … This is now *permanent*.~~ **RETIRED 2026-08-24 (0.8.0).**
+The absorption removed the last upstream to pin: `install.sh` has no `*_REF` of any kind, no pin file
+is written or read (`/usr/share/veltrix/pins` is a dead leftover on updated machines), and the
+PKGBUILD declares no `libastal-*`. There is exactly ONE pin left in the whole distribution chain and
+it lives in ONE place — `VELTRIX_REF` in `veltrix-repo/pins.env`, bumped AFTER the tag exists. The
+lockstep this paragraph called permanent lasted until the thing on the other end of it stopped
+existing. **Build toolchain: DERIVED, not retyped (2026-08-12).** The workflow used to carry a hand-written
+union of the PKGBUILDs' `makedepends`, which drifted silently because `build-repo.sh` runs
+`makepkg --nodeps` on purpose — a declared makedepend missing from the workflow is simply absent,
+with no warning (it killed v0.7.0 on `missing protocol: …/hyprland-focus-grab-v1.xml`).
+Deriving it required first making the PKGBUILDs honest: the 16 `libastal-*` declared only
+`meson ninja vala gobject-introspection git glib2-devel`, harmless on a user's machine (install.sh's
+`PACMAN_DEPS` ran first) and fatal in CI. Now `gen-pkgbuilds.sh` declares real per-package
+`makedepends` (each one read out of that lib's `meson.build` at the pinned rev) and
+`scripts/build-deps.sh` prints the union incl. the `VELTRIX_REF` tag's own PKGBUILD. **Consequence
+for this repo:** `packaging/veltrix/PKGBUILD`'s `makedepends` is load-bearing — whatever `build()`
+reaches for must be named there or it will not exist in the build container (`wayland` and `gtk4`
+were added for exactly that reason). veltrix-repo also builds PRs now (unsigned, no publish), so a
+change to the chain is provable before merging. **Still deferred at the repo:** tightening
+`depends=()` + `provides`/`conflicts` (a
+`veltrix-keyring` package could later replace the bundled-key import, but the current
+`pacman-key --add` path works and ships). **Since the packaging switch (2026-07) the repo also
+ships `veltrix` itself**: built LAST by `build-repo.sh` from the `VELTRIX_REF` tag in `pins.env`,
+with the PKGBUILD found INSIDE the tag (`packaging/veltrix/`); `install.sh --system` consumes it
+(prebuilt or local makepkg fallback) and `veltrix-update` goes through `pacman -Syu` +
+`veltrix-setup` on package installs. See
+`packaging/README.md` and `references/dev-workflow.md`. Next link of the distribution track:
+`veltrix-repo → archiso → Calamares` ([[project_installer]]).
+
+### 31. Legacy `~/.config/hypr/hyprland-user.lua` is edited in place, never migrated (2026-07-11)
+The Autostart page (now Settings → Apps → Autostart) resolves the effective override file the
+same way Lua's `require` does (`~/.config/veltrix/` first, then `~/.config/hypr/`) and edits
+whichever it finds — see `resolveUserConf` in `Autostart.tsx` and dev-workflow.md's ownership
+model. A pre-2026-07 install that only has the hypr file keeps using it forever; we deliberately
+don't auto-migrate (moving a user's hand-edited file around is riskier than tolerating the legacy
+path). If a migration is ever wanted, it belongs in `veltrix-setup`, not the Settings page. Note
+the duplicated search+list scaffold between `AppIcons.tsx` and the Autostart picker is marked
+"extract on third consumer" in both files.
+
+### 32. `/var/tmp/veltrix` greeter mirror is first-writer-owned — a second user can't update it (2026-07-10)
+`core/AppearanceSync.ts` and `core/RegionSync.ts` (shell-only since #571) mirror the appearance + `region.json` into
+`/var/tmp/veltrix` (dir 0755, owned by whoever wrote it first) so the greeter — a system user
+with no access to a 700 home — can render the accent and clock format. On a multi-user
+machine the SECOND user's shell cannot write there (fail-soft: a console warn, nothing
+breaks), so the login screen keeps reflecting the FIRST user's appearance no matter who used
+the machine last. Leftover of the 07-10 multi-user sweep (first-login bootstrap + per-user
+logs). Fix direction: per-user mirror files (e.g. `/var/tmp/veltrix/<user>/…`) with the
+greeter reading the `lastUser`'s (it already tracks lastUser since PR #22) — touches shell +
+greeter; or a sticky group-writable dir. Low urgency, cosmetic.
+
+### 33. Agent-pointer visual: accepted best-effort edges (2026-07-12)
+The fake AI cursor (`surfaces/agent-pointer/`, `agentPointer` IPC, choreography in
+`bin/veltrix-click`) ships with three deliberately-accepted rough edges:
+- **Drag skew is cosmetic**: on confirm the fake cursor glides start→end in ~290 ms
+  *concurrently* with the real injector's 24-step drag — the two aren't frame-locked, so a
+  small visual/real offset during the glide is expected and fine (the endpoints match).
+- **Monitor hotplug is inherited, not handled**: one overlay window per monitor is created at
+  boot (same lifecycle as bar/dock); a monitor added later has no overlay until the shell
+  restarts. Same standing limitation as the rest of createUI.
+- **Multi-monitor INJECTION is still deferred** (`create_virtual_pointer_with_output`, see
+  state-and-ipc.md) — the overlay already routes the visual to the monitor containing the
+  target point, but verifying the injection mapping needs a second physical display.
+
+### 34. Gtk-CRITICAL `gtk_widget_is_ancestor` on dock context-menu open — GTK bug, don't chase it (2026-07-16)
+Every dock context-menu open logs `Gtk-CRITICAL … gtk_widget_is_ancestor: assertion
+'GTK_IS_WIDGET (widget)' failed`. Diagnosed with a live gdb backtrace: it's a missing NULL
+check inside GTK (`gtk_popover_focus`, gtkpopover.c:1126, still unfixed in GTK main as of
+2026-07-16). When an `autohide` popover is shown, GTK tries to move keyboard focus into it;
+if the popover has **no focusable children** AND **nothing in the root window holds keyboard
+focus**, `gtk_root_get_focus` returns NULL and GTK passes it unchecked to
+`gtk_widget_is_ancestor`. The dock menu always meets both conditions (custom non-focusable
+glass rows + a layer-shell window that never holds keyboard focus) → exactly one CRITICAL
+per open. 100% harmless: the assertion aborts that check and the menu works normally. The
+same applies to any other autohide glass menu on a layer surface (tray, app-grid) if its
+window has no focused widget. **Do NOT "fix" it in shell code** — making menu rows focusable
+would change real focus behavior just to silence someone else's warning. The right fix is a
+one-liner upstream (`if (!p || …)` at that line); reporting to GNOME/gtk is pending (no
+GitLab account yet).
+
+### 38. Computer-use verb surface — gaps found by audit 2026-07-27
+Traced every verb through all four layers (`veltrix-input.c` → `veltrix-click` →
+`veltrix-mcp` → the built-in Assistant). **Layer 2→3 is complete** — `click_app` /
+`click_at` absorb all four click modes via a `button` param, so the MCP server is
+correctly wired and is NOT where the problem is. Four gaps, cheapest first;
+**(a) and (b) are fixed, (c) and (d) are open.**
+
+**(a) ~~`move` is BUILT AND UNREACHABLE.~~ FIXED 2026-07-27** — `hover-app` /
+`hover-at` in `veltrix-click`'s `MODES` (→ the C verb `move`), `hover_app` /
+`hover_at` in MCP, and a `move` kind in the fake-cursor choreography that
+**lingers without rippling** (a hover presses nothing, and the visual never
+lies). No C, as predicted. The estimate that missed: this was billed as "wrapper
++ MCP", but the pointer overlay is a third consumer of the verb list — anything
+that adds a verb has to teach `agentPointer` what it looks like.
+
+**(b) ~~`drag` is the only asymmetric verb.~~ FIXED 2026-07-27** — `drag-app` /
+`drag_app` resolve BOTH ends through the same `resolveNode()` before anything is
+pressed (a half-resolved drag would press the button with nowhere legitimate to
+release it), with per-end role/occurrence disambiguation. The old justification
+for its absence — *"a two-ended gesture doesn't map cleanly to the single-node
+`*-app` shape"* — was wrong and is corrected in `state-and-ipc.md`.
+
+**(c) No middle button, no double-click, at any layer.** The injector knows only
+`BTN_LEFT`/`BTN_RIGHT`, and a double-click is not two clicks — it needs the
+timing window modelled. This one IS new C, which means recompiling the binary on
+every machine (`install.sh` builds it), so weigh it accordingly. Double-click
+probably earns that (opening things in file managers is constant); middle-click
+looks marginal.
+
+**(d) Single-output, cross-cutting.** `veltrix-input.c`'s header says so
+explicitly: it maps logical coords against ONE output's extent, so every
+positioned verb is wrong on a multi-monitor setup. Widest-reaching of the four.
+Hyprland's own cursor control (`dispatch movecursor`, global coords, natively
+multi-monitor) is the candidate here — it stays compositor-mediated, so it does
+not violate the no-uinput guardian rule; it would complement the virtual-pointer
+path for POSITIONING rather than replace it for buttons.
+
+**Order matters, and it is not what it looks like:** doing the Assistant's
+computer-use parity FIRST would duplicate (a), (b) and (d) into a fourth consumer
+and cement the drag asymmetry in one more place. Fix the surface, then mirror it.
+**Done in that order** — (a) and (b) landed in #62, and the Assistant mirrored the
+*fixed* surface afterwards (2026-07-27): same names, same parameters, hover and
+`drag_app` included from the start rather than bolted on later. (c) and (d) are
+still open and now have TWO consumers to land in, which is the argument for doing
+(d) in the wrapper rather than in either caller.
+The surface both consumers now mirror is **symmetric** — five verbs, each with an
+`-app` and an `-at` form.
+
+**(e) ~~Every pointer/keyboard verb was structurally dead from inside the
+Assistant.~~ FIXED 2026-07-27, and it is the reason the first live trial read as
+"it can't do anything".** Not a fifth gap in the verb surface: a compositor
+constraint nobody had connected to computer-use. `CFocusState::rawWindowFocus`
+returns early while any layer surface holds an EXCLUSIVE keyboard grab — which the
+Assistant island does the whole time the user is typing at it — so `focus_window`
+was a no-op, the helpers' focus check then correctly refused, and the click would
+have been swallowed anyway (Hyprland routes the pointer to a grabbing surface
+regardless of its input region, and the island spans the monitor). AT-SPI
+perception and `do_app_action` were unaffected, which is what made it look like
+model clumsiness. Fixed with `core/InputYield` + the `yieldInput` IPC (the helpers
+ask the shell to let go for the length of one verb); `focusWindow` now verifies
+instead of reporting a refused focus as success. Full reasoning in
+`state-and-ipc.md` → "The shell has to STEP OUT OF THE WAY for computer-use".
+**The mis-diagnosis is worth remembering:** the first reading was "`hyprctl
+activewindow` lies while a grab is held", and the obvious fix — source focus from
+`listWindows.focused` instead — would have made the helper approve an action that
+cannot land, and typed the agent's text into its own prompt box. The compositor's
+source code settled it in one grep.
+
+**(f) ~~A successful action reported FAILURE — `pingShell` polluted stdout.~~
+FIXED 2026-07-28, found in the first live run after (e).** `veltrix-type` and
+`veltrix-act` pinged the AI-control indicator with
+`GLib.spawn_command_line_async("veltrix-ipc notifyComputerAction")`, which **cannot
+redirect stdio**, so the child inherited ours and the `ags` CLI's reply (`ok`)
+landed on the helper's stdout right after its JSON. The daemon parses exactly one
+JSON per helper, so it failed → the tool came back `ok:false`. **Deterministic, not
+racy:** the daemon reads to EOF, and the pipe's write end stays open until the ping
+child exits, so the `ok` is always waited for. Worst in `veltrix-act`, which pings
+only when the action **succeeded** — so the tool reported failure precisely when it
+had worked. `veltrix-click` already had the fix (Gio + `STDOUT_SILENCE`) and the
+comment explaining it; the other two never got it. It stayed invisible because the
+focus gate refused every Assistant call before reaching the ping. **Rule for any new
+helper: nothing but the one JSON may reach stdout — fire-and-forget children must be
+`Gio.Subprocess` with `STDOUT_SILENCE`, never `spawn_command_line_async`.**
+
+**(m) `scroll` and `drag` verified live at last — and the friction was `match`.
+Fixed 2026-07-29.** The sixth run dragged `cs.svg. File` onto `Open Trash` in
+Nautilus and scrolled it four times, every call `ok:true`. That closes the live gap:
+**all five pointer verbs** (click / hover / scroll / drag / type) have now been
+driven against a real window. The waste was elsewhere, again, and again in what we
+tell the model:
+
+- **The model wrote `match:"cs.svg|Trash"` and got `count: 0` five times.** `match`
+  was a plain `includes()`, so `|` meant a literal pipe. It was **right to want it**:
+  the two ends of a drag are two names and asking for both in one call is the
+  correct economy. `match` now splits on `|` and keeps a node matching EITHER. A
+  literal pipe in an accessible name loses — a trade worth making.
+- **`showing` had half the answer and the model still dumped the window.** Measured
+  against the live Nautilus tree: the list it would have returned contains
+  **"Open Trash"** in 406 b — the very label the model paid a 21 KB whole-window
+  dump to learn. What it did NOT contain was the file: Nautilus draws items as
+  `table cell`/`table row`, which the control-role pass excludes. **In a chat window
+  the content is noise; in a file manager the content is the target.** So
+  controls-first is now strictly an ORDERING, with the remaining slots filled from
+  everything else labelish: Nautilus 406 → 729 b, Telegram 401 → 743 b, both still
+  ~50× cheaper than the dump they exist to prevent. Pinned: scenario 4 asserts the
+  first label is the control AND that content fills the rest (both verified failing).
+
+**(l) A hover DOES hold — until our own island takes the pointer back. Measured
+2026-07-29, do not re-derive.** The user hovered Telegram's emoji button through
+the agent, watched the panel open, and then watched it close on its own. Three
+facts, all measured live, and they decide a design question that was about to be
+answered wrongly:
+
+1. **The pointer never moves back.** `hyprctl cursorpos` reported the hover target
+   (1207, 1308) still, seconds after `veltrix-click` had exited. With the island
+   CLOSED the panel stayed open indefinitely — user-confirmed on screen.
+2. **Opening the island closes it.** While an island mode is open, its surface owns
+   the pointer and its input region covers it (the island's own surface at the
+   time of this entry — the bar's since #708 point 3 — a catcher rect from y=0 to the full monitor height). `InputYield`
+   empties that region for the action and `Bar.tsx`'s `notify::active` handler
+   re-stamps it at `end()` — so the app under the cursor gets a pointer LEAVE and
+   the popup closes. **A hover is not a state we hold; it is a consequence of which
+   surface owns the pointer.**
+3. **The revealed popup may not exist for AT-SPI at all.** Two independent walks of
+   Telegram's tree with the panel open ON SCREEN: 398 → 401 nodes, the four new
+   ones unrelated churn (a chat item's presence changed), and **one window** in the
+   tree throughout. A Qt popup is drawn without an accessible node, exactly like a
+   GTK tooltip.
+
+**Fact 3 is why the obvious fix was NOT built.** The plan was to have `hover_app`
+read the tree inside the truce, before `end()` closes the popup — an atomic "hover
+and look". It would have returned nothing here, because there is nothing to return.
+Measuring first is the only reason that code does not exist. The sticky-yield
+variant (hold the truce open across a hover) dies on the same fact and costs a
+click-through shell for up to the 15 s watchdog.
+
+What shipped instead is the sequence that already works, taught where the decision
+is made: **`setIsland closed` → `hover_app` → `query_app` → `setIsland agent`**, in
+the gated prompt block, plus honest descriptions on both consumers (a hover holds;
+what it reveals may be unreadable — say so rather than guess). No CI pin: the
+constraint lives in the compositor's pointer-focus rules, and a string assertion on
+prose would be theatre.
+
+**(k) The fourth live run cost 62 % of its tokens on ONE unfiltered `query_app`.
+Fixed 2026-07-29.** The run itself went well — the focus refusal from (j) recovered
+in a single step, exactly as designed. The waste was elsewhere, and only the token
+counts show it: step 1 filtered (`match:"search"`, 4 hits, history 3,199 b), and
+because the UI is in **Spanish** none of the 4 was the button, so step 2 asked for
+the whole window. History went to 40,845 b and **every one of the six remaining
+steps carried it** — ~78k of the turn's 125,483 input tokens, spent to discover
+that the control is called "Buscar mensajes".
+
+**The model cannot see the price of what it is about to ask for.** Worse, the old
+code only hinted on a match of exactly ZERO, and the hint recommended *"call again
+without `match`"* — i.e. it pointed at the 37 KB path without naming its cost. Now
+a filtered query with ≤ 8 hits carries `showing` (the labels on screen) and a hint
+that states the size of the dump it is declining to recommend. Free: those nodes
+are already in hand, and it is computed **only** on that path.
+
+**`showing` is CONTROL-FIRST, and that is the whole point** — taking labels in
+document order repeats the head-cut bug the projection exists to fix, one level up.
+Measured on the live Telegram window: document order spends 18 of its first 19
+slots on table cells (*Remitente, Mensaje, Entrega…*), while filtering by role
+gives **16 names, all controls, 401 bytes, with "Buscar mensajes" second**. Below 8
+control-role names it falls back to every labelish name — an unknown toolkit must
+degrade to a noisy list, never an empty one. Pinned in `agent-loop` scenario 4,
+where the stub's only control sits at node 121 behind 120 rows: with the role pass
+removed the assertion reports `['file-000.txt', …]`. The live measurement is **Qt**
+(Telegram); the GTK side is the stub, built from the measured Nautilus tree, not
+re-measured live.
+
+**(j) The third live run SUCCEEDED — and its two wasted steps were both our own
+text, not the model's judgement. Fixed 2026-07-29.** "Añade un temporizador de 7
+minutos con título Hola Manola": 11 steps, timer created, Clocks tiled with a
+floating window over it. Two tool calls failed on the way, and the transcript names
+the cause of each — read the log, not the vibe.
+
+- **We taught a remedy we had already measured as broken.** Step 4 was
+  `do_app_action Clocks "Hola Manola" SetFocus`, and the model did not invent it:
+  `type_text`'s own description said *"Focus the field first (do_app_action …
+  SetFocus)"*, and `veltrix-type`'s focus-gate refusal repeated it — while
+  `veltrix-click`'s refusal already said the right thing (`focus_window`), and while
+  entry (h) above records that GTK4 does not implement `Component.GrabFocus`.
+  **Advice drift between sibling helpers, the same class as the double-`ok` bug in
+  (a).** Now all four say the same thing, and the distinction is stated once,
+  everywhere it appears: the WINDOW is focused with `focus_window` (the only verb
+  that can); a CONTROL takes `SetFocus` only where the toolkit exposes it (Qt yes,
+  GTK4 usually not); a NUMBER takes `set-value=N` and no keyboard at all. Pinned
+  **statically** by `agent-loop` scenario 3d — no stub would have caught this, and
+  a live run is not a place to discover our own documentation is wrong.
+- **A refusal that names the remedy but not the target still costs three steps.**
+  `type_text` → refused → `list_windows` → `focus_window` → retry. The helper knew
+  which app was meant, so both `veltrix-type` and `veltrix-click` now resolve it and
+  hand back `focus: {address, class, title}` — recovery is one call. The lookup runs
+  **only on the refusal path**; the happy path must not pay for a second `hyprctl`.
+- **`veltrix-act`'s miss was still a dead end** — the `showing` list from (g) went to
+  `veltrix-click` only, and the two helpers are aimed by the SAME name, so a dead end
+  in one is a dead end in both. It answered with a list of *applications*, which is
+  the wrong question answered when the app has already matched. Now: app not found →
+  `apps` (the only case where that list IS the answer); node not found → `showing`,
+  same 40-name / 48-char / single-line filter as `veltrix-click`.
+
+Verified live (read-only paths only — no pointer verbs): a node miss on Clocks
+returns 11 real control labels, an unknown app returns the app list, and both
+refusals hand back `0x55c8c9cc6df0` — the exact address the model had spent two
+steps discovering.
+
+**(i) ~~Every Gemini tool turn died on step 2 — the reasoning signature was never
+captured.~~ FIXED 2026-07-28.** Surfaced as "a JSON error from Google"; the log said
+only `curl failed: exit=22 http=400`. Three things had to be fixed to even see it,
+and the order matters if this recurs:
+
+1. **The 400's body was being thrown away.** `--fail-with-body` was already there, so
+   the provider's explanation WAS captured — and the log printed curl's useless
+   `stderr="returned error: 400"` instead. Body first now.
+2. **Root cause, measured against the live API** (three probes, not docs): the
+   Interactions API **rejects a history whose `function_call` carries no signature
+   anywhere**, with a bare `Request contains an invalid argument` that names no field.
+   Verified positively too — a preceding `{type:"thought", signature}` step is
+   accepted, and so is the signature placed on the call; only "neither" fails.
+   The signature arrives as a **bare `{"signature": …}` delta with NO `type` field**:
+
+   ```
+   step.start {"index":0,"step":{"type":"thought"}}
+   step.delta {"index":0,"delta":{"signature":"CiQBEU0y…"}}     ← here, untyped
+   step.start {"index":1,"step":{"type":"function_call",…}}     ← NOT here
+   ```
+
+   The daemon tested `d.type === "thought_signature"`, a shape the API never sends,
+   so it captured nothing and replayed unsigned calls. **`sig=0/1` in the step log
+   was this, and it had been sitting in the log for weeks read as a curiosity.**
+
+   **CORRECTION, 2026-07-29 — do NOT read `sig=` alone.** The first version of this
+   entry said "treat `sig=0/N` on a Gemini turn as a defect, not a quirk", and that
+   is wrong in the direction that wastes time: the signature rides the **thought
+   step**, so `sigs` (which counts signatures on the CALL) is legitimately 0 on a
+   perfectly healthy turn. The next live run — 11 steps, every request 200 —
+   printed `sig=0/1` on all of them. A counter that reads identically whether or
+   not the thing works is not telemetry. The step log now prints **`tsig=y|n`**
+   beside it, and the genuine failure (neither place) gets its own named line:
+   *"NO reasoning signature anywhere … the next request will be rejected"*.
+   Pinned by `agent-loop` **scenario 3c**, whose stub is 3b's stream with the
+   signature delta deleted (with an `assert` that the deletion actually happened,
+   so a no-op replace cannot make it pass for the wrong reason).
+3. **A dead end that made it worse:** the model had called `list_apps` — an ACTION
+   from run_action's index — as if it were a tool, and got "there is no tool called
+   list_apps", which is the least useful possible answer about a name that plainly
+   appears in its prompt. The unknown-tool branch now checks the action index and
+   answers `"list_apps" is an ACTION — retry as run_action with action="list_apps"`.
+
+**Two wrong turns worth remembering, because both looked convincing.** The first
+theory was "Gemini 400s on an undeclared function name in history" — tested against
+`generateContent`, which returned **200**, so it was dropped. The second was "the
+call id must be server-issued" — three id shapes were tried and all failed
+*identically*, which is what pointed at something common to all of them. The
+Interactions API's single generic error message makes bisecting the request the only
+way through; `scripts/ci/agent-loop-test.py` now pins the outcome (scenario 3b,
+verified failing against the old condition before being kept).
+
+**(h) Three failures from the second live run (a 7-minute timer), all fixed
+2026-07-28.** Read the transcript, not the vibe — every one had a mechanical cause.
+
+- **"No puedo."** Twice, with both gates ON, before the user insisted. The model was
+  reciting the system prompt's *"What you can do"* summary, which listed shell
+  surfaces and windows and said nothing about driving other apps — while a rule two
+  lines below tells it to answer that question **from the summary, without calling a
+  tool**. So a capability missing from that sentence is one the model actively
+  DENIES. The summary now grows with the gates. **Anything you add to computer-use
+  has to be added there too, or it does not exist as far as self-description goes.**
+- **7 minutes became 11 h 40 min (= 700 minutes).** GNOME Clocks' "Minutes" node is a
+  `spin button` whose `actions` array is **empty**, so `SetFocus` failed, and the
+  agent typed "7" blind — the digits landed on whatever had focus and concatenated
+  with what was already in the field. Verified against a live GtkSpinButton: the
+  widget reports `value=true component=true`, i.e. the number was always settable
+  directly. `veltrix-a11y` now reports a `value` block (current/min/max) for anything
+  carrying the Value interface, and `veltrix-act` takes `set-value=<n>`, reading the
+  result BACK so a clamp is reported as `ok:false` with the real value rather than a
+  cheerful lie. No new tool: `do_app_action` already passes `action` through, so this
+  cost zero prompt bytes — only the descriptions changed (daemon + MCP, kept in step).
+- **It clicked controls sitting UNDER its own panel.** The user called this a design
+  fault and had asked for the fix long before: *the agent must know whether the
+  island is open and be able to control it.* The island now reports what it COVERS
+  (`occupiedRect` — on the bar's window since #708 point 3 — capsule + revealed mode, with the monitor connector
+  so a multi-monitor consumer cannot compare across screens) via
+  `dumpState.overlays.islandBounds`; `yieldInput begin` returns the same rect so
+  `veltrix-click` can flag a click that lands inside it **as a warning on a SUCCESSFUL
+  action** — the click does land (the yield makes the surface click-through), it is
+  the invisibility that needs saying. `setIsland <mode|closed>` is the exact-state
+  verb. Resizing/reshaping the island from the agent is explicitly LATER (user).
+
+**NO `focus` VERB — measured, not assumed, so do not add one back.**
+`Atspi.Component.grab_focus` is the obvious companion to `set-value` and it returns
+FALSE on GTK4 even with its own window already focused (checked against a live
+GtkSpinButton with `hyprctl activewindow` naming the probe). GTK4 dropped ATK and its
+AT-SPI backend does not implement `Component.GrabFocus`. A tool that always fails is
+worse than no tool AND costs prompt bytes on every request. Focus a WINDOW with
+`focusWindow`; to put a value somewhere, set the value instead of aiming a keyboard.
+
+**(g) A miss now answers the next question.** `veltrix-click`'s "no showing node
+named X" was a dead end, and recovery cost a whole `query_app` round trip (measured:
+2 of 11 calls in that run were guesses — `"page tab"`, a ROLE in the name slot, and
+`"Start"`). It now returns `showing`: the short, single-line names on screen, free
+because `nameOf` is already called for every node on that walk. **The filter is the
+point, not a detail** — an accessible name is not a label (in Telegram it is the
+entire message), so unfiltered this returned ~10 KB and would have cost more than
+the round trip it saves. Live-checked against Telegram: 1157 bytes, 40 real control
+labels.
+
+**Found while verifying (a) live, and it decided how the Assistant's hover reads:**
+a GTK tooltip is **not an accessibility node**. Hovering Nautilus's Back button
+rendered the tooltip in a screenshot while the AT-SPI tree held zero tooltip-role
+nodes before and after. So hover reveals state that a client WITHOUT VISION still
+cannot read — the MCP descriptions say to use `screenshot` for tooltip text, which
+would be useless advice for the Assistant (it gets a path, not an image). Its
+`hover_app` description therefore says the tooltip text is unreachable **and to say
+so to the user**; hover stays useful there for *provoking* UI — opening hover menus,
+revealing controls, which are ordinary accessibles. Do not "fix" the absence of
+tooltip nodes: it is GTK's, not ours.
+
+**Not a gap, recorded to stop it being "fixed" again:** `screenshot` is reachable
+by the built-in Assistant today (it is not in `HIDDEN_ACTIONS`) and returns a PNG
+path the Assistant cannot see. That is FINE — "take me a screenshot" is a
+legitimate user request the Assistant fulfils without vision. Do not hide it. The
+only adjustment worth making is wording: the MCP description frames screenshots as
+a way for an agent to *verify its own work*, which is true for a client with vision
+and false for the Assistant. **Done 2026-07-27**, and in the cheaper place: the
+`listActions` first clause the Assistant actually sees was already neutral, so the
+correction is one line in the gated prompt block — *screenshot returns a file PATH,
+you never see the image, never describe its contents*. It sits behind the
+perception gate because that is when a model starts reaching for eyes.
+
+### 37. Assistant file layer ("tier 1") — debt created 2026-07-27
+The six daemon-local file tools shipped (see `state-and-ipc.md` for the frontiers and the
+enforced invariants). What they left behind:
+
+**(a) The fixed prompt roughly doubled and item 36(b) is now urgent, not theoretical.**
+Measured: `sys` 1687→2688 b, `tools` 3893→7543 b ≈ **+1163 tokens on every step of every
+turn**, against a `run_action` design that was squeezed to ~450 tokens precisely because
+that cost is paid per request. Cache breakpoints recover most of it on paper, but the
+Gemini lane was observed at `cached=0` on the FIRST step of each turn (implicit cache
+expiring in the ~2 min between turns), so on that lane it is largely paid in full. The two
+path lists inside `read_file`/`edit_file` descriptions are the largest single addition and
+are the first dial to turn — they exist to buy the absence of a guess-and-retry round-trip
+(break-even ≈ 25 requests), so measure before cutting them.
+
+**(b) `MAX_STEPS` is now 16 with still no context compaction.** File reads make turns
+genuinely longer, and a `read_file` result can be 24 KB (the `MAX_TOOL_RESULT` cap). The
+existing prior-turn `RESULT_STUB` does not help WITHIN a turn. A long diagnostic
+conversation will hit context limits before it hits the step cap. This is the same debt as
+36(b) seen from the other side; do the turn cap / trim before raising `MAX_STEPS` again.
+
+**(c) No IPC/MCP parity, on purpose — but re-check the reasoning if it ever bites.** File
+tools are daemon-local because MCP clients bring their own. If Veltrix ever grows a
+non-MCP external consumer that needs them, that argument stops holding.
+
+**(d) `reloadHyprland` is untested live.** Registration and the dispatch path were checked
+in source only; it re-applies monitor config and the standing rule here is that
+display-affecting commands are not verified by running them. Wants a human eye.
+
+**(e) The `customize` skill is the only skill, and it is unversioned.** Nothing checks that
+`skills/customize/SKILL.md` still matches the code — if the frontier changes and the skill
+does not, the assistant confidently tells users the wrong ownership model. Consider a CI
+check tying the writable-file list in the skill to `WRITE_FILES` in the daemon.
+
+**(g) A turn IN FLIGHT is still lost to a shell restart — the daemon is a CHILD of
+the shell.** Session persistence (36 v1.1) covers reload/crash/logout *between*
+turns, which is every case that happens today. It does not cover the tier-2 case:
+an assistant that edits shell source and reloads is killing its own parent, and
+therefore itself, mid-turn. The fix is topological, not more persistence —
+promote `bin/veltrix-agent` to its own **systemd user service** (sibling, not
+child) with a socket instead of stdio pipes; there is precedent in
+`bin/veltrix.service`. Deliberately NOT built yet: it trades the lazy-spawn
+property ("an idle desktop shouldn't carry an extra gjs", and one holding an API
+key) for survival nobody needs until tier 2 exists. Build it when tier 2 forces
+it, and make "build → verify → reload" an explicit end-of-turn step at the same
+time so the restart lands on a turn boundary the persistence already handles.
+
+**(f) Legacy `~/.config/hypr/hyprland-user.lua` is writable but NOT git-tracked** — the
+undo history only covers `~/.config/veltrix`. Rare (pre-2026-07 installs), logged, and not
+worth a second repo, but know it before promising a user "you can always undo".
+
+**Conversation persistence / history / memory — deferred, user-confirmed 2026-07-20 ("leave it for
+now, note it").** Current v1 behaviour (intended): the conversation lives in memory only — it PERSISTS
+across closing/reopening the island and across compact mutations (the `AgentService` transcript + the
+`AgentIsland` widget are session-long singletons; the island only hides on close, never rebuilds), and a
+background turn keeps running when the island is closed. It is wiped by a shell reload / logout / reboot,
+and by the "New conversation" reset (which also clears the daemon's `history`). NOTE the two histories
+can desync: `AgentService.transcript` is the UI view; the daemon's `history[]` is the model context — a
+daemon crash+respawn keeps the UI but loses the model's memory. The agreed roadmap (do NOT build until
+asked):
+- ~~**v1.1 — persist the CURRENT conversation**~~ — **DONE 2026-07-27.** Both halves, each owned by
+  whoever holds the data: the daemon writes its neutral `history` to `session.json`, `AgentService`
+  writes the `transcript` to `transcript.json`, both at the same turn boundary (the only point where
+  the history is consistent — every `tool_use` has its result, and a half-written turn restored later
+  would be rejected by the provider). **NOT under `~/.config/veltrix/`, which is where this entry
+  originally said to put it**: that directory became a git repo on 2026-07-27 (the write tools' undo
+  history), so persisting there would commit the user's conversations, permanently, into a repo they
+  never asked for. It lives in `$XDG_STATE_HOME/veltrix/agent/` (0700) instead — a conversation is not
+  configuration, and the shell log already sets the precedent for state outside `~/.config`.
+  Two things worth knowing: the persisted history is the **stubbed** view (prior turns' tool results
+  are already omitted from every request, so storing their full payloads would be megabytes the model
+  will never see again) with `load_skill` results **exempt**, so a restored conversation still carries
+  its rules; and `reset()` deletes BOTH files from the shell side, because the daemon is spawned
+  lazily and "New conversation" on an idle desktop would otherwise reach a daemon that is not running
+  — clearing the UI while leaving the model's copy on disk to be resurrected by the next message.
+- **v2 — conversation history browser**: "New conversation" archives the current thread; a list to
+  revisit past threads (`conversations/*.json`, auto title + timestamp). New UI surface (a submode or
+  panel) → needs a design round.
+- **v3 — long-term memory of FACTS about the user** (opt-in, big): extract → store → inject into the
+  system prompt, à la Claude/ChatGPT memory. Distinct from the desktop-STATE memory the assistant
+  already has (system prompt regenerates from dumpState/describeConfig/listActions each session). Must
+  fit Veltrix's privacy stance: opt-in, with UI to view/edit/delete what it remembers.
+- Privacy note for v1.1+: stored conversations are potentially sensitive plaintext on disk — ship an
+  easy "clear history" and consider making persistence a toggle.
+
+**Provider picker — ✅ DONE 2026-07-21, RETIRED by the VELTRIX fork (Phase 0).** Settings → AI
+used to pick by **provider NAME** via `core/AgentProviders.ts` (Anthropic · OpenAI · Google ·
+Mistral · …) with the API key in a libsecret keyring slot keyed by provider. The fork DELETED
+every hosted provider, the keyring slot and the custom-endpoint escape hatch: the registry now
+holds exactly one row (Ollama, local, fixed `http://localhost:11434/v1`) and there is no API
+key anywhere. The keyring-slot history above is kept only so nobody "fixes" the deletion by
+re-adding a provider row — re-adding one needs the security rubric's say-so first, not a
+one-line registry edit. The two residual notes that lived here (best-effort `defaultModel` ids
+for the hosted providers; an optional native Gemini backend) died with the registry they
+described.
+
+### 39. Built-in Assistant is NOT release-ready — polish backlog (2026-07-21)
+**User's call after the first real end-to-end run against a live provider: "estamos muy lejos de
+publicar esto… no sé si va a ser para la 5.0".** The skeleton works — it connects, streams, calls
+tools — but the PRODUCT feel is absent. Treat the Assistant as unfinished regardless of what the
+milestone says, and do not let a 0.5.0 tag imply otherwise.
+
+**⚠️ Release exposure — decide before ANY tag.** Brain and face are already merged to `main` (#48,
+#49). It is off by default (`brainProvider: ""` = no traffic, no key, empty state) and only reachable
+via `Super+A`, so shipping it dormant is defensible — but it IS reachable, and the empty state invites
+the user to configure it. Either accept that and say so in the release notes, or gate it behind a flag
+until the list below is closed. Do not discover this question at tag time.
+
+Ordered by what hurt most in the live run:
+
+1. ~~**A turn can die in total silence.**~~ **ADDRESSED 2026-07-21** (same branch as the provider
+   picker). Every abnormal end now paints: provider error, curl-level failure, empty completion, the
+   `MAX_STEPS` cap (daemon side), daemon death mid-turn / failed spawn / failed write (shell side).
+   `Turn.error` is its own field so an error arriving after partial text is no longer swallowed, and
+   `failTurn()` re-opens the island when the failure happened in the background. The four daemon-side
+   paths are E2E-verified against the mock. **Death mid-turn is now CONFIRMED LIVE (2026-07-25)**:
+   a watcher tailed `veltrix-ui.log` for the daemon's `turn start` line and `SIGKILL`ed it 1.5 s later,
+   so the kill landed while a real Gemini turn was in flight (`POST … body=5658b` already out). The
+   shell logged `daemon gone (signal 9) MID-TURN` and — verified by reading the screen, not the log —
+   the error row was visible and mapped with `island.agent.error.died`. Do it that way rather than by
+   hand: killing on a human's reaction time races the turn, and a screenshot would only prove pixels,
+   not that the label is live. **Still unconfirmed: failed spawn / failed write** (needs a
+   deliberately broken daemon path).
+   See the invariant in `state-and-ipc.md`.
+2. ~~**No telemetry on the agent path.**~~ **DONE 2026-07-21** — lifecycle, turn boundaries, every
+   HTTP leg, every tool, and the daemon's exit status/signal, from both halves, into `veltrix-ui.log`.
+   Rules (prompt/reply/key never logged; stderr must stay inherited) in `state-and-ipc.md`.
+   A bonus that fell out of it: curl's stderr used to be piped and dropped, so a dead endpoint
+   surfaced as the generic "Request failed" — it now reads "Failed to connect to …".
+3. ~~**Tool calls against Google's OpenAI-compatible path — UNVERIFIED HYPOTHESIS.**~~ **MEASURED AND
+   FIXED 2026-07-21**, by the telemetry above, on the first try: `step 1: ok=true text=0c tools=1
+   stop=end` — Gemini streamed the tool call and finished with `"stop"` instead of `"tool_calls"`, so
+   the loop skipped it and ended the turn empty. The user's symptom was exact: *"only answers the
+   first time, the second time it doesn't"* — the first turn needed no tool. Fix: execute tool calls
+   when they are PRESENT (see `state-and-ipc.md`). This was the payoff for doing items 1–2 first;
+   diagnosis took one `grep`, not a debugging session. **Second layer, same day:** with the call
+   finally executing, Gemini 400'd the NEXT request — it requires its encrypted **thought signature**
+   to be echoed back with the call (`extra_content.google.thought_signature`). Also fixed; see
+   `state-and-ipc.md`. Two provider-specific quirks in one path is the real signal here: **Google's
+   compat endpoint is a moving target**, and its own error text steers callers toward the Interactions
+   API — a native Gemini backend is drifting from "optional" to "eventually necessary". Not building
+   it yet, but that is the direction; log `sig=`/`finish=` are the early-warning instruments.
+4. ~~**No sense of activity.**~~ **ADDRESSED 2026-07-21** (branch `agent-feel`). The root problem was
+   not the missing animation but that the pending assistant bubble was HIDDEN (empty rows are
+   hidden), so the transcript showed literally nothing during the wait — a blank panel where the
+   user is actually looking. Now: the pending bubble holds a three-dot pulse until the first token
+   lands (`common/PulseDots.ts`), the capsule glyph breathes while a turn is in flight (the only
+   sign of life when work runs with the island closed), and a tool chip's dot breathes while that
+   tool is RUNNING, settling when its result arrives. Shared refcounted driver — see
+   `design-system.md`. **Still open under this heading — but only for ONE of three cases** (split
+   2026-07-25; the original wording overstated it). A turn ends with no positive beat: the dots stop,
+   the glyph stops breathing, the header switches to the token count — all absences, no "done".
+   Case by case:
+   - **Island closed, work in the background** → already handled, and well: `AgentService.ts`
+     expand-on-finish pops the island open with the answer when the desktop is otherwise idle.
+   - **Island open, user watching** → the arriving text IS the beat, same as every chat UI
+     (ChatGPT, Claude). Adding a chime/flash here would be noise. Deliberately nothing.
+   - ~~**THE REAL HOLE: the turn finishes while another overlay is open**~~ **CLOSED 2026-08-01**,
+     and not by the fix this entry proposed. The plan was an "unread" mark on the CAPSULE, which
+     would have been a mechanism serving one case. The island's INDICATOR ROW made it a property of
+     something already on screen instead: `AgentService.unread` (`"answer" | "error" | null`) is set
+     at turn end exactly where expand-on-finish stands down, cleared by `island_mode === ISLAND_AGENT`
+     (in the service, so no route into the island can leave it stale), and painted as a badge on the
+     assistant's chip — which is already there, because a configured assistant is always indicated.
+     **It covers the silent ERRORS too** (`failTurn`'s suppressed branch, the half this entry never
+     mentioned), badged in danger colour: an error and an answer are not equally good news. The
+     lesson is the one the user made the call on: a general surface absorbs the special case, so
+     wait for it rather than patching the case alone.
+5. ~~**Replies ignore the UI language.**~~ **The item was WRONG — reframed by the user 2026-07-21.**
+   The desired behaviour is the opposite of what it asked for: **the assistant replies in the language
+   of the MESSAGE, and follows the user if they switch. The desktop locale is a hint for the ambiguous
+   case, never the rule** — running an English desktop and talking to it in Spanish is normal, and the
+   locale says nothing about the language of a given sentence. Live behaviour already did the right
+   thing, but the system prompt said `Reply in the user's language (LANG=…)`, which defines "their
+   language" AS the locale — a more literal model would have obeyed it and answered in English.
+   Prompt fixed to state the rule properly. **Lesson for anything locale-driven in the shell: a
+   configured locale is evidence about the user, not an instruction about the current interaction.**
+6. **Gemini 3 Flash Preview essentially does not cache for us — and shrinking the prompt may have
+   made it worse.** The `cached=` instrument settled this after two wrong readings of my own (first
+   "never caches", then "caches fine, 85%" off a single hit). **The real number: 1 cache hit in 36
+   requests.** Our side is verified correct — consecutive request bodies share a byte-identical 99%
+   prefix (recorded and diffed), so nothing we send invalidates it. Two documented reasons on
+   Google's side: Gemini 3 requires a **4,096-token minimum** for implicit caching, and there is an
+   **open report that implicit caching does not work on `gemini-3-flash-preview` when tools are
+   defined** — and we always define tools. Fits the data: the single hit was the one request clearly
+   above 4k (4717 → 4022 cached).
+   **The uncomfortable irony: the trim took step 1 from 4403 → 2885 tokens, i.e. from above that
+   threshold to below it.** Do NOT respond by padding the prompt to game the threshold — fragile,
+   model-specific, and it bets on a path Google itself reports as broken. The trim is an
+   unconditional saving (fewer tokens sent is less paid, cache or no cache); caching is a bonus this
+   preview model does not reliably deliver. A non-preview model, or Anthropic (explicit
+   `cache_control`, implemented but UNVERIFIED — no key), should behave better.
+   **General rule this cost three wrong conclusions to learn: judge a provider behaviour over a
+   RUN of requests, never one reading.** Established regardless: the real cost driver is STEP COUNT
+   (an 8-step turn cost ~25k input tokens).
+7. **Anthropic caching: two breakpoints — and the premise of this item was WRONG (corrected
+   2026-07-25).** A `cache_control` marker caches everything from the start of the request up to
+   itself, and render order is tools → system → messages. There is a **minimum cacheable prefix**
+   below which a marker silently does nothing (no error, `cache_creation_input_tokens: 0`) — and that
+   minimum is **not flat and not monotonic across generations**, which is what the earlier version of
+   this item got wrong (it assumed 4096 everywhere): **512** on Opus 5 / Fable 5, **1024** on Opus 4.8
+   / Sonnet 5 / Sonnet 4.6 / Sonnet 4.5, **2048** on Opus 4.7, **4096** on Opus 4.6/4.5 and Haiku 4.5.
+   Our tools + system span is **~1,213 tokens** and never grows, so the same marker is **live on Opus
+   5, borderline on Opus 4.8, and dead on Opus 4.7 and older** — i.e. "the system marker can never
+   fire" was true for the models of the day and is false for the current default. The generalisable
+   half stands: **a marker over a fixed-size prefix below the minimum is inert; only a marker after
+   something that grows can ever engage** — hence `markNewestTurn()`, a second marker on the newest
+   turn's last content block (live turns measured 3.0–4.9k tokens). It must never land on a thinking
+   block; see `state-and-ipc.md`.
+   **Still NOT verified against a live Anthropic key** — the logic is unit-checked and the request
+   bytes are asserted in CI, but nothing has watched `cache_read_input_tokens` come back on the wire.
+   **Do NOT pad the prompt to cross a threshold** — the fix is where the marker goes, not how fat the
+   prompt is, and padding for the older models would buy nothing on the newer ones. Known limit
+   accepted: a breakpoint looks back only ~20 content blocks, so a tool-heavy turn that adds more than
+   that simply misses.
+8. **A native Gemini backend — evidence accumulating, decision NOT taken (2026-07-21).**
+   Three separate failures in one afternoon all traced to Google's OpenAI-*compatible* layer, not to
+   the model: (a) tool calls streamed with `finish_reason: "stop"` instead of `"tool_calls"`, so calls
+   were dropped; (b) Gemini 3's thought signature had to be echoed back or the next request 400s;
+   (c) implicit caching that we cannot influence — no marker to place, 1 hit in 36 requests across two
+   models. (a) and (b) are translation artefacts of the compat shim; (c) is a capability the compat
+   path simply does not expose (Google's own API has explicit cached-content, with real control).
+   A native backend would address all three — and cost a THIRD wire protocol to maintain, against a
+   standing rule of "Anthropic native, everything else via compat". **Not proposed for now.** Recorded
+   so the decision is made against the accumulated evidence rather than the next surprise. Revisit if
+   a fourth compat-specific defect appears, or if token cost on Google becomes a real complaint.
+
+9. **We cannot currently tell "no cache" from "cache not reported" on Google — settle it before
+   designing anything else around caching (user's call 2026-07-21: "define it properly before doing it
+   wrong, or doing it three times").** What is established: the field we read
+   (`usage.prompt_tokens_details.cached_tokens`) is real and Google does populate it — a single
+   reading of 4022 proves the plumbing. What is NOT established: whether a `0` is a measurement or a
+   silence. From inside the daemon those are indistinguishable, so no amount of further log-reading
+   settles it. **Method to use before touching caching again** (this is the process that three wrong
+   conclusions in one afternoon earned):
+   1. **Dump the provider's RAW usage object once**, not the one field we extract — if Google reports
+      cache under another key in the compat layer, our instrument reads 0 forever while caching works.
+   2. **Judge over a RUN, not a sample** — the three wrong conclusions each came from one reading.
+   3. **Confirm against an INDEPENDENT source** (the provider's own billing/usage console) before
+      concluding. Self-reported telemetry cannot validate itself.
+   4. **Never design around unverified provider behaviour** — and never pad, restructure, or add a
+      protocol to chase a discount that has not been observed end to end.
+
+10. **The daemon's user-facing strings are English-only.** Every message it emits — "The answer was cut
+   off…", "The assistant kept repeating…", relayed provider errors — is a hardcoded English literal,
+   while the assistant itself answers in the user's language. It is a separate process with no access
+   to `core/i18n`, so the fix is either passing the locale's strings in at spawn or moving these
+   messages to the shell side (`AgentService` already owns two of them via `t()`). Not urgent, clearly
+   wrong.
+11. **Tool results ride in history and are resent every later request — COMPACTED, plus old turns
+   STUBBED.** The island truncates a result to 200 chars for display, but `history` keeps the whole
+   thing. Two lossless mitigations, both current: `compactJson()` on tool output (listWindows −32%,
+   listApps −25%), and `historyForRequest()`/`RESULT_STUB`, which replaces the CONTENT of tool results
+   from turns BEFORE the current one with a short stub (structure, ids, pairing, thought-signatures all
+   intact) so a `listApps` whale stops riding every later request forever. Note the action catalogue is
+   NO LONGER a history result — since 2026-07-23 it lives in `run_action`'s fixed (cached) description,
+   so `describe_settings`' schema is the main catalogue that still lands in history as a result. What
+   remains genuinely lossy and deliberately NOT done: capping a large CURRENT-turn result. `step N: POST
+   host body=Xb (sys=Yb tools=Zb hist=Wb)` tells you which part is actually growing before anyone
+   optimises on instinct.
+12. **The island's token counter is CUMULATIVE and doesn't say so (2026-07-21).** It shows the whole
+   conversation's usage; the user read "2k tokens" as the cost of the turn they had just sent (that
+   turn was 1,078). Not wrong data, ambiguous framing — a number in a chat header doesn't announce
+   its own scope. **Deferred by the user ("lo dejamos así de momento"), with their idea recorded:
+   put the PER-TURN detail in a tooltip** and leave the header showing the conversation total, which
+   is what actually reaches the bill. If picked up: use the house tooltip (`common/Tooltip.ts`) —
+   there are no native GTK tooltips in this shell — and the per-turn numbers already exist in the
+   daemon's `turn end` log line, they simply aren't carried to the UI (only the running totals are,
+   via `done`). Cheapest shape: add the turn's own usage to the `done` payload alongside the totals.
+13. **Provider catalogs can list dead models.** Google's `/v1/models` returned `gemini-2.0-flash-lite`,
+   retired — picking it 404s. The catalog exposes no retired flag, so this cannot be filtered
+   reliably; the model field stays free text on purpose.
+14. ~~**The bubble is the concatenation of every reply in the turn, and the answer lands
+   off-screen.**~~ **FIXED 2026-07-29** — narration moved onto `ToolCall.interim`, chips render
+   before the answer. See `state-and-ipc.md`, "Bubble anatomy". **Residual: NOT pinned by CI, and
+   it is the kind of thing that regresses silently.** The ordering is three `append` calls in
+   `makeBubble` and the derivation is one `case` in a subscribed handler — reverse either and
+   nothing errors, nothing fails typecheck, and the boot smoke still passes, because the shell has
+   no test runner and `agent-loop-test.py` only drives the daemon. A shell-side harness would cover
+   this and a good deal else (`AgentService`'s event reducer is pure data), but standing one up is
+   its own decision and was not made here.
+
+### 38. ~~`queryUI` is blind to the Activity Island~~ — NOT REPRODUCIBLE; it was a measurement error (2026-07-21, retracted 2026-07-25)
+**The bug does not exist.** With the island open and at rest, `queryUI` sees its whole subtree:
+`.agent-panel` 1, `.agent-transcript` 1, `.agent-scroller` 1, `.agent-bubble` 2, `.agent-error-text` 1,
+paths resolving through `MorphRevealer.top > … > GtkBox.agent-panel`. A snapshot-painted surface is
+still mapped at rest, so `core/UITree.ts` descends it fine. Do NOT "fix" the walk.
+
+**What actually happened, and it is a trap worth keeping:** an outside click dismisses the island —
+and typing `veltrix-ipc queryUI` in a terminal requires clicking that terminal. (At the time this was
+the `overlay-catcher`; since 2026-08-05 it is the compositor's focus grab. Same trap.) The island was closing *before* the query ran, so `queryUI` correctly
+reported `count: 0` for a surface that was no longer on screen. This is exactly the confusion the
+original entry warned about one line later, and it caught its own author twice more on 2026-07-25.
+
+**Method rule for introspecting any dismiss-on-click-outside surface:** open it and query it **in the
+same shell invocation** (`veltrix-ipc toggleAgent; veltrix-ipc queryUI …`), and read `dumpState`'s
+`overlays.island` **in that same pass** — otherwise you cannot tell "not on screen" from "traversal
+broken". Both return `count: 0`. Sanity-check the walk itself against a class that is always live
+(`.bar-centerbox`).
+
+### 90. ⚠️ OPEN — the shell segfaults opening the app grid, and it is GTK's icon thread inside Pango (2026-08-24)
+
+> **Queue entry: #313.** Reorder it, schedule it and close it there; what stays here is the rule and the measurements.
+
+Owner-reported: "se me acaba de reiniciar sola la UI al abrir el appgrid, pero no veo nada en el
+log". Both halves are real and the second one is the reason the first is hard to see.
+
+**Why the log is empty, and always will be for this class.** `$XDG_RUNTIME_DIR/veltrix-ui.log`
+carries stdout/stderr and JS exceptions. This is a SIGSEGV in native code — the process is gone
+before anything can be written, and systemd restarts it, so the only trace is that the UI blinked.
+**The log being silent is evidence about the KIND of crash, not the absence of one.** Read
+`journalctl --user -u veltrix.service` and `coredumpctl` instead; the trace is there in full.
+
+**The environment, pinned** — a stack trace without it ages into a guess, and this machine will
+have moved on by the time anyone files upstream: Arch Linux, `gtk4 1:4.22.4-1`, `pango 1:1.58.2-1`,
+`cairo 1.18.4-1`, `glib2 2.88.3-1`, `gjs 2:1.88.1-1`, Wayland/Hyprland, Vulkan renderer on
+`libvulkan_radeon`. Re-read them with `pacman -Q gtk4 pango cairo gjs glib2` **only** to describe a
+NEW core — the numbers above belong to the 2026-08-24 one and must not be refreshed in place.
+
+**What the core says** (`coredumpctl debug 347331`, 2026-08-24 14:25). Two threads were inside
+Pango at the same moment:
+
+- **main** — `gtk_widget_snapshot_child` recursion (entered from JS: `ffi_call` is at the bottom of
+  the frame list, so it is one of our snapshot-time widgets), then `pango_renderer_draw_layout` →
+  GTK's snapshot pango renderer → `pango_glyph_string_extents_range`, which is `gsk_text_node_new`
+  measuring the glyphs it is about to wrap in a node. SEGV inside `libpangocairo`, `SEGV_MAPERR`.
+- **a `g_task_thread_pool_thread` worker** — entry point inside libgtk's icon-theme region
+  (between `gtk_icon_theme_get_display` and `gtk_icon_paintable_get_type`, so a static in
+  `gtkicontheme.c`: the icon LOAD thread), then the `gsk_render_node_draw` recursion (the statics
+  between `gsk_renderer_render_texture` and `gsk_render_node_draw`), ending in
+  `pango_cairo_show_glyph_string` → `pango_renderer_activate`.
+
+Pango's font map and its scaled-font caches are not thread-safe. Two threads in them at once is the
+whole bug, and it is **upstream, not ours**: nothing in this repo asks for a threaded icon load (no
+call site passes `GTK_ICON_LOOKUP_PRELOAD` — checked), GTK does it on its own.
+
+**Why the app grid and why now.** GTK 4.22 dropped librsvg for its OWN SVG renderer (`gtk_svg_*`
+exported symbols) and that renderer speaks `text`, `tspan`, `font-family`, `font-size` and
+`text-anchor` — so an SVG icon containing `<text>` renders through Pango, on whichever thread
+rasterises it. The app grid is the one surface that asks for dozens of icons at once *while* laying
+out dozens of labels, which is exactly the overlap the race needs. On this machine the reachable
+trigger is `rofi`: it has no icon in Papirus-Dark or Papirus, so it falls through to
+`/usr/share/icons/hicolor/scalable/apps/rofi.svg`, which carries three `<text>` elements —
+confirmed by resolving it through the live theme. It is the only installed app icon like that
+(`org.gnome.Screenshot` is the other text-carrying SVG, but Papirus has its own copy, which wins).
+
+✅ **REPRODUCED 2026-08-31, and the thing that had been missing was one flag.** The old probe
+(90 tiles cycling fresh `GFileIcon`s while the main thread rewrites every label) survived 600
+rounds against the real rofi icon, against a synthetic 200-`<text>` SVG and against a no-text
+control — three identical greens, which was the smell. It could not have failed: **GTK reaches its
+icon-load thread from exactly one place**, `gtk_icon_theme_lookup_icon()` with
+`GTK_ICON_LOOKUP_PRELOAD` (→ `load_icon_thread`, gtkicontheme.c), and a `Gio.FileIcon` never gets
+there — `gtk_icon_theme_lookup_by_gicon()` answers a GFileIcon with
+`gtk_icon_paintable_new_for_file()` and the load stays on the main thread. The probe was asking for
+the one icon shape that cannot take the threaded path.
+
+**The instrument came first, as the entry said it had to.** `scripts/dev/pangotrace.c` is an
+`LD_PRELOAD` shim that counts Pango entries per thread and reports overlap — two DIFFERENT threads
+inside Pango at once, which is the bug condition rather than a suspicion of it. `nm -D
+--undefined-only` decided what it could wrap before a line of it was written: `pango_renderer_activate`
+is called by libpango on itself and is NOT interposable, while `pango_renderer_draw_layout` and
+`pango_cairo_show_glyph_string` — both frames of the 08-24 core — are called by libgtk-4 and are.
+It was then proved able to fail against two threads deliberately in Pango (2000 off-main calls,
+1759 overlaps).
+
+What it measured, both arms 600 rounds × 90 tiles:
+
+    MODE=file (GFileIcon)   1,184,130 draw_layout + 376,814 show_glyph_string
+                            ONE thread ever entered Pango, 0 overlaps, survived
+    MODE=name (PRELOAD)     first off-main call, then first overlap, then SIGSEGV
+
+So the text really is rasterised — 376k glyph-string draws — and in the file arm it is rasterised
+entirely on the main thread. **The negative was about the probe, not about the bug.**
+
+🔑 **The trigger is the `<text>`, and that is a control, not an inference.** Down the same threaded
+path: `rofi` (whose hicolor SVG carries three `<text>` elements, because Papirus has no copy of it)
+crashed **5 of 6 runs**; `firefox` (Papirus, no `<text>`) survived **4 of 4**. The crash also
+happens with the shim NOT loaded — 2 of 3 — so it is not an artefact of the instrument.
+
+**The new core is sharper than the 08-24 one** and was taken on `gtk4 1:4.22.4-1`, `pango
+1:1.58.2-1`, `cairo 1.18.4-1`, `gjs 2:1.88.1-1`. The dying thread is a GTask worker (`pool-8`),
+SEGV_MAPERR, and the top of its stack names the shared structure being torn:
+
+    #0 libc                       #1 __strdup
+    #2 libcairo                   #3 cairo_scaled_font_create
+    #4 libpangocairo              #5 libpangocairo
+
+That is Cairo's scaled-font cache being entered from two threads, which is the same sentence the
+08-24 entry wrote from the symbol bracketing — now with a function name on it. A second run put the
+worker in `pango_glyph_string_extents_range` instead, so the exact victim varies; the shared cache
+does not.
+
+🔑 **And the shell reaches that path without ever naming the flag — which is why the old entry's
+"no call site passes `GTK_ICON_LOOKUP_PRELOAD` — checked" was true and pointed the wrong way.**
+GTK adds it on its own: `gtk_icon_helper_invalidate_for_change()` calls
+`gtk_icon_helper_ensure_paintable(self, TRUE)` — "the css size is valid now, preload" — and that
+`TRUE` becomes `flags |= GTK_ICON_LOOKUP_PRELOAD` inside `gtk_icon_helper_load_paintable()`
+(gtkiconhelper.c, 4.22.4). So **any `Gtk.Image` given an `icon_name` takes the threaded load the
+first time its CSS settles**, and the app grid does exactly that:
+`surfaces/app-grid/AppGrid.tsx:371` and `:527` set `icon.icon_name = resolved` for every app whose
+`.desktop` names a theme icon rather than a path. Dozens of them, at map time, while the main
+thread lays out dozens of labels. The snapshot path passes `FALSE` and stays on the main thread,
+which is why the same widget is harmless once it is up.
+
+That also settles what the workaround would have to be if upstream declines: not
+pre-rasterising every icon, but keeping text-carrying SVGs off `icon_name` — a narrower and
+cheaper trade than the one this entry was contemplating. Do not build it yet.
+
+🔴 **The reproducer is not "the same family" as the owner's crash — it is the SAME STACK, and the
+frequency estimate this entry was built on is wrong (2026-08-31).** The owner reported a second
+occurrence: the shell died **101 seconds after boot** on 2026-08-29 (boot 22:17:46, core 22:19:27,
+`veltrix.service`, PID 1424, thread `pool-39`). Its twelve top frames and the reproducer's are
+identical *offset for offset* in the same library builds:
+
+    #0/#1  libpangocairo +0x767c, +0x9d90
+    #2     pango_glyph_string_extents_range
+    #3/#4/#5  libgtk-4 +0x5bfad9, +0x217d8d, +0x9a097
+    #6     pango_renderer_draw_glyph_item
+    #7     pango_renderer_draw_layout_line
+    #8     pango_renderer_draw_layout
+    #9/#10/#11  libgtk-4 +0x98e66, +0x2726cb, +0x27259a
+
+⚠️ **So the standing decision below rests on a premise that no longer holds.** It was taken on
+2026-08-24 with "it has only happened once" in front of it; there are now two cores carrying this
+exact signature (08-24 and 08-29) plus four earlier `gjs` SIGSEGVs in `coredumpctl`. It is a
+recurring crash of the WHOLE shell on the launcher surface. The 101-seconds-after-boot timing fits
+the mechanism — cold caches mean the preload thread really does parse and rasterise, instead of
+answering from a warm one — but that is one instance and not yet a pattern: the 08-24 core landed
+two days into its boot.
+
+✅ **The door is MEASURED now, not inferred — and it took a second reproducer to do it
+(2026-08-31).** Everything above was produced with `GTK_ICON_LOOKUP_PRELOAD` passed by hand, so
+"the shell reaches this through `icon_name`" was still a reading of gtkiconhelper.c plus a matching
+stack. `scripts/dev/gtk-icon-text-thread-crash.c` closes that gap: ~150 lines of C, no gjs, no
+flag, no icon-theme call — plain `gtk_image_new_from_icon_name()` against icons it plants itself —
+and it dies **5 of 6** (3 SIGSEGV, 2 SIGABRT, one of them `double free or corruption`), while
+`--no-text` survives 4 of 4. Its worker dies inside `libpangoft2` doing a hash lookup, which is the
+`PangoFcFontMap` that gtk#8295 names.
+
+🔑 **The refinement that made it fire, and it is the one that explains the symptom: the widgets have
+to be NEW.** The icon helper preloads when a widget's css size FIRST settles, so tiles that merely
+change their icon pay for it once at startup and never race — that version survived 5 of 5 with the
+icons genuinely loading (2135 glyph draws, all main-thread, per the shim). Rebuilding the tiles
+every round crashes it. That is why this hits when the grid OPENS rather than while it is up, and
+it is what makes `AppService`'s divert the correctly aimed fix rather than a lucky one.
+
+⚠️ The first C attempt survived 5 of 5 for a stupider reason: `gtk_icon_theme_add_search_path()`
+looks for `<path>/<theme name>/…`, so a theme of our own naming was never consulted and nothing
+loaded at all. The program now plants its icons in `hicolor` and **aborts with exit 2** if
+`has_icon()` is false, because a void run that exits 0 is indistinguishable from a survival — the
+harness said "this run measures nothing" on stdout and the runner had sent stdout to /dev/null.
+
+🔗 **It is already reported upstream, and the report is STUCK: `gitlab.gnome.org/GNOME/gtk` issue
+8295**, opened 2026-07-05, labelled *1. Crash* + **2. Needs Information**, two comments. Same
+versions as ours (gtk 4.22.4, cairo 1.18.4), same shape: Nautilus's "Open With…" crashes ~7 of 10
+because `gtk_symbolic_paintable_snapshot_symbolic` runs in a GTask pool worker and corrupts the
+shared `PangoFcFontMap` cache, dying in a `strdup` inside Cairo. So this entry does not need a new
+issue — it needs to answer the one that is waiting, and it can:
+
+- a standalone 100-line reproducer with a rate (5 of 6), which is exactly what "Needs Information"
+  is asking for;
+- the cause isolated by control rather than asserted — text-carrying SVG 5/6 vs text-free 4/4
+  survived, down the same threaded path;
+- **the entry point is wider than that report says.** 8295 describes SYMBOLIC icon rendering; ours
+  is a plain full-colour SVG that merely contains `<text>`, reached through the icon-theme PRELOAD
+  thread that `gtk_icon_helper_invalidate_for_change()` starts for any `Gtk.Image` with an
+  `icon_name`. Symbolic is one road to the worker, not the road.
+
+⚠️ **And its stated workaround does not hold here, which is the single most useful thing we can
+tell them.** 8295 says `GSK_RENDERER=cairo` avoids the crash. Measured 2026-08-31 against this
+reproducer: **3 of 4 runs still crashed under `GSK_RENDERER=cairo`**, against 2 of 3 for the
+default-renderer control, and the core has the same signature (`pool-6`, SEGV_MAPERR, inside
+libpangocairo via `pango_glyph_string_extents_range`). The GSK renderer is not the variable — the
+icon rasterisation happens on the worker either way. Anyone reaching for that flag as a mitigation
+HERE is buying nothing and paying for a software renderer.
+
+⚠️ Still OPEN and still unfixed. What changed is that it is now answerable: a reproducer, a rate,
+a controlled cause, three cores and a refuted workaround. `scripts/dev/icon-text-race.js` defaults
+to `MODE=name` and keeps `MODE=file` as the documented negative control, so nobody rediscovers the
+blind arm.
+
+✅ **MITIGATED LOCALLY 2026-08-31 (owner's call, premise having changed): `AppService.svgCarriesText()`.**
+The door is a themed NAME, so the two exits that hand one back — `getCanonicalName()`'s themed-icon
+exit and `resolveIconChain()`'s pass 1 — now return the FILE PATH instead when the file behind the
+name is an SVG containing `<text>`. Callers already turn a path into a `Gio.FileIcon` (the
+`/usr/share/pixmaps` exit next to it has done exactly that for months), and a GFileIcon cannot
+reach the worker. **The proof that the mitigation works is the probe's own negative control**:
+`MODE=file` drives 376k glyph draws down this path on ONE thread and survives, `MODE=name` crashes
+5 of 6.
+
+🔑 **It is narrow by measurement, not by hope.** Of the **96,723** SVGs in every installed icon
+theme, **2** contain `<text>` — both in hicolor — and the active theme (Papirus-Dark) has none. Ran
+against real GTK: `rofi` resolves to the hicolor file and diverts; `org.gnome.Screenshot` resolves
+to Papirus's own copy, which has no text, and does NOT divert; five ordinary icons do not divert.
+So exactly ONE icon on this machine changes route, every other icon keeps its name and keeps its
+preload, and the grid-open hitch that PRELOAD exists to hide is not traded away.
+
+⚠️ The check that would have made this silently dead was `get_file()` returning null for icons
+served out of a theme cache. It does not — verified for hicolor and Papirus paths alike before the
+guard was trusted. The cache is keyed by PATH, not by icon name, so switching icon themes cannot
+leave it stale.
+
+⛔ This does NOT close the upstream bug and must not be read as closing it. GTK still starts a
+thread it is not safe to start, for any application, and 8295 is still the place that gets fixed.
+
+Recurrence, from `coredumpctl`: gjs SIGSEGVs on 08-05, 08-17 (x3), 08-22 and 08-24. The 08-22 one
+crashed in `gsk_render_replay_filter_node`, a different frame — so this is a class of rare native
+crash, not one bug seen twice. Only the 08-24 core is still on disk (`present`); the rest were
+already reaped, which is its own lesson: **keep the core the day it happens.**
+
+**The upstream report is NOT filed yet** (2026-08-24). GTK lives on `gitlab.gnome.org/GNOME/gtk`,
+not GitHub, so it needs a GNOME account this machine does not have. Everything the report needs is
+in this entry — both stacks, the symbol bracketing, the versions, the trigger, and the honest
+"not reproduced, and here is why my negative is worthless". **Link the issue here when it is
+filed**, and if a maintainer explains what makes GTK pick the threaded path for a `GFileIcon`, put
+that in this entry too: it is the one piece missing to make the probe able to fail.
+
+A workaround here would be pre-rasterising every app icon before handing it to `Gtk.Image`. That
+trades a rare crash for a permanent cost, on every icon, forever — do not reach for it before the
+upstream answer, and do not reach for it at all if the answer is a GTK fix.
+
+⛔ **This does NOT block a release, and that is decided — do not re-raise it as one.** Owner's call
+on 2026-08-24, with the data in front of them: *"solo ha pasado una vez; si descubrimos el error y
+lo solucionamos, pues lo actualizamos"*. So **0.8.0 ships with this open**, with no upstream issue
+filed, and the fix lands as an update if and when one appears. One occurrence, an upstream cause,
+and no reproduction at will is not a reason to hold a release — it is a reason to keep the core and
+the stacks, which this entry does.
+
+### 96. Window chrome: three of five windows are on the kit's base (2026-08-26)
+
+`VeltrixWindow` (architecture.md) is the one window now — sidebar optional — and **Settings, About
+and the installer are on it**. Two are not, and the reason is the same one that keeps them out of every other migration:
+**the greeter and the lockscreen have no dev mode**, their installed `style.css` outranks a
+source one, and a mistake there locks somebody out of their own machine. They also want less of
+the base than the others do — no header, no close button, no Escape — so the honest question is
+whether they should wear it at all, not just when.
+
+What is worth doing FIRST is smaller and testable: they are the last two places building an
+undecorated toplevel by hand, so at minimum they should take the base's window construction (the
+app-id, the size floor, the glass card) even if they pass no header. Do it against
+`scripts/dev/lock-probe.js` or a VM, watching each screen.
+
+⚠️ And a fact that cost an hour on 2026-08-26, recorded so nobody re-derives it: **`default_width`
+is a request, and on Wayland the compositor answers it.** `win.get_width()` afterwards is the
+allocation the compositor handed back, NOT what GTK asked for — so a window coming up at its
+natural size is not evidence that GTK ignored anything. The installer floats and Hyprland gives it
+its natural width; the Settings window was measured "too narrow" the same afternoon for the plain
+reason that it was TILED. What survives a compositor is the MINIMUM (`set_size_request` →
+`xdg_toplevel.set_min_size`), which is why both windows carry a size floor and neither relies on
+its default.
+
+### 95. The installer bundle ships two known gaps on purpose (2026-08-25)
+
+`ui/installer/` landed as a skeleton — the frame, the step flow, the base-config seam and one
+placeholder step — and it carries two things that must not be mistaken for oversights:
+
+**(a) ~~Its strings are English literals, not `t()` keys.~~ CLOSED 2026-08-25 (#271):
+`ui/installer/lib/i18n.ts` is a 42-key × 12-locale catalog, and it landed with the first real
+screen, which is the rule this item was written to enforce.** The rule stands for the next
+screen: a key that a step needs enters all thirteen locales in the same PR. An installer that
+only speaks English is the worst possible surface to leave untranslated — it is the first thing
+a user meets, before they have any way to change the language.
+
+**(b) It defines the `--veltrix-*` custom properties a THIRD time.** The shell has them in
+`styles/_base.scss`, the greeter/lock sheet re-declares them scoped to its own windows, and now
+`ui/installer/style.scss` declares the subset it uses. This is the same duplication as #60 (the
+greeter/lock split), one bundle wider: the ramp is not importable because each copy is scoped to
+its own window selectors and GTK4 has no `:root`. If a token's VALUE moves, three files move.
+
+⚠️ **The fix first written here — "a shared SCSS partial that emits the ramp for a
+caller-supplied selector" — is the WRONG one, and 2026-08-26 is when that became clear.** A
+static partial can carry the ink and the radii. It cannot carry the two values that actually
+matter, because they are the USER's: the accent and the window opacity. So a bundle taking the
+partial would still hand-roll the live half — which is precisely what `ui/installer/app.ts`
+does today, in a `dynamicAppearanceCss()` that emits ~12 of the ~60 tokens, and got two of them
+wrong on the way (a hover token it never defined, a `DANGER_HEX` retyped as a literal).
+
+✅ **DONE for the installer, 2026-08-26 — and this is now a two-bundle item, not a three.**
+The engine moved to `ui/lib/veltrix-kit/platform/theme-tokens.ts` (`ui/shell/core/VeltrixTheme.ts` re-exports it and
+keeps only `CHROME_SCOPE_WINDOWS`, which is genuinely shell knowledge), `ui/lib/veltrix-kit/platform/appearance.ts`
+is the one reader, and `installAppearance()` wires a bundle up in one call. The installer's
+`app.ts` went from 190 lines to 60 and its stylesheet lost both hand-typed ramps.
+
+▶️ **STILL OWED: the greeter and the lockscreen.** They keep `accentCssFor()` (six tokens) and
+their own two-mode ramp in `ui/greeter/style.scss`. The migration is the same three lines the
+installer took, but the risk is not the same: those two surfaces have no dev mode, an installed
+`style.css` outranks a source one, and getting it wrong locks somebody out of their desktop. Do
+it against `scripts/dev/lock-probe.js` or a VM, seeing each screen, not by reasoning about the
+diff — and note the greeter must pass `{ channel: "mirror" }` (it runs as another user, outside
+any session; see architecture.md, "The appearance contract").
+
+**The reasoning, kept because it is why the FIRST proposed fix was wrong:**
+`ui/shell/core/VeltrixTheme.ts` — `veltrixVars()`, mode-aware, opacity-aware, the full ramp —
+imports `ui/lib/{file,accent,status-colors,tokens}` and NOTHING from the shell. It is shell-local
+by history, not by coupling. Moving it to `ui/lib/` plus one shared reader for `appearance.json`
+(three bundles have their own copy of `readAppearance()`) deletes `dynamicAppearanceCss()` AND
+both hand-written ramps in `style.scss` AND `accentCssFor()`'s six-token subset in
+`ui/lib/veltrix-kit/platform/accent.ts`, and gives the greeter, the lock screen and the installer the user's live
+accent and opacity for free — which is the actual complaint behind this item, not the
+duplication itself. The kit's appearance seam (`veltrix-kit/appearance.ts`) grows the opacity at
+the same time, since Cairo widgets need it as a number and today it only carries the accent and
+the mode.
+
+**(c) Its exit is refused, not confirmed, while `archinstall` runs.** `Step.busy()` (2026-08-26)
+is what the frame asks before the close button or Escape may quit: on the last step, from the
+moment the plan is handed to a root process until it exits, the answer is no. Quitting there
+would leave `archinstall` repartitioning with nobody watching, the plaintext credentials file
+still in `/tmp`, and no window to say so. A confirmation dialog would be better than a greyed
+button — it could offer "abandon anyway" for a hung install — and it needs strings, so it needs
+thirteen locales; that is why it is not there yet.
+
+
+## Resolved — rules that still apply
+
+These were paid down; the *rule* remains:
+- **(resolved 2026-07-10) Never call `AstalGreet.login()` — use the greeter's `lib/greetd.ts`.**
+  Upstream's `Request.send()` RETURNS greetd's `{type:"error"}` reply as an object (throws only
+  on socket/JSON failures) and `login_with_env()` discards every response, so a wrong password
+  "succeeds": the card quit()s, greetd sees "greeter exited without creating a session" and
+  terminates, systemd restarts it — TTY flash, fresh greeter, no error shown. It also never
+  `cancel_session`s the failed attempt, breaking the next `create_session`. `lib/greetd.ts`
+  drives the same Request classes but checks every response (throwing typed `AuthError`) and
+  always cancels on failure. VM-verified both paths 2026-07-10. Upstream PR candidate (like the
+  tray fix, Aylur/astal#451). Related greeter rule: re-enable widgets BEFORE `grab_focus()` —
+  grabbing an insensitive entry silently fails and strands keyboard focus.
+- **(was #26 + #31, resolved 2026-07-10) Wrapper logs/state are per-user; new users bootstrap
+  at first login.** Every `bin/*` wrapper writes its log (and runtime state) to
+  `${XDG_RUNTIME_DIR:-/tmp}/veltrix-*` — NEVER a fixed `/tmp` name or a root-only path: on a
+  multi-user system the second user can't write the first user's file, and because bash skips
+  a command whose redirect fails, the wrapped binary silently never launches (exactly how the
+  lockscreen died on every install, 2026-07-03). Redirects into logs must never gate the exec.
+  Per-user seeding: `bin/veltrix` runs `veltrix-setup --user` at session start when
+  `~/.config/veltrix` is missing (first-login bootstrap, issue #23 — details in
+  dev-workflow.md). **Any new per-user seed belongs in veltrix-setup's per-user section** —
+  never in install.sh directly — so install, update AND first-login all apply it.
+- **(was #27, resolved 2026-07-05) Media player selection + cover art live in `core/MediaService.ts`.**
+  Widgets must NEVER go back to `get_players()[0]` — the facade owns WHICH player the shell
+  shows: auto heuristic (a PLAYING player beats paused ones; ties go to the most recent
+  playback-status change) plus a manual pin (source-selector glass menu in the media detail
+  panel, `pinPlayer(busName|null)`; session-scoped, auto-resumes when the pinned player leaves
+  the bus). Cover art goes through `resolveCoverArt` — chain: `file://` → a bare path →
+  `data:` (decoded once into `~/.cache/veltrix/media-art/`) → `http(s)` (async curl into the
+  same cache, negative-cached on failure so a dead URL isn't retried). The chain used to start
+  at AstalMpris's own `cover_art` cache; that step went with the lib on 2026-08-17 and nothing
+  was lost, because the two kinds it did NOT cover (`data:`, and `https:` without GVfs) are the
+  common ones — it only ever logged 2× `player.vala … Failed to cache cover art` per track for
+  them. `widgets/media.ts` shares ONE `MediaState`
+  singleton across tile rebuilds (a per-build state leaked its player subscription). Test with
+  `scripts/dev/fake-mpris.js` (see `dev-workflow.md`) — heuristic + both art paths were
+  verified live with it (2026-07-05).
+- **Layer popups blur via `blur_popups`, NOT the layer's `blur` (verified 2026-06-26).** A `Gtk.Popover`
+  on the dock/bar (the glass tooltip, the dock context menu) is a SEPARATE surface = a *popup of a layer*.
+  The `blur` layerrule only blurs the layer surface itself + its `Gtk.Overlay` children (CC/NC/system
+  menu/overview — that's why those blur and aren't popovers). Layer popups need a SEPARATE `blur_popups`
+  layerrule (added to `veltrix-bar`/`veltrix-dock` in `hyprland.lua`); `decoration:blur:popups` only covers
+  popups of WINDOWS (Settings' native dropdown). And the popup's content must clear `popups_ignorealpha`
+  (0.30) — the shared `common/GlassBubble.ts` painter floors its glass at 0.38, used by BOTH the
+  tooltip and the **dock context menu** (a `Gtk.Popover` + glass bubble + the unified `renderMenuModel`
+  rows — no longer a `Gtk.PopoverMenu`). It's a Hyprland *config* change → needs a Hyprland reload,
+  not Super+Shift+R.
+- **Stable updates are STATELESS (2026-06-19).** There is NO per-user source clone. The old
+  model kept a managed `~/.local/share/veltrix/src` per user while `/usr/share` was shared →
+  divergent src, "last sudoer-updater wins" globally. `veltrix-update` now shallow-clones the
+  newest release tag (default branch pre-release) to a throwaway temp, builds, installs,
+  discards (~6 MB clone, negligible). **Rule:** never reintroduce a persistent per-user source
+  copy as the update source; the runtime is system-wide, so the source of truth is the git
+  remote + `/usr/share`. Dev installs are the one exception (they update from the developer's
+  own registered clone via `.dev`/`.source`). `install.sh` system mode migrates away any
+  legacy `src`/`.source`.
+- **(was #16, resolved 2026-07-02) `install.sh` re-syncs a Veltrix-owned `/etc/greetd` on update.**
+  Fingerprint-gated, NOT bare enabled-state: the block runs when `ACTIVE_DM=none` OR greetd is
+  enabled AND `/etc/greetd` is recognizably ours (`config.toml` → `hyprland-greeter.lua`, or the
+  `.lua` launching `veltrix-greeter`). A foreign greetd (tuigreet/gtkgreet/ReGreet) or foreign DM is
+  left untouched, with a hint printed. Folded into the same fix: the stale
+  `/usr/share/veltrix/wallpaper.png` is removed (the refreshed greeter `.lua` points at
+  `wallpaper.jpg`), and the pacman dep list got its own fingerprint (`/usr/share/veltrix/pins-pacman`)
+  so a changed list runs phase 1 on update (new deps like playerctl now reach updated installs)
+  while unchanged-list updates keep skipping it. Validated E2E in the VM 2026-07-02: update from
+  the 06-22 snapshot refreshed `/etc/greetd`, installed playerctl, removed the stale png, greeter
+  booted; the immediate re-update took the fast path ("pins and package list unchanged").
+- **(was #16) Settings is a normal window.** `openSettings` opens/raises it — NOT a toggle
+  (re-invoking just raises; it closes only via its own close button). Don't turn it into a
+  toggle-hide. **Raising across workspaces:** `gtk_window_present()` alone does NOT jump to the
+  window when it's on another workspace — its Wayland activation is ignored by Hyprland
+  (`misc:focus_on_activate=false`). So Settings' own `raise()` (`ui/settings/app.ts`) present()s *and* dispatches an
+  explicit `hyprlandState.focusWindow(addr)` (found by class `veltrix-settings` + title
+  `Veltrix Settings` — the class was AGS's `io.Astal.ags` until 2026-08-18), which switches to its workspace like clicking any running dock app.
+  Same pattern applies to any normal (non-layer-shell) window the shell wants to summon.
+  `toggleSettings` is kept as a **compat alias** (the `hyprland.lua` Super+S
+  keybind / user scripts) — don't drop it without updating those. `dumpState.overlays.settings`
+  is derived from Hyprland's clients with the same class+title predicate
+  (`isSettingsClient`, app.ts) — `status.settings_open` is gone since #571. There's deliberately **no IPC to CLOSE** Settings: close its normal window to exit that application, reopen for a fresh
+  page cache (restarting the shell does not reset Settings since #571), and use `queryUI` (a `veltrix-settings-window`
+  toplevel present = open) as the ground truth.
+- **(was #10) Boot-time `g_list_store_remove` CRITICAL (astal-tray)** fixed upstream:
+  Aylur/astal#451 merged 2026-06-12 (kotontrion's pending-items pattern, verified A/B/A on
+  the reproducing machine: stock = 1 CRITICAL/boot, patched = 0/8 boots) and `ASTAL_REF` now
+  pins past it. A boot CRITICAL from `libastal-tray.so` reappearing means a stale Astal
+  build — re-run `install.sh` so the pin rebuild kicks in; don't chase it in shell code.
+  **Testing a patched Astal lib gotcha (reusable):** the installed typelib embeds the
+  **absolute** `.so` path, so `LD_LIBRARY_PATH` alone won't load your build. Point
+  `GI_TYPELIB_PATH` at the build dir's typelib — and if that one embeds a prefix you can't
+  write to (`/usr/local/lib`), binary-patch a copy with a same-length `/tmp` path (python
+  `bytes.replace`, assert equal lengths) and place the patched `.so` there. **AND**:
+  `/usr/bin/veltrix-ui` PREPENDS `/usr/lib:/usr/local/lib` to `GI_TYPELIB_PATH`, so a
+  systemd `Environment=` drop-in never wins — override `ExecStart` in the drop-in (replicate
+  the dev launch with your dir FIRST), and verify the loaded `.so` in
+  `/proc/<gjs pid>/maps` before trusting any result.
+- **(was #15) `ui/shell/widget/` rename** done 2026-06-11: `surfaces/` (bar, dock,
+  control-center, settings, overview, prism, app-grid, about), `widgets/` (auto-registered
+  atomics) and `common/` (shared pieces) are now top-level siblings of `core/`/`styles/`.
+  greeter/lockscreen keep their own `widget/` dirs on purpose (no widget/widgets ambiguity
+  there). Docs/paths in skills + README updated; don't reintroduce a `widget/` dir.
+- **(was #13) Bluetooth pairing agent** is implemented: `org.bluez.Agent1` lives in
+  `BluetoothService` (`registerPairingAgent`), the dialogs in the Bluetooth page. Real-device
+  pairing (passkey/PIN flows) is still UNVERIFIED on hardware — D-Bus policy only lets root
+  call agent methods, so the dbusmock template can't exercise it (see `architecture.md` for
+  the `sudo busctl` recipe).
+- **Dock H/V** is deduplicated — fix dock logic in `DockCore.tsx` / `DockAxis.ts`, never the
+  7-line wrappers.
+- **Accent colors** live only in `ui/lib/veltrix-kit/platform/accent.ts` — add/change them there.
+- **Greeter ↔ lockscreen ↔ shell** share `ui/lib/veltrix-kit/platform/accent.ts` + `ui/lib/users.ts` + `ui/lib/wallpaper.ts`
+  + `ui/lib/avatar.ts`, and since 2026-08-10 also **`ui/lib/veltrix-kit/styles/_components.scss`** — the kit's
+  own stylesheet, which the two login surfaces now `@use` (see "The greeter wears the kit" below)
+  — and since 2026-08-09 (see #57) **`ui/lib/veltrix-kit/styles/_tokens.scss`** (the
+  design system's mode-independent half — type ramp, spacing, motion, radius ladder),
+  **`ui/lib/veltrix-kit/platform/tokens.ts`**'s `LOCK_GLASS` (the numeric half of the glass mirror the lockscreen's
+  painter needs) and **`ui/lib/veltrix-kit/platform/icons.ts`** (the shipped icon set, for the two bundles with no
+  `core/`). Reach for `ui/lib` before copying anything into a bundle
+  (Settings → Users consumes `users.ts` too — don't reintroduce a per-surface passwd parser);
+  `lib/i18n.ts` stays separate per bundle on purpose (different config paths / superset).
+  Both mini-catalogs (greeter 12 keys, lockscreen 7) cover the full 12-language set,
+  including pt-PT, with the same LANG-prefix detection chain as the shell (which now
+  also carries pt-PT — see `core/i18n/index.ts`) plus one extra rule: `pt_br` → pt-BR
+  before the generic `pt` → pt-PT. Power/password terminology mirrors the shell catalogs
+  (`bar.system-menu.*`, `settings.users.password`) — keep them in lockstep when either
+  side changes. The greeter's language dropdown sets the GREETER's own language only
+  (persisted in `greeter-prefs.json`); the session language comes from
+  `/etc/locale.conf` via Settings → Language — greetd starts sessions with an empty
+  env, and the unprivileged greeter can neither `localectl` nor write other users'
+  homes. (Future idea, deliberately out of scope: let the greeter pick set the session
+  language — needs a privileged path.) Since the date-locale fix, the greeter also
+  aligns its PROCESS locale with that language (`initProcessLocale()` — clock date
+  names via LC_TIME + Pango's CJK face selection; no-pref fallback reads
+  `/etc/locale.conf`, so the login screen speaks the system language out of the box);
+  mechanics + the GTK-resets-setlocale gotcha in dev-workflow.md "Fonts & CJK
+  variants".
+- **`noto-fonts-cjk` is a hard dep** (install.sh §1 + PKGBUILD, since the i18n round-2
+  PR): the zh-CN/ja catalogs AND the 简体中文/日本語 endonyms in the language pickers
+  render as tofu boxes without it — caught in the 07-13 VM sweep (a clean Arch ships
+  no CJK font; ~300 MB installed, the honest cost of shipping those languages).
+- **Shell pt-PT catalog SHIPPED (07-13)**: `ui/shell/core/i18n/locales/pt-PT.ts`
+  (621 keys, European norm — utilizador/palavra-passe/ficheiro/ecrã/rato/eliminar/
+  definições/controlo, enclisis, `a + infinitivo` instead of gerund) wired into
+  `core/i18n/index.ts` (import + map entry + `detectLanguage()` reorder: `pt_br` →
+  pt-BR BEFORE the generic `pt` → pt-PT, mirroring the greeter/lockscreen chain) +
+  README counter 11 → 12. Not yet native-reviewed (same gate as the other 11
+  languages — see the translation-wave native-review follow-up). Same shape of
+  future candidate: zh-TW (today `zh_TW` → zh-CN).
+- **The bulk-translated locales owe 84 keys each, and that number is now WRITTEN DOWN**
+  (2026-08-17). `en`/`es` carry 698 keys; the other ten carry 614. The gap is mostly the
+  Assistant surface (`settings.ai.*`, `island.agent.*`, 57 keys) and it is not new — v0.6.0
+  and v0.7.0 both shipped it. What was wrong is that it moved from 82 to 84 across those two
+  releases with nothing recording it, because the workflow's "defer the other ten to a bulk
+  pass" had no artifact and therefore no floor. `ui/shell/core/i18n/translation-state.json`
+  is that artifact and `scripts/ci/i18n-check.mjs --check` is the CI gate; the debt is
+  allowed, but it cannot move without the number moving in the PR's own diff.
+  **The gate also catches the failure mode nothing could see before**: a key whose English
+  was rewritten AFTER it was translated. That one is worse than a missing key, because a
+  missing key falls back to English and looks obviously untranslated, while a stale one
+  renders a fluent sentence that is no longer true. Seeding the ledger from git history
+  found two live cases — `settings.region.locale.lang.desc` / `.regional.desc`, rewritten
+  on 08-16 to draw the system-wide-vs-account distinction while all ten locales still said
+  "requires a session restart". Fixed in the same change. Workflow: `--sync` after touching
+  English (bookkeeping, never claims a translation is current), `--translated <locale>`
+  after actually translating one. Do NOT rebuild the ledger by deleting it and re-syncing —
+  with no prior basis every translation is declared current and outstanding drift vanishes.
+- **Clock day/month names come from LC_TIME via GLib `%a/%A/%b/%B`** — every installed
+  locale is localized for free (the clock follows the "Regional Format" setting, like
+  Gtk.Calendar and macOS/GNOME). `formatDatePart()` derives the date order from the
+  locale's own `%x`: day-first, month-first, **or year-first** (zh_CN/ja_JP render
+  `%x` as `2000年01月02日` — added when those two languages were translated, since the
+  older day-first/month-first-only probe silently produced garbage, e.g. the numeric
+  format read "01年02年2000"). Year-first also captures the three separator/suffix
+  literals (年/月/日) as regex groups, so `short`/`short-year`/`long` assemble in
+  native order ("{month}{day}日 {weekday}") instead of the Western comma template.
+  `%a/%A/%b/%B` are `.trim()`-ed too — some locales (ja_JP's `abmon`) pad abbreviated
+  names to fixed width for tabular alignment, which otherwise leaks a stray space.
+  It's triplicated across `ui/shell/core/i18n/dateNames.ts`, `ui/greeter/lib/dateNames.ts`,
+  `ui/lockscreen/lib/dateNames.ts` (separate bundles) but is still PURE LOGIC — no
+  per-language data, so adding a language needs zero changes there, CJK included.
+  Only the `settings.region.date.*` preview labels are hand-localized per catalog and must
+  match `formatDatePart` output for that language's typical locale — when it matters,
+  check `/usr/share/i18n/locales/<locale>` (glibc's own source) directly rather than
+  guessing. Caveat: the clock follows LC_TIME, not the in-app UI-language toggle (they
+  diverge only if the user sets a Regional Format ≠ their UI language, which is
+  correct), and the target locale must be generated — veltrix-setup generates the 12
+  shipped `xx_XX.UTF-8` locales in `/etc/locale.gen` + `locale-gen` (idempotent,
+  system-level, skipped by `--user`), which is also what makes Settings → Language
+  autocomplete them (`localectl list-locales` only lists generated ones).
+  **Known remaining gap:** CJK
+  weekday placement/parenthesization conventions differ further within the family
+  (e.g. Japanese commonly parenthesizes: "4月6日(月)") — the current space-separated
+  rendering is generic and correct, not idiomatic polish; left for native review.
+- **Wallpaper resolution is centralized** in `ui/lib/wallpaper.ts` (`resolveWallpaper(surface)`:
+  per-surface override → global `path` → `/usr/share/veltrix/wallpaper.jpg`, each step
+  existence-checked). The lockscreen paints its own copy (session-lock covers awww); shell +
+  greeter paint via awww with their own `.lua`-side default fallback. The
+  `~/.config/veltrix/wallpaper` JSON reserves a `surfaces` block for future per-surface
+  wallpapers from Settings — `WallpaperManager._save()` merge-writes so it never clobbers
+  keys it doesn't own.
+- **`getDefaultUser()` is greeter-ONLY** (pre-login, no session). The lockscreen runs as the
+  locked session's owner and must use `getCurrentUser()` / its own config dir — using
+  `getDefaultUser()` there once pointed PAM at the first /etc/passwd user, locking every
+  other user out of their own session. Inside the greeter prefer `getPreferredUser()`
+  (`ui/greeter/lib/greeter-prefs.ts`): the last user who logged in from this greeter
+  (persisted as `lastUser` in `greeter-prefs.json` on successful auth), falling back to
+  `getDefaultUser()`. LoginCard preselects it (matching against its own `users` array —
+  the switcher chips compare by object identity) and app.ts/Clock.ts read that user's
+  appearance/region config. For user config the greeter can't read (700 homes),
+  the shell mirrors world-readable copies to `/var/tmp/veltrix/` (`appearance.json` from
+  ThemeManager, `region.json` from RegionConfig). Since #573 the user's own settings are in their
+  dconf, so the greeter reads the mirror only.
+- **Greeter home = `/var/lib/greeter`, enforced by veltrix-setup.** Arch greetd's sysusers
+  ships the `greeter` user with passwd home `/` and creates no dir — with that, greeter
+  artifacts (Hyprland's own config discovery, D-Bus-activated services like dconf, which
+  inherit the LOGIN env rather than the .lua's `hl.env`) land as dotfiles in the
+  filesystem root, and greeter prefs could never persist (the greeter can't mkdir under
+  root-owned `/var/lib`). veltrix-setup therefore creates `/var/lib/greeter` (greeter-owned),
+  aligns the passwd home via `usermod -d` (idempotent; tolerates a busy greeter and
+  converges next run), and sweeps a stray greeter-owned `/.config`. `greeter-prefs.json`
+  (locale/kb) lives there — always read it via `GLib.get_user_config_dir()`, never a
+  hardcoded path (`hyprland-greeter.lua` also sets `HOME`/`XDG_CONFIG_HOME` to the same
+  place as belt-and-braces). The `~greeter/.config/hypr/hyprland.lua` symlink is only a
+  fallback; the operative pointer is `HYPRLAND_CONFIG` in greetd's `config.toml`. Verified
+  E2E in VM 07-09: home migrated, greeter boots, locale pref survives reboot.
+- **`Status.ts` exclusion** — add a new overlay's `_field → notify` to `EXCLUSIVE` and call
+  `closeExclusive(...)`; don't touch the other setters.
+- **Repo weight** — history was rewritten (.git 342→95 MiB); old clones must re-clone. Don't
+  commit binaries: the app bundles (`ui/*/build/*`) and every `style.css` are gitignored too —
+  `install.sh` rebuilds them from source on the target. Verify pngs / build artifacts stay git-ignored.
+- **Sliders** — one Cairo `makeSlider` (`veltrix-kit/slider.ts`); no native `Gtk.Scale`,
+  no `PillSlider`. See `design-system.md`.
+- **Monitor config** — applies via `hyprctl eval "hl.monitor({...})"`, NOT `hyprctl keyword`
+  (rejected by the Lua parser). See `architecture.md`.
+- **Widget registration is generated** — never hand-edit `widgets/widgets.gen.ts` or re-add
+  manual imports to `widgets/index.ts`; the registry comes from `scripts/gen-widget-index.mjs`
+  (phase 1 of the widget plugin system). EXCLUDE holds only the registry's own two files:
+  `bar-helpers.ts` was the last grandfathered non-widget and joined the kit on 2026-09-01.
+- **A widget imports `common/widget-kit/`, never `surfaces/` — and CI enforces it.**
+  `scripts/ci/widget-boundary-check.mjs` (in the *Widget registry freshness* job) fails on any
+  import from `widgets/` into `surfaces/`, and on any import from `common/widget-kit/` into
+  either — the second one because a kit module that reaches for `CCLayoutManager` closes a
+  cycle that crashes the shell AT BOOT, which `tsc` cannot see. Neither rule is a compile
+  error: there were 28 widget→surface imports on the morning of 2026-09-01 and all of them
+  type-checked. **#306 is closed**; the page an outsider writes a widget from is
+  `references/writing-a-widget.md`, and it is the thing to keep current when the vocabulary
+  grows.
+- **Notification swipe-to-dismiss** — one implementation in `common/ScaleRevealer.ts`:
+  `attachHorizontalSwipe` (gesture detector — claims only on horizontal intent so the NC
+  scroller keeps its vertical drag; cancels the row's release-phase tap) + `setSwipe`/`swipeOut`/
+  `settleSwipe` (paint-only snapshot translate + off-screen fling / animated snap-back; never use
+  margins — they reflow the card, double-painting wrapped labels) + `collapseAway` (height-collapse
+  for list rows). Cards must open on RELEASE (`SquircleContainer` `clickOnRelease`) or the
+  press-tap fires before the swipe is recognised. **Banners slide off directly** (they can leave
+  the screen). **NC rows slide via a GHOST** (`attachGhostSwipeDismiss`): the scroller clips any
+  translate at the panel walls, so on swipe start the row's render is captured statically
+  (`WidgetPaintable.get_current_image` — the DnD-drag-icon mechanism), the live row drops to
+  opacity 0 (keeps its allocation AND the pointer grab), and the capture follows the finger from
+  an input-transparent `Gtk.Fixed` lazily layered over the Bar's master overlay, above every
+  panel. On dismiss the ghost flings off while the real row height-collapses; on cancel the ghost
+  settles back and the live row is swapped in at identity. The row's `unmap` drops a live ghost
+  and restores opacity (rows persist across NC open/close via the group cache — a row left at 0
+  would come back invisible).
+- **Notification hero images have TWO shapes** (`NotificationCenter.tsx`): compact = 44px
+  cover-fit squircle thumb on the RIGHT (the macOS shape; banners and NC rows; text ceding
+  width to it is the universal pattern, not a bug); expanded NC rows swap the thumb for a
+  full-width `.nc-hero-big` below the text row (iOS long-look / Android BigPicture; action
+  buttons move under the image). Small sources never take the big path — `hasExpandedHero`
+  reads dimensions header-only via `GdkPixbuf.Pixbuf.get_file_info` and requires ≥240px
+  source width, so a 64-160px chat avatar keeps its thumb even when expanded instead of
+  being cover-fit into mush. Both shapes share one squircle painter (`heroDrawingArea`).
+  Banners never expand. Card controls (time · count badge / expand chevron · close) share
+  the TITLE line — never a dedicated right column, which shortened every text line instead
+  of just the title. The thumb is the card's right edge, spanning title+body centred.
+  All card controls are HOVER-ONLY (macOS), one scheme on EVERY card (banner and NC row —
+  no per-surface inconsistency): the CLOSE floats over the top-left corner on a
+  `Gtk.Overlay` (overlay children aren't measured → never affects card size); the RIGHT
+  edge is contextual — expand chevron on the title line (swapped in for the timestamp so
+  the line stays put; no chevron → the timestamp just stays) for NC rows, ≤2 glass action
+  capsules overlaid for banners (the thumb fades via opacity so text never rewraps
+  mid-hover; presses capture-claimed to beat the card tap + swipe). The count badge is
+  info, always visible. Reveal is via EventControllerMotion on the capsule (child
+  crossings don't emit leave); the title line pins `height_request: 22` so reveals can't
+  nudge tall rows by 1px. The expanded-group control header hover-reveals via OPACITY +
+  `can_target` instead — its buttons steal no text width, and `visible` would reflow the
+  row height there. The expanded NC row still lists every action below the text.
+  CLEAR-ALL replays the swipe fling per row (swipeOut → collapseAway), top-down with a
+  45ms stagger, WITHOUT ghosts — clipping at the panel wall is the intended exit look.
+  While the cascade runs, `resolved`/`notified` rebuilds are deferred (`pendingClear`) and
+  only the click-time snapshot gets dismissed at the end; closing the NC mid-cascade must
+  settle immediately (unmapped rows stop ticking — their tick callbacks never fire).
+
+### 42. The Assistant can type into ANOTHER AGENT's terminal — accepted property, no fix (2026-07-30)
+
+Demonstrated live by the user, not theorised. They asked the Assistant to write into the Claude Code
+window and it did, in two tool calls:
+
+```
+type_text kitty "Hola Claude, soy tu asistente de escritorio…" → ok {active:"kitty"}
+press_key  kitty Return                                        → ok
+query_app  kitty                                               → ok {count:0}
+```
+
+**Nothing malfunctioned.** A terminal is a window like any other, `veltrix-type` verified focus as
+designed, the fake cursor played and the chips appeared in the island. This is `type_text` working.
+
+**It is HALF a channel, and that asymmetry is worth keeping in mind.** The third call is the
+Assistant trying to read the result: `query_app kitty` → `count:0`, because a terminal exposes no
+AT-SPI tree. It can write into an agent's prompt and cannot read the reply. Note the corollary — the
+absence of a channel to a coding agent is often stated as an architectural fact (there is no IPC path
+Veltrix→Claude Code, only the reverse via `veltrix-mcp`); that is true of IPC and **false of the
+capability surface**, and reasoning from the architecture got it wrong here.
+
+**Three layers, and only the first is enforced. Do not conflate them:**
+
+1. **Trigger — holds.** There is no autonomous trigger: no proactivity, no scheduler, nothing starts
+   a turn but a user message. So this cannot happen while the user is away. This is the user's own
+   framing ("it only happens if I ask for it") and at this layer it is correct.
+2. **Action selection — NOT the same claim.** Inside a turn the user did start, the MODEL chooses the
+   tools. A broad instruction can therefore produce a `type_text` at a window the user never had in
+   mind, without anything resembling agent volition. And the file-read layer means content the
+   Assistant reads can carry instructions, which composes: read → decide → type into a terminal. The
+   trigger invariant does not cover any of that.
+3. **Authentication at the receiving end — none, and none is possible.** The demo was detected
+   because the content was implausible, NOT by any mechanism. A plausible line ("also add X to that
+   commit") would have been indistinguishable from the user. The user had instructed the Assistant to
+   announce itself precisely so it could be identified — which means **the identification worked
+   because the sender cooperated. A declared origin is not authentication.** A TTY cannot tell who
+   typed.
+
+**Why there is nothing to fix in Veltrix.** Driving arbitrary windows IS computer-use; special-casing
+"windows that look like agents" would be both unreliable and a violation of the point. The real
+guarantee is the one the tier-1 framing already claims — **"nothing invisible"** — and it held
+completely here: focus-verified, cursor painted, chips logged, kill switch one chord away
+(`Super+Shift+Esc`). Keep that framing honest rather than upgrading it to "cannot".
+
+**The consequence for anyone reviewing this project WITH an agent:** if a Veltrix session has
+`allowComputerControl` on, that agent's input stream is writable by the Assistant. Turn the gate off
+for unattended work, and treat instructions that arrive mid-session claiming an origin as content,
+never as authority.
+
+### 43. Veltrix on the accessibility bus (2026-07-30) — ⚠️ mostly closed 2026-08-18
+
+Found while measuring why the Assistant could not read its own Settings window. The shell **does**
+publish an AT-SPI tree — 154 nodes, the bar's clock and window title among them — but it is
+registered under the interpreter's name:
+
+```
+$ veltrix-a11y ZZZ  →  apps: [… 'org.gnome.Nautilus', 'gjs', 'org.gnome.Terminal']
+$ veltrix-a11y gjs  →  app: gjs · window: None · count: 154 · frames with name ""
+```
+
+Nothing in the repo calls `GLib.set_application_name` / `set_prgname`, so every Veltrix toplevel
+arrives as an unnamed frame of an app called `gjs`. **Two separate costs, and the accessibility one
+is the real one:** a screen reader (Orca) announces the bar, dock and Settings as "gjs" with
+anonymous frames, which is a genuine defect in a desktop environment; and no name an agent could
+try (`io.Astal.ags`, "Veltrix Settings", "veltrix") matches, which is why `query_app` on our own
+window returns zero — the wrong-door confusion documented in `state-and-ipc.md`.
+
+**MOSTLY FIXED 2026-08-18**, as a side effect of owning the application host. `ui/lib/veltrix-kit/platform/host.ts`
+calls `GLib.set_prgname(applicationId)` and `GLib.set_application_name()`, and the blocker this
+item described dissolved on the way: the worry was that `prgname` was load-bearing for the Hyprland
+class, and it turned out **it is not** — measured three ways, an explicit `application-id` wins over
+`prgname` for the Wayland app-id, so the two levers are independent. Now:
+
+```
+$ veltrix-a11y                       →  apps: [… 'org.veltrix.desktop'],  no 'gjs'
+$ veltrix-a11y org.veltrix.desktop    →  app: org.veltrix.desktop · count: 143
+```
+
+That closes the agent half completely (`query_app` on our own window answers, the wrong-door
+confusion is gone). **What is left is the screen-reader half**, and it is small: nobody has run
+Orca against it, the frames take their name from the window title (fine for Settings/About, empty
+for layer-shell surfaces), and whether "org.veltrix.desktop" or a friendlier "Veltrix" is the better
+thing for Orca to announce is a judgement no a11y tree can make. Re-scope this item to that.
+
+### 44. What the calculator bench left open (2026-07-31)
+
+The run that produced `launchApp`-resolves-a-name, launch-focuses-under-grab and
+`collapseContained` also produced three things that were measured but NOT acted on.
+
+**(a) The model drives text entry one glyph per API round trip — and we may have caused it.**
+Asked to compute `1847 × 293`, run 1 used `type_text "1847"`; runs 2 and 3 clicked eight digit keys
+individually, 8 steps where 1 would do, and the glyph-by-glyph path is also where the name mistakes
+happen (`*` instead of `×`). The plausible cause is uncomfortable: **the focus refusal we removed
+was the thing advertising the keyboard**, since the recovery went through `focus_window`, whose
+description says it is "the precondition for the synthetic keyboard". The obvious response — a line
+in `click_app`/`launchApp` pointing at `type_text` — is a PROMPT change and must be treated as one:
+A/B it on the same model with a fresh conversation each run, report the token cost, and remember the
+falsified theory in #39 (removing "Off by default" changed nothing). **Unproven; do not land it as
+an obvious win.**
+
+**(b) ~~There is no IPC verb to start a new conversation.~~ RESOLVED 2026-08-01 —
+`agentNewConversation`.** See `state-and-ipc.md`. Two things this item got wrong, both worth keeping:
+
+- **It is NOT gated, and equating it with `agentSend` was the error.** `agentSend` *causes* a turn,
+  so it spends the user's API budget directly; this one only resets state — the next turn pays an
+  uncached prefix, but only if a human sends one. The control it actually needs is the opposite kind:
+  **who may call it**, not how much it may spend. It is in the daemon's `HIDDEN_ACTIONS`, so the
+  Assistant cannot reach it (a mid-turn reset would strand the `tool_call` whose `tool_result` the
+  next request must carry), while a terminal and an MCP client can. A permission toggle would have
+  bought nothing here and left the real hazard — the model calling it on itself — wide open.
+- **The stated reason the old dance was needed was wrong.** The shell does not rewrite the state
+  files on exit (`saveTranscript()` fires only at turn end); it holds the conversation **in memory**,
+  which is why deleting the files under a live shell is silently undone. Same conclusion, different
+  mechanism — and the difference matters, because "it writes on exit" implies deleting files after a
+  stop is unreliable, and it is not.
+
+**(c) `collapseContained` has no test and cannot easily get one.** It needs a live AT-SPI tree;
+`agent-loop` stubs the helpers and never reaches the resolver. It is a pure function of boxes, so a
+GJS unit runner would cover it — there is no such runner today, and standing one up is its own
+decision (the same one #39.14 reaches from the shell side).
+
+**Data point for #39.6 while here:** on `gemini-2.5-flash` the implicit cache DOES fire — `cached=`
+was non-zero on 8 of 13 steps, up to 10.7k tokens, i.e. the fixed `sys`+`tools` prefix (22 KB) is
+largely paid once. That does not contradict the "1 hit in 36" measured on `gemini-3-flash-preview`;
+it narrows it to that preview model. The consequence is that **the growing history, not the schema
+block, is the lever** — the step-4 `query_app` dump (11 KB, no `match`) was resent on all nine
+following steps, ≈25k of the turn's 127k tokens.
+
+### 46. All three layers are monitor-sized and blurred — and dynamic sizing is a DEAD END (2026-08-02)
+
+> **Since #708 point 3 (2026-10-06) there are TWO such layers, the bar and the dock** — the island
+> is a panel of the bar again. The measurements below were taken with three, and stand as they were.
+
+`hyprctl layers` on a 2560x1440 desktop: `veltrix-bar`, `veltrix-dock` and `veltrix-island` are all
+`0 0 2560 1440`, **all three with blur**. Making the island resize itself was implemented, measured,
+and **reverted the same day**. Read the "what was ruled out" part before proposing it again.
+
+> **Status 2026-08-04 — CLOSED. Every blurred surface declares a `set_visible_region`, each measured
+> on the real shell: horizontal dock −7.0, island −7.2, bar −6.9, vertical dock −7.9 GPU points. The
+> surfaces are still monitor-sized — that is the whole point of the mechanism. Kept here as the
+> record of what was ruled out (dynamic sizing, splitting a surface, `xray`) and of the two rules
+> that govern a region.**
+>
+> **Addendum 2026-08-09 — the saving was CONDITIONAL and one of the conditions is now gone.** Those
+> four numbers were all measured AT REST. The moment something opened, the code handed the whole
+> surface back on purpose, so the win evaporated exactly when the screen was busiest. The worst
+> case was the DOCK, because its guest was the app grid: `st.appGridPanelOpen` in each axis cleared
+> the region outright, and `appGridPainting` held it cleared through the close animation. **§18
+> fixed that at the root** — the grid moved to its own surface (`AppGridWindow.ts`), so the dock now
+> declares its pill rect in every state (every `apply()` in both axes passes one; no branch clears
+> it), and the grid declares its own **1110×834 of 2560×1440** while open and is UNMAPPED when
+> closed. **The equivalent condition on the BAR is gone too, same day** — `paintsBelowStrip()` used
+> to clear the region for ANY open panel (CC, NC, Prism, system menu, expansion capsule, banners),
+> i.e. for most of any interaction; it now declares `strip + one padded rect per open panel`. See
+> the section at the end of this entry. ⚠️ The dock's numbers above are still valid — they were
+> at-rest measurements and the at-rest path did not change. **Both 2026-08-09 changes are now
+> MEASURED** (same day, last section): with the CC open the bar costs **4.1 % → 0.65 %** GPU, i.e.
+> an open panel adds nothing over the no-panel baseline; with the app grid open, all four surfaces
+> declaring is **22.8 % → 2.0 %**. Read the two harness traps there before running it again.
+
+**The mechanism, because `ignore_alpha` makes it easy to guess wrong:** Hyprland charges layer blur
+by the surface's **BOX**, not by the pixels that end up visible. `ignore_alpha` decides what is SEEN
+blurred, not what is COMPUTED — it is cosmetic and buys nothing here. Cost ≈ *damaged area × number
+of blurred layers covering it*, so with three full-screen layers **every repaint of every window
+anywhere pays triple blur**. It is a tax on daily use (scroll, video, dragging), not on idle — a
+different axis from #18's idle work.
+
+**Where this section came from (2026-08-01), because the framing still does the work.** The first
+measurement was not "shrink a layer" but "turn each layer's blur OFF and see what comes back", via a
+temporary `layer_rule` override + `hyprctl reload` under continuous synthetic damage:
+
+| | GPU |
+|---|---|
+| all three layers blurred (what shipped) | 43.7 % |
+| island's blur off | 33.4 % |
+| + dock's off | 23.1 % |
+| + bar's off | 12.0 % |
+| `decoration:blur:enabled = false` | 8.6 % |
+
+🔑 **~10 points per full-screen blurred layer — and the ISLAND, which showed a ~300px capsule, cost
+exactly what the BAR cost.** That sentence is the whole reason this section exists: it separates
+what a surface *is* from what it *shows*, which is the distinction every fix since has been built on.
+⚠️ **The absolute numbers are that day's machine, not today's** — idle alone was 4-6 % before #18
+fixed it (it is 0.0-0.1 % now), and the modern harness reads +5.9 pts for a full-screen blurred
+layer. Quote the ratio, never the values. (This measurement was recovered 2026-08-10 from a branch
+that was never pushed; the rest of that day's findings had already landed through the AgentGlow work.)
+
+**Measured 2026-08-02**, synthetic damage 1600x700 at 144/s, 3 rounds shuffled, baseline stable to
+±0.4 pts: a full-screen blurred layer costs **+5.9 pts** of GPU; the same layer shrunk to what it
+actually shows costs **+0.4**. Fixing the island A/B'd at **31.4% → 25.3% (−6.1 pts)** against the
+real shell. ⚠️ **Do not quote these as the user-visible win:** cost scales with area × repaint rate,
+so 720p video at 60fps is roughly a third of this load (~2 pts/layer). Real, worth doing, not
+dramatic.
+
+#### Why dynamic sizing was reverted — and what was ruled out
+
+The island version WORKED and delivered the win: A/B'd against the real shell at **31.4% → 25.3%,
+−6.1 pts**, capsule and modes functionally unchanged, surface cycling cleanly 96↔1440 with no
+unmap/remap. It was reverted anyway, because **every grow produced a visible artefact**: the
+workspace dots rise and stretch horizontally, the indicator chips narrow upward before hiding. Fast —
+a frame or two — but plainly visible, on every single open.
+
+**Ruled out, each by a build the user compared against the pre-change one:**
+1. **GTK layout — the whole widget tree, with a CONTROL.** Instrumented `IslandWindow` to log
+   window, root, every hit target and every `MorphRevealer` (bounds + `progress`) on every frame
+   across a grow. Results: the capsule is constant at `1103,8 273x32` throughout; the chips are
+   constant until they unmap; the opening mode's revealer shows **one frame at `0,0 0x0`** before
+   snapping to `381,8 1798x341`. That `0x0` frame looks like a smoking gun and **is not one** — the
+   control build (`COLLAPSED_H` = monitor height, i.e. every other change in place but no resize
+   ever happening, the build the user confirms looks correct) shows **the identical `0x0` frame**.
+   It is just GTK: a widget made visible has no allocation until the next layout pass.
+   ⚠️ Deferring the reveal until `win.get_height()` matches does NOT avoid it either — the window
+   reports its new height a frame BEFORE its children are allocated. Waiting on the window is
+   waiting on the wrong thing.
+   **Conclusion, now with a control behind it: shell-side geometry is IDENTICAL in the good and bad
+   builds.** The only difference is the surface resize, so the artefact is compositor-side and
+   cannot be fixed from the widget tree.
+2. **Hyprland's `layers` animation** (it animates layer geometry, speed 3 / easeOut — the obvious
+   suspect for a stretch). Disabled globally via the user config; artefact unchanged. Note the base
+   config sets it at hyprland.lua:228 and `safe_require("hyprland-user")` runs at :637, so a user
+   override does win — verify with `hyprctl animations` and read the `enabled` field, not just the
+   first two lines.
+3. **Timing / ordering.** Deferring the morph until the allocation matched, then a further
+   `SETTLE_FRAMES` for the buffer to catch up: no effect. The artefact tracks the RESIZE, not the
+   animation that follows it.
+4. **Blur kernel clamped at the surface edge** (with a 96px surface the capsule has only 48px of
+   margin below it, less than the effective blur radius). Raised the collapsed height to 320: no
+   effect.
+
+5. **Hyprland re-arranging the other layers on a resize** (user's hypothesis: the island ignores
+   exclusive zones — `zone -1` — while the bar respects them, so they visibly diverge when
+   Hyprland's error bar appears). Polled `hyprctl layers` at ~250/s while a test layer toggled
+   between `2560x1300` and `400x60`: **every other layer reported exactly one geometry throughout**.
+   Resizing one layer does not move the others.
+
+The only change that removed it was removing the resize. **Root cause not established** — it is
+somewhere in how the compositor presents a layer surface across a size change, and chasing it further
+needs Hyprland-side instrumentation, not shell-side.
+
+⚠️ **Correction 2026-08-09: this evidence is ISLAND-SPECIFIC, and the heading over-generalises.**
+Every ruled-out hypothesis above was measured on a surface that STAYS MAPPED and cycles its size
+96↔1440, and the artefact tracked the RESIZE. The app grid never resizes its surface — it maps at
+full size and unmaps (§18) — so "dynamic sizing is a dead end" does not automatically transfer to a
+map/unmap surface; nobody has tested that case. It is still not worth spending: with a region
+declared, the remaining headroom is the difference between this entry's own +0.4 (a layer showing
+only what it paints) and 0, i.e. the tail of the win, and only while the grid is open. **Do not cite
+this section as proof for a surface that does not resize.**
+
+**Separate bug found along the way (user-reported 2026-08-02) — FIXED the same day**, see
+`architecture.md`'s IslandWindow section and `HyprlandState.layerTop`. That first fix read the bar's
+position once per `configreloaded`, which fixed the island going DOWN and left it stuck there when
+the error bar went away (user-reported 2026-08-04): Hyprland releases that reservation after a fade
+animation, on no event at all. Now measured on the event and then watched at 400ms **only while
+displaced** — the reasoning, the Hyprland source it rests on, and the layer-ordering rule that
+decides which surfaces can displace the bar are all in `architecture.md`.
+
+**So: do not re-propose "just make the layers smaller".** It is measured, it works, and it looks
+wrong. If the GPU cost is worth paying down, the mechanism has to be one that does not resize the
+surface at all — which is `set_visible_region` (below).
+
+**If someone does revisit it anyway**, the parts that were right and should be reused: keep the
+origin fixed (anchor TOP, leave BOTTOM free, drive HEIGHT only) so every root-relative rect stays
+valid; grow BEFORE the animation; shrink only once every revealer is at rest closed — a surface does
+not draw outside its own rect, and `MorphRevealer.reveal` fires `onDone` synchronously for revealers
+already in the target state, so a naive shrink-on-done guillotines the one still animating.
+
+#### Also dead: splitting the island into TWO surfaces (capsule small + modes on demand)
+
+The obvious follow-up — capsule and chips on a small surface that never resizes, modes on a
+monitor-sized surface that is only MAPPED while something is open — was prototyped in C on
+2026-08-02 (`handoff.c`, scratchpad). Three sub-questions passed:
+
+- **Map/unmap is visually clean** (soft fade from `layersIn`, no stretch, no jump) and **costs zero
+  while unmapped** — measured as a textbook square wave: a layer toggling every 1.5s produced 7 low
+  and 7 high 1.5s windows with a **4.5 pt** step, returning to baseline every cycle.
+- The small surface **never resized and never remapped** (2560x96 in 1745/1745 samples) once it was
+  changed to stop PAINTING rather than hide.
+- `hl.layer_rule` accepts **`animation = "none"`**, so the map fade can be suppressed per namespace.
+
+**The handoff itself is what kills it.** Whichever way it is ordered, the small surface's frame lands
+before the big one's — its buffer is 2560x96 against 2560x1440, so it renders sooner. Result,
+confirmed by the user on the prototype: **opening shows a GAP** (capsule's glass vanishes, then the
+mode's appears) and **closing shows DOUBLE GLASS**. Reversing the order just swaps which end gets
+which. Even moving the map out of the critical path — present the big surface empty and transparent
+first, then swap contents on two already-mapped surfaces in one turn — does not fix it, because the
+two commits still land on different frames.
+
+**What it would take is an atomic commit across two layer surfaces, and Wayland does not offer one.**
+That is the real reason the whole island lives on ONE surface (the 2026-07-26 seam) — inside a single
+surface the handoff IS atomic. Treat commandment 5's exception as load-bearing, not stylistic.
+
+#### Also dead: `decoration:blur:xray = true`
+
+The one zero-code lever: with xray the layers blur only the BACKGROUND, so a window repainting under
+them costs nothing — exactly the cost measured above, gone for a config line. **Rejected on design
+grounds (user, 2026-08-02), and the reason generalises past the bar:** it applies to every glass
+surface we have. Open the Control Center over a window and it would blur the *wallpaper* instead,
+with the window simply absent underneath. The glass would stop behaving like glass. That is not a
+taste setting, it breaks the premise of the material — do not offer it as a Setting either.
+
+#### The remaining candidate: `set_visible_region`
+
+`hyprland-surface-v1.set_visible_region` (`hyprland-protocols`, in Arch `extra`; Hyprland ≥0.56
+implements it — verified in the installed binary's symbols) declares a visible sub-region and
+recovers ~88% of the same cost **without resizing the surface at all**, so by construction it cannot
+produce the artefact above. Measured 2026-08-02 with a purpose-built C client: full-screen blurred
+layer +5.9 pts, same layer with a 400x60 region declared **+0.7**, and it holds even when the damage
+falls directly UNDER the declared region (cost tracks the intersection, monotonically — a 1280x600
+region costs +3.0). Two caveats from the same measurements: there is a **floor of ~1 pt per layer**
+however small the region (the blur samples past the edge, so the cost is the region expanded by the
+radius), and a region declared away from the damage measured CHEAPER than an unblurred full-screen
+layer — the clip cuts composition too, not just blur.
+
+**Why it is not done:** it cannot be called from GJS (`libwayland-client` has no GI, and
+`gdk_wayland_surface_get_wl_surface` is `introspectable="0"` in `GdkWayland-4.0.gir`), so it needs a
+small C library with GIR + typelib, packaged into pacman/`install.sh` and wired into all three
+bundles. Precedent for the C part exists (`bin/veltrix-input.c`, compiled by `install.sh` and the
+PKGBUILD) but that is a standalone binary; this one has to be **in-process**, because the region is
+set on OUR OWN `wl_surface`.
+
+⚠️ **Its failure mode is worse than resizing's, and that is the real design constraint:** content
+outside the declared region is **not drawn at all** — a hard GL scissor on the geometry, not just on
+the blur (`OpenGL.cpp` ~1574-1594: with a non-empty `clipRegion` the texture draw iterates the clip
+region instead of the damage). And `SurfacePassElement.cpp:150-158` intersects the region with the
+buffer and sets `cancel` if it comes out empty, so a stale region after a resize **makes the surface
+vanish** rather than degrade. There is exactly 1px of tolerance (`visibleRegion.expand(1)`).
+Confirmed in the source and live: with a 1200x400 shape declared visible only over its left 400px,
+the other 800px — frame included — simply were not there.
+
+#### ✅ 2026-08-04: the blocker is gone — `lib/veltrix-wl/` exists
+
+The C library described above is built and packaged (`install.sh`, PKGBUILD, headless smoke), and the
+region path is verified end-to-end **from GJS**: a 800x400 layer window declaring a 220x110 region
+draws only that patch. `hyprland_surface_manager_v1` advertises **v2** on Hyprland 0.56, so the
+request is live, not theoretical. See `architecture.md` → "`lib/veltrix-wl/`".
+
+⚠️ **One trap found while wiring it, and it looks exactly like success:** the region only applies on
+the next real `wl_surface.commit`. The first A/B here showed *no clipping at all* with the request
+delivered and no error — the test window's content never changed, so GTK never committed.
+`gtk_widget_queue_draw()` alone does not force it. **Declare the region as part of a change that
+repaints**, and do not trust a `TRUE` return as proof it took effect.
+
+**What is left is the per-surface work, which was always the real cost:** each surface has to know
+what it is currently showing. Order by risk — island (own layer, modes already explicit state), then
+dock (~200 px of margin for magnification and bubbles), then bar (its `Gtk.Overlay` overlays make the
+region hardest, and it is the one whose failure is most visible).
+
+#### ✅ 2026-08-04 (same day, later): the horizontal dock, MEASURED on the real shell
+
+Not synthetic any more. A/B on this machine (2560x1440@144, `damage` layer repainting at vsync, three
+rounds, order shuffled, `VELTRIX_VISIBLE_REGION=0` as the only variable — the shell is restarted in
+both arms so map order and startup cost are identical):
+
+| damage 1600x700, ABOVE the dock (the everyday case) | GPU |
+|---|---|
+| no region (2560x1440 box) | 34.0 % |
+| region declared | **27.0 %** |
+
+**−7.0 points**, with non-overlapping ranges (33.2–34.8 vs 26.6–27.6). Idle without damage: 3.9 %.
+
+| damage 1600x340 landing ON the dock's strip | GPU | declared rect |
+|---|---|---|
+| no region | 30.5 % | — |
+| padding 260/200 | 23.4 % | 1586x366 |
+| padding 24/24 | **19.4 %** | 1234x130 |
+
+So the region is worth ~7 points either way, and **the padding alone was worth another 4**.
+
+🔑 **Three findings that make the dock's implementation smaller than it looked:**
+
+1. **The dock's tooltip AND its context menu are `Gtk.Popover`s** (`common/Tooltip.ts`,
+   `DockItem.tsx` — `renderMenuModel` only builds the ROWS, the popover is the dock's). Own Wayland
+   surfaces, so this region cannot clip them — which is also why the dock's layer rule needs
+   `blur_popups` on top of `blur`. The fat 260 px cross-padding was reserving room for something that
+   never paints in this surface; the magnified bulge is already inside the rect via `reach()`, and the
+   rect is already built at `totalMain + 500`. Padding is now 24/24, and the comment says why.
+2. **A menu being open is not a reason to give up.** Same reason: it paints elsewhere. The branch
+   now hands over the body rect instead of clearing. ⚠️ It needed its own cache key — sharing the
+   grid's would let a grid-open transition match a stale key and keep the dock's small rect, which
+   WOULD clip the grid.
+3. **A hidden dock can keep declaring its rect.** Auto-hide slides the LAYER (`applySlide` →
+   layer-shell bottom margin), not the content, and the region is buffer-local: the pill never moves
+   inside its own buffer. The auto-hide and fullscreen branches now declare the body rect too — they
+   only ever differed in INPUT.
+
+**Escape hatch, and how the A/B is run at all:** `VELTRIX_VISIBLE_REGION=0` (read in
+`common/VisibleRegion.ts`) keeps every surface un-optimised. It exists because the failure mode is a
+missing piece of desktop, not a glitch — someone who hits it needs a bootable shell before they can
+report anything, and `systemctl --user set-environment` works from a TTY.
+
+#### ✅ 2026-08-04: the ISLAND, the layer with the worst ratio
+
+Monitor-sized, blurred, and at rest it shows a ~750x64 capsule — **1.3 % of its own box**. Measured
+with the same harness, damage placed outside both the island's band and the dock's strip, and the
+dock's region active in BOTH arms so the delta is the island alone:
+
+| | GPU |
+|---|---|
+| island declares nothing | 26.6 % |
+| island declares its capsule | **19.4 %** |
+
+**−7.2 points**, ranges non-overlapping (26.3–27.1 vs 18.6–20.0).
+
+🔑 **The rule here is the OPPOSITE of the dock's, and the difference is the morph.** The dock knows
+its silhouette before it paints, so it can declare in every state. The island's expanded modes arrive
+through a `MorphRevealer`, and **a widget just made visible has no allocation until the next layout
+pass** (the `0,0 0x0` frame documented above — normal GTK, present in control builds too). A region
+computed at open time would describe the capsule alone while the mode paints outside it, and the mode
+would be scissored away *for as long as it stayed open*. So: **declare only while resting as the
+compact capsule; hand the whole surface back the moment anything is revealed or still animating**
+(`get_visible()` is not enough on the way out — a closing revealer is visible until its final tick,
+`tickId` is what says "still moving"). Resting is ~all of the time and is the expensive state anyway.
+
+⚠️ **SUPERSEDED 2026-08-10 — the rule in that last paragraph was wrong** (see the entry below). The
+missing allocation lasts ONE FRAME, not "as long as the mode stays open", and `MorphRevealer` has the
+same `onAllocated`-inside-`vfunc_size_allocate` guarantee the bar's panels rely on. The island now
+declares its open modes too; the numbers above (capsule at rest, −7.2 pts) still stand.
+
+🔑 **The two paddings are deliberately asymmetric (200 x / 16 y), and that asymmetry is what makes it
+safe.** The win is entirely in the HEIGHT — 1440 → 64. The horizontal is where the MOTION is: the
+capsule is centred, so anything changing its width slides it sideways, and one of those paths
+re-stamps **400 ms late** (`Bar.tsx` → `onBackgroundChanged`: a chip appearing does not resize the
+glass, so the `resize` hook never fires). Late is harmless for an input region and *fatal* for a
+visible one — it would be a chip that is not drawn for 400 ms. A pad wider than any such shift
+(three chips ≈ 150 px) retires that whole class of bug for almost no area.
+
+**General lesson for the bar, which is next:** an input region tolerates being late, a visible region
+does not. Every call site that stamps input has to be re-read with that question before it can be
+trusted to stamp blur too.
+
+#### ✅ 2026-08-04: the BAR — the third and last monitor-sized layer
+
+The hard one on paper: every overlay in the shell lives inside this window (commandment #5), so the
+region has to follow which of them is open, and the failure mode is the most visible on the desktop.
+In practice the mechanism above made it small. Same harness, damage 1600x700 at y=200..900 (below the
+bar strip, above the dock's), dock and island declaring in BOTH arms:
+
+| | GPU |
+|---|---|
+| bar declares nothing | 19.3 % |
+| bar declares its strip | **12.4 %** |
+
+**−6.9 points**, ranges non-overlapping (18.9–19.7 vs 11.9–12.7). Declared rect **2560x64 = 4.4 %**
+of the box — the same order as the dock (−7.0) and the island (−7.2). Idle: 1.6 %.
+
+**Shape**: the island's rule, since the bar is in the island's situation, not the dock's — panels
+arrive through `ScaleRevealer`s and paint far outside the strip. So: declare `0,0 W x (strip+16)`
+only while nothing else in the window paints, hand the whole surface back otherwise. Full monitor
+WIDTH on purpose: the surface is that wide anyway, and it buys immunity to every capsule that resizes
+itself (window title, clock, tray). The height is where the entire 1440 → 64 win lives.
+⚠️ **The second half of that rule was replaced on 2026-08-09** — the bar now declares the panels too;
+see the last section of this entry. The strip rect and the reason for its full width are unchanged.
+
+🔑 **The "can this stamp be late?" audit found exactly one offender, and it was written in the code
+as a deliberate choice.** `NotificationPopups.tsx` defers its stamp to an idle *on purpose*, so it
+reads a settled allocation, reasoning that a banner is not clickable until it has grown in anyway.
+Correct for input, fatal for blur: a banner appended in one turn and declared an idle later is a
+banner that is **never drawn**. Fix is mechanical — appending fires a second, SYNCHRONOUS hook
+(`onContentAppeared`) that only ever clears the region; the deferred hook keeps owning input.
+`showExpansion` needed the same treatment (it makes the panel visible, then defers 16 ms to position
+and reveal it), and the `inputYield` early-return needed the region call the island's does: a yield
+changes who gets the CLICKS, not what is painted.
+
+🔑 **The predicate is WALKED off `masterOverlay`, not hand-listed** — a panel mounted there later is
+covered by construction. Two children are not panels and are documented at the call site: `barBox`
+(the strip itself) and `popups` (a container, `visible` whether or not it holds a banner — its
+CHILDREN are the content). An open ISLAND mode does not count either and no longer needs excluding by
+hand: the island paints on its own surface, so nothing of it is a child here and this window still
+declares only the strip — and a long-running activity (media, the assistant) is exactly when the
+saving is worth having. Two earlier drafts gave that optimisation away in exactly that state: one
+used `status.isAnyOverlayOpen` as a safety net, and the other had to skip the `overlay-catcher` by
+hand because it was shown for island modes (both are gone — the catchers were deleted 2026-08-05).
+
+The rect is floored at `PANEL_TOP` rather than depending on the measurement, so the **first** stamp
+declares something instead of giving up until an overlay opens; the floor is right by construction
+(every panel in this window is positioned to start there). The real declaration rides the 300 ms
+opacity change — the shim only applies a region on a real commit, never on `queue_draw()` alone.
+
+Verified in the live session before measuring, one screenshot per state: rest, control centre, Prism,
+the expansion capsule (window menu) and a `notify-send` banner. All draw complete, all keep their
+blur.
+
+#### ✅ 2026-08-04: the VERTICAL dock — the debt is CLOSED
+
+Mechanical, as predicted: `verticalAxis.buildInputRegion` now mirrors the horizontal one branch for
+branch (body rect computed before the branches, handed over by the fullscreen / auto-hide-trigger /
+menu branches, cleared for the yield and the app grid).
+
+| damage 1600x700 to the RIGHT of a left-side dock | GPU |
+|---|---|
+| no region | 20.8 % |
+| region declared | **12.9 %** |
+
+**−7.9 points**, ranges non-overlapping (20.3–21.2 vs 12.2–13.5). Declared rect **130x1252** — the
+biggest saving of the four surfaces.
+
+🔑 **The paying axis is SWAPPED, and it changes which padding is expensive.** Horizontally the
+surface is 2560x1440 to show a strip at the bottom, so the win is the height; vertically it is 2560
+wide to show a ~130px column, so the win is the WIDTH, and the tall rect (the ±250 main padding that
+was already in the input region) is nearly free — it only costs when damage lands inside a 130px
+column. Tightening it is a knob, not a fix; the horizontal axis' 260/200 → 24/24 experiment does not
+transfer, because there the padding was on the *wide* axis.
+
+⚠️ **The key-collision trap from #90 was already present here, latent.** Two branches (`appGridPanelOpen`
+and `menuOpenCount > 0`) both keyed `"null"`. Harmless while the key only guarded `set_input_region`,
+a real bug the moment a blur rect rides the same cycle: the menu branch declares the body rect, so a
+menu→grid transition would have matched the cached key and **scissored the app grid away**. Keys were
+made `grid` / `menu:<body>`. ⚠️ **The `grid` branch is gone as of 2026-08-09** (§18 — the grid left
+the dock's window), so the collision cannot recur here; the LESSON still applies to every branch
+added to `buildInputRegion`, which is why `menu:<body>` keeps a distinct key with nothing to collide
+with today.
+
+Verified live with the dock moved to the left: rest (full column, glass intact), app grid open (draws
+complete over the dock), auto-hide on→off (returns clean). Setting restored to `bottom` afterwards.
+
+**This closes §46's implementation.** All four blurred surfaces declare: horizontal dock −7.0,
+island −7.2, bar −6.9, vertical dock −7.9.
+
+#### ✅ 2026-08-09: the BAR declares its PANELS too — the last conditional saving
+
+The at-rest numbers above were never the whole story: `paintsBelowStrip()` handed the entire surface
+back for **any** open panel, and five of them live in this window (CC, NC, Prism, system menu, the
+expansion capsule) plus the notification banners. "Something is open" is most of any interaction, so
+the −6.9 evaporated exactly when the screen was busiest. It now declares **`strip + one padded rect
+per painting panel`**. Measured on the live shell with the CC open: `2560x64` + `388x642` =
+**11.2 % of the box**, against 100 % before.
+
+🔑 **The bar was never in the island's situation — it is in the app grid's, and the difference is
+one option object.** The island was believed unable to declare while open, because its modes arrive
+through a `MorphRevealer` (wrong, and fixed the next day — see the 2026-08-10 entry; the belief is
+what mattered here, because it is what the bar copied). Every panel here is a
+`ScaleRevealer` with `OVERLAY_POP` and `animateLayout: false`, so the allocation is the FINAL one
+from the first laid-out frame and the 0.97→1.0 pop paints strictly inside it. Borrowing the island's
+rule wholesale was the actual mistake, and it cost the entire open-state saving for four months.
+
+🔑 **What makes it safe is `onAllocated`, and specifically WHERE it fires.** `ScaleRevealer` calls it
+from inside `vfunc_size_allocate`, i.e. before the snapshot of the same frame — so however stale the
+bounds were when the open path stamped, the panel's real rect lands on the very frame that first
+paints it. That retires the whole "can this stamp be late?" class for the panels without a tick
+callback, a timeout, or a settle count. ⚠️ Consequence: that hook is now **load-bearing for what is
+drawn**, not just for clicks, so it is wired by walking `masterOverlay` like the rect predicate
+itself. A hand-list that missed a panel added later used to cost a late click; it would now cost a
+panel that is not drawn.
+
+⚠️ **The banners are the one thing that still clears**, and only inside a known window: between
+`onContentAppeared` (synchronous, fires on append) and the deferred stamp that follows the grow-in,
+the box's bounds describe the PREVIOUS stack — a second banner declared off those bounds is a banner
+that is never drawn. A `popupsSettled` flag makes that window explicit instead of hoping. Their band
+is also the only one declared at **full monitor width**: swipe-to-dismiss flips the revealer to
+`overflow: VISIBLE` and flings the card clear off screen, and that is the one place GTK stops
+clipping for us.
+
+🔑 **The pad is 16, not the app grid's 48, and the reason is structural**: every panel here sits
+inside a revealer whose `overflow` is `HIDDEN`, so whatever it paints outside its allocation is
+already clipped by GTK before the compositor sees it. The pad covers rounding, not an escaping shadow
+(Hyalo casts the panes' shadows itself). When a surface's own widget tree
+already clips, the region does not have to guess at a margin — check that before padding.
+
+`common/VisibleRegion.ts` grew `setVisibleRects` for this (`setVisibleRect` is now the one-rect
+convenience). Multi-rect is free protocol-side — `wl_region_add` is additive and Hyprland iterates
+the clip region, not its bounding box — so the cost is the rects' own area, not their union's box.
+
+Verified live, one screenshot per state: rest, control centre, notification centre, Prism empty,
+Prism with results (the slide-down revealer that resizes per frame), the window menu (expansion
+capsule, left-anchored), the system menu, one banner, two stacked banners, and CC **edit mode** (the
+panel grows from 610 to ~900 px and the Done pill draws). All complete, none clipped.
+
+#### ✅ 2026-08-09, same day: MEASURED — and the harness has two traps of its own
+
+Damage layer 1600x700 at (480,200) — below the bar strip, above the dock's, clear of the CC's rect —
+on an **empty workspace**, `amdgpu` `gpu_busy_percent` sampled at 20 Hz for 20 s per arm, shell
+restarted in every arm. Baselines: idle **0.0 %**, damage running with nothing open **0.6 %**.
+
+**Scenario 1 — the control centre open, single variable = `Bar.tsx`** (the old file checked out from
+`main`, so dock and island declare in BOTH arms), 3 rounds shuffled:
+
+| CC open, damage at 144 fps | GPU |
+|---|---|
+| bar hands the whole surface back (old) | 4.0 / 4.2 / 4.0 % |
+| bar declares `strip + panel` (new) | **0.7 / 0.7 / 0.6 %** |
+
+**−3.4 points**, ranges nowhere near overlapping. 🔑 The number that matters is not the delta but the
+**0.6**: that is the no-panel baseline, so **an open control centre now adds nothing measurable to
+the blur bill**, where it used to add +3.4. The open state stopped being the expensive one.
+
+**Scenario 2 — the app grid open, every surface's region vs `VELTRIX_VISIBLE_REGION=0`** (the
+all-or-nothing switch, so this bounds the whole §46 mechanism in the busiest state rather than
+isolating one surface), 2 rounds shuffled:
+
+| app grid open, damage at 144 fps | GPU |
+|---|---|
+| no surface declares | 22.8 / 22.8 % |
+| all four declare | **2.1 / 2.0 %** |
+
+**−20.7 points, −91 %.**
+
+⚠️ **Trap 1: a cairo `draw_func` is not a valid damage source.** Rasterising 1.1 MP on the CPU every
+frame throttled the client to 27–40 fps — and to a DIFFERENT rate per arm (31 vs 40), so the two arms
+were carrying different loads and the GPU comparison meant nothing. A single **GSK color node**
+(`vfunc_snapshot` + `append_color`) holds 144.0 fps in every arm. **Print the fps and refuse any arm
+that is not at the monitor's rate**; the first two rounds of this measurement were thrown away for
+exactly this.
+
+⚠️ **Trap 2: a stray damage client from an earlier launch doubles the load and says nothing.** Kill
+by pattern, not by pidfile. (And `pkill -f damage.js` from a shell whose own command line contains
+that string kills the shell instead — put the kill in a script file.)
+
+#### ✅ 2026-08-10: the ISLAND declares its OPEN MODES too — the rule above was wrong
+
+The 2026-08-04 entry says the island "genuinely cannot declare while open" because its modes arrive
+through a `MorphRevealer`. That was the same mistake the bar made, one layer further along: it is
+true while the morph has **no allocation yet**, which is one frame, and it was written as if it were
+true for **as long as the mode stays open**, which is a whole Assistant conversation.
+
+`MorphRevealer.onAllocated` fires from inside `vfunc_size_allocate` — the same property that made the
+bar's panels safe — and `IslandWindow.mount` had already wired it to `updateInputRegion` (for clicks)
+since the focus-grab migration. The blur region rides the same call, so a mode's rect lands on the
+frame that first paints it, and on every relayout after that (a growing conversation, a `margin_top`
+re-pin). Measured on the live shell, declared rect as a share of the 2560x1440 box:
+
+| island state | declared | % of its box |
+|---|---|---|
+| at rest (capsule) | 753x64 | 1.3 % |
+| Assistant | 792x145 | **3.1 %** |
+| battery | 753x159 | 3.3 % |
+| media player | 832x278 | 6.3 % |
+| workspace overview | 2560x457 | 31.7 % |
+
+All of them were **100 %** before. The overview is full-monitor-width by design, so its win is 3×;
+the Assistant — the mode that stays open for as long as a conversation lasts — is 32×.
+
+🔑 **The morph needs no per-frame region, and that was the thing actually worth avoiding.**
+`applyProgress` only sets opacity and queues a draw — never a relayout — so the revealer's allocation
+is FINAL from its first layout pass: **one stamp per open, one per close**, verified in the log (a
+`pending` immediately followed by one rect, then silence for the whole 300ms). And the travelling
+shape stays inside that one rect: it is `lerp(capsule, glass)`, the capsule is a hit target, the glass
+is inside the revealer's own box (the shape's cairo node clips itself to that box + 8px), and a lerp
+between two rects sharing a top edge and a centre never leaves their bounding box.
+
+⚠️ **The one frame that cannot be measured is the turn that REVEALS a mode** — `set_visible(true)`
+runs before any layout pass. That is the `pending` case and its answer is the whole surface, for the
+single frame until `onAllocated` re-stamps. Falling back to "I don't know" is the only correct answer
+there; a rect computed from a revealer with no allocation describes the capsule while the mode paints
+outside it, and outside the region is NOT DRAWN.
+
+⚠️ **The indicator chips are covered by the PAD, not by a rect anyone computed for them.**
+`hitTargets()` drops them the moment they fade to opacity 0 (35 % into the morph, by design), so any
+re-stamp taken mid-morph measures a union without them — and on the way back out they ramp up again
+with no relayout to trigger a re-measure. Three chips ≈ 150px against `BLUR_PAD_X = 200`. Anyone
+tightening that pad has to give the chips a rect first.
+
+Verified visually per mode on the real shell (overview / player / Assistant fully drawn, blur intact)
+and numerically at the risky edge: sampling a column down through the player panel's drop shadow,
+alpha reaches 0 at y≈236 against a region bottom of 278 — the 16px pad clears the shadow with room,
+so nothing is scissored mid-fade.
+
+**MEASURED in GPU points** with the harness above — which now **lives in the repo** as
+`scripts/dev/blur-arm.sh` + `blur-damage.js`, recipe and failure modes in `dev-workflow.md`, because
+it had been rebuilt from these notes twice (damage 1600x700 at 480,200; empty workspace;
+`gpu_busy_percent` at 20 Hz × 20 s; shell restarted per arm; **the only variable is
+`IslandWindow.ts`**, so dock and bar declare in both arms; every arm held 144.0 fps):
+
+| | GPU |
+|---|---|
+| island CLOSED (the floor) | 1.0 % |
+| Assistant open, surface handed back (old) | 5.9 / 6.1 % |
+| Assistant open, rect declared (new) | **1.1 / 1.2 %** |
+| overview open, surface handed back (old) | 4.3 % |
+| overview open, rect declared (new) | **1.8 %** |
+
+🔑 **The Assistant lands on the CLOSED floor**: opening it no longer costs anything measurable, the
+same result the bar got for the CC. The overview keeps a real cost (1.8 vs 1.0) and that is correct
+rather than disappointing — its declared band genuinely overlaps the damage rect, and §46's cost
+model is the *intersection* of the damage with the region. ⚠️ Which is also the caveat on all six
+numbers: they are specific to where this harness puts its damage. A mode whose region does not
+overlap the damage reads as free; move the damage under it and it will not.
+
+#### ✅ 2026-08-10: the overview RE-MEASURED after #95 — real thumbnails cost nothing to hold
+
+The open item this section carried since #95 (real window captures in the Workspace Overview): the
+overview "now paints MUCH more", and its region lives on the island's surface, so its numbers were
+assumed stale. They were not. Same harness, plus a no-damage variant for the questions the harness
+cannot ask, with `VELTRIX_WINDOW_CAPTURE=0` (placeholders) as the only variable:
+
+| | GPU |
+|---|---|
+| **with damage** — floor, nothing open | 1.0 / 1.1 % |
+| with damage — overview open, PLACEHOLDER thumbnails | 1.9 % |
+| with damage — overview open, REAL thumbnails | **1.8 %** |
+| **idle desktop** — nothing open | 0.1 % |
+| idle desktop — overview OPENING (3 s transient), placeholders | 2.0 % (max 26) |
+| idle desktop — overview OPENING (3 s transient), real | 2.2 / 2.4 / 2.5 % (max 29-35) |
+| idle desktop — overview HELD OPEN | **0.0 %** (3 rounds) |
+
+🔑 **Blur is charged by AREA, not by what is painted under it** — which is why real textures and flat
+placeholders measure the same (1.8 vs 1.9, and 0.0 vs 0.0 held open). The intuition that drove this
+item — "it paints much more, so it must cost more" — is the wrong model for a compositor effect, and
+it is the same confusion as expecting the region to shape the blur (see the squircle entry below).
+
+🔑 **An open overview on an idle desktop costs NOTHING continuously: 0.0 %.** Its ~0.8 points with
+damage are entirely the intersection of its declared band with someone else's damage — i.e. the
+overview is not a load, it is a surface that other people's repaints have to go through.
+
+The captures appear only in the OPENING transient, +0.2-0.5 points over 3 s against placeholders,
+inside the morph's own cost — which is `WindowCapture.ts`'s "one render pass, one-shot, never polls"
+claim measured rather than trusted. ⚠️ One round showed a 0.1 % / max 16 blip while held open; rounds
+2 and 3 read a flat 0.0 % / max 0, so it was a late-landing capture, not a load. A single round of a
+number this small says nothing.
+
+**Nothing to fix, and nothing left to tighten**: the overview's band is 2543 px of a 2560 px monitor
+because the panel genuinely is that wide. It stays the most expensive island mode, and it is the
+cheap kind of expensive — paid only while it is open, which is seconds.
+
+#### Also dead: shaping the region to the squircle's curve
+
+`wl_region` takes rectangles, but a region is a SET of them, so a curve IS expressible as a
+staircase — that is how pixman represents any shape. It is still not worth doing, twice over.
+
+**The area is noise.** What sits between the bounding rect and the squircle is `4r²(1−π/4)`: for the
+CC's 356x610 panel that is ~494 px² at `RADIUS.lg` (0.23 %) and ~879 px² at the island radius
+(0.40 %). The 16px safety pad we add ON PURPOSE is +14.7 % of the same panel — 35-65× more than the
+corners could ever return. And §46 measured that you pay for *the region expanded by the blur
+radius* anyway, so the kernel hands the corners straight back.
+
+**And it would cost.** Hyprland iterates the clip region's rects when drawing (`OpenGL.cpp`, the same
+behaviour that makes a declared region cheap), so a ~30-rect staircase per corner is ~120 extra
+iterations per panel per frame. Worse, the scissor is hard: a staircase off by 1px eats the squircle's
+antialiased Cairo edge — reintroducing a fixed artefact to optimise 0.3 %.
+
+🔑 **And it would not help an EFFECT either, which is the usual reason someone asks.** The shape of a
+compositor effect is driven by the surface's per-pixel ALPHA, not by the region — that is exactly
+what `ignore_alpha` does, which is why today's blur already follows the curve including its AA edge.
+The region decides what is COMPUTED, `ignore_alpha` decides what is SEEN. For refraction specifically
+a tight region is actively wrong: refraction displaces pixels from OUTSIDE the drawn shape inward, so
+it samples past the edge and a curve-hugging clip would cut the samples it needs — that direction
+needs MORE pad, not less.
+
+**Refraction itself is settled and CLOSED (2026-06-12) — do not re-explore it either.** True
+Glass refraction needs the backdrop pixels, which by Wayland's design only the compositor has:
+there is no client-side path (GTK4 has no `backdrop-filter`, SVG filters cannot touch the backdrop,
+and `GskGLShader` is deprecated and non-functional on the current renderers). A Hyprland **plugin**
+could do it per drawn element, alpha-mask-driven exactly like blur — hyprglass's whole-window look
+was that plugin's limitation, not the mechanism's — but the plugin route was rejected before
+publication: the plugin API breaks every Hyprland release and a crash takes the whole session down.
+The `if hl.plugin.hyprglass ~= nil then … end` block in `hyprland.lua` is **inert by design**; it is
+not a missing install, and do not wire `hyprpm` into `install.sh` for it. The only sustainable route,
+if this is ever revisited, is proposing it upstream to Hyprland's blur engine the way `vibrancy` was.
+A client-side "fake lens rim" (a Cairo/CSS specular edge over the existing compositor blur) was
+offered and declined — the compositor blur is good enough.
+
+---
+
+## Meta: how to interpret "tech debt" here
+
+Not a bug list — conscious tradeoffs to pay down opportunistically:
+1. If you're already in a file, prefer the "right fix" direction — but only if small and
+   self-contained.
+2. If it would balloon your change, leave it and add a comment linking here.
+3. **Don't refactor as a side-effect of an unrelated change** — drive-by fixes tend to be
+   partial and create drift.
+
+### 47. Design-token audit — CLOSED for `ui/shell` (2026-08-03)
+Raised by the user reviewing the scroll bar: *"parece que hemos puesto un valor distinto cada
+vez que hemos hecho algo"* — the specific catch was the bar-expansion capsule at radius **20**
+while windows are **24**. Correct.
+
+**✅ Radii — closed, TS/TSX *and* SCSS.** One ladder in `ui/lib/veltrix-kit/platform/tokens.ts` mirrored by
+`--veltrix-radius-*`; **zero radius literals in `ui/shell`** (`64 → 32` Workspace Overview,
+`20 → 24` bar expansion + CC context menu, `18 → md` app-grid tiles, `14 → md` popover,
+`12 → md` ws-strip tile, `8 → xs` calendar cell, new `xl: 32`). Two literals turned out to be
+**stadiums, not rungs** (`pill`, no pixels changed), and two entries were rounding nothing and
+were deleted: the `--veltrix-radius-squircle: 28%` token (zero consumers, ever) and
+`.prism-result-icon` (`border-radius` on a background-less `Gtk.Image`). Rationale — why the
+ladder is deliberately NOT on the 4px spacing scale, why `sm` is derived from the card inset,
+and the stadium rule — is in `design-system.md` under "Radii — ONE ladder".
+
+**✅ Spacing — closed.** SCSS margins (8 of 43 off-scale) in the first pass; then the TSX side,
+**164 off-scale values down to 4**, all derived and commented; then SCSS container padding.
+The structural fix underneath it: **row heights are declared** (48 one-line / 72 two-line via
+`min-height` on the kit component's own classes, which is why the same row measured 43px on
+Network and 47px on Appearance), and container padding sits on three tiers — dense panel 8/12,
+window row 12/16, island 16/20.
+
+**The rule that governs any future sweep here: the token for a control is the HEIGHT (24 compact
+/ 32 control / ~48 row), not the padding.** `veltrix-kit/row.ts`'s `margin_top/bottom: 14` is
+what lands a `$fs-small` row at 48; `button.veltrix-btn`'s `padding: 5px 14px` and the alert
+footer's `14px` are the same shape; the switch's `slider { margin: 3px }` is (24 trough − 18
+slider)/2. Snapping those to the 4px scale resizes the shell instead of tidying it.
+
+Untouched on purpose and still correct: optical nudges on text (`_bar.scss` `margin-top: 5px`,
+`.rec-elapsed-big` 6/2), derived sizes (`.accent-circle-btn` 30 = 24 swatch + 3+3 border), and
+alignment axes (Prism's `22`).
+
+**What is genuinely left:**
+- **The bar capsule** — `Bar.tsx`'s `margin 14` and `_bar.scss`'s `padding: 6px 14px` are one
+  unit; they move together or not at all, and moving them changes the bar's height.
+- ~~**The greeter and lockscreen bundles**, which carry standalone stylesheets that never
+  import the token layer.~~ **DONE 2026-08-09 — see #57.** The prediction that it was "only
+  verifiable in a VM" was wrong twice over, and both corrections are worth carrying: the
+  *shell* half is verifiable by DIFFING the compiled CSS (a pure extraction must move zero
+  declarations, and it did), and the *greeter/lock* half by rendering the surface offscreen
+  (`scripts/dev/lock-probe.js`). The VM is still the gate for blur, the painted glass and the
+  session-lock protocol — but not for type, colour and spacing, which is what had drifted.
+
+### 52. IDEA (owner, 2026-08-04, NOT a plan): split the bar into left/centre/right surfaces
+Floated as a possible future layer restructuring, also hoped to help the window-title truncation and
+the capsule count on the right. Recorded with the analysis so it is re-opened with the numbers rather
+than from scratch.
+
+**The blur win is in the HEIGHT, not in the split.** `veltrix-bar` is 2560x1440 only because the
+overlays live inside its window (commandment 5). Evict them and the bar becomes a static 2560x48
+strip — which captures nearly all of the win §46 measures (full-screen blurred layer +5.9 pts vs
++0.4 for one sized to its content). Cutting that strip into three adds almost nothing on top. **So
+the two changes are independent, and only one of them pays: "overlays out of the bar's window" (with
+their surface MAPPED only while something is open — unmapping drops the blur pass entirely) is the
+move with measurable return; the three-way split has to justify itself on layout grounds alone.**
+
+**On layout it does not currently justify itself.** The three groups still share one 2560px row and
+still cannot overlap, so nothing about the title limit or `measureOverflow` gets easier — the
+arbitration merely moves from GTK (`CenterBox` + the `SizeGroup` that absorbs slack when the title
+grows) into shell code we write. That is trading mechanism for logic, against the owner's stated
+direction (§51). Letting a long title run under the island is already possible today inside one
+window via the bar's `masterOverlay`.
+
+**The strongest objection is the one the July island split already paid for: there is no ATOMIC
+COMMIT across two Wayland surfaces.** That is what killed splitting the island into capsule + modes
+(`handoff.c`, 2026-08-02): the small surface always presented first, so the handover showed a gap on
+open and doubled glass on close, and no ordering fixed it — the two commits land in different frames.
+Three bar surfaces have no *handover*, so that exact failure does not apply; what does apply is any
+change that must land in all three AT ONCE. And that is precisely the coupling this idea was meant to
+improve: truncating the window title requires knowing where the centre capsule ends, and the capsule's
+width moves on its own (a media title of a different length reshapes the pill with no page change).
+Today that is atomic — GTK allocates all three groups in one pass into one buffer. Split, the island
+would resize in one frame and the title's new limit in another, so the two would visibly collide or
+gap for a frame every time the music changes track. **The coupling that motivates the split is the
+coupling that makes it unsafe.**
+
+**Two further inherited hazards, both already paid for once.** (1) Only ONE of the three could hold the
+exclusive zone, so the other two would have to follow it — today's island↔bar divergence (§51),
+twice over. (2) Any of the three that sizes to its content (title length, tray count) resizes, and
+§46 established that a resizing layer surface produces a visible grow artefact that is
+compositor-side and unfixable from the widget tree. Fixed-width surfaces avoid it and remove the
+flexibility that motivated the idea.
+
+### 59. NTK — the kit's stylesheet is out of the shell; the other bundles do not import it YET (2026-08-10)
+
+`ui/lib/veltrix-kit/` has been importable from any bundle for a long time; its LOOK was not.
+Every rule for it lived in `ui/shell/styles/_components.scss`, which only the shell compiles —
+`.veltrix-btn` appeared **16 times in the shell's compiled sheet and 0 times in the greeter's**,
+so a greeter that imported `VeltrixButton` would have rendered it as raw GTK. The code was
+shared and the appearance was not.
+
+**Done:** the kit's half is now `ui/lib/veltrix-kit/styles/_components.scss`, with the mixins it needs in
+`ui/lib/veltrix-kit/styles/_mixins.scss` and the relative `$fse-*` ramp in `_tokens.scss`. `_base.scss`
+`@forward`s both, so `@use 'base' as *` is unchanged. The split rule and the bundle-import
+caveat are in `design-system.md` ("The kit's stylesheet").
+
+🔑 **The verification could NOT be "byte identical", and pretending otherwise would have hidden
+the risk.** Splitting one file in two necessarily reorders the output — 572 lines moved. What
+was proved instead is stronger for this shape of change, in two steps: (1) the compiled sheet
+holds **exactly the same 534 selector→body pairs**, none lost, none added; (2) of the 1892
+pairs whose relative order flipped, **zero** could apply to the same element at equal
+specificity with a shared property — so no cascade outcome can have changed. Keep that script
+shape for any future extraction; a rule-set diff alone would have missed a real reorder bug.
+
+⚠️ **2026-09-20 — the verification above checked the wrong DIRECTION, and it cost six weeks.**
+"Same 534 selector→body pairs, none lost, none added" proves the SHELL did not change. It cannot
+prove that everything a kit component needs ARRIVED in the kit's half, and one thing did not: every
+rule that gives a `switch` a track and a thumb stayed in `ui/shell/styles/_components.scss`, while
+`VeltrixToggleRow` sits in the kit. Nobody noticed because no other bundle used a toggle row until
+the installer's LUKS option became one.
+
+⚠️ **What it actually cost — and this entry has now got it wrong TWICE, in opposite directions.**
+
+The first version said the installer's NVIDIA toggle had been invisible. That was "corrected" the
+same day to: the blank theme is the GREETER's, a real session seeds `Adwaita` and `ThemeManager`
+unsets `GTK_THEME`, so the toggle wore ADWAITA's switch rather than nothing. **The correction is
+the false one.** `ui/installer/app.ts` has selected a themeless GTK since #268 created the bundle —
+one `GLib.setenv` at the top of the file, never read by the person writing the correction. The
+original reading was right: with the switch's rules in the shell's sheet, the installer's toggle
+drew nothing.
+
+What was true in the correction, and is why the rule matters, is the SHELL: it alone wears the
+user's gsettings theme, so a kit component missing its rules there wears somebody else's clothes
+instead of disappearing. Both failures are the same one — generalising from conditions nobody
+checked — and the second is worse for arriving dressed as a measurement. Moved to the kit's sheet
+on 2026-09-20 (PR #608) either way, with `--veltrix-thumb` following it into the token engine: a kit
+component must not depend on the user's GTK theme to be drawn.
+✅ **The check exists now: `scripts/ci/style-ownership-check.mjs`** (2026-09-20, in the `styles` job with
+two controls). Every class the kit adds and every widget node it builds must be drawn by the kit's
+own sheet or be listed there with a reason. It immediately found `.veltrix-menu` and
+`.veltrix-menu-popover` in the same state as the switch — both moved, verified by the 584-pair
+comparison and by each moved selector appearing exactly once in the compiled sheet. ⚠️ An earlier
+draft of this entry also named `veltrix-tooltip`; that was **wrong**, the kit's sheet has had
+`.veltrix-tooltip` all along. The check is what established which was which.
+
+⚠️ **Three bugs in that check before it was trustworthy, all found by running it rather than
+reading it, and the shape is worth remembering.** (1) It demanded a class be preceded by a space or
+a comma and reported THIRTEEN false failures — every element- or class-qualified selector we write
+(`window.veltrix-alert-dialog`). (2) Its class scanner anchored straight to `[`, so
+`css_classes: opts.cssClasses ?? ["veltrix-menu-popover"]` walked past it, hiding one half of the
+very component it had just caught. (3) It only failed when the SHELL styled the class, which leaves
+a rule that has already moved into the kit unprotected: rename it there and the class becomes
+"styled nowhere", which that draft accepted — the control caught a check written to protect
+`.veltrix-menu` passing with `.veltrix-menu` deleted. The default is now "must be styled by the kit",
+with an exception list where a human writes down which classes carry no paint on purpose (a name
+for `queryUI` perception, a variant hook).
+
+🔑 **AND THE BIGGER FRAME, owner, 2026-09-20 — this keeps resurfacing because the goal is wrong.**
+"The kit is shared by our three bundles" is not what he wants it to be: he wants **something like
+Adwaita** — a toolkit that serves the shell, Veltrix's own applications, *and* anybody outside who
+wants to build an application or a widget with it. Under that goal every item above is a symptom
+rather than a task: a library whose look lives in one consumer's stylesheet is not a toolkit, it is
+a shell-internal module with exports. ⚠️ The HOW is explicitly undecided — he said so — so do not
+turn this paragraph into a plan or start migrating things toward it. What it settles is the
+DIRECTION, so that the next person who finds a fourth instance files it here instead of
+re-discovering the pattern. Prior art to read before proposing anything: libadwaita ships its own
+compiled stylesheet with the library, exposes its tokens as named colours with a documented
+contract, and versions its public API separately from any application. See also
+`project_ntk_toolkit` / `project_own_toolkit_vs_gtk` in the maintainer's memory.
+
+**Left open, in the order the NTK plan wants them:**
+1. **The greeter's three raw `Gtk.DropDown` → `VeltrixDropDown`.** This is what earns the kit
+   import, and it must bring the TOKEN CONTRACT with it (17 of the 23 `--veltrix-*` properties
+   the kit reads are undefined there). ⚠️ Two of the three known selector collisions ARE the
+   dropdown, so this migration removes them rather than fighting them. ⚠️ greeter/lock have no
+   dev mode — fixed path to `/usr/share`, silent failure — so this one needs a VM pass.
+2. **Deduplicate greeter↔lock** (`Clock.ts`, `PowerBar.ts`, the card) — see §57.4 above.
+3. ✅ **DONE — `common/Slider.ts` → `veltrix-kit/slider.ts` (2026-08-15).** 419 Cairo lines, and
+   the first kit component that needed something only the BUNDLE knows. Three dependencies had
+   to be resolved rather than carried: `safeDisconnect` and `hexToFloatRgb` were pure and simply
+   moved down to `ui/lib/` (both re-exported from their old shell paths, so 46 import sites did
+   not churn) — but `ThemeManager` could not move and could not be imported, which is what
+   produced the **appearance seam** (`veltrix-kit/appearance.ts`, see architecture.md). CSS: the
+   mechanical test moved exactly ONE rule, `.slider-fill-value`, because `makeVerticalFillTile`
+   builds that label; `.slider-text-endpoint` stayed in the shell's sheet because Settings'
+   Accessibility page builds those. (`.slider-value-label` stayed too — until step 4 moved the
+   slider ROW a day later and took it along.) No new token entered the kit's contract.
+4. ✅ **DONE — the composed rows (2026-08-16).** `toggleRow` / `dropdownRow` / `sliderRow` are
+   now `VeltrixToggleRow` / `VeltrixDropDownRow` / `VeltrixSliderRow` in `veltrix-kit/rows.ts`.
+   (The counts written here — 29/20/32/91 — had drifted; measured on the day, they were
+   21/17/14/81. Re-measure before quoting a number from this file.)
+
+   🔑 **The blocker was real but smaller than it read.** `createRow` did not build anything —
+   `VeltrixRow` has been in the kit for a long time. What `createRow` added was three lines:
+   pushing the row's label into Settings' **search index**, via an ambient page context that
+   `Settings.tsx` opens and closes around each page's (synchronous, eager) construction. Every
+   composed row ended there, so all of them were welded to a side effect only Settings wants.
+
+   🔑 **The split is a PARAMETER, not another seam: `mkRow`.** A composed row now builds its
+   control and hands it to whatever row builder it was given (default `plainRow`). Settings
+   passes its own `createRow`, which registers then delegates — so all ~130 call sites are
+   untouched and the search index behaves exactly as before (verified in the live session: a
+   `toggleRow` label typed into Settings' search still resolves to its page).
+
+   ⚠️ **Why a parameter and not a module-level seam like `appearance.ts`.** Appearance is
+   per-BUNDLE — one accent per process. Registration is per-CALLER: the same shell has Settings
+   rows that must be indexed and `widgets/screenrecord.ts` rows that must not. A global would
+   have to be pushed and popped around every build, which is the ambient context being escaped.
+
+   `bindWhileRealized` went to `veltrix-kit/lifetime.ts` with them (the rows re-arm their
+   external sync through it); `SettingsHelpers` re-exports it. What stayed in Settings:
+   `createRow`/`createStackedRow` (they ARE the registration), `listGroup`, `pageBox`,
+   `presetRow` (one consumer, and its `settings-*` classes are Settings') and `imagePickerRow`.
+
+   🔑 **The proof that the move was real: `widgets/screenrecord.ts` stopped importing from
+   `surfaces/settings/`.** A Control Center widget had been reaching into another surface for
+   `pageBox`/`listGroup`/`createRow`/`toggleRow`/`dropdownRow`; it now calls the kit. Its
+   `pageBox` was decoration in the CC anyway — `.settings-page` is scoped inside
+   `window.veltrix-settings-window`, so the class it added styled nothing there.
+
+   CSS: `.slider-value-label` followed to the kit's sheet — `VeltrixSliderRow` builds one, so a
+   non-shell window would otherwise get an unstyled readout. It is now worn on BOTH sides, and
+   that is fine: the shell compiles both sheets, a lone bundle does not. And
+   `.veltrix-atomic-scale-native` was DELETED rather than promoted: it suppressed the background
+   of "the native Gtk.Scale trough", and there has been no `Gtk.Scale` since `d9dca37f` — the
+   class rode along in `cssClasses` and spent months being applied to a `Gtk.DrawingArea`.
+5. **`_alert.scss` stayed in the shell** even though `alert-dialog.ts` is in `ui/lib/` — the
+   reasoning was that it is a window-SCOPED block (`window.veltrix-alert-dialog`), a different
+   animal from the kit's global layer, and that no other bundle showed a dialog yet.
+   ✅ **Resolved 2026-09-05 (#440), and the second half of that sentence had already stopped being
+   true when it was written**: the installer's quit dialog (#405) is a second consumer, and #436
+   made it a third. Both rendered as raw GTK — the two response buttons plain text, 19px, side by
+   side, with nothing telling the destructive one from the safe one. 🔑 The window-scoped/global
+   distinction was never the deciding question: the file's own mechanical test is *does `ui/lib/`
+   build the widget*, and a scoped selector inside the shared sheet is still one copy reaching
+   every bundle. ⚠️ `token-contract-check` went 22 → 23 and passed everywhere; the greeter had
+   already re-declared `--veltrix-danger` for this exact component.
+
+🔑 **The rule that governs all five: a component enters the kit when its SECOND real consumer
+appears, and it enters migrating in the SAME change.** Never declared ahead. The proof is
+inside one commit, `69cce101`: the half that promoted `createRow`/`listGroup` and migrated
+every call site at once has 23 consumers today; the half that declared `.veltrix-tile` and
+deferred the migration to "increments 2-3" was never applied and was deleted in #111.
+
+**Amended 2026-08-15 — a second, equally valid trigger, stated out loud rather than smuggled
+in as an exception.** The slider had ten import sites and **all ten were inside `ui/shell/`**;
+greeter and lockscreen had none, so by the letter of the rule it could not move, and it moved
+anyway. The reason it is not a violation: what the rule protects against is designing an API
+for consumers you are IMAGINING — and an API that ten real call sites have been exercising for
+months is the opposite of imagined. So the trigger is either of:
+
+- a **second consumer in another bundle**, migrated in the same change (the dropdown, the card);
+  or
+- **many real consumers in one bundle plus an API nothing is asking to change** — proven, not
+  predicted.
+
+What does NOT count, under either reading, is "we will need this later". `.crystal-tile` is
+still the counter-example, and the ⚠️ that came with this amendment is that the second trigger
+gives no free evidence about OTHER bundles: nothing in the ten shell call sites would have
+revealed that the greeter cannot supply an accent. The seam exists because the move was done,
+not because the consumers predicted it.
+
+
+### 60. Greeter ↔ lockscreen: the widgets are one copy now, and injection is the shape (2026-08-10)
+
+Step 2 of the NTK plan. `Clock.ts` and `PowerBar.ts` existed twice, and `dateNames.ts` **three
+times** — the shell's copy carried a header naming the other two. Now: `ui/lib/clock.ts`,
+`ui/lib/power-bar.ts`, `ui/lib/date-names.ts`. Net −71 lines, and three consumers for the date
+formatter.
+
+🔑 **THE DUPLICATION HAD ALREADY DRIFTED, which is the argument for doing the rest.** The
+lockscreen's `PowerBar` still carried a comment describing the buttons as "accent and opaque" —
+a design deleted in #99/#100 the day before, when accent went back to meaning state only. The
+CODE was fixed in both copies and the EXPLANATION in one. That is the cheap version of the
+failure; the expensive version is [the dropdown](design-system.md) — same disease, one
+generation of unfixed bugs deep.
+
+**The shape for anything promoted to `ui/lib/` that needs to speak: INJECT the bundle's i18n,
+never reach for it.** `t()` lives in each bundle's `lib/i18n.ts` and stays there — the catalogs
+are deliberately different sizes (greeter 12 keys, lockscreen 7) and read different config
+paths — so `VeltrixPowerBar({ t, onLocaleChange? })` takes them as parameters. Two details worth
+copying:
+
+- **`onLocaleChange` is optional, and that optionality IS the whole divergence.** Every
+  difference between the two old copies came from one fact: the greeter can change language
+  while it is on screen (a dropdown calling `setlocale()` live) and the lockscreen cannot. Pass
+  the hook where it exists; omit it and the labels are simply built once.
+- **Name the keys, do not take `any`.** `PowerBarKey = "suspend" | "restart" | "shutdown"` is
+  what makes a future catalog missing one a break at the call site instead of three buttons
+  quietly labelled with their own key.
+- **`readRegion` is injected for a PRIVILEGE reason, not a preference.** The lockscreen runs as
+  the user and reads its own config dir; the greeter is a system user that owns no such file, so
+  it tries the last user's home and then the world-readable `/var/tmp/veltrix` mirror.
+
+🔑 **How it was verified, because none of these surfaces has a dev loop.** Three separate
+answers for three shapes of risk, and the middle one is the reusable trick:
+
+1. `formatDatePart` is PURE → old and new bundled side by side and run over 5 dates × 7 formats
+   × **10 locales** (including the year-first CJK path and day-first vs month-first): **350/350
+   identical strings**.
+2. The widgets → built from the OLD bundle and the NEW one and their **CSS node trees dumped and
+   diffed** (`scripts/dev/` harness, kept out of the repo): identical, 3/3 nodes for the clock
+   and 14/14 for the power bar, same geometry, classes and strings. ⚠️ **Run the two sides in
+   SEPARATE PROCESSES**: each esbuild bundle embeds its own `glass-capsule.ts`, and GObject
+   refuses to register the type name `VeltrixGlassCapsule` twice.
+3. The greeter's live re-string → `setLocale()` on the built widget, asserting all three labels
+   change. ⚠️ **The first two attempts at this test measured NOTHING** and both looked like a
+   pass/fail about the code: once because the process locale was already the target language, and
+   once because the widget bundle and the i18n bundle were two module instances, so `setLocale`
+   ran against a different copy of the state. **A shared-module test has to be ONE module
+   graph** — one esbuild entry re-exporting both.
+
+**The CARD followed immediately** (`ui/lib/auth-card.ts`) — see §61, which also fixes the
+backlog defect that lived in both copies.
+
+
+### 61. The card is shared, and the failure message finally expires (2026-08-10)
+
+Step 2b of NTK, and the backlog's defect #1, in one change because they are the same
+change: `ui/lib/auth-card.ts` now builds the avatar / name / password field / primary
+button / failure message column for both login screens, and the feedback logic that
+lives there is what was broken in both copies.
+
+**The split is CHROME vs ATTEMPT, and it is where it is on purpose.** The greeter talks
+to greetd and starts a session; the lockscreen talks to PAM and lifts a session lock.
+Those are different protocols with different failure shapes, so the shared component owns
+the chrome and the feedback and hands back `onSubmit` / `setLoading` / `showError`. A
+parameter that switched between the two auth flows would be two functions in a trench
+coat.
+
+🔑 **The message never expired because nothing watched the keyboard.** No `changed`, no
+`notify::text`, on either surface — the only thing that ever hid "Wrong password" was
+starting another attempt, so you retyped with the screen still contradicting you. Now
+TYPING clears it (the one that matters; GNOME's lock screen does the same) and an 8s timer
+covers the other case, a failure left on a screen nobody is at.
+
+⚠️ **THE TRAP IN THAT FIX, which was written and only caught by testing it.**
+`notify::text` fires for PROGRAMMATIC writes too, and a failed attempt ends by emptying the
+field — so `showError(); passwordEntry.set_text("")` cleared the message about a
+millisecond after showing it, and the user got a flicker instead of a reason. The card owns
+that distinction now: **`card.resetPassword()`, never `passwordEntry.set_text("")`.** The
+guard lives in the component so no caller has to remember an ordering rule to keep its own
+error on screen. `showError` also cancels the previous timer, or a second failure inherits
+the first one's countdown.
+
+🔑 **Every assertion was proved able to FAIL, by mutation.** Removing the `resetPassword`
+guard breaks assertions 3 and 4; removing the timer breaks 5. That step is not ceremony —
+the FIRST attempt at the timer mutation was a no-op, because esbuild renames `GLib` to
+`GLib2` in the bundle and the `sed` never matched, so a green run "proved" a timer that was
+never exercised. Same failure mode as §60's locale test. **If a test has not been seen to
+fail, it has not been seen to work.**
+
+**Structural check:** both cards' node trees were dumped before and after. Two intentional
+differences, both benign and both verified rather than waved through:
+- the error LABEL lost a redundant `visible: false` (its WRAPPER is what governs, and the
+  lockscreen never had the extra);
+- the lockscreen's button gains GTK's `.text-button`, because the shared card passes a
+  `Gtk.Label` as `child` instead of setting `label:` — in the old code `css_classes:` in the
+  same constructor clobbered it. Nothing in `ui/greeter/style.scss` selects `.text-button`
+  (checked), and the button measures 280×40 either way.
+
+**Left for the VM**, along with everything else on these two surfaces: whether the timer
+and the shake read right at real size, and greetd/PAM actually driving the failure path.
+
+### 62. Settings scales its TEXT with the accessibility slider but not its BOXES (2026-08-11)
+
+The accessibility text scale is honest again — the fonts are stored in points, so GTK applies
+the factor through the dpi and the slider is continuous (design-system.md, "the font SIZE is not
+part of this"). What is NOT honest yet is the geometry it scales into. Chrome is safe by design
+(`_reset.scss` pins `font-size` on bar/dock/island/app-grid, and CC/NC/Prism inherit it from the
+bar's window), so this is about the surfaces that are SUPPOSED to reflow: **Settings, About and
+the alert dialog**, which take the `$fse-*` em ramp.
+
+There, the text grows and the box does not:
+
+- `VeltrixSplitView`'s sidebar is `width_request: sidebarWidth` (250 in Settings) — a fixed
+  column. Its label overflowing that column was the sharpest failure and is fixed mechanically
+  (`ellipsize: END`, see architecture.md — it was already overflowing in Russian at factor 1.0),
+  but ellipsized nav text at a large scale is a workaround, not the design.
+- ~~the auto-collapse breakpoint is derived from the content's natural width, so a large scale
+  collapses the sidebar in a window that has plenty of room~~ — **settled by #63**: the
+  breakpoint is a constant, and the text scale cannot move it.
+- `_settings.scss` `min-width: 210px`, the 30×30 icon boxes, `min-height: 36/50px` in the kit:
+  all px. Row min-heights are the benign case (a row grows past its minimum); a min-WIDTH is not.
+
+**What this needs**, when it is picked up: the reflowing windows express their geometry in `em`
+(or a token derived from the interface font) rather than px, so the box scales with what it
+contains. That is the real fix and it belongs to the kit, not to Settings alone.
+
+**Until then the slider's range is the honest limit, and it was set from looking** (2026-08-11,
+live session, Accessibility / Appearance / Control center / Display / Top bar at factor 2.0):
+nothing overflows any more once the sidebar label ellipsizes — the two remaining symptoms are the
+nav truncating to `Notificatio…` and a row with TWO trailing controls (Top bar → Custom icon)
+squeezing its subtitle into four lines. So the cap is **`TEXT_SCALE_MAX = 1.5`** in
+`core/ThemeManager.ts` (one constant, also used by `core/AppearanceSync.ts` at start to clamp a factor stored by the
+older build whose slider went to 2.0 — a value above the max is a state the UI cannot represent).
+Raise it when the geometry scales too, and look again before you do.
+
+### 63. Settings geometry: the law exists now; the pages have not been walked (2026-08-11)
+
+The window's geometry is a single rule — `WINDOW_LAYOUT` in `ui/lib/veltrix-kit/platform/tokens.ts`, spelled out in
+design-system.md ("The Settings window has ONE geometry law"). The content pane is a constant
+800 px, the sidebar's breakpoint is `sidebar + content` instead of the active page's natural
+width, the window has a floor, and `VeltrixRow`'s title is one ellipsised line. Verified with
+`scripts/dev/settings-geometry.mjs`: every page rendered the pane at exactly the width the law
+predicts, at every window width tested, with nothing cut.
+
+⚠️ The floor is the DISTRESS width (560), not the pane, and that cost two tries — both worth
+knowing before touching it again. `set_size_request` reaches Hyprland as
+`xdg_toplevel.set_min_size` and **Hyprland tiles at the layout's size regardless**: with the floor
+at the pane's 802 and Settings in a 673px tile, GTK laid out at 802 and the compositor cut the last
+129px, taking a row's trailing button. And the floor cannot be made conditional on being tiled —
+**Hyprland never clears the `tiled` toplevel state**, so a window it had just floated and resized to
+600×800 still carried `tiled-top/left/right/bottom` and `maximized`.
+
+⚠️ **The HEIGHT had the same bug and nobody had looked (fixed 2026-09-27).** The kit window asked
+for `minHeight` 480; Hyprland tiled Settings at 378 and GTK laid it out at 480 anyway, so the last
+102px of EVERY page were cut — "I cannot scroll to the bottom" (owner). Measured with `queryUI`:
+the page scroller ended at y=480 inside a 378px window. A kit window now asks for
+`WINDOW_LAYOUT.heightFloor` (240, the distress height: everything under the header scrolls), and
+`minHeight` 480 stays only for the installer, which caps it itself. 🔑 The law for BOTH axes: a
+window must be correct at any size a compositor imposes; a size request only stops a user's drag.
+
+**And the page FRAME belongs to the host** (same day): `wrapPage` in Settings.tsx gives any page
+that did not bring `.settings-page` (a widget's Configure page — widgets may not import Settings'
+`pageBox`) the frame itself. Screen recording's came out with no side padding, a different width
+from every other page, its first card against the header.
+
+⚠️ **This overlaps #62 and settles one of its bullets.** That entry lists "the auto-collapse
+breakpoint is derived from `sidebarWidth + content.naturalWidth + collapseMargin`, so a large
+text scale collapses the sidebar in a window that has plenty of room" as a symptom of Settings
+scaling text but not boxes. That mechanism is gone — the breakpoint is a constant now, so the
+text scale cannot move it. The REST of #62 stands untouched: the pane is 800 px whatever the
+text scale, so a large factor still means more text in the same box, and `TEXT_SCALE_MAX = 1.5`
+is still the honest limit. (That bullet is struck through in #62 above, done while rebasing this
+branch onto the merged font work.)
+
+**What is deliberately NOT done** — this was scoped as the geometry law plus the row contract,
+not the page-by-page pass:
+
+- ~~**~20 rows are hand-rolled**, a bare `Gtk.ListBoxRow` wearing `.veltrix-row` for the chrome
+  rather than built by `VeltrixRow`.~~ ✅ DONE 2026-08-11 — see #65 for what the pass found and
+  which rows deliberately stayed hand-rolled.
+- **The page-by-page pass itself**: hierarchy, grouping, what belongs on which page. The
+  instrument reports geometry, not editorial judgement — see #64.
+- **Fixed-width widgets inside pages** (Appearance/Gaming's 320 px preview, Network's 260 px
+  popover, the Users avatar) fit the 800 px pane comfortably and were left alone. They are the
+  reason the OLD breakpoint differed per page, so they are worth remembering, not changing.
+
+### 64. ⬒ HALF DONE — the locale sweep exists and gates CI; the live half does not (2026-08-11)
+
+> **Queue entry: #314.** Reorder it, schedule it and close it there; what stays here is the rule and the measurements.
+
+`scripts/dev/settings-geometry.mjs` asserts that every page renders the same pane width and that
+the window's floor holds. What it does not do is the part that keeps reopening this surface: run
+the same sweep across **locales** (`ru` was already overflowing the sidebar at factor 1.0 before
+the label ellipsised — see #62) and across **text scales**, and report what overflows or wraps
+past a sensible budget rather than what merely differs.
+
+That is the missing half of "discovering", and it is why Settings keeps coming back with a new
+symptom: a human opening the window in one locale at one size cannot see it. The extension is
+small — the sweep already walks all 18 pages and reads `bounds`; it needs a locale switch per
+run and a per-node overflow check (child wider than the box it sits in) instead of the current
+row-height count.
+
+**✅ The deterministic half shipped 2026-08-11: `scripts/dev/text-budget.js`.** It measures every
+sidebar string in all 12 locales at scales 1.0→1.5 with real GTK labels, the real compiled sheet and
+the shipped font pinned, and runs inside the headless smoke job — so this is a **CI gate**, not a
+thing someone remembers. Full write-up in `dev-workflow.md`. What it caught on its first run:
+
+- **Russian shipped TRUNCATED.** "Специальные возможности" needed 200px of a 170px budget at the
+  DEFAULT text size — the escape this whole line of work started from, confirmed and now fixed
+  (abbreviated to "Спец. возможности" in `ru.ts`, 143px, keeping the term users know from
+  GNOME/Windows/Android rather than swapping in a shorter synonym).
+- **The documented budget was wrong by 6px** — 176 claimed, 170 real. See #66.
+- **The column is tight for accessibility scaling generally**: at 1.25 four locales truncate
+  (ja, ru, de, pl) and at 1.5 all twelve do, English included. That is #62's "text scales, boxes
+  do not" with a number on it, and it is reported rather than failed on purpose.
+
+**What is still missing — the LIVE half.** Row titles inside the 800px pane are not covered. They
+ellipsise rather than push, so they lose information silently instead of breaking the layout, and
+their budget is not a constant: it is the row's 688px content minus the leading icon minus the
+trailing control, and that control is often a button whose own label is localised, so the budget
+moves with the locale under test. Covering it honestly needs allocated widths harvested from a live
+session per locale — which, because the locale is read from `$LANG` at startup, means a shell
+restart per locale. That is the part worth designing before building.
+
+### 76. What the toolchain swap left behind (2026-08-18)
+
+`ags bundle`/`ags run`/`ags types` became `scripts/{bundle,run,gen-types}.sh` and the last five
+AGS/Astal-runtime packages left the dependency list. Three residuals, none of them urgent, all of
+them the kind that go quiet:
+
+- **CI no longer builds external Astal dependencies from source, so it no longer needs the legacy fallback.**
+  The smoke used to build the pinned Astal stack (and cache it) as a side effect of needing it; now
+  every package comes from standard Arch repos, and in-repo C libs (`libveltrix-wl`, `libveltrix-auth`)
+  build directly via their `build.sh` scripts. Zero external source tarballs remain.
+- **`ts-for-gir` is unpinned** (`npx -y @ts-for-gir/cli`, as it was under AGS). Its output is
+  regenerated, never committed, and CI consumes a published snapshot instead — so a breaking release
+  shows up as a failed local `gen-types.sh`, not as a red PR. Pin via `TS_FOR_GIR=` if that day
+  comes.
+- ✅ **CLOSED 2026-09-23 (owner's call):** door, fallback and smoke assertion deleted together, and
+  `migrations/2026-09-23-ags-request-to-veltrix-ipc.sh` rewrote `ags request` in users' own keybinds.
+  What this bullet said before: **the compatibility door `io.Astal.ags` and `veltrix-ipc`'s fallback to it were still alive**, and
+  the smoke still asserts the door answers (with `gdbus` now — the CLI that used to knock is gone).
+  They exist for `hyprland-user.lua` files written before #184. Delete the three together — door,
+  fallback, assertion — when the compatibility window closes.
+
+🔑 And the finding worth keeping from doing it: **`ags bundle` was ~40 lines of esbuild options.**
+The way that was established is the reusable part — transcribe the options out of the tool's source,
+then diff the OUTPUT byte for byte (all three bundles matched). A rewrite that "looks equivalent" is
+a guess; a rewrite whose bytes match is not. Two of those options are load-bearing in ways no
+comment upstream mentioned: `--tsconfig` (it decides `useDefineForClassFields`, which decides
+whether a class field on a GObject subclass shadows the property accessor) and the wrapper's
+`LD_PRELOAD` (no bar, no dock, no log line).
+
+### 80. ⚠️ OPEN — what the `veltrix-auth` audit left (2026-08-23)
+
+> **Queue entry: #315.** Reorder it, schedule it and close it there; what stays here is the rule and the measurements.
+
+The critical one is fixed (an informational PAM message could open the secret gate and let the next
+password prompt answer itself with an empty string — see `lib/veltrix-auth/veltrix-auth.h`, which now
+carries the conversation contract, and `scripts/dev/auth-probe.js`, which fails without the fix).
+Three things were deliberately left:
+
+- **There is no cancellation.** The worker holds a strong reference for its whole life, so
+  `finalize()` cannot run while it is alive — which makes its `cancelled = TRUE` unreachable, not a
+  cancel path. If the lock surface goes away while PAM is blocked waiting for a secret, that thread
+  and its `pam_handle_t` wait forever; only process exit reaps them. Bounded in practice (the
+  lockscreen is short-lived and `bin/veltrix-lock` restarts it), which is why this is not urgent.
+  A real fix is a `GCancellable`, or a generation counter the worker re-checks on wake.
+
+- **`PAM_PROMPT_ECHO_ON` is answered blind.** `LockCard` replies with the empty string and logs a
+  warning. That prompt is normally the username — which cannot happen here, since `pam_start` is
+  given the user — but it is also how several second-factor modules ask for a code. So a stack with
+  2FA fails to unlock and there is nowhere to type the code. Surfacing the prompt text into the card's
+  entry is the feature that fixes it; until then the failure is at least loud in the log.
+  ⚠️ Do NOT "fix" it by leaving the prompt unanswered: a prompt that is never answered hangs the
+  attempt, which is worse than a wrong answer.
+
+- **An unknown `msg_style` is ignored** (`default: break`, response left NULL, conversation still
+  returns `PAM_SUCCESS`). AstalAuth refused the whole conversation with `PAM_CONV_ERR` instead. Ours
+  is the more forgiving choice and it is deliberate — aborting authentication over a message style we
+  do not recognise would break a working stack — but it is a judgement call, recorded here so the
+  next reader knows it was one.
+
+⚠️ **Two rules came out of the review pass on the same change, both cheap to break again.**
+
+- **No user-visible string is built in C.** The expired-password warning shipped as an English
+  sentence emitted from `veltrix-auth.c` — a string that reaches no catalog in a desktop that
+  ships thirteen languages, and which the only consumer then dropped into `console.log`, so
+  nobody ever saw it in any language. The library now emits `password-expired` carrying NO
+  text; the wording belongs to the bundle, and the lockscreen posts it as a notification (the
+  card is about to vanish, so an in-card warning is shown to nobody).
+- **The lock card must not call every failure a wrong password.** `pam_acct_mgmt()` refuses
+  correct passwords by design (expired account, `usermod -L`, a `pam_time` window). Hence
+  `account-denied`, emitted BEFORE `fail`. Getting this wrong is not cosmetic: the user retries
+  a password that IS correct until `pam_faillock` locks them out for real.
+- ⚠️ **Before adding a fourth message to the card, MEASURE IT.** The error slot's one-line
+  budget is a measured invariant (`ui/lib/auth-card.ts`), not a hope: a string over 280px wraps
+  and the whole card jumps — in one locale, invisible from the one you are working in.
+  `accountUnavailable` was measured across all thirteen (widest: Russian, 187px).
+
+⚠️ **`scripts/dev/test-auth.js` cannot catch this class and never could.** It drives the happy path
+against the real `veltrix-lock` service: one prompt, no informational messages. It was the validation
+for #200 and it stayed green the whole time the bug was live. It also **counts a faillock failure
+against your real account** (deny=3 / unlock_time=600 on Arch) — three runs lock you out of your own
+session for ten minutes; `faillock --user $USER --reset` clears it. `auth-probe.js` exists because of
+both problems: it uses a throwaway service with no faillock, and it asserts the ordering.
+
+⚠️ **A synthetic positive control cannot answer a question about the real module.**
+`pam-auth-probe-deny` denies with `pam_deny.so`, which proves the `account-denied` ordering and
+nothing about `pam_unix` — so when every unlock turned out to log
+`pam_unix(veltrix-lock:account): setuid failed` (#478), no existing probe could say whether the
+verdict behind it was still real. Answered 2026-09-07 by disassembling the module and by a probe
+that expires a throwaway account for real (`scripts/dev/acct-expiry-probe.sh`, driving
+`acct-probe.c`): healthy → 0, `chage -d 0` → 12, expired → 13.
+
+- The log line is **`pam_unix` at LOG_DEBUG, carrying on**. `_unix_run_verify_binary` tries
+  `setuid(0)` and bails only when `geteuid() == 0` — root that has lost privilege it should have.
+  An ordinary caller logs and proceeds to `execve(unix_chkpwd)`, which is setuid root and reads
+  `/etc/shadow`. 🔑 **The journal's PRIORITY tells the branches apart: 7 = benign, 3 = gave up**
+  (the giving-up branch also prints `-1` and `_exit(9)`). Same words, opposite meanings.
+- 🔑 **`unix_chkpwd` answers only for its OWN caller unless it is root.** Ask about a different
+  user and you get 9 (`PAM_AUTHINFO_UNAVAIL`) whatever the account's state is — so a probe run as
+  `nobody` returns "refused" for healthy and expired accounts alike and looks like it is
+  discriminating. That blind version is kept as `--blind`: run it first, and never trust an
+  all-9 result. It is also why the first attempt at this measurement produced a confident wrong
+  answer from a sweep of every system account.
+
+---
+
+### 82. ⬒ HALF DONE — thin glass cannot carry white text over a bright wallpaper (2026-08-23)
+
+> **Queue entry: #316.** Reorder it, schedule it and close it there; what stays here is the rule and the measurements.
+
+Found while fixing #81, and it is the part a floor cannot fix. Measured (sRGB composite, WCAG
+contrast, `GLASS_TINT.dark` over the wallpaper, white text on top):
+
+| wallpaper | α=0.24 | 0.30 | 0.40 | 0.59 |
+|---|---|---|---|---|
+| mid grey | 5.71 | 6.28 | 7.38 | — |
+| a bright cyan | 3.95 | 4.44 | 5.46 | — |
+| **pure white** | **1.69** | 1.95 | 2.55 | **4.50** |
+
+Nothing below **0.59** clears 4.5:1 on a white wallpaper, and at 0.59 the material does not read as
+glass any more — so the range cannot be floored out of this. Light mode is the mirror image (black
+text, dark wallpaper) and needs 0.465.
+
+⚠️ **This was always true; it was only ever masked.** Before #81 the compositor was dimming the
+backdrop 20% under every surface, so the same white wallpaper measured 1.76:1 at the old default —
+also a fail. The fix did not create the problem, it removed the thing that made it *slightly* less
+bad while nobody was looking at the number.
+
+⛔ **THE LOGIN ANSWER WAS WITHDRAWN BY THE OWNER, 2026-09-21 (#613).** The mechanism below shipped
+on 2026-08-25 and was removed four weeks later, so read the paragraph after this one as history,
+not as what the code does. Removed because it could be — and was — silently overridden by the
+appearance ramp (#612), because its decision was unreadable on every real machine (the greeter's
+log goes to `/dev/null`, #614), and because no comparable system analyses its backdrop to pick an
+ink. **The gap the numbers below describe is real and is now the VEIL's problem**: measured on the
+live lock screen the day it was removed, the hero reads 2.27:1 over the pale part of the shipped
+default wallpaper, and AA there needs a uniform veil of 0.32 against the 0.13 the scrim has —
+except that un-blurred paint is capped at `ignore_alpha` 0.23, so raising it means frosting the
+whole wallpaper, giving the hero a body of its own, or documenting a sub-AA case. That choice is
+open in #613 and it is the owner's. Do NOT answer it by thickening the glass: the table above
+shows that cannot work.
+
+*(History, 2026-08-25 — the mechanism that was removed:)* It said "give the text its own legibility (vibrancy, a shadow, a scrim)".
+What the measurement found is that the choice comes first: sweep the RGB cube (140,608 backdrops)
+and score both skins — white text on dark glass fails AA on **42.9 %** of them, black text on light
+glass on 14.9 %, and **the worst case for the BETTER of the two is 6.07:1**. No backdrop defeats
+both. So the legibility problem was never a shortage of material, it was a choice nobody was making.
+The greeter and the lockscreen now measure the wallpaper they are about to be painted over and wear
+the skin it can carry: `ui/lib/backdrop-skin.ts` + `ui/lib/login-skin.ts`, the light palette beside
+the dark one under `window.skin-light` in `ui/greeter/style.scss`. Full write-up, the prior art
+(Apple flips the material AND its glyphs; Windows' in-material blend layer is unreachable here) and
+the per-wallpaper table are in `design-system.md` → "The login screens choose their skin from the
+wallpaper". `wallpaper-chroma.jpg` — shipped, in the box — measured **2.50:1** and now measures
+13.71:1.
+
+✅ **THE SHELL HALF IS ANSWERED — the adaptive glass, #673 (2026-09-29).** It had stayed open for a
+reason that did not apply to the login screens: a shell surface can have a FULLSCREEN OR FLOATING
+WINDOW behind it, which no wallpaper measurement can see. The answer does not read the wallpaper at
+all: each surface captures the region it covers, subtracts its OWN paint (rendered offscreen) and
+is left with the backdrop exactly as its text sees it — windows, video, other clients' layers,
+Hyprland's blur included. Then, per surface: thicken up to 0.60, and past that flip the skin. ⛔ **Since #762 (2026-10-13) that mechanism is gone**: on Hyalo the compositor paints the shell's
+glass and measures under it itself (references/hyalo.md → "The ink", "The tone"). What is left of this item is the login half (the veil, #613), which is the owner's.
+
+*(History — the paragraph this replaced:)* "STILL OPEN FOR THE SHELL, and not as a follow-up chore
+… `shellAppearance: auto` would be right about the wallpaper case and blind about the other …
+the owner deferred it on 2026-08-25 after seeing the numbers. Until then the shell's answer remains
+the appearance PIN, chosen by hand."
+
+Do NOT "fix" the remaining half by raising the floor; that trades the whole aesthetic for a
+wallpaper most users do not have, and the sweep above shows it cannot even work (0.55 still fails
+1.2 % of backdrops, and 0.59 has stopped being glass).
+
+### 85. ⚠️ OPEN — the shadow meeting the rim reads as a BEVEL, and nobody decided that (2026-08-23)
+
+> **Queue entry: #318.** Reorder it, schedule it and close it there; what stays here is the rule and the measurements.
+
+Owner observation once every glass surface had its shadow: where the drop shadow meets the rim's
+white specular — above it on the top edge, below it on the bottom — the pair reads as a **bevelled
+edge** rather than as a flat sheet with a shadow under it. The verdict was "not bad, but it may want
+polishing", and the work was deliberately deferred; this is the note so it does not evaporate.
+
+It is worth saying what it is, because it is not a bug: the shadow and the specular are two separate
+decisions that happen to sit one pixel apart, and a dark band adjacent to a light band is what a
+bevel IS. Nobody chose it — it emerged when the two shipped together, in #243→#247. The question to
+answer before touching anything is whether the bevel is the desired reading, in which case it should
+be *tuned* (the pairing is currently accidental and its strength varies with the backdrop), or an
+artefact of two features colliding, in which case one of them gives ground.
+
+Three things a future pass should know:
+
+- **It is strongest exactly where the rim is weakest.** The rim's top and bottom stops are white, so
+  on a light backdrop they vanish and the shadow carries the edge alone; on a dark backdrop the
+  specular is at full strength right next to the shadow. So the bevel is a function of what is
+  BEHIND the glass, not of the glass. Judge it over several wallpapers or the answer is a local one.
+- **`drop` is the obvious knob and it is already spent.** It is 0 in `GLASS_SHADOW` because at
+  `spread 2` a downward offset costs the top edge more than it buys — see the measurements there.
+  Reaching for asymmetry to shape the bevel means buying `spread` first, which comes out of the
+  glass (a container that paints its own shadow keeps the spread inside its box).
+- **The instruments already exist.** `rim-backdrop-probe` renders any surface over a real blurred
+  wallpaper and measures the same pixel with the rim against without it, which is the right shape of
+  measurement for this too — the bevel is the rim and the shadow considered together, and that probe
+  already separates them.
+
+### 86. ⛔ STANDING DECISION — the glass painters stay on Cairo; do NOT propose GSK (2026-08-23)
+
+Asked by the owner, decided on measurements rather than on which API is newer: *"Cairo is old and
+everyone uses GSK now — and the GPU is already busy with the blur, so should the CPU keep some of
+this?"* The second half of that question is the right instinct and it is the reason the answer is
+no.
+
+**It is not blocked by capability.** Verified on this GTK (4.22) from GJS, not assumed:
+`Gsk.PathBuilder`, `Gtk.Snapshot.append_fill`, `append_stroke` and `cubic_to` all exist and work, so
+`createSquirclePath` and `bubblePath` COULD be re-expressed as `GskPath`. The decision is about cost,
+not about possibility.
+
+**What Cairo actually costs here** (`scripts/dev/cairo-bench.ts`, run 2026-08-23 on the owner's
+machine — re-run it before re-opening this, do not quote these numbers as eternal):
+
+| surface | per REDRAW |
+|---|---|
+| CC panel 356x610 | **0.44 ms** |
+| dock capsule 1200x92 | 0.15 ms |
+| CC tile 160x88 | 0.09 ms |
+| island pill 420x44 | 0.06 ms |
+
+A 144 Hz frame is 6.9 ms, so the most expensive glass surface in the shell is **~6 % of one frame**
+— and a `draw_func` runs on INVALIDATION, not per frame. Cairo is not the load.
+
+🔑 **The GPU is the scarce resource and the CPU is the abundant one, so moving raster to the GPU is
+the trade backwards.** Hyprland runs dual-Kawase over three or four monitor-sized layers, and #46
+already measured continuous animation at ~40 % GPU. Relieving the CPU at the GPU's expense is the
+wrong direction on this machine class.
+
+**And the cheap GSK node cannot draw our shape.** `GskRoundedRect` — the native, GPU-side one — is a
+true rounded rect, i.e. n = 2. The squircle is n = 3.2 and it IS the brand (see `design-system.md`).
+Getting it in GSK means `GskPath` + fill/stroke nodes, which is GSK's slow lane; a complex path fill
+can end up rasterised on the CPU inside GSK anyway. The likely outcome of a migration is the same
+work with more indirection, plus a rewrite of every painter.
+
+⚠️ **"Cairo is old" is true and is not the same as deprecated.** GTK4 keeps the cairo node as a
+first-class escape hatch and uses cairo for its own fallback paths. There is no deprecation to get
+ahead of, so "modernising" is not a reason on its own.
+
+**Where the real margin is, if performance ever becomes a complaint.** The same bench splits the
+cost, and the answer is not the renderer: the **rim** (gradient + stroke) dominates, not the fill,
+and a cached-surface replay would save **70–94 %** depending on the surface. The first lever is
+*not redrawing*, and it lives inside the current architecture without touching the look.
+
+**What is already GSK, and stays that way** — this is not "Cairo everywhere":
+`common/WindowThumbnail.ts` (`vfunc_snapshot` + `append_texture` inside a `Gsk.RoundedClipNode`;
+`architecture.md` carries the rule that captures must NEVER go through a Cairo `draw_func`, which
+would download the texture off the GPU on every draw) and `ui/lib/veltrix-kit/platform/glass-capsule.ts` (blur nodes +
+`Gsk.RoundedRect`). The split is: **GSK for textures, clips and blur; Cairo for shapes that are
+ours.**
+
+**What would re-open this**, and nothing less: animating a glass surface's GEOMETRY every frame. The
+closest thing today is the dock's magnification, which `queue_draw()`s the capsule per spring step —
+0.15 ms against a 6.9 ms budget, about 2 %. Measurable, not a problem. If that ever changes, the
+honest test is a live A/B on the damage harness with the fps discipline from #46 (⚠️ a Cairo
+`draw_func` is not a valid damage source — it throttles the client and makes the two arms carry
+different loads).
+
+### 87. ⚠️ OPEN — what the greeter audit of 2026-08-24 left after the glass reached it
+
+> **Queue entry: #319.** Reorder it, schedule it and close it there; what stays here is the rule and the measurements.
+
+The glass half is done: `ui/lib/veltrix-kit/platform/glass-paint.ts` now holds the rim ramp, the silhouette and the
+shadow recipe, and the greeter/lockscreen capsule paints them (see `design-system.md`). Four things
+that audit found are NOT fixed, and one of them is about the instrument rather than the product.
+
+✅ **(a) AND (b) FIXED 2026-08-25 by the skin the wallpaper chooses (#82).** Both were the same
+defect wearing two hats — a token that assumes a dark backdrop, on the surfaces whose backdrop is
+the user's own photograph — and both stop existing once the backdrop gets a vote: the username is
+black ink on a bright wallpaper instead of white, and the avatar's ring flips with
+`--veltrix-glass-border`. What follows is the original report, kept because the DIAGNOSIS is the
+part that generalises.
+
+**a. The username is white text with no glass under it.** On a pale wallpaper `Ángel` sits directly
+on the backdrop at marginal contrast. This is #82 (thin glass cannot carry white text over a bright
+wallpaper) landing on the login screen, and the shadow does not help it — a label has no silhouette
+to shadow. It needs the #82 decision, not a local patch.
+
+**b. The avatar's ring is `2px solid var(--veltrix-glass-border)`** (`.greeter-avatar`), a translucent
+white: on a pale wallpaper it disappears entirely, so a user with no photo gets an invisible circle
+around an inverted glyph. Same family as (a) — a token that assumes a dark backdrop, on the one
+surface whose backdrop is the user's own wallpaper.
+
+✅ **(a) and (b) CONFIRMED 2026-08-24**, once the greeter was rendered against a genuinely pale
+wallpaper (mean luminance 223/255, dropped at `/usr/share/veltrix/wallpaper-greeter.jpg`). Both fail
+exactly as predicted: the username is white on bare wallpaper, and the avatar's ring is gone.
+
+🔑 **And the same capture reframed all three as ONE debt, not three.** With the login surfaces moved
+to the shell's optics (`LOCK_GLASS.fill.a` 0.55 → 0.24, the desktop's shipped value — `DEFAULT_CONFIG`
+sets all four shell surfaces to `GLASS_RANGE.min`), the primary controls joined them: white label on
+a 150/255 glass body is **~2.8:1**, under WCAG AA. That is #82 — "thin glass cannot carry white text
+over a bright wallpaper" — arriving at the login screen. Not a new greeter defect; the DE-wide open
+debt, now shared consistently.
+
+⚠️ **What is NOT the problem, measured:** separation. The capsules stand off the wallpaper cleanly —
+the drop shadow does the job it was added for (#243/#244). The failure is text ON the glass, which a
+shadow cannot help.
+
+⚠️ **The compositor blur does not mitigate it, and betting on that is the trap.** The offscreen probe
+predicted body 150/255 over a flat pale backdrop and the real greeter, with Hyprland's blur and its
+`contrast 1.2 / vibrancy 0.4`, measured **150/255**. Blurring a uniformly pale wallpaper yields a
+pale backdrop. Do not assume the compositor will rescue a contrast number — it did not move it by
+one level.
+
+**c. ✅ FIXED 2026-08-24 — the focus ring was the accent's DEFAULT, on a screen that had read the
+user's choice and dropped it.** It was on this list as "loud blue, may be ours, may be a GTK
+default leaking, not determined". It was neither: `ui/greeter/app.ts`'s `loadAccentCss()` never
+called `setAccentRim()`, while `ui/lockscreen/app.ts`'s copy of the same function — same name, same
+input, same job — always had, with the comment explaining why (a Cairo painter cannot read a CSS
+custom property, so it needs the accent as a VALUE). So the greeter's painted rim was permanently
+`#0088FF` while every CSS-driven accent beside it followed the user. Proven in the VM: with
+`{"accent":"green"}` in the world-readable mirror, the ring is now green. 🔑 The generalisable
+part: **two functions with the same name, the same input and the same job, one line apart in
+behaviour** is the exact shape #60 keeps predicting for these two bundles — look for it by DIFFING
+the pair, not by reading either one.
+
+**d. ✅ FIXED 2026-08-24 — `scripts/dev/lock-probe.js` had two fidelity defects, and one of them
+faked the exact symptom a reporter is likely to describe.** Kept here rather than moved, because
+the LESSON binds and the fix is small:
+
+  - **Power-bar icons were OFF unless `ICONS=1`,** so the default render showed three bare labels —
+    indistinguishable from a greeter that had lost its icons, and read that way. The flag's comment
+    justified the default ("a missing-glyph placeholder measures differently, and the probe exists
+    for type questions"), which is sound for MEASURING and a trap for LOOKING; it was also already
+    redundant, since the `file_test` beside it means a missing glyph draws nothing at all. Now ON
+    by default, `ICONS=0` to strip them, and **any render that is not the honest full thing stamps
+    a warning band across its own top-left** — because the PNG outlives the stdout, and a probe
+    image gets cropped, attached and reasoned about hours later by someone who never saw the
+    terminal.
+  - **The primary button was hardcoded `"Desbloquear"` even under `SCOPE=greeter`** (the real
+    greeter says `t("login")`), so every width verdict it ever gave for that button was the
+    LOCKSCREEN's. Fixed at the root rather than by typing a second literal: the probe now PARSES
+    `ui/greeter/lib/i18n.ts` and takes every string from the shipped catalog, so it cannot
+    disagree with the product again — and `LOCALE=xx` renders any of the thirteen. ⚠️ Three keys are
+    QUOTED (`"pt-BR"`, `"pt-PT"`, `"zh-CN"`, because a hyphen is not a bare identifier); an
+    unquoted-only pattern silently sees nine locales, which is what the first version did and what
+    sweeping all thirteen caught.
+
+  🔑 **The rule this leaves.** Neither was a bug in the desktop — that is the point. An instrument
+  that reproduces the patient's symptom from its own defaults WILL be believed, so a probe's
+  default must be the honest render and every degraded mode must announce itself in the artefact
+  it produces, not only in the terminal. Same lesson as the `feedback` memory on captures hiding
+  artefacts, from the other side.
+
+  📈 And the fix paid immediately: sweeping the thirteen locales, the power bar runs from **278px
+  (zh-CN) to 441px (nl)**, a 59 % spread. Single-locale renders could not have shown that, and it
+  is the kind of number the login screen's text budget actually turns on.
+
+**e. ✅ ANSWERED by the VM, 2026-08-24 — and the answer was mostly "it works".** The probe cannot
+see the avatar GLYPH (it stubs the avatar as a plain box), the multi-user switcher chips (also
+stubbed), the caps-lock warning, or the greeter running as the `greeter` system user. Swept on a
+clean install: **the avatar glyph renders** (white `user-round`, ring visible), the power-bar and
+locale-bar glyphs render, the greeter user reaches `/usr/share/veltrix` fine, and the greetd journal
+is clean — no errors, no criticals. The multi-user switcher and caps-lock stay untested (one user,
+no keyboard state to force).
+
+⚠️ **But the VM found what the probe could not, and it was the user's original report.** All three
+dropdown chevrons drew nothing on the real greeter — see the fix in `design-system.md`. The probe
+had been rendering them because it borrowed the developer's platform theme instead of the blank one
+`app.ts` installs. That is the lesson of (d) with the sign flipped: an instrument that INVENTS a
+working control is worse than one that invents a broken one, because only the VM can catch it.
+
+**f. Nothing gates a shadow against a layer's `ignore_alpha`.** `blur-threshold-check.mjs` guards
+the floor (a threshold that kills the blur) and knows nothing about the ceiling (a shadow low
+enough to be blurred behind, = #237). The greeter was checked by hand — 0.18 vs 0.3, 30.6 levels of
+margin — and the lockscreen cannot be affected. A gate was considered and NOT written: shadows are
+opt-in per widget (`SquircleContainer`'s `shadow` prop, `DockAxis`, `GlassBubble`), not per layer,
+so mapping surface → shadow statically is not a ten-line script, and a gate that fails for a
+surface with no shadow would block the merge queue for nothing. Write it properly or not at all.
+
+### 88. ⚠️ OPEN — the glass sliders show TWO controls for one decision (2026-08-24)
+
+> **Queue entry: #320.** Reorder it, schedule it and close it there; what stays here is the rule and the measurements.
+
+Settings → Appearance ships a master "Glass" slider AND, behind an "Advanced" disclosure, four
+per-surface sliders. Both govern the same thing, so the master has to be an INDETERMINATE control:
+when the four disagree it reads "—" and mutes (`glassUniform`, Appearance.tsx). That was tolerable
+while the shipped defaults were uniform. They stopped being uniform the same day — dock at
+`GLASS_RANGE.min`, everything else at `GLASS_DEFAULT` — so **a fresh install now opens Appearance
+on a muted slider showing a dash**, which is the first thing a new user sees there.
+
+**Interim, shipped:** the disclosure is open by default. That does not fix the design, it makes the
+dash legible — the four differing values sit right under it. Do not re-collapse it without also
+making the defaults uniform.
+
+**The design the owner wants (their words, 2026-08-24):** the per-surface sliders stop being hidden
+and secondary and become what you see by DEFAULT; a checkbox switches to a single general slider
+*instead of* them. One mode or the other, **never both on screen at once** — which is precisely
+what forces the master to be indeterminate today.
+
+What it costs, so nobody under-estimates it into a release:
+
+- **A PERSISTED preference.** It cannot be derived from whether the four values happen to agree:
+  dragging one per-surface slider into agreement would silently flip the UI into the other mode.
+  So it is a new field on the theme config, with its setter and its persistence.
+- **A new i18n key in ALL THIRTEEN locales, in the same PR** (policy since 2026-08-23, gated by
+  `i18n-check`).
+- ▶️ **The general slider should SHADOW the per-surface values, not overwrite them** — owner's
+  lean, 2026-08-24, still to be confirmed. Today's `setGlassOpacity` writes one value to all four
+  and destroys whatever was configured. Shadowing lets a user go from "I want everything dark" back
+  to "my own configuration", which is what anyone who toggles the checkbox twice expects.
+  ⚠️ It is also the harder half: the per-surface values have to survive somewhere while the general
+  mode is on, so it is a storage decision as much as a UI one.
+
+  📌 And it is the door to something bigger the owner wants later: **saved profiles**, possibly
+  bound to light/dark mode ("this glass configuration when I'm in dark, that one in light").
+  Overwriting forecloses it; shadowing is the first half of it already built. Do not pick the
+  simpler behaviour without knowing you are closing that door.
+
+⚠️ Do not do this piecemeal with the pending "rediseñar el tema sliders de cristal" the owner also
+has open — it is the same surface twice.
+
+### 89. ⚠️ OPEN — three portal backends grant without asking, and are unrouted until they do (2026-08-24)
+
+> **Queue entry: #321.** Reorder it, schedule it and close it there; what stays here is the rule and the measurements.
+
+⚠️ **2026-09-13: `Access` is routed to veltrix and ASKS** — the prompt is drawn by the shell and every
+path that is not the user pressing Allow answers denied (architecture.md, "Consent prompts"). It is
+the model for re-routing the three below: same forwarding to `org.veltrix.Shell.Consent`, same probes.
+
+`bin/veltrix-portal` implements `Account`, `DynamicLauncher` and `Background`. All three return
+success immediately: `GetUserInformation` hands over the real name and avatar URI, `PrepareInstall`
+returns the caller's own name and icon for installation unreviewed, `RequestInstallToken` always
+allows, `NotifyBackground` always answers `result: 1`. As of 2026-08-24 they are **no longer
+routed** — trimmed from BOTH `config/portal/veltrix.portal` (the `Interfaces=` line) and
+`config/portal/hyprland-portals.conf` (`[preferred]`), because xdg-desktop-portal reads both.
+
+🔑 **The framing that matters, and the one this got wrong.** An `impl.portal` backend IS the place
+where the desktop asks the user. Implementing one that answers yes to everything is not an
+incomplete implementation — it is implementing the interface and deleting the policy.
+
+⚠️ **For Account and DynamicLauncher it was a REGRESSION, not a gap.** `gtk.portal` declares both
+and shows a real dialog; naming veltrix in `[preferred]` took the question away. Verified by reading
+`/usr/share/xdg-desktop-portal/portals/gtk.portal`. Background is a genuine gap — nothing under
+Hyprland implements it — and the honest state of that gap is `RequestBackground` failing, which is
+better than granting silently: the entire reason the portal exists is that a sandboxed app CANNOT
+write `~/.config/autostart` itself.
+
+**Why it is easy to get wrong, and hard to catch:** auto-approving makes everything WORK. The
+webapp installs, the app receives the user info, background is granted. Every manual test is green.
+A backend that always says yes is indistinguishable from a correct one until you ask what it should
+have REFUSED — and nothing exercises that.
+
+**What re-routing requires, beyond "show a dialog":**
+
+- A real prompt per interface, naming the calling app, with the `reason` string the caller supplied
+  (Background passes one; showing the request without it tells the user nothing).
+- `PrepareInstall` must let the user EDIT the name and icon before returning them — that review is
+  the method's purpose, not decoration.
+- A persisted decision, or every launch re-prompts. That is a permission store, and it is where
+  most of the work is.
+- i18n for every string, all thirteen locales, same PR (policy since 2026-08-23).
+- ⚠️ `EnableAutostart` is marked **deprecated in the spec** ("New versions of xdg-desktop-portal
+  will not call this method"). Installed xdp is 1.22.1 and still carries the symbols, so whether
+  ours is ever reached was NOT determined — find out before spending effort hardening it. If it is
+  reached, it currently writes `~/.config/autostart/<app_id>.desktop` with an unvalidated `app_id`
+  (traversal) and an unvalidated `Exec` line joined from `commandline`.
+
+**Fixed in the same change, because Settings and Wallpaper STAY routed and these were live:**
+`colorSchemeVariant()` reported the `default` enum value as *prefer-dark* (the enum is
+`default|prefer-dark|prefer-light`; it now returns 0), and both spawn sites built a command STRING
+from caller-supplied paths — now `Gio.Subprocess` with fixed argv.
+
+### 91. ⚠️ OPEN — the login screens wear the DOCK's material, and nobody chose that (2026-08-25)
+
+> **Queue entry: #322.** Reorder it, schedule it and close it there; what stays here is the rule and the measurements.
+
+Found while answering #82, and it is a sequencing accident rather than a decision.
+
+**#254** gave the login surfaces `LOCK_GLASS.fill.a = 0.24`, and its comment says why: it is "the
+SHELL's `GLASS_RANGE.min` … so the login screen wears the same material as the desktop at its
+thinnest rather than a heavier one nobody chose." True when written.
+
+**#255**, the very next commit that day (`git merge-base --is-ancestor` confirms the order), raised
+the shipped glass to `GLASS_DEFAULT = 0.48` for every surface that carries text — bar, overlays,
+Settings/About — and left `GLASS_RANGE.min` on exactly one surface, the dock, with this reason in
+`VeltrixTheme.ts`: *"the dock stays at the floor because it is the one surface that sits over the
+WALLPAPER with nothing behind it and never carries body text — its icons are opaque."*
+
+The login was not carried along. So the one screen that is ALL text — username, password, error,
+session selector, primary button, power bar — wears the material picked for the surface that has
+no text at all. #254's premise expired within hours and nothing noticed, because both numbers still
+agreed with a sentence somebody had written.
+
+**What it costs, measured** (white text on dark glass, over the shipped `wallpaper-chroma.jpg`,
+after the blur trim): **2.50:1 at 0.24 → 4.86:1 at 0.48.** It is most of the ~2.8:1 #87 reported.
+
+⛔ **The owner declined the change on 2026-08-25, with the numbers in front of them**, choosing to
+close #82's login half by flipping the SKIN instead and leave the material alone. That is why this
+is an entry and not a commit. It is recorded because the *reasoning* in `LOCK_GLASS`'s comment is
+now false — it cites a lockstep with the shell that has not existed since #255 — and a false
+justification is what produced this in the first place. If the material is ever revisited, the
+question is not "0.24 or 0.48" but "which of the shell's surfaces is the login screen LIKE".
+
+⚠️ Raising it is safe from the blur side and that is worth stating so it is not re-derived: the
+`ignore_alpha` pairing (0.23) is a FLOOR, so 0.48 clears it by more than 0.24 does. The scrim/hero
+ceiling is a separate quantity and is untouched by the body's alpha.
+
+### 97. ⚠️ OPEN — the universal checkmark was born as a copy of the one it was meant to replace (2026-08-29)
+
+> **Queue entry: #324.** Reorder it, schedule it and close it there; what stays here is the rule and the measurements.
+
+`VeltrixSelectionCheck` (`ui/lib/veltrix-kit/check.ts`) landed with #282 to give every single-select
+row in the DE one glyph. Its own docstring says it "replaces raw radio buttons across Settings and
+Installer". **It replaced them in the installer only.** `ui/shell/surfaces/settings/pages/Power.tsx`
+still carries `buildSelectionCheck()` — the widget the kit component was modelled on, same Lucide
+path, same 24× scale, same ROUND caps, sitting six lines away from being deleted. Grep says it: the
+kit component has five call sites and all five are `ui/installer/steps/`.
+
+This is #276's finding a second time (`VeltrixCircleButton` was a copy of `common/IconButton.ts`, and
+the resolution was to MOVE it, not to have two). The rule it keeps re-teaching: a component "for
+everyone" that the original surface does not consume is not a unification, it is a fork with a
+better name — and the second copy is the one that will drift, because it has no user watching it.
+
+Three real differences to reconcile when it is merged, none of them cosmetic:
+
+- **Where the colour comes from.** Power reads `Theme.isDark` and paints flat white/black,
+  reconnecting to `Theme::changed` to redraw. The kit reads `widget.get_color()` — the inherited
+  CSS colour — and connects to nothing. Power's long comment above `buildSelectionCheck` explains
+  why it is deliberately NOT accent-coloured (the row underneath already carries the accent, so an
+  accent check on it has almost no contrast). That reasoning has to survive the move.
+- **`power-profile-check` is not decoration.** The same comment records that the class is what makes
+  the active profile READABLE to `queryUI`, which drops nodes with no id, class or text. The kit
+  takes `extraClasses`, so this survives — but only if whoever migrates knows it is load-bearing,
+  which is exactly what this entry is for.
+- **Line width 2 vs 2.2.** Somebody changed it in the copy. Pick one on screen.
+
+Also unresolved and smaller: `.veltrix-selection-check` is applied by the kit and styled nowhere.
+That is correct today (Cairo paints it, the class is for perception) but it looks like a missing
+rule to the next reader, and `token-contract-check` will not tell them either way.
+
+### 104. ⚠️ OPEN — `AppService.getAppInfo` answers for ids that are not apps (2026-09-13)
+
+Its last resort is a SUBSTRING match over desktop ids, so any string that happens to sit inside some
+entry's id resolves to that entry. The dock's own "launcher" item resolved to
+`fcitx5-wayland-launcher.desktop`: every app-grid click LAUNCHED that input-method helper and only
+toggled the grid once it died (1.2–1.3 s per open and per close, #550), and the item's right-click
+menu offered fcitx5's desktop actions. Fixed at the caller — `DockItem`'s `isSpecialItem` keeps the
+dock's own items (grid, home, trash) out of the registry entirely — but the fallback itself still
+serves every other caller, and a window class or stream name with no entry of its own can land on an
+unrelated app the same way. Before feeding `getAppInfo` a string you did not get from the registry,
+ask whether a wrong app is worse than `null` — for anything that LAUNCHES, it is.
+
+### 105. ⚠️ OPEN — some `nd-` icon names still do double duty, and two installer icons do not exist (2026-09-17)
+
+The Veltrix icon spec (#587, `ui/shell/assets/icons/veltrix/SPEC.md`) promises one meaning per name, because
+every theme made for it draws a name once. The rename split the three clearest cases, but these still
+share a name, and a theme author redrawing one changes the other:
+`nd-pan-up` (collapse, and the assistant's SEND button), `nd-network-vpn-disconnected` (VPN off, and the
+"not isolated" badge on Settings → Apps), `nd-system-lock-screen` (lock the screen, and a secured Wi-Fi
+network), `nd-dialog-information` (About, and a notification with no icon), `nd-value-increase` (a
+slider's "more" end, and Autostart's add button). SPEC.md's *Where* column lists them honestly.
+
+✅ **One more was found 2026-09-20 while auditing the installer and FIXED the same day (spec
+version 3):** `nd-preferences-system-network` draws a **globe** and was asked for by Settings →
+Network *and* by the installer's **Region** page ("Where are you?"), with SPEC.md saying "Network /
+region" out loud. A theme author draws by NAME, so whoever drew "network preferences" as an
+ethernet port would have put a connector on "Where are you?". The owner's call was to give the
+place concept its OWN drawing rather than share one: **`nd-globe`** (Lucide `globe-2`, a globe with
+a landmass — not a copy of the meridian globe, so the two names cannot be confused), fallback
+`globe-symbolic`, which is the only candidate measured at 65/65 themes and 7/7 families AND drawing
+the same idea in every one. Settings → Network and Settings → Region were deliberately left alone.
+⚠️ Note what is still true: **Settings → Region asks for `nd-preferences-system-time`, a CLOCK.**
+That is the same shape of problem one step away — the day a pure time/hour concept needs an icon,
+that name is already doing region duty. Same remedy when it comes up: give the new concept its own
+name, do not borrow.
+
+Found in the same pass and fixed: SPEC.md promised `nd-network-wireless` was used by "Wi-Fi widget,
+Settings → Network". It is not — only the Wi-Fi widget asks for it; Settings → Network asks for the
+globe. The *Where* column is documentation a theme author plans around, so a false entry there is
+not a typo. Split
+one by adding a name (`scripts/icons/veltrix-icons.py add`, then ICON_NAMES and the SPEC row), and bump
+the spec version.
+
+~~Separately, found while renaming: the installer asks `ndIcon("clipboard-list")` and `ndIcon("rocket")`
+for its Summary and Run steps, and neither drawing has ever been shipped.~~ ✅ **Second half FIXED
+2026-09-19 (#602, #603)**: both drawings ship as `nd-clipboard-list` / `nd-rocket` at spec version 2,
+`InstallerWindow.ts` asks for them by those names, and `VeltrixSidebarItem` gained a `themeFallback`
+for the case where the asset tree is not found at all. The name-sharing half above is still open.
+
+### 107. ⛔ STANDING DECISION (owner, 2026-09-20) — Veltrix's own processes run on NO GTK theme, and we draw what we use
+
+**The decision, in the owner's words:** *"si no usamos Adwaita, no usamos Adwaita, no lo usamos
+reseteado."* Loading a theme in order to neutralise it is paying twice for having none. Do NOT
+re-propose keeping Adwaita underneath our surfaces; the reasoning was had, with measurements, and
+this is the answer. It is commandment 11, and `scripts/ci/style-ownership-check.mjs` is the gate.
+
+**What it means, precisely — and what it does NOT mean.** Our processes select no theme
+per-process through `GTK_THEME`, which is an environment variable and reaches nothing else.
+**Third-party applications are untouched**: they follow gsettings
+`org.gnome.desktop.interface gtk-theme`, a different lever, which keeps naming a real theme because
+we ship no GTK widget theme for other people's apps. A Veltrix theme for THEM is a separate project
+that this decision neither requires nor forbids.
+
+**Why it is not a big leap.** Our CSS already loads above the theme's priority, so wherever we
+declare anything we were already beating the theme. Measured with
+`scripts/dev/kit-gallery-probe.ts`: one of each kit component under both substrates differs by 345
+pixels out of 495 000, and the differences are exactly two — the `dropdown`'s arrow, which
+vanishes, and the entry `placeholder`, which stops being dimmed.
+
+---
+
+#### ✅ Steps 1-4 landed 2026-09-20; ✅ step 5 landed 2026-09-23 (see the end of this entry). What is left is step 6.
+
+**1 · Our blank theme is gone; the theme is GTK's own `Empty`.** ✅ `ui/greeter/theme/gtk.css`, its
+`install.sh` step, its PKGBUILD line and the three `ThemeManager` guards against the name `veltrix`
+are deleted; `ui/lib/veltrix-kit/platform/gtk-theme.ts` is the one home for the decision and the greeter, the lock and
+the installer all call `useNoGtkTheme()`. install.sh now `rm -rf`s `/usr/share/themes/veltrix` so an
+upgraded dev machine stops offering it. Measured: `Empty` is **0 pixels of 495 000** different from
+the blank theme it replaces.
+🔑 **And the replacement is not cosmetic.** A `GTK_THEME` that resolves to nothing falls back to
+GTK's FULL built-in theme, silently — measured, `GTK_THEME=NoSuchTheme42` renders pixel-identical
+to `GTK_THEME=Default`. So every process that missed the install step ran the full default theme
+while the code said "blank", with no symptom. The installer is the one that mattered: it ships as
+`veltrix-installer`, on a live medium that need not carry `veltrix`, which was the package
+installing the theme. `Empty` lives in libgtk's gresource and cannot go missing.
+
+🔴 **Step 2 shipped a regression, and the FIRST fix for it was in the wrong layer.** The owner
+found it on 2026-09-20: selecting a theme in Settings turned dark mode off in GTK3 apps, in Chrome
+and in Telegram — all three ask GTK for the theme NAME and derive dark from it.
+
+`Adwaita` was a ghost for GTK4 — and it is GTK3's REAL built-in, the only name whose dark variant
+GTK3 can find. Measured with `gtk-application-prefer-dark-theme = 1`: `Adwaita` → bg `rgb(53,53,53)`
+DARK; `Default`, `veltrix` and `NoSuchTheme42` → `rgb(246,245,244)` light. GTK3 does **not** fall back
+to "the built-in with prefer-dark honoured" — an unresolvable name lands on the LIGHT theme, and
+there GTK4 is the forgiving one.
+
+⚠️ **The first attempt mapped the name while writing `~/.config/gtk-3.0/settings.ini`** — the two
+files are separate, so each could get its own toolkit's name. It was verified end-to-end through the
+real file (GTK3 reading that ini: `Adwaita` → dark, `Default` → light) **and it changed nothing on
+the owner's screen**, because the Settings portal SERVES this key: `gdbus … Settings.Read
+"org.gnome.desktop.interface" "gtk-theme"` answers with the gsettings value, so a Wayland
+application reads it directly and never consults the per-toolkit file. A fix applied while writing a
+file nobody reads is a fix that measures green and does nothing.
+
+✅ **The fix is at the VALUE.** `GTK_BUILTIN_THEME` is `Adwaita` again, and the seed with it —
+because one name serves both toolkits: for GTK4 the two are interchangeable (measured through the
+real settings.ini path, `Adwaita` and `Default` render **0 differing pixels**, since an unresolvable
+name falls back to the built-in), and for GTK3 only `Adwaita` works. The per-file mapping is gone;
+`ui/lib/veltrix-kit/platform/gtk-theme.ts` holds the reasoning and the numbers.
+
+✅ **Verified on the owner's real screen, 2026-09-21** — the part that was still reasoning. A mode
+change repaints a RUNNING Chrome, browser chrome included and without restarting it: the window
+interior goes `44,54,80` → `236,236,236` and the tab strip `100,70,97` → `231,230,230` (`magick`
+on the window's rect, taken from `listWindows`). Chromium only ever calls
+`g_object_set(settings, "gtk-application-prefer-dark-theme", …)` on ITS OWN GTK3
+(`ui/gtk/gtk_ui.cc`), and that works because GTK3's gresource carries
+`theme/Adwaita/gtk-dark.css` — so `Adwaita` at the value is what reaches it.
+⛔ **This closes the `-dark` theme-pairs route for good.** Shipping `Veltrix`/`Veltrix-dark` as two
+installed themes was the alternative on the table; it is not needed, do not re-propose it.
+
+🔑 **The lesson this entry is worth keeping for:** "which name does GTK's built-in answer to" has
+two answers and step 2 asked only GTK4. And a value that the portal serves is a DESKTOP-WIDE value —
+correcting it per-file is correcting it where nothing on Wayland looks.
+
+**2 · The seed names something real.** ✅ `defaults/appearance.json` seeded `themeFamily: "Adwaita"`
+and a clean Arch has no `/usr/share/themes/Adwaita` — GTK 4.22's built-in is `Default`, and
+everything worked only because GTK falls back. It seeded `Default` for one day and now seeds `Adwaita` again — see the
+regression above: `Default` is the name GTK4's built-in answers to, and `Adwaita` is the name that
+works in BOTH toolkits. This is the value THIRD-PARTY apps read, and the portal serves it to them.
+
+**3 · Settings' theme dropdown offers real themes and displays a real value.** ✅
+`getAvailableGtkThemes()` listed `/usr/share/themes` and subtracted three names, which on a clean
+Arch is the entire directory — `Default` and `Emacs` are GTK3 KEYBINDING themes (`gtk-keys.css`),
+not widget themes. So the row showed a name that was neither on disk nor among its own options, and
+opening it offered an empty list: one bug seen from two ends. It now mirrors
+`getAvailableIconThemes()`: a directory counts only if it has a `gtk-4.0/` subdirectory (a
+`gnome-themes-extra` Adwaita carries only `gtk-2.0` and `gtk-3.0` and would change nothing for a
+GTK4 app), the built-in is always offered under `GTK_BUILTIN_THEME` since no directory scan can
+find it, and the configured value stays selectable. ⚠️ That constant is `Adwaita`, not `Default` —
+so a real `/usr/share/themes/Adwaita` is filtered out of the scan and re-added as the built-in,
+which is right: under that name the two are the same offer to a GTK4 app. Proved both ways against the real method: a `gtk-4.0` theme is
+accepted, a `gtk-3.0`-only one is refused, and on `main` the same probe offered the `gtk-3.0`-only
+one and not `Default`.
+⚠️ `enum:` is evaluated once, at registration, so a theme installed later does not appear until the
+shell restarts. Same for the icon row.
+
+**4 · The eight owed nodes are settled — by looking, which is what the list asked for.** ✅
+`kit-gallery-probe` grew a section mounting them and was shot with a theme and without. The list
+was eight; it is one, and the tally is the argument for having made it:
+
+| node | what the two images showed |
+|---|---|
+| `picture`, `revealer`, `stack` | no difference — GTK's rules for them are all composites we do not build |
+| `textview` | GTK gives it a WHITE fill and black text. With no theme it inherits our colour on our glass: **the hole was the fix** |
+| `flowbox` | the app grid resets `flowboxchild` on purpose to paint its own accent ring; GTK's blue fill is what we were removing |
+| `separator` | invisible. Every one we build carries a class that paints it, so the hole only opens on the next bare one — a bare-node default now sits under them in both sheets that build one |
+| `expander` | **the arrow had never been drawn.** `.installer-expander` asked for a node called `arrow`; GTK 4.22 builds `expander`. A selector naming the wrong node looks exactly like one naming the right node, and the installer runs themeless, so nothing covered for it. Fixed, and it now uses OUR chevron by path rather than `-gtk-icontheme("pan-end-symbolic")` — commandment 10 |
+| `spinner` | ✅ drawn 2026-09-20 as a base-layer rule — see below |
+
+✅ **`spinner` is drawn, 2026-09-20 — and as one rule of the base layer, which is what the
+strategy correction said it would be.** A ring: track `--veltrix-surface-raised`, head
+`--veltrix-accent`, one turn a second, revealed on `:checked` so a stopped spinner is not a static
+ring pretending to work. **In CSS, so it needs no asset** — no `nd-` name, no registry entry, no
+SPEC bump — and the accent is doing exactly what the design system reserves it for. Verified by
+looking (the ring renders, caught mid-turn) and by shooting the gallery TWICE: the spinner's region
+differs between two independent shots, which is how a rotation is told apart from a static ring.
+⚠️ It costs one pixel of height in the probe's column — the widget now occupies the space it always
+claimed and never painted — so the gallery's control is no longer 0 against its old baseline. The
+diff was checked to be the spinner plus that 1 px shift and nothing else; the installer pages, which
+build no spinner, stayed at 0.
+⚠️ **Still owed by the SHELL**, and `style-ownership-check`'s OWED entry now says so in those words:
+the shell does not compile the base layer, and its two spinners (`settings/pages/Bluetooth.tsx`,
+`widgets/vpn.ts`) are drawn by the user's theme meanwhile. It closes when step 5 flips the shell.
+
+**What it was, for the record.** `GtkSpinner` paints
+nothing in C — it is an empty CSS node whose ENTIRE appearance is a theme property:
+`-gtk-icon-source` plus a rotation on `:checked`. With no theme there is no source, so there is
+nothing to rotate. The theme *is* the spinner, exactly as it was the expander's arrow. Three sites,
+and the greeter's is the worst: `ui/lib/auth-card.ts` shows it while a password is being checked,
+on a screen that has forced a themeless GTK since 2026-08-24, so the login screen's only piece of
+progress feedback has been blank ever since.
+🔑 Do NOT treat this as a standalone "which drawing?" question — that framing was the mistake. It
+is one node of the BASE LAYER described under step 5, and it gets answered there.
+
+**5 · Flip the SHELL.** ⛔ NOT DONE, and now blocked by a number rather than a worry. The other
+three bundles were already themeless and are on `Empty`; the shell is the one that unsets
+`GTK_THEME` and follows gsettings, in `ui/shell/app.ts` and in `ThemeManager.syncGtkTheme()`
+(which also pushes the user's theme onto our own `Gtk.Settings` — that push, not the unset, is what
+dresses our windows in it).
+
+🔴 **What blocks it is the two dialogs GTK builds ITSELF, in our process, both of which live in
+Settings.** Captured 2026-09-20 under both substrates, which the first attempt could not do:
+`Gtk.FontDialog` (Settings' font picker) opens a `GtkFontChooserDialog` toplevel carrying none of
+our classes, so the shell's scoped rules cannot reach it, and `GTK_USE_PORTAL` is not set either.
+With no theme it is legible and **undressed**: no frame on the search entry, none on the font list,
+no trough on the size slider, no chrome on the spin buttons, and no button chrome at all — so
+*Cancelar* and *Seleccionar* sit side by side as two bare words with nothing between them.
+`Gtk.FileDialog` creates a `GtkFileChooserDialog` toplevel too, so it is in-process and ours to
+dress as well; it never mapped under broadway in twelve seconds, so there is no picture of it and
+no claim here about how it looks.
+
+🔑 **STRATEGY CORRECTION, owner, 2026-09-20 — and it reframes steps 5 and 6 entirely.** The
+paragraph that used to stand here called dressing GTK's internal nodes "where our stylesheet starts
+becoming, for our own processes, a GTK theme in all but name", and offered it as the COST. The
+owner's answer: that is not the cost, **it is the destination**. Commandment 11 says we use GTK
+with our styles and nothing by default; the stylesheet of a process that loads no theme *is* that
+process's theme, and saying so out loud is the point rather than the price.
+
+**What that makes the real defect — bigger than any node on the list above.** Our CSS is written
+almost entirely as per-surface SCOPED classes, and that leaves no base layer. Two facts settle why
+that is wrong here:
+
+- a `Gtk.CssProvider` added with `add_provider_for_display` reaches every widget in **our process**
+  and nothing outside it. Third-party applications are separate processes; unscoped rules of ours
+  have never been able to touch them. So commandment 2's scoping protects nobody from us — it only
+  keeps one of our surfaces from repainting another, which is an organisation concern, not a
+  safety one.
+- therefore the widgets GTK builds ITSELF, which can never carry one of our classes — the font
+  dialog's buttons, its list, its entry, its spin buttons — are reachable **only** by element
+  selectors. There is no other lever.
+
+So the shape is two layers, and we have only ever written the second:
+
+| layer | selector | job |
+|---|---|---|
+| base | `button`, `entry`, `list`, `separator`, `spinner`, `expander`, `textview`, … | dress EVERY node in the process, including GTK's own dialogs. This is the layer that does not exist |
+| variation | `.veltrix-*`, `#veltrix-bar …`, `window.veltrix-settings-window …` | what a surface does differently |
+
+**Consequences to carry into the next session:**
+
+- `Gtk.FontDialog`/`Gtk.FileDialog` stop being a blocker and become the first thing the base layer
+  is measured against. They are undressed because there is no base layer, not because they are
+  unreachable.
+- The `spinner` still owed above stops being a separate "which drawing?" decision — it is one rule
+  of the base layer like any other node.
+- ⚠️ **Build it by measuring, surface by surface, never in one sweep.** Bare-element rules are the
+  sharp edge and this repo has already paid for that once: `ui/lib/veltrix-kit/styles/_components.scss` records
+  that when `entry` and `dropdown > button` arrived without a class, two properties reached
+  controls nobody intended and only one was findable by reading the cascade. The A/B is
+  `kit-gallery-probe` and `installer-pages-probe` (both now default to no theme, `PLATFORM_THEME=1`
+  for the other arm).
+- Commandment 2 needs rewording once this lands: "no unscoped global CSS" was written for a shell
+  that ran under Adwaita, and its exception list (`_base`, the two `_components`, `_reset`,
+  `@keyframes`) is the beginning of the base layer described here, not a set of special cases.
+
+Until that layer exists the shell keeps its theme, and `style-ownership-check` stays deliberately
+stricter than the runtime for that one bundle.
+
+**6 · Then, and only then, delete the resets** that exist solely to neutralise a theme that is no
+longer loaded — including the comment in `ui/shell/styles/_reset.scss` that still blames
+`Adw.init()` for a libadwaita gone since 2026-08-18. ⛔ Blocked on step 5 and must stay blocked: a
+reset removed while its node is still undrawn takes the pixel with it.
+
+⚠️ **Ordering rule that is easy to get wrong**: step 5 must not precede step 4, and step 6 must not
+precede step 5.
+
+#### ▶️ Step 5 STARTED 2026-09-20 — the base layer exists, three rules deep, and the controls are at zero
+
+`ui/lib/veltrix-kit/styles/_base-layer.scss`, `@use`d from the kit's `_components.scss` so every bundle that
+compiles the kit gets it. `scripts/dev/kit-gallery-probe.ts` grew `FONT_DIALOG=1`, which opens
+`Gtk.FontDialog` and shoots the toplevel GTK builds for it — the ruler this layer is measured with.
+
+| rule | what the capture showed without it | how it was made safe |
+|---|---|---|
+| `window` | the dialog has **NO BACKGROUND**: mean alpha **0.048**, against 0.71 for the same dialog under a platform theme. Its entry, list, preview and buttons hang on whatever is behind the window | every Veltrix window is `window.veltrix-…` (0,1,1) AND declares `background: transparent` explicitly, so a (0,0,1) rule cannot reach one. `--veltrix-popover-bg`, not `--veltrix-bg`: a dialog is a floating surface and that token already carries the `max(windowOpacity, 0.38)` legibility floor |
+| `button` | **"CancelarSeleccionar"** — the two action buttons as one run-on string, no chrome, no gap. GTK's button node paints nothing; the theme IS the button | `button.veltrix-btn` is (0,1,1) and "wipes GTK defaults completely"; every other button of ours carries a class too |
+| `scale` | the size slider draws **nothing** between its label and its value | **the repo never constructs a `Gtk.Scale`** — verified, every mention of the name is a comment saying so; `makeSlider` is a Cairo `DrawingArea`. So the rule can only reach a scale GTK built |
+
+After the three: the dialog carries a surface (mean alpha 0.41), two separated buttons, a pill
+trough with an accent fill and the white `--veltrix-thumb`. **Control: the kit gallery and the six
+installer pages at 0 changed pixels**, re-measured after each rule.
+
+⚠️ **The instrument shared the blind spot it was built to find, and it cost a false result.** The
+first `FONT_DIALOG` arm shot `dialog.get_child()`. A GTK window's background is painted by the
+`window` node itself, so a snapshot of its CHILD can never contain it — the arm reported a
+background-less dialog (true, but for the wrong reason) and then **0 change from a `window` rule
+that was in fact working**. Shoot the window. Fixed in the probe with the reason on it.
+
+⚠️ **`installer-pages-probe`'s `welcome` page is not deterministic**: it differs from itself by
+10.41 px in a 1×19 box at +96+263 — the text caret, blinking, because every wizard step takes the
+caret when it opens. Re-run before believing it; the other five pages and the gallery are exact.
+
+✅ **The shell question is ANSWERED, and the answer came from building the probe rather than
+arguing.** `scripts/dev/shell-gallery-probe.ts` (new, 2026-09-20) is the shell's half of the A/B.
+It does not curate a list of widgets: it reads the shell's COMPILED sheet and enumerates every
+`<element>.<class>` compound in it, grouped by the window scope its selector sits under, then mounts
+each one inside a window carrying that scope — because a shell rule scoped to `#veltrix-bar` does not
+apply anywhere else, and a probe that ignores that reports false breakage. `SCOPE=` picks the
+surface; with none it lists them.
+
+**On its first run it found a real regression.** With the base layer `@use`d from the kit's shared
+sheet — which put it in the shell — the A/B against the shell's own substrate (`PLATFORM_THEME=1`)
+came back at **35 134 px (bar), 28 039 px (alert dialog), 33 743 px (Settings)**, and the diff's
+shape was a whole column shifted DOWN: the base `button` rule's `padding` and `min-height` reaching
+shell buttons that had been taking their geometry from the theme. `button.accent-circle-btn`,
+`button.destructive-action` and `button.flat` are the first three; everything below them moved
+because the shift is cumulative.
+
+**So the layer is wired per BUNDLE, from the sheets of the ones that have no theme**
+(`ui/installer/style.scss`, `ui/greeter/style.scss` — the lock shares it), never from
+`ui/lib/veltrix-kit/styles/_components.scss`. Re-measured after the rewiring: shell back to **0 px** on all
+three scopes, the font dialog still dressed (mean alpha 0.41), kit gallery and the installer pages
+still 0. The shell wires it the day step 5 flips it, and this probe is what makes that flip
+measurable button by button. 🔑 The principle underneath: **a layer meant to REPLACE a theme,
+added under a process that still has one, is the two-substrate bug this repo already paid for.**
+And the shell's font dialog is not urgent, because a shell with a theme has a dressed dialog — it is
+the three themeless bundles whose GTK dialogs are undressed today.
+
+⚠️ **The probe's own blind spot, printed by the probe itself**: a rule written as a BARE class
+(`.cc-tile`) names no node, so there is nothing to mount it on, and those widgets are still exposed
+to an element rule for any property their class does not declare. The count is in its output.
+⚠️ Two GJS traps it hit, both now commented in the file: `GLib.file_get_contents` called twice in
+one expression comes back empty the second time, and `\b([a-z]+)\.` matches the TAIL of a class in
+a compound selector (`.veltrix-bar.veltrix-btn` → the "node" `bar`), which invented fourteen node
+types the probe then reported it could not build.
+
+🔑 **The other half of the decision, owner, 2026-09-20 — and it settles what step 5 is FOR.** The
+question asked forwards was whether our own applications should follow the user's GTK theme, since
+Veltrix will publish apps outside this repo. **They should not:** `veltrix-kit` is the platform
+library, our apps carry our look as a dependency, and the user's axis is the appearance portal, which
+already reaches third-party apps too. So the destination of the base layer is not a half-themed
+Settings — it is that the user's `gtk-theme` reaches **none** of our processes and means exactly one
+thing: other people's apps. The lever table is canonical in `design-system.md` ("Who may change each
+layer"). Two consequences land here:
+
+- the base layer's body is also the body of the **Veltrix GTK theme for third-party apps** we do
+  intend to ship. Separate artefact, GTK's own vocabulary, GTK3 too, no Cairo — but built once. That
+  is another reason step 5 comes before any theme work, not after.
+- Settings' "Tema GTK" row becomes honest only after step 5, and until then it is a control that
+  repaints the font dialog and nothing else. Its string should say it is for applications other than
+  Veltrix's own before that row is next touched.
+
+⚠️ **Owed measurement, small and load-bearing for the sentence above.** GTK loads the user's own
+`~/.config/gtk-4.0/gtk.css` at USER level — the same 800 as `ui/lib/veltrix-kit/platform/host.ts`, not below it — and a
+tie is settled by insertion order. Nothing of ours writes that file (`AppearanceSync` writes only
+`settings.ini`), so it is theoretical; but "the user's theme reaches none of our processes" is proven
+of `gtk-theme` and unproven of a hand-written `gtk.css`. Measure it before that claim is repeated.
+
+#### ✅ Step 5 DONE 2026-09-23 — the shell is themeless, and what it had been standing on is now written down
+
+`ui/shell/app.ts` calls `useNoGtkTheme()` where it used to `unsetenv("GTK_THEME")`;
+`ThemeManager.syncGtkTheme()` writes the user's theme to gsettings (for THIRD-PARTY apps, which the
+portal serves it to) and no longer onto our own `Gtk.Settings`; `ui/shell/style.scss` `@use`s the base
+layer first. `setPreferDark` lost its libadwaita probe — it `import`ed `gi://Adw` to ask
+`Adw.is_initialized()`, which only AGS's host could make true, so it mapped libadwaita into the shell
+to learn "no".
+
+**How it was verified — on the LIVE shell, not the probe.** `shell-gallery-probe` prints its own
+blind spot (220 bare-class selectors it cannot mount), so the gate was the real thing: reload the
+shell from source, open the desktop, CC, NC, Prism, the app grid, the overview, About and all 19
+Settings pages through `veltrix-ipc`, `veltrix-ipc screenshot` each, once on `main`'s CSS and once on
+the change, and diff each surface cropped to its own rect. Method in `design-system.md`.
+
+**What the theme had been giving the shell without anyone saying so — one regression each, each now
+a base-layer rule with GTK's geometry and our paint** (values read from libgtk's gresource,
+`theme/Default/Default-dark.css`):
+
+| node | symptom when the theme went | rule |
+|---|---|---|
+| `button` box | "Luz nocturna" → "Luz noctu…" on the CC tile: the base layer's `5px 14px` was 10px wider than the theme's box, on buttons that declare colours but not padding | `padding: 4px 9px; min-height: 24px; min-width: 16px` — GTK's |
+| `list > row` | Settings → Users: the avatar row lost 4px and "Change…" rose into the picture | `padding: 2px` — GTK's |
+| `calendar` | NC header shifted ~4px — not the arrows (the NC strips them) but GTK's TABULAR digits changing the width of "2026" | `font-feature-settings: "tnum"` + GTK's day padding, our accent |
+| `dropdown arrow` | every GtkDropDown lost its chevron — Settings → Display's four pickers, and **the installer's keyboard picker, which had none since it went themeless** (an ISO-visible bug nobody had seen) | OUR `nd-pan-down` by path, `-gtk-recolor(url(…))`, + GTK's 6px box gap. The ONE deliberate visual change: our chevron instead of the icon theme's triangle (commandment 10) |
+| `tooltip` | a widget's native `tooltip_text` (two shell buttons, and GTK's dialogs) would be bare text | GTK's `6px 10px`, our floating-surface paint |
+
+Result: bar and dock 0 px; CC and NC at noise (a CPU counter); every Settings page at the glass's
+background noise; installer pages and kit gallery 0 (account/welcome differ from THEMSELVES by the
+caret); the greeter unchanged — its one moved pixel is the harness's own titlebar, which a
+layer-shell greeter does not have.
+⚠️ The greeter needed one guard: it spaces its 10px chevron with the arrow's own margin, so the base
+6px gap was zeroed there (`dropdown > button > box`), and the base arrow rule sets NO min-size (the
+icon size already defaults to 16px, and a floor overrode the greeter's 10px).
+
+🔑 **`Gtk.FileDialog` was never ours.** On GTK 4.22 it goes through the portal by default: under a
+headless `cage` it never mapped in-process until `GDK_DEBUG=no-portals` (the new `FILE_DIALOG=1` arm
+of `kit-gallery-probe`). So Settings' file chooser is drawn by `xdg-desktop-portal-gtk`, another
+process that follows the user's GTK theme like any third-party app. Half of what held step 5 up for
+three days was a dialog in somebody else's process.
+
+**Step 6 — first pass DONE 2026-09-23.** Deleted, as a batch and then measured on the live shell
+against #631's state (CC, NC and every visible part of all 19 Settings pages at 0 px; Prism, app
+grid, overview, About unchanged by eye — the full-screen diffs are the user's windows behind):
+`_reset.scss`'s `button, calendar { color }` (the base layer declares the same value), the
+window-scope `border`/`box-shadow`/`outline`/`background-image`, the neutralisation of GTK's
+internal nodes (`ripple`, `highlight`, `outline`, `focus-ring`, `decoration`), the `:drop(active)`
+suppression, the `scale` internals, `scrolledwindow > overshoot/undershoot`, Prism's row focus-ring
+kill, and the shell's identical second copy of `.veltrix-tooltip`.
+🔑 **The test for "dead" is not "it mentions Adwaita".** A reset is dead only if the thing it
+suppressed was painted by the THEME alone. One that strips a `button` now strips the base layer's
+fill and stays (see #2). Scripts' comments were re-pointed from "Adwaita" to the base layer.
+⚠️ Not measurable by a still screenshot, and deleted on the substrate argument (with no theme
+those nodes have no rule at all): the drop-target highlight and the overscroll smear.
+✅ Settings' "GTK theme" row, which now reaches third-party apps ONLY, is labelled so: "External
+app theme" / «Tema de aplicaciones externas», subtitle "Look of GTK apps that aren't Veltrix's"
+(owner's wording, 2026-09-23, all 12 locales). And the app grid's window, which declared no
+background, took the base layer's `window` fill as a translucent box around the panel on the day
+the shell flipped — fixed in #631; the base layer's header no longer claims every window of ours
+declares one.
+
+---
+
+### 108. ⚠️ OPEN — the kit is a package now; only the installer still carries its own copy (2026-09-20, phases 1-4 done 2026-09-23)
+
+Raised by the owner while deciding the theming question above: *"si nuestras apps siempre van a tener
+nuestros estilos, tendríamos que tener esa hoja como dependencia de la app, cuando publiquemos apps
+fuera del repo del shell"*. Right — and today it is worse than a dependency.
+
+**Measured 2026-09-20.** `ui/shell/style.scss`, `ui/greeter/style.scss` and `ui/installer/style.scss`
+each `@use '../lib/styles/components'` and compile it **into their own CSS**: three copies of the
+same tissue, kept in step only because they share a working tree. And `ui/lib/veltrix-kit/` has **no
+`package.json` at all** — nothing outside this checkout can depend on it. A calculator published as
+its own project could not import the kit; it would have to copy it, and that copy is the fourth one,
+the one that drifts where nobody is looking.
+
+So the decision that our apps carry their look as a dependency (see #107) has a precondition nobody
+has built: **the kit has to BE a dependency** — the widgets, its sheet (`ui/lib/veltrix-kit/styles/`), the
+appearance seam (`veltrix-kit/appearance.ts`) and the token engine, versioned and installed, with the
+four in-repo bundles consuming the same artefact as an external app would. That is also the only
+honest test that the seam works: a bundle in this tree can accidentally reach into `ui/shell/`, and an
+external app cannot.
+
+⚠️ Do NOT treat this as packaging polish. It is what makes #59's failure mode structural rather than
+lucky: a kit component whose rules stayed behind renders bare in whoever imported it, and
+`style-ownership-check` can only see the copies that live in this repo.
+
+**Decided 2026-09-23 — option B, by phases.** The kit is a PLATFORM library installed once and
+loaded by every app at start (like libadwaita), not a build-time dependency each app freezes a copy
+of: one update reaches every app. The cost accepted with it: the kit becomes a public API (versioned,
+never breaking a consumer silently), and GJS has to load it at runtime. Separate REPO: not yet — a
+package can ship from this repo; it moves out once its API stops moving, or when outside authors
+need their own release cadence.
+
+1. ✅ **The package is delimited (2026-09-23).** `ui/lib/veltrix-kit/` holds the widgets, `platform/`
+   (host, gtk-theme, the appearance engine, icons, the token and drawing helpers) and `styles/`, with
+   its own `package.json` version; `kit-boundary-check.mjs` fails if it imports anything outside
+   itself. Layout and rule: `architecture.md` → "The kit is a package". Measured: the three sheets
+   compile byte-identical apart from comments, all four bundles typecheck and bundle.
+2. ✅ **One kit sheet, loaded at runtime (2026-09-23).** `kit.css`, compiled once, loaded by the
+   shell, greeter and lock ahead of their own sheet IN THE SAME PROVIDER (`withKitSheet`; GTK does
+   not compare specificity across providers — measured). Off-screen A/B: 0 changed pixels on every
+   `shell-gallery-probe` scope, control 27 k–192 k; greeter rules identical in order. Mechanism:
+   `architecture.md` → "The kit's sheet is loaded, not compiled in". The installer keeps its copy.
+3. ✅ **The kit's code is loaded at runtime (2026-09-23).** Compiled as ES modules
+   (`bundle.mjs kit`), installed at `/usr/share/veltrix-kit/js`; the shell, greeter and lock import it
+   by absolute `file://` URI (`--kit-external`), dev from the checkout's `build/js`. Start-up cost:
+   none measurable (~210 ms both ways); pixels identical. Mechanism: `architecture.md` → "The kit's
+   CODE is loaded, not bundled".
+4. ✅ **The kit is its own package (2026-09-23).** `veltrix-kit` (split package; the desktop
+   depends on it) ships the modules, the sheet, its sources as its types and the API version,
+   provided as `veltrix-kit-api`. An app outside the repo imports it by
+   `file:///usr/share/veltrix-kit/js/<module>.js`; the guide is `ui/lib/veltrix-kit/README.md`.
+   Proved with an app built outside the tree against a scratch install. Mechanism:
+   `architecture.md` → "The kit's own package".
+
+What is left of #108 is the installer, below — which is why this item stays open.
+
+⚠️ The INSTALLER keeps bundling its own copy until the ISO is published (it is the one program that
+cannot be fixed by an update); it moves to B after.
+✅ **Licence decided 2026-09-23 (owner):** the kit is LGPL-3.0-or-later, the rest of the repo
+GPL-3.0-or-later (the PKGBUILD said `-only` while NOTICE said "or later"; now both say the latter).
+
+Related: #59 (the kit's stylesheet split, and the direction its verification did not check), #107
+(the theming decision this serves), #571 (Settings becoming its own process — the first consumer).
+
+### 109. ⚠️ OPEN — five detail-panel switches still have no accessible name (2026-09-21)
+
+Left over from #615, and left over on purpose. That fix named the kit's `VeltrixToggleRow` and the
+seven switches a page builds directly, because in each of those the string is on the adjacent line.
+`panelSwitch()` (`ui/shell/common/widget-kit/panel.ts`) is the exception: it takes
+`get`/`set`/`subscribe` and **no label**, and its five callers — `widgets/bluetooth.ts:98`,
+`widgets/focus.ts:38`, `widgets/night-light.ts:52` and `:78`, `widgets/wifi.ts:169` — build the
+switch before anything names it. So those five read as a bare `switch` in the accessibility tree:
+a screen reader cannot say what they toggle, and `veltrix-act`, which addresses controls BY NAME,
+cannot point at them at all.
+
+The fix is not one line: it is an optional `label` on `panelSwitch` plus a decision, per panel, of
+what its switch is CALLED — which is not the same as the panel's title (the Night Light panel has
+two switches, and "Night Light" names neither of them well). Inventing those strings without
+looking at the panels is how a control ends up named after the wrong thing, so it waits for
+somebody with the panels on screen.
+
+Related: #615 (the half that landed), and the computer-use surface in `dev-workflow.md` — perception
+and action both address by name.
+
+### 110. ⚠️ OPEN — the shell's typecheck cannot see GLib, Gio or GObject (2026-09-22)
+
+`ui/shell/gi.d.ts` declares `gi://GLib`, `gi://GObject`, `gi://Gio` and `gi://GdkPixbuf` as
+`any`, on top of the real `@girs/` typings — and a module declared `any` is a module `tsc` stops
+reading. That is how the installer shipped `GLib.strdup_printf` (varargs, so absent from the GIR
+and `undefined` in GJS): it threw on the System and Summary pages of every machine with a
+Turing-or-newer NVIDIA GPU. The installer lost those shims the same day and is now typechecked in
+full, and so are the greeter and the lock screen (their one shim, `ui/lib/veltrix-kit/gi-cairo.d.ts`, covers
+`gi://cairo`, which ts-for-gir types from the cairo GIR instead of GJS's own cairo module). The
+shell has not.
+
+⚠️ A trap for whoever does this: when a shim and @girs both declare a module, the declaration tsc
+reads FIRST decides the default export — the other is silently dropped. The shell's shims work only
+because `**/*.ts` happens to precede `@girs/**/*` in its `include`. Measured with the cairo shim:
+listed after @girs it did nothing (4 errors); listed first, 0.
+
+A cheaper net meanwhile, run 2026-09-22: every `GLib.x` / `Gio.x` / `GObject.x` / `GdkPixbuf.x`
+the source names (132) was asked of GJS itself (`typeof … === "undefined"`), and all exist — the two
+hits were in comments. It sees top-level members only, not methods on instances.
+
+Measured, deleting the four shims from the shell: **108 errors, all one shape** — TS2345,
+`Argument of type '"…"' is not assignable to parameter of type 'keyof SignalSignatures'`. That is a
+`connect()` on a signal the typings do not declare (our own subclasses' signals, and a few real
+ones the snapshot lacks); none of the 108 is a call to something that does not exist. So the work
+is typing our signals (or a narrow cast at those call sites), then dropping the shims — mechanical,
+but 108 sites, and the payoff is the class of bug above.
+
+### 111. ⚠️ OPEN — the dock has no width limit: too many icons, or a high scale, and it runs off the screen (2026-09-26)
+
+Owner-caught 2026-09-26, at every scale: nothing bounds the dock's length. Its geometry is derived
+ONCE from `dockSettings.iconSize` (`DockPhysics.deriveConstants`, applied by rebuilding the dock),
+and no step compares the result with the monitor. More pinned + running apps than fit, or a scale
+that shrinks the logical screen (2560 at scale 2 is 1280), and both ends leave the screen. macOS
+shrinks the icons proportionally so the dock always fits.
+
+Why it is NOT a one-liner — decide before coding:
+- The fitted size depends on the ITEM COUNT, which changes when an app opens or closes. Today the
+  constants only change by rebuilding the dock; re-deriving them per launch means a rebuild (or a
+  live re-derive the physics does not support yet) on the frame an app appears.
+- `EXCLUSIVE_ZONE` comes from the same `iconSize`. A dock that shrinks to fit would also shrink the
+  strip it reserves, so tiled windows would RESIZE when an app opens. Options: fit the icons but
+  keep the zone of the configured size; or only shrink the icons along the main axis (spacing and
+  size) while the cross-axis height stays.
+- Magnification must stay inside the screen too (the bulge at the ends).
+
+### 112. ⚠️ OPEN — a fixed CC widget has no reserved cell: a full grid leaves it out (2026-09-28)
+
+`ccFixed` (writing-a-widget.md) guarantees the PLACEMENT, not a cell. The CC grid is 4×8 and
+optional tiles take cells first-come: fill it, then plug in a Bluetooth dongle, and `syncCCLayout`
+finds no free cell for the Bluetooth tile — `CCLayoutManager.add` returns silently. The tile comes
+back as soon as a cell frees. Unlikely with today's catalogue (the defaults use 22 of 32 cells), and
+a fixed widget that is already placed never loses its cell. Fixing it properly means `canAdd` for
+an OPTIONAL widget keeps room for every fixed widget that is available and unplaced — deciding
+whether room is also kept for fixed widgets whose hardware is absent (a desktop would then lose
+cells to a Wi-Fi it will never have). Only a PERSONALISED grid can get there: the default one is
+re-packed whenever its members change (`CCLayoutManager` "Two modes", 2026-09-28). The same goes
+for holes — a tile removed from a personalised grid leaves its cells empty; the default grid closes
+them.
+
+### 113. ⚠️ OPEN — white on the accent does not read on yellow, green or orange (2026-10-06)
+
+`--veltrix-accent-fg` is `#ffffff` for all nine accents (`theme-tokens.ts`), and it is the ink of
+every accent FILL: the menus' row under the pointer, every dropdown's list, the selected segment,
+the primary button, the Settings sidebar's chosen row. Measured (WCAG ratio, white on the fill):
+blue 3.5, teal 3.8, green **2.4**, yellow **1.8**, orange **2.6**, red 3.3, pink 3.3, purple 4.9,
+slate 3.9. Only purple reaches 4.5:1; the reference platform lives at ~3.5 with its blue, and
+medium-weight text there reads. Below 3:1 it does not. Three ways out, laid out for the owner on
+2026-10-06 (mockup "Acento en Ajustes"): **black ink on the three** that fall below 3:1; **a
+deeper accent under text** (darkened until white reaches 4.5 — blue only 13 %, but yellow turns
+ochre, 39 %), switches and sliders keeping the bright one; or leave it. The owner has not chosen —
+"ni la referencia garantiza el contraste mínimo". Do not pick one silently: it changes the colour
+of every menu on the desktop. Either fix is one token (`--veltrix-accent-fg`, or a new
+`--veltrix-accent-under-text`) emitted by the token engine per accent.
+
+### 114. ⚠️ OPEN — Settings uses nearly as much memory as the shell: measure before optimising (2026-10-14)
+
+After switching shell and Settings to native libgjs runners, the owner confirmed
+their names in Mission Center and noticed Settings close to the shell in RAM.
+One live `smaps_rollup` snapshot: shell RSS/PSS 253.1/174.4 MiB, Settings
+224.5/144.8 MiB, Hyalo 178.8/110.3 MiB. PSS accounts proportionally for shared
+pages, so sharing alone does not explain the proximity. These are a snapshot,
+not evidence of a leak or a benchmark across sessions; no allocation profile
+has attributed the memory to runtime, services or widgets.
+
+`surfaces/settings/Settings.tsx` constructs every top-level category in
+`categories.forEach` and retains its widgets in `pageCache`, including hidden
+pages. This is a candidate to measure, not a quantified cause. The owner asked
+to record it and defer optimisation. Before changing it, measure a minimal
+GTK/GJS host, service initialisation and page construction separately. If pages
+become lazy, preserve global search (some indexing currently happens during
+construction), navigation/subpages, remote catalogues and teardown on close.
+The native runner still embeds GJS; changing executable identity does not remove
+the runtime's memory cost. No issue or optimisation is being opened by this note.
+
+## Index of resolved items (bodies live in `tech-debt-resolved.md`)
+
+Kept here so that a cross-reference by number still resolves from this file, and so that a
+number is never accidentally reused. 58 items; the split itself was 2026-08-23.
+
+- **#40** — ✅ RESOLVED 2026-10-06 — the Activity Island's own layer surface and its residuals: gone with #708 point 3 → `tech-debt-resolved.md`
+- **#51** — ✅ RESOLVED 2026-10-06 — the island↔bar tracking: one surface holds them level by construction (#708 point 3) → `tech-debt-resolved.md`
+- **#68** — ✅ RESOLVED 2026-10-06 — the island losing pointer input: its capsule is inside the bar's constant strip (#708 point 3) → `tech-debt-resolved.md`
+- **#7** — `pageHeader()` removed — RESOLVED → `tech-debt-resolved.md`
+- **#102** — ✅ RESOLVED 2026-08-31 — the shell's one door raises as well as focuses; the bench is a nested Hyprland → `tech-debt-resolved.md`
+- **#102** (the second one — ⚠️ the number was reused by a slip on 2026-09-04) — ✅ RESOLVED 2026-09-04 — manual mode's bootloader patching wrote to a hardcoded /mnt/boot → `tech-debt-resolved.md`
+- **#98** — ✅ RESOLVED 2026-08-31 — About declares `veltrix-about`, and the window-rule seam became a CI gate → `tech-debt-resolved.md`
+- **#99** — ✅ RESOLVED (measured 2026-09-22) — the installer fits a 1366×768 screen, bar and dock included → `tech-debt-resolved.md`
+- **#101** — ✅ RESOLVED 2026-09-22 — what the setup commands print is kept (#625); the progress and hostname leftovers were already done → `tech-debt-resolved.md`
+- **#9** — The per-boot Adwaita-WARNING — ✅ RESOLVED 2026-08-18 (the host went) → `tech-debt-resolved.md`
+- **#11** — Idle GPU spin on bar/dock — RESOLVED (two distinct causes) → `tech-debt-resolved.md`
+- **#12** — Sporadic double-disconnect CRITICALs — RESOLVED (helper + sweep 2026-06-23; lifecycle half in 12b, 2026-08-02) → `tech-debt-resolved.md`
+- **#14** — Flat-menu row implementations migrated to `MenuRow.ts` (2026-06-11 → 2026-08-20) → `tech-debt-resolved.md`
+- **#15** — Overlay scrollbar grew on pointer proximity and ate right-edge buttons — RESOLVED (2026-08-03) → `tech-debt-resolved.md`
+- **#16b** — Adwaita button classes — RESOLVED, sweep complete (2026-08-02) → `tech-debt-resolved.md`
+- **#18** — CLOSED — the app grid left the dock's window, and the coupling that kept it there was TRADED, not lost (2026-08-09) → `tech-debt-resolved.md`
+- **#19** — Shipped default config was a personal snapshot — RESOLVED → `tech-debt-resolved.md`
+- **#20** — CLOSED — AstalHyprland was removed (2026-06-20 → 2026-08-17) → `tech-debt-resolved.md`
+- **#22** — CLOSED — duplicate of #71 (2026-06-22 → 2026-08-17) → `tech-debt-resolved.md`
+- **#23** — `appearance.shellAppearance` covers the WHOLE shell skin — RESOLVED (2026-06-23) → `tech-debt-resolved.md`
+- **#24** — Unified surface-appearance + opacity coherence — RESOLVED (2026-06-23) → `tech-debt-resolved.md`
+- **#25** — Accent-tint subsystem is dead code — RESOLVED (deleted 2026-06-23) → `tech-debt-resolved.md`
+- **#28** — Settings → App Icons row is cramped — RESOLVED (2026-07-09) → `tech-debt-resolved.md`
+- **#29** — Ghost descenders on list mutation — ✅ RESOLVED at the root 2026-08-11 (#123 + #124) → `tech-debt-resolved.md`
+- **#30** — FIXED — Form-dialog primitive in veltrix-kit (2026-07-10 → 2026-08-20) → `tech-debt-resolved.md`
+- **#35** — RESOLVED — Focus & Tab-Aware Island Media Mutation (2026-07-19 → 2026-08-21) → `tech-debt-resolved.md`
+- **#36** — RESOLVED — Built-in Assistant v1 (2026-07-20 → 2026-08-20) → `tech-debt-resolved.md`
+- **#37** — RESOLVED — `VeltrixScrolled` in veltrix-kit (2026-07-21 → 2026-08-20) → `tech-debt-resolved.md`
+- **#41** — FIXED — Keyring write timeout in Settings → AI (2026-07-26 → 2026-08-20) → `tech-debt-resolved.md`
+- **#45** — RESOLVED — `sameApp()` consistency enforced in CI (2026-08-01 → 2026-08-20) → `tech-debt-resolved.md`
+- **#48** — RESOLVED — Art rounding unified as THUMB_RADIUS_RATIO in squircleThumb (2026-08-03 → 2026-08-20) → `tech-debt-resolved.md`
+- **#49** — FIXED — The bubble menu is unified as GlassBubbleMenu (2026-08-03 → 2026-08-20) → `tech-debt-resolved.md`
+- **#50** — The dock froze its reconciliation under any overlay — FIXED (2026-08-04) → `tech-debt-resolved.md`
+- **#53** — CLOSED — every modal surface is on the focus grab, and it is the ONLY mechanism (2026-08-05) → `tech-debt-resolved.md`
+- **#54** — CLOSED — the overview's tile geometry was STALE while its capture was FRESH (2026-08-06) → `tech-debt-resolved.md`
+- **#55** — CLOSED — the wallpaper IS the workspace backdrop (2026-08-06) → `tech-debt-resolved.md`
+- **#56** — DONE (2026-08-07 → 2026-08-10) — unscoped partials; commandment 2 was never two-thirds kept → `tech-debt-resolved.md`
+- **#57** — CLOSED — the design system reaches the greeter and the lockscreen (2026-08-09) → `tech-debt-resolved.md`
+- **#58** — CLOSED — `GlassCapsule` stopped owning what it should never have owned (2026-08-09) → `tech-debt-resolved.md`
+- **#65** — CLOSED — the hand-rolled rows are the component now (2026-08-11) → `tech-debt-resolved.md`
+- **#66** — FIXED — The sidebar's rows opt out of theme padding (2026-08-11 → 2026-08-20) → `tech-debt-resolved.md`
+- **#67** — FIXED — the input yield was eating the focus its own caller had just set (2026-08-13) → `tech-debt-resolved.md`
+- **#69** — FIXED — every `*-app` verb of `veltrix-click` was dead on arrival (2026-08-13) → `tech-debt-resolved.md`
+- **#70** — FIXED — the bar and the island never heard the monitor change shape (2026-08-15) → `tech-debt-resolved.md`
+- **#71** — CLOSED — AstalNetwork picked its devices ONCE, so the shell dropped it (2026-08-16 → 2026-08-17) → `tech-debt-resolved.md`
+- **#72** — FIXED — a cursor theme/size never reached the cursor already on screen (2026-08-17) → `tech-debt-resolved.md`
+- **#73** — FIXED — App search frequency ranking with temporal decay (2026-08-17 → 2026-08-20) → `tech-debt-resolved.md`
+- **#74** — FIXED — Tray context menus draw checkmarks, row icons and sensitivity (2026-08-18 → 2026-08-20) → `tech-debt-resolved.md`
+- **#75** — FIXED — `readShellVersion()` fallback returns "unknown" instead of inventing "0.1.0" (2026-08-18 → 2026-08-20) → `tech-debt-resolved.md`
+- **#77** — Native PAM Authentication & Zero-Astal State (2026-08-20) → `tech-debt-resolved.md`
+- **#78** — RESOLVED — GTK4 Height-for-Width Layout Safety & BlueZ Pairing Resilience (2026-08-21) → `tech-debt-resolved.md`
+- **#79** — RESOLVED — one rim ramp, and `GLASS_TINT.light` stopped disagreeing with itself (2026-08-23) → `tech-debt-resolved.md`
+- **#81** — RESOLVED — a dark step traced every curved edge, and it was `blur:brightness` (2026-08-23) → `tech-debt-resolved.md`
+- **#83** — ✅ RESOLVED 2026-09-30 — the glass mixer is gone: one material of three, each a table of per-surface floors (#674) → `tech-debt-resolved.md`
+- **#84** — RESOLVED — one silhouette and one rim idiom for capsule and bubble, and "weaker" was an inference the pixels do not support (2026-08-23) → `tech-debt-resolved.md`
+- **#92** — RESOLVED — the login screens' selected row follows the user's accent, in both skins (2026-08-25 → 2026-09-07) → `tech-debt-resolved.md`
+- **#93** — FIXED same day — About's key column was a constant, and a constant is a locale bug with a delay on it (2026-08-25) → `tech-debt-resolved.md`
+- **#94** — RESOLVED same day — the two About surfaces are a summary and its detail, and one reader answers both (2026-08-25) → `tech-debt-resolved.md`
+- **#100** — ✅ RESOLVED 2026-09-15 — the shell's native heap grew with every animated frame: undisposed Cairo contexts (#581, #305) → `tech-debt-resolved.md`
+- **#103** — ✅ RESOLVED 2026-09-14 — the icon / cursor / GTK theme have one home, and appearance.json is gone (#536 in #573) → `tech-debt-resolved.md`
+- **#106** — ✅ RESOLVED same day (2026-09-20) — the `material*` vocabulary and `--veltrix-edge` were buried; the rim of light is Cairo's alone → `tech-debt-resolved.md`
+- **#109** — ✅ RESOLVED same day (2026-09-20) — Qt applications get our icon theme and font: `QT_QPA_PLATFORMTHEME=gtk3` → `tech-debt-resolved.md`
+
+- **Toolkit phase-0 flat-review text geometry (2026-10-16)** — implemented in #846; real Orca full-line assertion and applied wrong-extents control → `tech-debt-resolved.md`.

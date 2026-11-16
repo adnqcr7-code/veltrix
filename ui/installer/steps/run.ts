@@ -1,0 +1,787 @@
+// Step 8 — Installation execution and live progress output with safety arm guard.
+
+import Gtk from "gi://Gtk?version=4.0"
+import GLib from "gi://GLib"
+import Pango from "gi://Pango"
+import Gio from "gi://Gio"
+import type { Step } from "../lib/flow"
+import { VeltrixButton, VeltrixScrolled, showVeltrixAlert } from "../../lib/veltrix-kit"
+import { t, getLocale } from "../lib/i18n"
+import { getAnswers } from "../lib/answers"
+import { assemblePlan, type AssembledPlan } from "../lib/plan"
+import { archinstallStamp, configureInstalledBootloader } from "../lib/bootloader"
+import { writeKeyboardConfig } from "../lib/keyboard-config"
+import { applyRealName } from "../lib/real-name"
+import { writeSwapFstabEntries } from "../lib/swap"
+import { copyNetworkConnections } from "../lib/network-connections"
+import { releaseTargetDisks } from "../lib/release-target"
+import { archinstallLogTail, copyLogToTarget, openLiveLog, type LiveLog } from "../lib/install-log"
+import { COMMAND_LOG, reportCommandLog } from "../lib/command-log"
+import { stripAnsi } from "../lib/ansi"
+import { connectivity, isUsable } from "../lib/network"
+import { DOWNLOAD_DIRS, STALL_QUIET_MS, failedDownloading, failedWriting, looksStalled } from "../lib/stall"
+import { measureMirrors, prepareLiveMirrorlist, restoreTargetMirrorlist } from "../lib/mirrors"
+import { isPreview, previewSkip } from "../lib/preview"
+import { heading, prose, formatDuration, formatLiveTimer } from "./common"
+import { PhaseMarker } from "../widget/PhaseMarker"
+import {
+  BaseProgress, RUN_PHASES, desktopProgress, isPlumbing, overallFraction, readDesktopLog,
+  type PackageProgress,
+} from "../lib/run-progress"
+
+export function RunStep(): Step {
+  let _busy = false
+  let _outcome: "success" | "failure" | null = null
+  let _proc: Gio.Subprocess | null = null
+  /**
+   * Handed in at build time, and the reason the footer is honest.
+   *
+   * ⚠️ `Step.busy` documents that a step reporting busy MUST call this when the
+   * answer changes — and this step never took the callback at all. `sync()` runs
+   * on entering the step, when `_busy` is still false, so it showed Close and a
+   * primary, highlighted "Restart now"; `_busy` flipping to true a moment later
+   * notified nobody. Both stayed lit for the whole install, over a partition
+   * table that had already been written (measured on the 09-02 ISO, #391), and
+   * they happened to be correct again at the end, which is what hid it.
+   */
+  let _notify: (() => void) | undefined
+
+  const setBusy = (v: boolean) => { _busy = v; _notify?.() }
+
+  return {
+    id: "run",
+    title: () => t("runTitle"),
+    nextLabel: () => t("continue"),
+    busy: () => _busy,
+    outcome: () => _outcome,
+    ready: () => false,
+
+    build(notifyReady) {
+      _notify = notifyReady
+      const box = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        spacing: 16,
+        hexpand: true,
+        vexpand: true,
+      })
+
+      // ⚠️ No page heading while it runs. The window's own header already says
+      // "Installing Veltrix" (this step's title), and the page used to open with
+      // "Installing system..." over a line that said "Installing Veltrix" again —
+      // the same sentence twice on one screen (owner, 2026-09-23). The card below
+      // is what the page is about; the heading comes back at the end, when it has
+      // something of its own to say (installed, or failed).
+      const head = heading("")
+      const desc = prose("", "installer-prose--dim")
+      head.visible = false
+      desc.visible = false
+      box.append(head)
+      box.append(desc)
+
+      // ── The card: what it is doing now, how far, and for how long ──────────
+      //
+      // ⚠️ What was here first was `GLib.timeout_add(80ms, () => progressBar.pulse())`
+      // — a bar that swept back and forth for twenty minutes and told nobody
+      // anything (#307). Then four named phases and a bar that moved in quarters,
+      // whose third phase hid the longest wait of the install. Now five phases
+      // that match what is really happening, and inside the two long ones a REAL
+      // count of packages (lib/run-progress.ts says where each number comes from).
+      // Where there is nothing to count, the line under the bar is the last thing
+      // the work printed, which is the honest answer to "what is it doing now".
+      const PHASE_TITLES = ["runPhaseNetwork", "runPhaseDisk", "runPhaseBase", "runPhaseDesktop", "runPhaseConfig"] as const
+      const PHASE_SHORT = ["runStepNetwork", "runStepDisk", "runStepBase", "runStepDesktop", "runStepConfig"] as const
+      let phase = -1
+
+      const card = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        spacing: 10,
+        css_classes: ["installer-run-card"],
+        hexpand: true,
+      })
+      const cardHead = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 12, hexpand: true })
+      const cardTitles = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 2, hexpand: true })
+      const stepOf = new Gtk.Label({ label: "", css_classes: ["installer-run-step-of"], xalign: 0 })
+      const phaseTitle = new Gtk.Label({
+        label: "", css_classes: ["installer-run-phase"], xalign: 0,
+        halign: Gtk.Align.FILL, hexpand: true, wrap: true,
+      })
+      cardTitles.append(stepOf)
+      cardTitles.append(phaseTitle)
+      const percent = new Gtk.Label({ label: "", css_classes: ["installer-run-percent"], valign: Gtk.Align.END })
+      cardHead.append(cardTitles)
+      cardHead.append(percent)
+      card.append(cardHead)
+
+      const progressBar = new Gtk.ProgressBar({ hexpand: true, css_classes: ["installer-run-bar"] })
+      card.append(progressBar)
+
+      const cardFoot = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 12, hexpand: true })
+      // Ellipsised rather than wrapped: it is a single moving line, and a wrapping
+      // one would make the card change height under the reader's eyes.
+      const detail = new Gtk.Label({
+        label: "", css_classes: ["installer-run-detail"],
+        halign: Gtk.Align.FILL, hexpand: true, xalign: 0,
+        ellipsize: Pango.EllipsizeMode.END, single_line_mode: true,
+      })
+      const timerLabel = new Gtk.Label({
+        label: "", css_classes: ["installer-run-timer"], halign: Gtk.Align.END,
+      })
+      timerLabel.update_property([Gtk.AccessibleProperty.LABEL], [t("runElapsedTime")])
+      cardFoot.append(detail)
+      cardFoot.append(timerLabel)
+      card.append(cardFoot)
+      box.append(card)
+
+      let timerSourceId = 0
+      let startMonotonic = 0
+
+      // The five phases in one quiet line under the card. Each marker is drawn
+      // (lib/phase-marker.ts): a check when done, a ring that fills with the
+      // phase's own progress while active, an empty ring while pending.
+      const stepRow = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 16, css_classes: ["installer-run-steps"] })
+      const steps = PHASE_SHORT.map(key => {
+        const marker = PhaseMarker()
+        const name = new Gtk.Label({ label: t(key), css_classes: ["installer-run-step"] })
+        const item = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 6 })
+        item.append(marker.widget); item.append(name)
+        stepRow.append(item)
+        return { marker, item }
+      })
+      box.append(stepRow)
+
+      // Shown only while the install is waiting on a connection that has gone —
+      // see lib/stall.ts for what counts, and for why nothing is killed.
+      const stallWarn = prose(t("runWaitingForNetwork"), "installer-prose--warning")
+      stallWarn.visible = false
+      box.append(stallWarn)
+      // Offered only while that warning is up: waiting is legitimate (the
+      // connection can come back), and so is not waiting — pacman takes minutes
+      // to give up on mirrors nobody is reaching, and no stalled run in four
+      // recovered. Whose choice that is was the question the owner answered: the
+      // person's, not a timer's.
+      let stopInstall: (() => void) | null = null
+      let stoppedByUser = false
+      const stopButton = VeltrixButton({ label: t("runStopInstall"), halign: Gtk.Align.START })
+      stopButton.visible = false
+      stopButton.connect("clicked", () => {
+        showVeltrixAlert({
+          parent: box.get_root() as Gtk.Window,
+          heading: t("runStopHeading"),
+          body: t("runStopBody"),
+          responses: [
+            { id: "wait", label: t("runStopKeepWaiting") },
+            { id: "stop", label: t("runStopConfirm"), suggested: true },
+          ],
+          onResponse: (id) => { if (id === "stop") stopInstall?.() },
+        })
+      })
+      box.append(stopButton)
+      // The child's last lines, kept to tell a download failure from any other
+      // one when the run ends. Ours are not in it.
+      let childTail: string[] = []
+
+      // Progress inside the phase: the two package phases count, the other three
+      // take seconds and have nothing to count.
+      const baseProgress = new BaseProgress()
+      let desktop: PackageProgress = { fraction: 0, stage: null, done: 0, total: 0 }
+      let lastLine = ""
+      const phaseProgress = (): PackageProgress | null =>
+        phase === 2 ? baseProgress.progress : phase === 3 ? desktop : null
+
+      // Western digits (0-9) in every locale: `-u-nu-latn` pins the numbering
+      // system (bilingual decision, 2026-11-12). A bare "ar" already renders
+      // latn; "ar-SA" would render Arabic-Indic digits. The percent sign
+      // itself stays the locale's (٪ in Arabic).
+      const percentFormat = new Intl.NumberFormat(`${getLocale()}-u-nu-latn`, { style: "percent", maximumFractionDigits: 0 })
+      const paint = () => {
+        const p = phaseProgress()
+        const within = phase >= RUN_PHASES.length ? 1 : (p?.fraction ?? 0)
+        const overall = phase < 0 ? 0 : overallFraction(Math.min(phase, RUN_PHASES.length - 1), phase >= RUN_PHASES.length ? 1 : within)
+        progressBar.fraction = overall
+        percent.label = percentFormat.format(Math.floor(overall * 100) / 100)
+        const shown = Math.min(Math.max(phase, 0), PHASE_TITLES.length - 1)
+        stepOf.label = t("runStepOf").replace("%1", String(shown + 1)).replace("%2", String(PHASE_TITLES.length))
+        phaseTitle.label = t(PHASE_TITLES[shown])
+        detail.label = p?.stage
+          ? t(p.stage === "download" ? "runPkgDownloading" : "runPkgInstalling")
+              .replace("%1", String(p.done)).replace("%2", String(p.total))
+          : lastLine
+        steps.forEach((s, i) => {
+          const state = i < phase ? "done" : i === phase ? "active" : "pending"
+          s.marker.set(state, i === phase ? within : 0)
+          for (const st of ["done", "active", "pending"]) s.item[st === state ? "add_css_class" : "remove_css_class"](`is-${st}`)
+        })
+      }
+
+      const enterPhase = (i: number) => { phase = i; lastLine = ""; paint() }
+      paint()
+
+      // ── Counting the desktop pass ───────────────────────────────────────────
+      // Once a second from the base system on: whether the desktop has begun, then
+      // downloads from COMMAND_LOG, installs from how
+      // many packages the target's database has gained since the big transaction
+      // began (pacman writes no per-package line there without a tty). Only armed:
+      // a dry run has no /mnt to read.
+      let desktopPollId = 0
+      const baselines = new Map<number, number>()
+      const countInstalled = (): number => {
+        let n = 0
+        try {
+          const en = Gio.File.new_for_path("/mnt/var/lib/pacman/local")
+            .enumerate_children("standard::type", Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+          let info: Gio.FileInfo | null
+          while ((info = en.next_file(null)) !== null) if (info.get_file_type() === Gio.FileType.DIRECTORY) n++
+          en.close(null)
+        } catch {}
+        return n
+      }
+      const pollDesktop = () => {
+        // ⚠️ The desktop begins when the first custom command creates OUR log in
+        // the target — not when archinstall says "Executing custom command". That
+        // line is real, but it came down the pipe only at the very END of the
+        // desktop install, all five at once (measured 2026-09-23): the first
+        // attempt waited for it and sat on "base system, 158 of 158" for the
+        // whole desktop. The file is ours, so it cannot arrive late.
+        if (phase === 2) {
+          if (!GLib.file_test(`/mnt${COMMAND_LOG}`, GLib.FileTest.EXISTS)) return GLib.SOURCE_CONTINUE
+          enterPhase(3)
+        }
+        if (phase !== 3) return GLib.SOURCE_CONTINUE
+        let text = ""
+        try {
+          const [ok, bytes] = GLib.file_get_contents(`/mnt${COMMAND_LOG}`)
+          if (ok) text = new TextDecoder().decode(bytes)
+        } catch {}
+        const st = readDesktopLog(text)
+        // ⚠️ The baseline is taken the first time the transaction is SEEN, which
+        // is while it downloads — pacman downloads everything before it installs
+        // anything, and this runs every second.
+        if (st.mainTx >= 0 && !baselines.has(st.mainTx)) baselines.set(st.mainTx, countInstalled())
+        const since = st.installing && !st.finished ? countInstalled() - (baselines.get(st.mainTx) ?? 0) : 0
+        desktop = desktopProgress(st, since)
+        if (!desktop.stage && st.lastLine) lastLine = st.lastLine.replace(/^>>\s*/, "")
+        paint()
+        return GLib.SOURCE_CONTINUE
+      }
+      function startDesktopPoll(arm: boolean) {
+        if (!arm || desktopPollId) return
+        desktopPollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, pollDesktop)
+      }
+      function stopDesktopPoll() {
+        if (desktopPollId) { GLib.source_remove(desktopPollId); desktopPollId = 0 }
+      }
+
+      const textBuffer = new Gtk.TextBuffer()
+      const textView = new Gtk.TextView({
+        buffer: textBuffer,
+        editable: false,
+        cursor_visible: false,
+        wrap_mode: Gtk.WrapMode.CHAR,
+        monospace: true,
+        hexpand: true,
+        vexpand: true,
+        css_classes: ["installer-log-view"],
+      })
+
+      const { widget: logScrolledWidget, scrolled } = VeltrixScrolled({
+        child: textView,
+        minContentHeight: 220,
+        propagateNaturalHeight: false,
+        alwaysVisible: false,
+        reserveLane: false,
+      })
+      scrolled.vexpand = true
+      scrolled.hexpand = true
+      logScrolledWidget.vexpand = true
+      logScrolledWidget.hexpand = true
+
+      const logCard = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        css_classes: ["installer-log-card"],
+        hexpand: true,
+        vexpand: true,
+      })
+      logCard.append(logScrolledWidget)
+
+      const expander = new Gtk.Expander({
+        label: t("runShowLog"),
+        expanded: false,
+        css_classes: ["installer-expander"],
+        child: logCard,
+        vexpand: true,
+        hexpand: true,
+      })
+      box.append(expander)
+
+      // Offered only once a run has FAILED: that is when the log has to leave this
+      // machine — onto a USB stick, into a report. A finished install already
+      // carries it in /var/log (lib/install-log.ts).
+      let liveLog: LiveLog = { path: "", write() {} }
+      const saveLogButton = VeltrixButton({ label: t("runSaveLog"), halign: Gtk.Align.START })
+      saveLogButton.visible = false
+      const savedLabel = new Gtk.Label({
+        label: "", css_classes: ["installer-phase-detail"], visible: false,
+        halign: Gtk.Align.FILL, hexpand: true, xalign: 0, wrap: true,
+      })
+      saveLogButton.connect("clicked", () => {
+        const dialog = new Gtk.FileDialog({ title: t("runSaveLog"), initial_name: "veltrix-installer.log", modal: true })
+        dialog.save(box.get_root() as Gtk.Window, null, (_d, res) => {
+          let dest: Gio.File | null = null
+          try { dest = dialog.save_finish(res) } catch { return } // cancelled
+          if (!dest) return
+          try {
+            Gio.File.new_for_path(liveLog.path).copy(dest, Gio.FileCopyFlags.OVERWRITE, null, null)
+            savedLabel.label = t("runLogSaved") + (dest.get_path() ?? dest.get_uri())
+          } catch (e: any) {
+            savedLabel.label = `${e.message || e}`
+          }
+          savedLabel.visible = true
+        })
+      })
+      box.append(saveLogButton)
+      box.append(savedLabel)
+      // "Show log" while it is shut, "Hide log" while it is open. It used to say
+      // Show in both states (D-27).
+      expander.connect("notify::expanded", () => {
+        expander.label = expander.expanded ? t("runHideLog") : t("runShowLog")
+      })
+
+      // One funnel for every line, ours and the child's alike. The child's arrive
+      // TTY-shaped and have to be undressed (lib/ansi.ts); ours never carry an
+      // escape, so the call costs them nothing — and being HERE rather than at
+      // the pipe means a caller added later cannot forget it. A line that was
+      // something and is now nothing was pure terminal control: printing a blank
+      // row for it is how the log came out padded with gaps.
+      const appendLog = (raw: string, opts: { quiet?: boolean } = {}) => {
+        const line = stripAnsi(raw)
+        if (line === "" && raw !== "") return
+        const endIter = textBuffer.get_end_iter()
+        textBuffer.insert(endIter, line + "\n", -1)
+        liveLog.write(line)
+        // The same line the log gets, under the phase — so the page says what it
+        // is doing without anybody having to open the expander to find out.
+        //
+        // ⚠️ `quiet` is for the lines the page ALREADY says in its own words: the
+        // network warning went into the log AND into this one line, so the same
+        // sentence appeared twice, once elided to the column width.
+        //
+        // Our own `[TAG] ` prefixes are for the log, not for a sentence under a
+        // bar, and archinstall's `Executing custom command "set -o pipefail; …`
+        // is our wrapper verbatim — the line that sat there for the whole desktop
+        // install and made the page read as broken.
+        if (line.trim() && !opts.quiet && !isPlumbing(line.trim())) {
+          lastLine = line.trim().replace(/^\[[A-Z]+\]\s*/, "")
+          paint()
+        }
+        const adj = scrolled.vadjustment
+        if (adj) adj.value = adj.upper - adj.page_size
+      }
+
+      const finishRun = (success: boolean) => {
+        if (timerSourceId) {
+          GLib.source_remove(timerSourceId)
+          timerSourceId = 0
+        }
+        const totalSec = startMonotonic > 0
+          ? Math.max(0, Math.round((GLib.get_monotonic_time() - startMonotonic) / 1_000_000))
+          : 0
+
+        // Before setBusy: its notify is what repaints the footer, and the footer
+        // reads the outcome.
+        _outcome = success ? "success" : "failure"
+        setBusy(false)
+        stopDesktopPoll()
+        if (success) { phase = RUN_PHASES.length; paint() }
+        // The card was the page while it worked; what is left is the outcome, in
+        // the heading, and the row of steps saying how far it got.
+        card.visible = false
+        head.visible = true
+        desc.visible = true
+
+        if (success) {
+          head.label = t("runSuccessHeading")
+          desc.label = totalSec > 0
+            ? t("runSuccessInTime").replace("%s", formatDuration(totalSec))
+            : t("runSuccessProse")
+          desc.remove_css_class("installer-prose--warning")
+          desc.add_css_class("installer-prose--dim")
+        } else {
+          head.label = t("runFailedHeading")
+          // archinstall's own last words for a download that died are a Python
+          // traceback and "please report it to archinstall" — accurate about
+          // where it failed and useless about why. When the child's output shows
+          // it could not download, say that, and what to do about it.
+          desc.label = stoppedByUser
+            ? t("runFailedStoppedProse")
+            // Space is asked of archinstall's own log too: its first sync keeps
+            // pacman's words there and prints only "Failed to sync" to us. The
+            // network is NOT — that log also holds mirror failures archinstall
+            // recovered from, which would blame the network for anything later.
+            : failedWriting(childTail) || failedWriting(archinstallLogTail()) ? t("runFailedSpaceProse")
+            : failedDownloading(childTail) ? t("runFailedNetworkProse") : t("runFailedProse")
+          desc.remove_css_class("installer-prose--dim")
+          desc.add_css_class("installer-prose--warning")
+          expander.expanded = true
+          saveLogButton.visible = liveLog.path !== ""
+        }
+      }
+
+      // Execute archinstall
+      GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+        // First, so even a run that stops at the network check leaves a file.
+        liveLog = openLiveLog()
+        setBusy(true)
+
+        startMonotonic = GLib.get_monotonic_time()
+        // ⚠️ Re-armed at every tick for the next whole second SINCE START, not a
+        // repeating 1000 ms source: GLib schedules a repeating timeout from the
+        // previous dispatch, so each tick's lateness is carried into the next and
+        // every so often the display jumped a second (…:41 → …:43).
+        const updateTimer = () => {
+          const elapsedUs = Math.max(0, GLib.get_monotonic_time() - startMonotonic)
+          timerLabel.label = t("runElapsedValue").replace("%s", formatLiveTimer(Math.floor(elapsedUs / 1_000_000)))
+          const untilNextMs = Math.ceil((1_000_000 - (elapsedUs % 1_000_000)) / 1000) + 5
+          timerSourceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, untilNextMs, () => {
+            updateTimer()
+            return GLib.SOURCE_REMOVE
+          })
+          return GLib.SOURCE_REMOVE
+        }
+        updateTimer()
+
+        enterPhase(0)
+        const answers = getAnswers()
+
+        // ⚠️ Checked HERE, before archinstall is spawned, and not one line later.
+        // Everything below this point needs the network — pacstrap, the curl that
+        // fetches the repo signing key, the `pacman -Sy` of the three Veltrix
+        // packages — and the first thing archinstall does is erase a partition
+        // table. Failing after that leaves a machine with no operating system at
+        // all, which is strictly worse than the one it had five minutes ago.
+        connectivity({ fresh: true }).then(c => {
+          if (!isUsable(c)) {
+            appendLog(`[ERROR] ${t("runErrNoNetwork")}`)
+            finishRun(false)
+            return
+          }
+          // Still phase 0, and deliberately: this IS the network phase, and it
+          // is the last moment the network is used for something other than
+          // downloading the system. It runs here rather than earlier in the
+          // wizard because here is where a slow answer costs nothing anybody
+          // notices — the install that follows takes minutes — and because a
+          // measurement taken five pages ago could be describing a Wi-Fi network
+          // the person has since left.
+          if (isPreview()) {
+            appendLog(previewSkip("reflector --sort rate (measuring mirror speed)"))
+            startInstall(answers, [])
+            return
+          }
+          appendLog(`[MIRRORS] ${t("runMirrorsMeasuring")}`)
+          measureMirrors(getAnswers().country?.code ?? null).then(servers => {
+            // Both outcomes are said out loud. A silent empty answer is
+            // indistinguishable from a measurement that was never attempted,
+            // and this is the one step of the install whose whole value is
+            // invisible afterwards.
+            if (servers.length > 0) {
+              appendLog(`[MIRRORS] ${t("runMirrorsChosen")}${servers.length}`)
+              for (const url of servers) appendLog(`[MIRRORS]   ${url}`)
+            } else {
+              appendLog(`[MIRRORS] ${t("runMirrorsNone")}`)
+            }
+            startInstall(answers, servers)
+          })
+        })
+
+        return GLib.SOURCE_REMOVE
+      })
+
+      function startInstall(answers: ReturnType<typeof getAnswers>, measuredMirrors: string[]) {
+        // Two modes, and WHERE it runs picks one: the live medium installs for real, anything
+        // else is a dry run. There is deliberately no variable that arms it elsewhere — the
+        // dangerous direction is unreachable, not merely discouraged. `VELTRIX_INSTALLER_DRY_RUN`
+        // only ever points the safe way, so the worst a typo in it can do is refuse to install.
+        const isLiveMedium = GLib.file_test("/run/archiso", GLib.FileTest.EXISTS)
+        const isForcedDryRun = GLib.getenv("VELTRIX_INSTALLER_DRY_RUN") === "1"
+        const isArm = isLiveMedium && !isForcedDryRun
+
+        // ⚠️ Nothing here touches a disk any more, in EITHER mode. Both hand the
+        // layout to archinstall in the plan (lib/disk-config.ts), which
+        // partitions, formats, makes the subvolumes and mounts them itself — so
+        // running a partitioner of our own as well would write the disk twice,
+        // ours first and archinstall's over the top (#310). What used to live
+        // here was `sgdisk`, `mkfs.*`, `btrfs subvolume create` and eight mounts,
+        // guarded by an arm gate that three of its own commands escaped.
+        if (answers.disk) {
+          appendLog("[PREP] The disk layout is archinstall's to write — see the plan below.")
+        }
+
+        let plan: AssembledPlan
+        try {
+          plan = assemblePlan(answers, undefined, measuredMirrors)
+        } catch (e: any) {
+          appendLog(`[ERROR] Failed to assemble installation plan: ${e.message || e}`)
+          finishRun(false)
+          return
+        }
+
+        // ⚠️ Preview stops HERE, before the credentials file exists.
+        //
+        // Not for the sake of archinstall — it would get `--dry-run` anyway — but
+        // for the two lines below it: the plan and the CREDENTIALS are written to
+        // /tmp, and the creds file holds the account password hash. It is mode
+        // 0600 and it is deleted afterwards, which is right on a medium that is
+        // about to be powered off and wrong on a shared machine that will not be.
+        // The password is also the one thing somebody walking the installer for
+        // the tenth time is most likely to have typed carelessly.
+        if (isPreview()) {
+          appendLog(previewSkip("writing the plan and credentials to /tmp"))
+          appendLog(previewSkip("sudo archinstall --config … --creds … --silent --dry-run"))
+          appendLog(previewSkip("applyRealName + writeKeyboardConfig + configureInstalledBootloader (already gated on arm)"))
+          appendLog("")
+          appendLog("[PREVIEW] The plan that WOULD be handed to archinstall:")
+          for (const line of JSON.stringify(plan.config, null, 2).split("\n")) appendLog(line)
+          enterPhase(4)
+          finishRun(true)
+          return
+        }
+
+        const configPath = `/tmp/veltrix-plan-${GLib.random_int()}.json`
+        const credsPath = `/tmp/veltrix-creds-${GLib.random_int()}.json`
+
+        try {
+          GLib.file_set_contents(configPath, JSON.stringify(plan.config, null, 2) + "\n")
+          // Secure mode 0600 for creds
+          const file = Gio.File.new_for_path(credsPath)
+          const stream = file.replace(null, false, Gio.FileCreateFlags.PRIVATE, null)
+          const data = new TextEncoder().encode(JSON.stringify(plan.creds, null, 2) + "\n")
+          stream.write_all(data, null)
+          stream.close(null)
+        } catch (e: any) {
+          appendLog(`[ERROR] Failed to write temporary config files: ${e.message || e}`)
+          finishRun(false)
+          return
+        }
+
+        const cleanup = () => {
+          try { Gio.File.new_for_path(configPath).delete(null) } catch {}
+          try { Gio.File.new_for_path(credsPath).delete(null) } catch {}
+        }
+
+        const isRoot = GLib.get_user_name() === "root"
+        // ⚠️ PYTHONUNBUFFERED, or archinstall's own lines reach this page late:
+        // Python block-buffers stdout into a pipe, and whatever it prints between
+        // two of pacstrap's (a pty, so those flush) waits in the buffer — its five
+        // "Executing custom command" lines arrived together, after the desktop
+        // install they announce (2026-09-23). The stall check reads the time of
+        // the last line, so it was reading a delayed clock as well.
+        const args = ["archinstall", "--config", configPath, "--creds", credsPath, "--silent"]
+        const cmd = isRoot
+          ? ["env", "PYTHONUNBUFFERED=1", ...args]
+          : ["sudo", "-n", "env", "PYTHONUNBUFFERED=1", ...args]
+
+        if (!isArm) {
+          cmd.push("--dry-run")
+          appendLog(
+            isLiveMedium
+              ? "[INFO] Dry-run mode: VELTRIX_INSTALLER_DRY_RUN=1 is set. Nothing on disk will be touched."
+              : "[INFO] Dry-run mode: this is not an installation medium (no /run/archiso). Nothing on disk will be touched.",
+          )
+        } else {
+          appendLog("[INFO] Running in live installation mode.")
+        }
+
+        // ⚠️ Before the spawn, and it is what makes a second attempt possible: a
+        // failed or finished run leaves its swap on and its mounts (and, encrypted,
+        // its mapping) in place, and archinstall then dies on `umount -R [SWAP]`
+        // before writing anything (lib/release-target.ts). Stopping here if the
+        // disk cannot be freed is the same bargain as the network check above.
+        if (!releaseTargetDisks(isArm, answers, appendLog)) {
+          cleanup()
+          finishRun(false)
+          return
+        }
+        // Two leftovers in one file, both the LIVE mirrorlist: the servers earlier
+        // attempts prepended (archinstall never removes them), and 431 fallback
+        // servers, which is what decides how long a stalled download takes to
+        // fail. The full list goes to the installed system at the end.
+        const fullMirrorlist = prepareLiveMirrorlist(isArm, appendLog)
+
+        // ── The spawn starts in phase 1, and the child says when it is past it ─
+        //
+        // The four phases used to line up with this file's own boundaries: phase 1
+        // finished when OUR partitioner finished. That work is now inside the
+        // process about to be spawned, so ticking "Disk ✓" here would report a
+        // disk that has not been touched — and if archinstall then failed while
+        // partitioning, the screen would say the disk step had succeeded.
+        //
+        // ⚠️ The marker is `info(f'Installing packages: {packages}')`
+        // (archinstall's `lib/pacman/pacman.py`), the line immediately before
+        // pacstrap — an `info`, so it reaches stdout, unlike the `debug` lines
+        // around the mounting. If it ever stops matching the cost is a phase row
+        // that stays lit until the install finishes, not a wrong claim.
+        let awaitingBasePhase = true
+        enterPhase(1)
+
+        // ⚠️ Taken HERE, one line before the spawn, and it is not a log line.
+        // `configureInstalledBootloader` uses it to tell the loader entries THIS
+        // run produced from the ones that were already on the EFI partition — an
+        // ESP can be shared with a system that was installed first, and every
+        // edit it makes is scoped by this stamp (#443). archinstall fixes its own
+        // `init_time` when its Installer is constructed, which is after this, so
+        // ours can only be the earlier of the two.
+        const startedAt = archinstallStamp()
+        let lastLineAt = GLib.get_monotonic_time()
+
+        appendLog(`[EXEC] ${cmd.join(" ")}`)
+
+        try {
+          _proc = Gio.Subprocess.new(
+            cmd,
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE,
+          )
+
+          const stdoutPipe = _proc.get_stdout_pipe()
+          if (stdoutPipe) {
+            const dataStream = Gio.DataInputStream.new(stdoutPipe)
+            const readLineAsync = () => {
+              dataStream.read_line_async(GLib.PRIORITY_DEFAULT, null, (_src, res) => {
+                try {
+                  const [line] = dataStream.read_line_finish_utf8(res)
+                  if (line !== null) {
+                    lastLineAt = GLib.get_monotonic_time()
+                    childTail.push(line)
+                    if (childTail.length > 300) childTail = childTail.slice(-300)
+                    if (awaitingBasePhase && line.includes("Installing packages:")) {
+                      awaitingBasePhase = false
+                      enterPhase(2)
+                      startDesktopPoll(isArm)
+                    }
+                    if (phase === 2) baseProgress.feed(stripAnsi(line))
+                    appendLog(line)
+                    readLineAsync()
+                  }
+                } catch {}
+              })
+            }
+            readLineAsync()
+          }
+
+          // ── Is it waiting on a connection that has gone? ──────────────────────
+          // Every 20 s: how long since the child printed, and how much the
+          // download directories grew in the last STALL_QUIET_MS. Only when both
+          // say "nothing" is NetworkManager asked, afresh — and only its answer
+          // shows the warning. A line or growth hides it again.
+          const dirBytes = (path: string): number => {
+            let total = 0
+            try {
+              const en = Gio.File.new_for_path(path).enumerate_children("standard::size", Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+              let info: Gio.FileInfo | null
+              while ((info = en.next_file(null)) !== null) total += info.get_size()
+              en.close(null)
+            } catch {}
+            return total
+          }
+          const sizeHistory: Array<{ at: number, bytes: number }> = []
+          let asking = false
+          const stallTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 20, () => {
+            const now = GLib.get_monotonic_time()
+            const bytes = DOWNLOAD_DIRS.reduce((sum, d) => sum + dirBytes(d), 0)
+            sizeHistory.push({ at: now, bytes })
+            const windowUs = STALL_QUIET_MS * 1000
+            while (sizeHistory.length > 1 && now - sizeHistory[1].at >= windowUs) sizeHistory.shift()
+            // Not enough history to cover a whole window yet: not a stall.
+            const waitingUI = (visible: boolean) => { stallWarn.visible = visible; stopButton.visible = visible }
+            if (now - sizeHistory[0].at < windowUs) { waitingUI(false); return GLib.SOURCE_CONTINUE }
+            const stalled = looksStalled({
+              sinceLastLineMs: (now - lastLineAt) / 1000,
+              downloadedInWindow: bytes - sizeHistory[0].bytes,
+            })
+            if (!stalled) { waitingUI(false); return GLib.SOURCE_CONTINUE }
+            if (!asking) {
+              asking = true
+              connectivity({ fresh: true }).then(c => {
+                asking = false
+                const waiting = !isUsable(c)
+                if (waiting && !stallWarn.visible) appendLog(`[NETWORK] ${t("runWaitingForNetwork")}`, { quiet: true })
+                waitingUI(waiting)
+              })
+            }
+            return GLib.SOURCE_CONTINUE
+          })
+
+          // ⚠️ Our child is `sudo -n archinstall …`, so killing IT kills sudo and
+          // leaves archinstall — and the pacstrap under it — running as root on a
+          // disk nobody is watching any more. The install is ended from the other
+          // end: archinstall itself, then what may outlive it.
+          stopInstall = () => {
+            stoppedByUser = true
+            stopButton.sensitive = false
+            appendLog(`[STOP] ${t("runStopHeading")}`, { quiet: true })
+            const asRoot = (cmd: string[]) => {
+              try {
+                const full = GLib.get_user_name() === "root" ? cmd : ["sudo", "-n", ...cmd]
+                Gio.Subprocess.new(full, Gio.SubprocessFlags.STDERR_MERGE).wait(null)
+              } catch {}
+            }
+            asRoot(["pkill", "-TERM", "-f", "bin/archinstall"])
+            asRoot(["pkill", "-TERM", "-x", "pacstrap"])
+            asRoot(["pkill", "-TERM", "-x", "pacman"])
+            try { _proc?.force_exit() } catch {}
+          }
+
+          _proc.wait_async(null, (_procSrc, res) => {
+            GLib.source_remove(stallTimer)
+            stallWarn.visible = false
+            stopButton.visible = false
+            let success = false
+            try {
+              _proc?.wait_finish(res)
+              success = _proc?.get_successful() ?? false
+              stopDesktopPoll()
+              if (success) {
+                enterPhase(4)
+                applyRealName(isArm, answers, appendLog)
+                writeKeyboardConfig(isArm, answers, appendLog)
+                writeSwapFstabEntries(isArm, answers, appendLog)
+                copyNetworkConnections(isArm, answers, appendLog)
+                configureInstalledBootloader(isArm, answers, appendLog, startedAt)
+                restoreTargetMirrorlist(isArm, fullMirrorlist, measuredMirrors, appendLog)
+              }
+            } catch (e: any) {
+              appendLog(`[ERROR] Process exited with error: ${e.message || e}`)
+            } finally {
+              // Success or not: what the setup commands printed, which archinstall
+              // does not show (lib/command-log.ts) — before the copy, so it is in it.
+              reportCommandLog(isArm, appendLog)
+              // Success or not: a target that got as far as /var/log keeps the log.
+              copyLogToTarget(isArm, liveLog.path, appendLog)
+              // ⚠️ And then let go of the disk. archinstall unmounts nothing on exit,
+              // so a finished install sat mounted under /mnt with its swap on — and
+              // powering off from the button, or pulling the stick, is what somebody
+              // does next as often as pressing Restart. The same release a retry needs
+              // (lib/release-target.ts), after the last write: the log copy above.
+              releaseTargetDisks(isArm, answers, appendLog)
+              cleanup()
+              finishRun(success)
+            }
+          })
+        } catch (e: any) {
+          cleanup()
+          appendLog(`[ERROR] Failed to spawn installer process: ${e.message || e}`)
+          finishRun(false)
+        }
+
+      }
+
+      box.connect("unmap", () => {
+        stopDesktopPoll()
+        if (timerSourceId) {
+          GLib.source_remove(timerSourceId)
+          timerSourceId = 0
+        }
+      })
+
+      return box
+    },
+  }
+}

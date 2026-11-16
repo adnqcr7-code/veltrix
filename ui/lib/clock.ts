@@ -1,0 +1,109 @@
+import Gtk from "gi://Gtk?version=4.0"
+import GLib from "gi://GLib"
+import { formatDatePart, foldEasternDigits, type DateFormat } from "./date-names"
+import { playEntrance } from "./entrance"
+
+// The date + time block of the greeter and the lockscreen — the hero of both
+// screens. Returns the two labels in a column with no container chrome, for
+// embedding straight into the surface.
+//
+// ── WHAT WAS ACTUALLY DIFFERENT BETWEEN THE TWO COPIES ──────────────────────
+// One thing, and it is not cosmetic: WHERE the clock format is read from. The
+// lockscreen runs AS the user, in the session, so it reads GSettings
+// `org.veltrix.region` (#573). The greeter runs as a SYSTEM user outside any
+// session, with no access to that user's dconf, so it reads the world-readable
+// mirror the shell writes to /var/tmp/veltrix/region.json. That is a privilege difference, not a
+// preference, so it stays with the bundle and arrives here as a function.
+//
+// Everything else — the format strings, both timers, the classes, the column —
+// was identical, and is now written once.
+//
+// The DATE is not read at all: both screens show the long one, whatever the bar's
+// date format says (owner, 2026-09-28). A lock screen keeps its own clock — a large
+// clock and a 24-hour switch at most, never a date format — and a
+// short bar date ("Mon, 28 Sep") is too small a line under the hero clock. The time
+// format still follows the person's choice.
+const DATE_FORMAT: DateFormat = "long"
+
+export interface RegionSettings {
+    timeFormat: "24h" | "12h"
+    showSeconds: boolean
+}
+
+export interface ClockDeps {
+    /** Read the user's region settings. Differs per bundle by PRIVILEGE — see above. */
+    readRegion: () => RegionSettings
+    /** The bundle's locale-change subscription, where it HAS one (greeter only). */
+    onLocaleChange?: (fn: () => void) => void
+}
+
+export function VeltrixClock(deps: ClockDeps): Gtk.Widget {
+    // Read once, as both copies did: these two surfaces are built, shown and
+    // dismissed, and a settings change during a login is not a case that exists.
+    const region = deps.readRegion()
+    const timeFmt = region.timeFormat === "12h"
+        ? (region.showSeconds ? "%I:%M:%S %p" : "%I:%M %p")
+        : (region.showSeconds ? "%H:%M:%S" : "%H:%M")
+
+    // macOS-style 12-hour time (Phase 1, same as the bar's RegionConfig.formatClock):
+    // "6:44 PM", no leading zero — GLib's %I zero-pads ("06:44 PM").
+    const formatTime = () => {
+        const s = GLib.DateTime.new_now_local().format(timeFmt) ?? ""
+        // Western digits (E1), same pin as the bar's formatClock: glibc's %I/%H
+        // may render Eastern digits under ar_SA.UTF-8, and strftime has no
+        // numbering-system override, so fold on the formatted string.
+        const folded = foldEasternDigits(s)
+        return region.timeFormat === "12h" ? folded.replace(/^0/, "") : folded
+    }
+    const formatDate = () => formatDatePart(DATE_FORMAT, GLib.DateTime.new_now_local())
+
+    const dateLabel = new Gtk.Label({
+        label: formatDate(),
+        css_classes: ["greeter-date"],
+        halign: Gtk.Align.CENTER,
+        xalign: 0.5,
+    })
+
+    const timeLabel = new Gtk.Label({
+        label: formatTime(),
+        css_classes: ["greeter-clock"],
+        halign: Gtk.Align.CENTER,
+        xalign: 0.5,
+    })
+
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
+        timeLabel.label = formatTime()
+        return GLib.SOURCE_CONTINUE
+    })
+
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 60000, () => {
+        dateLabel.label = formatDate()
+        return GLib.SOURCE_CONTINUE
+    })
+
+    // The greeter's language dropdown changes the process locale live (setLocale →
+    // applyProcessLocale) — repaint the date now, not on the next minute tick. The
+    // lockscreen has no picker, so it passes nothing and this never exists.
+    deps.onLocaleChange?.(() => { dateLabel.label = formatDate() })
+
+    const box = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        spacing: 0,
+        // The hero block arrives WITH the card rather than being there before it —
+        // both screens are one composition, and animating the card over a clock
+        // that was already sitting there read as one element on a static backdrop.
+        // Same class pair and same transition as `.greeter-card`; the numbers
+        // differ because this block is `valign: START` and the card is CENTER, so
+        // centring gives the card half its margin back and this gets all of it.
+        css_classes: ["greeter-hero"],
+    })
+    box.append(dateLabel)
+    box.append(timeLabel)
+
+    // Same entrance as the card, same duration and curve, each on its own `map` —
+    // which is what keeps them in step without either knowing about the other. 21
+    // and not 40: this block is `valign: START`, so it keeps all of its margin as
+    // travel (and it is ADDITIVE with the `margin_top = 72` its host sets).
+    playEntrance(box, { rise: 21 })
+    return box
+}

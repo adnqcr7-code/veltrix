@@ -1,0 +1,222 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// veltrix-input — synthetic POINTER for the computer-use layer (Phase 2b-ii).
+// A minimal Wayland client that injects a pointer move / left-click via the
+// wlroots zwlr_virtual_pointer_v1 protocol (Hyprland supports it). No daemon,
+// no uinput, no root — the Wayland-native pointer path.
+//
+//   veltrix-input move       <x> <y> <w> <h>
+//   veltrix-input click      <x> <y> <w> <h>          # left button
+//   veltrix-input rightclick <x> <y> <w> <h>          # right button
+//   veltrix-input scroll     <x> <y> <w> <h> <dx> <dy> [ms [legs]] # wheel notches at (x,y)
+//   veltrix-input drag       <x> <y> <w> <h> <x2> <y2> [ms [legs]] # press at (x,y), glide to (x2,y2), release
+//
+// [ms] spreads the notches, or the glide, over that many milliseconds: a sustained scroll or a
+// slow drag, what scripts/dev/smoothness-probe.py measures an app's frames over. Without it a
+// scroll's notches go at once and a drag glides in ~290 ms, as before. [legs] repeats it that
+// many times, each leg the way back of the one before (one press for a drag), with no pause
+// between legs, and prints `LEG <start> <end>` per leg on stdout in CLOCK_MONOTONIC ms (Python's
+// `time.monotonic() * 1000`): the probe measures from the first notch, not from the process
+// start, and a new process per leg left a ~25 ms seam between legs.
+//
+// (x,y) is the target position and (w,h) the output's extent, BOTH in the same
+// (logical) units — motion_absolute maps x/w → output fraction, so the caller
+// passes logical output-relative coords + the output's logical size. For scroll,
+// <dx>/<dy> are signed wheel-notch counts (dy>0 = down, dx>0 = right); for drag,
+// <x2>/<y2> are the drop point in the same units as <x>/<y>. This is a
+// DUMB injector: all gating, focus verification, AT-SPI node resolution and
+// geometry mapping live in the veltrix-click GJS wrapper. Single-output for now
+// (default seat/output); multi-monitor output targeting is a follow-up.
+//
+// Build (see install.sh): wayland-scanner generates the protocol glue from
+// /usr/share/wlr-protocols/unstable/wlr-virtual-pointer-unstable-v1.xml, then
+//   cc veltrix-input.c <generated>.c $(pkg-config --cflags --libs wayland-client)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <linux/input-event-codes.h>   // BTN_LEFT
+#include <wayland-client.h>
+#include "wlr-virtual-pointer-unstable-v1-client-protocol.h"
+
+static struct wl_seat *seat = NULL;
+static struct zwlr_virtual_pointer_manager_v1 *mgr = NULL;
+
+static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
+                       const char *iface, uint32_t version) {
+    (void)data; (void)version;
+    if (strcmp(iface, wl_seat_interface.name) == 0)
+        seat = wl_registry_bind(reg, name, &wl_seat_interface, 1);
+    else if (strcmp(iface, zwlr_virtual_pointer_manager_v1_interface.name) == 0)
+        mgr = wl_registry_bind(reg, name, &zwlr_virtual_pointer_manager_v1_interface, 1);
+}
+static void reg_remove(void *d, struct wl_registry *r, uint32_t n) { (void)d; (void)r; (void)n; }
+static const struct wl_registry_listener reg_listener = { reg_global, reg_remove };
+
+// Monotonic milliseconds for the protocol's time argument.
+static uint32_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+// Emit |notches| discrete wheel steps on `axis` (sign of notches = direction).
+// One frame per notch, mimicking a real mouse wheel: source + continuous value +
+// discrete step count. value is the continuous fallback (15 units/notch — the
+// wlroots wheel convention); `discrete` is the integer step apps use for line/
+// notch scrolling. axis is called before axis_discrete (the latter extends it).
+// No axis_stop — wheel sources have no kinetic end (unlike touchpad/finger).
+static void nap_ms(long ms);
+static double mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+static void emit_scroll(struct wl_display *dpy, struct zwlr_virtual_pointer_v1 *vp, uint32_t axis,
+                        int notches, long gap_ms) {
+    if (notches == 0) return;
+    int step = notches > 0 ? 1 : -1;
+    int n = notches > 0 ? notches : -notches;
+    wl_fixed_t value = wl_fixed_from_double(15.0 * step);
+    for (int i = 0; i < n; i++) {
+        uint32_t t = now_ms();
+        zwlr_virtual_pointer_v1_axis_source(vp, WL_POINTER_AXIS_SOURCE_WHEEL);
+        zwlr_virtual_pointer_v1_axis(vp, t, axis, value);
+        zwlr_virtual_pointer_v1_axis_discrete(vp, t, axis, value, step);
+        zwlr_virtual_pointer_v1_frame(vp);
+        if (gap_ms > 0) { wl_display_flush(dpy); nap_ms(gap_ms); }
+    }
+}
+
+static void nap_ms(long ms) {
+    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+// Press at (x1,y1), glide to (x2,y2) over several interpolated motion steps with
+// small real-time gaps, then release — drag-threshold / DnD detection needs the
+// pointer to actually travel while the button is held, like a human drag (a
+// single press→jump→release at a new spot usually does NOT register as a drag).
+// Flush between steps so the events reach the compositor spread over time. The
+// caller has already positioned the pointer at (x1,y1). Left button only.
+static void emit_drag(struct wl_display *dpy, struct zwlr_virtual_pointer_v1 *vp,
+                      uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2,
+                      uint32_t w, uint32_t h, long duration_ms, int legs) {
+    // One motion every ~8 ms over a requested duration (a 125 Hz mouse); else 24 steps.
+    const int STEPS = duration_ms > 0 ? (int)(duration_ms / 8 > 24 ? duration_ms / 8 : 24) : 24;
+    const long GAP = duration_ms > 0 ? duration_ms / STEPS : 12;
+    wl_display_flush(dpy);   // make sure the initial positioning motion landed
+    nap_ms(40);
+    uint32_t t = now_ms();
+    zwlr_virtual_pointer_v1_button(vp, t, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
+    zwlr_virtual_pointer_v1_frame(vp);
+    wl_display_flush(dpy);
+    nap_ms(50);              // brief hold so the press registers before motion
+    for (int leg = 0; leg < legs; leg++) {
+        // Odd legs come back: from (x2,y2) to (x1,y1).
+        double ax = leg % 2 ? x2 : x1, ay = leg % 2 ? y2 : y1;
+        double bx = leg % 2 ? x1 : x2, by = leg % 2 ? y1 : y2;
+        double start = mono_ms();
+        for (int s = 1; s <= STEPS; s++) {
+            double f = (double)s / STEPS;
+            t = now_ms();
+            zwlr_virtual_pointer_v1_motion_absolute(vp, t, (uint32_t)(ax + (bx - ax) * f + 0.5),
+                                                    (uint32_t)(ay + (by - ay) * f + 0.5), w, h);
+            zwlr_virtual_pointer_v1_frame(vp);
+            wl_display_flush(dpy);
+            nap_ms(GAP);     // ~290ms glide total by default
+        }
+        if (legs > 1) printf("LEG %.3f %.3f\n", start, mono_ms());
+    }
+    nap_ms(50);              // settle at the target before dropping
+    t = now_ms();
+    zwlr_virtual_pointer_v1_button(vp, t, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
+    zwlr_virtual_pointer_v1_frame(vp);
+}
+
+int main(int argc, char **argv) {
+    const char *verb = argc >= 2 ? argv[1] : "";
+    int is_move   = strcmp(verb, "move") == 0;
+    int is_click  = strcmp(verb, "click") == 0;
+    int is_right  = strcmp(verb, "rightclick") == 0;
+    int is_scroll = strcmp(verb, "scroll") == 0;
+    int is_drag   = strcmp(verb, "drag") == 0;
+    if ((!is_move && !is_click && !is_right && !is_scroll && !is_drag) ||
+        ((is_scroll || is_drag) ? (argc < 8 || argc > 10) : argc != 6)) {
+        fprintf(stderr,
+            "usage: veltrix-input move|click|rightclick <x> <y> <w> <h>\n"
+            "       veltrix-input scroll <x> <y> <w> <h> <dx> <dy> [ms [legs]]\n"
+            "       veltrix-input drag   <x> <y> <w> <h> <x2> <y2> [ms [legs]]\n");
+        return 2;
+    }
+    uint32_t x = (uint32_t)strtoul(argv[2], NULL, 10);
+    uint32_t y = (uint32_t)strtoul(argv[3], NULL, 10);
+    uint32_t w = (uint32_t)strtoul(argv[4], NULL, 10);
+    uint32_t h = (uint32_t)strtoul(argv[5], NULL, 10);
+    long duration = argc >= 9 ? strtol(argv[8], NULL, 10) : 0;
+    int legs = argc == 10 ? (int)strtol(argv[9], NULL, 10) : 1;
+    if (legs < 1) { fprintf(stderr, "veltrix-input: legs must be at least 1\n"); return 2; }
+    int dx = 0, dy = 0;
+    uint32_t x2 = 0, y2 = 0;
+    if (is_scroll) {
+        dx = (int)strtol(argv[6], NULL, 10);
+        dy = (int)strtol(argv[7], NULL, 10);
+    } else if (is_drag) {
+        x2 = (uint32_t)strtoul(argv[6], NULL, 10);
+        y2 = (uint32_t)strtoul(argv[7], NULL, 10);
+    }
+
+    struct wl_display *dpy = wl_display_connect(NULL);
+    if (!dpy) { fprintf(stderr, "veltrix-input: cannot connect to Wayland display\n"); return 1; }
+
+    struct wl_registry *reg = wl_display_get_registry(dpy);
+    wl_registry_add_listener(reg, &reg_listener, NULL);
+    wl_display_roundtrip(dpy);   // populate globals
+
+    if (!mgr) {
+        fprintf(stderr, "veltrix-input: compositor does not expose zwlr_virtual_pointer_manager_v1\n");
+        return 1;
+    }
+
+    struct zwlr_virtual_pointer_v1 *vp =
+        zwlr_virtual_pointer_manager_v1_create_virtual_pointer(mgr, seat);
+
+    uint32_t t = now_ms();
+    zwlr_virtual_pointer_v1_motion_absolute(vp, t, x, y, w, h);
+    zwlr_virtual_pointer_v1_frame(vp);
+    wl_display_flush(dpy);
+    nap_ms(40);
+
+    if (is_click || is_right) {
+        uint32_t btn = is_right ? BTN_RIGHT : BTN_LEFT;
+        t = now_ms();
+        zwlr_virtual_pointer_v1_button(vp, t, btn, WL_POINTER_BUTTON_STATE_PRESSED);
+        zwlr_virtual_pointer_v1_frame(vp);
+        wl_display_flush(dpy);
+        nap_ms(50);
+        t = now_ms();
+        zwlr_virtual_pointer_v1_button(vp, t, btn, WL_POINTER_BUTTON_STATE_RELEASED);
+        zwlr_virtual_pointer_v1_frame(vp);
+    } else if (is_scroll) {
+        int n = (dy < 0 ? -dy : dy) + (dx < 0 ? -dx : dx);
+        long gap = duration > 0 && n > 0 ? duration / n : 0;
+        for (int leg = 0; leg < legs; leg++) {
+            int sign = leg % 2 ? -1 : 1;   // odd legs come back
+            double start = mono_ms();
+            emit_scroll(dpy, vp, WL_POINTER_AXIS_VERTICAL_SCROLL, sign * dy, gap);
+            emit_scroll(dpy, vp, WL_POINTER_AXIS_HORIZONTAL_SCROLL, sign * dx, gap);
+            if (legs > 1) printf("LEG %.3f %.3f\n", start, mono_ms());
+        }
+    } else if (is_drag) {
+        emit_drag(dpy, vp, x, y, x2, y2, w, h, duration, legs);
+    }
+
+    // Flush + roundtrip so the events actually reach the compositor before exit.
+    wl_display_flush(dpy);
+    wl_display_roundtrip(dpy);
+
+    zwlr_virtual_pointer_v1_destroy(vp);
+    wl_display_disconnect(dpy);
+    return 0;
+}

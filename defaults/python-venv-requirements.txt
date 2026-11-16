@@ -1,0 +1,14 @@
+# Python packages for the per-user venv (~/.local/share/veltrix/venv) that
+# bin/veltrix-hijri-date and bin/veltrix-prayer-times re-exec into (Arch has no
+# packages for either, and PEP 668 blocks system pip). Version-pinned AND
+# hash-pinned: install with `pip install --require-hashes -r this-file`
+# (install.sh and bin/veltrix-setup both do). Both packages have zero runtime
+# dependencies, so these two hashes are the complete set — no transitive
+# hashes to maintain. Hashes verified 2026-11-12 with `pip hash` over the
+# PyPI wheels (hijridate-2.6.0-py3-none-any.whl,
+# al_falak-1.2.1-py3-none-any.whl). Bump the version AND the hash together;
+# a version bump with a stale hash fails loud at install time, which is the
+# point. (Fix pass #1, security S-d: hijridate was version-pinned only, the
+# same as al-falak — now both are hash-pinned.)
+hijridate==2.6.0 --hash=sha256:290db60c7780acc2a7e2112fada70847e3c11c0030b998606db77ecf126c305b
+al-falak==1.2.1 --hash=sha256:ab603cd1c2eef603262057380162c4a5c8f9289cf37fe2375a92e777dcda721a

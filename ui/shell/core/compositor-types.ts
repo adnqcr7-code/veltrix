@@ -1,0 +1,389 @@
+// compositor-types.ts — the shapes and the interface of `core/CompositorState.ts`, apart
+// from it so both backends can import them without importing each other. Read the header
+// of CompositorState.ts first.
+
+import type { WindowBackground, WINDOW_BACKGROUNDS } from "../../lib/veltrix-kit/platform/theme-tokens"
+
+/** A window. `address` is bare hex (no `0x`) — compare with `bareAddr()` regardless. */
+export interface CompositorWindow {
+    address: string
+    /** The Wayland app id (X11 class under XWayland). */
+    class: string
+    title: string
+    /** What it was called when it opened: what a rule that runs once, at open, sees. */
+    initialClass: string
+    initialTitle: string
+    pid: number
+    x: number
+    y: number
+    width: number
+    height: number
+    workspace: { id: number; name: string }
+    /** Index into `monitors`. */
+    monitor: number
+    floating: boolean
+    pinned: boolean
+    mapped: boolean
+    hidden: boolean
+    /** Minimized (Hyalo, #724): hidden on its workspace until something brings it back — by
+     *  its own minimize, or with the window it is a dialog of. Never on Hyprland. */
+    minimized: boolean
+    /** The order it was minimized in, most recent highest; 0 when it was not minimized itself.
+     *  The dock gives each such window a thumbnail and its app icon restores the highest. */
+    minimizedOrder: number
+    xwayland: boolean
+    /** 0 none, 1 maximized, 2 fullscreen — NOT a boolean (`isRealFullscreen`). */
+    fullscreen: number
+}
+
+export interface CompositorWorkspace {
+    /** Negative for a special (scratchpad) workspace, whose name is `special:<name>`. */
+    id: number
+    name: string
+    /** The connector it is on (`DP-1`). */
+    monitor: string
+    monitorID: number
+    windows: number
+    hasfullscreen: boolean
+    /** Bare address of the window this workspace would focus, "" if none. */
+    lastwindow: string
+    lastwindowtitle: string
+}
+
+export interface CompositorMonitor {
+    id: number
+    name: string
+    description: string
+    make: string
+    model: string
+    serial: string
+    /** The mode, in pixels. */
+    width: number
+    height: number
+    refreshRate: number
+    /** Logical position. */
+    x: number
+    y: number
+    scale: number
+    /** wl_output transform, 0–7. */
+    transform: number
+    focused: boolean
+    disabled: boolean
+    activeWorkspace: { id: number; name: string }
+    specialWorkspace: { id: number; name: string }
+    availableModes: string[]
+}
+
+/** A window as the compositor reports it RIGHT NOW (`readWindows`): authoritative where
+ *  the cached `clients` is a snapshot of the last event. `address` is `0x`-prefixed,
+ *  `at`/`size` are [x, y] / [w, h] — the shape `listWindows` hands to agents. */
+export interface WindowSnapshot {
+    address: string
+    class: string
+    title: string
+    workspace: { id: number; name: string }
+    at: [number, number]
+    size: [number, number]
+    floating: boolean
+    fullscreen: number
+    pinned: boolean
+    /** Addresses of the windows in its tab group, itself included; [] when ungrouped. */
+    grouped: string[]
+}
+
+export interface WorkspaceSnapshot {
+    id: number
+    name: string
+    monitor: string
+    windows: number
+}
+
+export interface ClientGeom { x: number; y: number; width: number; height: number }
+export type ClientGeometry = Map<string, ClientGeom>
+
+/** What one compositor can do and the other cannot. A surface asks before it offers. */
+export interface CompositorCaps {
+    /** Tab groups (Hyprland). Hyalo has none, by the owner's decision. */
+    groups: boolean
+    /** A choice of tiling layout (`setLayout`). Hyalo has dwindle only, for now. */
+    layouts: boolean
+    /** The inner glow the Assistant lights on the window it works in (Hyprland ≥ 0.56). */
+    glow: boolean
+    /** A window can be minimized: hidden on its workspace, back through the dock (Hyalo, #724).
+     *  Hyprland has no minimize — an app's minimize button does nothing there. */
+    minimize: boolean
+    /** A floating window can be moved to absolute pixel coordinates (`moveWindowTo`,
+     *  Hyprland's `hl.dsp.window.move({ x, y })`). Hyalo has none — it draws its own
+     *  draggable title bar over the window instead (hyalo/compositor/src/render/
+     *  title_bar.rs), so the bar's drag handle is inert there. */
+    pixelMove: boolean
+    /** A window's owning process can be SIGKILLed (`killWindow`): a real force-kill,
+     *  not a polite close. A surface asks before it offers Force Quit. */
+    kill: boolean
+}
+
+export type CompositorKind = "hyprland" | "hyalo"
+export type CompositorSignal = "changed" | "config-reloaded" | "title-changed"
+
+/** wl_output transforms by number, in protocol order (Hyalo names them; Hyprland numbers). */
+export const TRANSFORM_NAMES = [
+    "normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180", "flipped-270",
+]
+
+/** Real fullscreen (over the bar), as opposed to maximized. */
+export const FULLSCREEN = 2
+
+export const bareAddr = (s?: string) => (s ?? "").toLowerCase().replace(/^0x/, "")
+
+export interface Compositor {
+    readonly kind: CompositorKind
+    readonly caps: CompositorCaps
+
+    // ── State, rebuilt from the compositor's events; read straight after "changed".
+    clients: CompositorWindow[]
+    workspaces: CompositorWorkspace[]
+    monitors: CompositorMonitor[]
+    clientsByWorkspace: Map<number, CompositorWindow[]>
+    /** Normal workspaces that exist. */
+    occupiedWorkspaces: Set<number>
+    specialWorkspaces: CompositorWorkspace[]
+    /** The normal workspace shown on the focused monitor. */
+    focusedWorkspaceId: number
+    readonly focusedWorkspace: CompositorWorkspace | null
+    readonly focusedMonitor: CompositorMonitor | null
+    /** The focused window — always one on the focused workspace (or a special one). */
+    readonly focusedClient: CompositorWindow | null
+    isRealFullscreen(client: CompositorWindow | null | undefined): boolean
+
+    // ── Fresh reads.
+    readWindows(): Promise<WindowSnapshot[]>
+    readWindow(address: string): Promise<WindowSnapshot | null>
+    readWorkspaces(): Promise<WorkspaceSnapshot[]>
+    /** Window boxes as of NOW, by bare address (`clients` geometry can be stale). */
+    readGeometry(): Promise<ClientGeometry>
+    version(): Promise<string>
+
+    // ── Window management. A window is named by its address, bare or `0x`-prefixed.
+    focusWorkspace(id: number): Promise<unknown>
+    /** Switch workspace from one of OUR surfaces (the app grid, the overview). */
+    focusWorkspaceFromShell(id: number): Promise<unknown>
+    /** `e+1`, `e-1`, `previous`, or a number. */
+    focusWorkspaceArg(arg: string): Promise<unknown>
+    focusDirection(dir: "left" | "right" | "up" | "down"): Promise<unknown>
+    /** Focus AND raise. The one door every route to a window goes through. */
+    focusWindow(address: string): Promise<unknown>
+    closeWindow(address: string): Promise<unknown>
+    /** Close the FOCUSED window, without naming it: on Hyprland the same
+     *  no-arg `hl.dsp.window.close()` Super+Q is bound to, so the caller
+     *  can never disagree with the compositor about which window is
+     *  focused — a selector re-resolved from state is a second answer to
+     *  the same question. On Hyalo it closes the reconciled focused
+     *  client (that backend's close needs an address). No focused window
+     *  is a no-op, never an error. */
+    closeFocusedWindow(): Promise<unknown>
+    /** SIGKILL the process owning the window — a real force-kill, NOT a polite close:
+     *  the app gets no save prompt and unsaved work is lost. `caps.kill` only. */
+    killWindow(address: string): Promise<unknown>
+    /** `caps.minimize` only. `focusWindow` restores a minimized window (and focuses it). */
+    minimizeWindow(address: string): Promise<unknown>
+    /** `caps.minimize` only: where one output's dock shows each minimized window, for the window
+     *  to shrink into it and grow back out of it — `[x, y, width, height]` in the dock's layer
+     *  surface (`namespace`), logical px, by window address. Replaces what that output said. */
+    setMinimizeTargets(output: string, namespace: string, targets: Record<string, [number, number, number, number]>): void
+    sendToWorkspace(address: string, wsId: number): Promise<unknown>
+    /** Toggle. */
+    floatWindow(address: string): Promise<unknown>
+    enableFloatWindow(address: string): Promise<unknown>
+    tileWindow(address: string): Promise<unknown>
+    togglePseudo(address: string): Promise<unknown>
+    togglePin(address: string): Promise<unknown>
+    toggleFullscreen(address: string): Promise<unknown>
+    /** Fill the workspace, bar and dock still in view (fullscreen mode 1); again to undo. */
+    toggleMaximize(address: string): Promise<unknown>
+    centerWindow(address: string): Promise<unknown>
+    /** Move a floating window to absolute logical pixels (`x`, `y` = the window's new
+     *  top-left). `caps.pixelMove` only: Hyprland moves it with `hl.dsp.window.move`
+     *  (Hyprland wiki, Dispatchers: `move({ window?, x, y, relative? })` — absolute
+     *  when `relative` is false); Hyalo has no such action and no-ops, because it
+     *  draws its own draggable title bar over the window instead. A tiled window
+     *  stays put — float it first (`enableFloatWindow`). The compositor clamps the
+     *  result to the usable area, as it does for its own drags. */
+    moveWindowTo(address: string, x: number, y: number): Promise<unknown>
+    floatAllInWorkspace(wsId: number): Promise<unknown>
+    tileAllInWorkspace(wsId: number): Promise<unknown>
+    /** No address = the focused window. */
+    sendToSpecial(name?: string, address?: string): Promise<unknown>
+    /** Floating or tiling per workspace (#513): the default, and the workspaces that differ.
+     *  A workspace whose mode CHANGES re-floats or re-tiles its windows; re-stating the same
+     *  mode moves nothing. */
+    applyWorkspaceModes(defaultMode: "floating" | "tiling", overrides: Record<string, "floating" | "tiling">): Promise<unknown>
+    /** `caps.groups` only. */
+    toggleGroup(address?: string): Promise<unknown>
+    moveOutOfGroup(address: string): Promise<unknown>
+    /** `caps.layouts` only. */
+    setLayout(layout: "dwindle" | "master"): Promise<unknown>
+
+    // ── Focus after our own surfaces let go of the keyboard (common/FocusGrab.ts).
+    restoreFocusAfterGrab(): void
+    afterGrabRelease(cb: () => void): void
+    /** Where the real pointer is (global logical), or null when it cannot be read. */
+    cursorPosition(): Promise<[number, number] | null>
+    /** Re-decide what the pointer is over without moving it. */
+    reevaluatePointerFocus(): Promise<unknown>
+
+    // ── The pointer, the glow, the config, pictures.
+    setCursor(theme: string, size: number): Promise<unknown>
+    /** Draw the real pointer or not; input is unaffected. Whoever hides it restores it. */
+    setRealCursorVisible(visible: boolean): Promise<unknown>
+    setGlow(enabled: boolean): Promise<unknown>
+    supportsGlow(): Promise<boolean>
+    reloadConfig(): Promise<unknown>
+    /** A PNG of one monitor (the focused one when unnamed) at `path`. Throws on failure. */
+    screenshot(path: string, monitor?: string): Promise<void>
+}
+
+/** The compositor with its GObject signals: "changed" = windows/workspaces/focus/monitors
+ *  (structural, often); "title-changed"(bareAddr) = a window renamed itself and nothing
+ *  else; "config-reloaded" = the compositor re-read its configuration. (Apart from
+ *  `Compositor` because each backend's `connect` is typed by its GObject class.) */
+export type CompositorObject = Compositor & {
+    connect(signal: CompositorSignal, cb: (...args: any[]) => any): number
+    disconnect(id: number): void
+}
+
+// ── Settings the compositor owns ─────────────────────────────────────────────
+//
+// What Settings chooses for the compositor — input, displays, workspace modes,
+// motion, the blur — goes through `CompositorSettings` (`settings` in CompositorState.ts).
+// Each backend applies it live AND persists it in the compositor's own layer: Hyprland's
+// `veltrix-*.lua` files (core/hyprland-settings.ts), Hyalo's `hyalo-settings.toml`, which
+// Hyalo writes itself when asked (core/hyalo-settings.ts). On both the user's own file
+// (`hyprland-user.lua`, `hyalo.toml`) is read last and wins.
+
+/** The input options both compositors take, in Settings' terms. */
+export interface InputSettings {
+    /** -1..1, every pointing device. */
+    pointerSpeed: number
+    /** `adaptive` or `flat`. */
+    accelProfile: string
+    mouseNaturalScroll: boolean
+    numlockOnBoot: boolean
+    kbLayout: string
+    kbVariant: string
+    /** ms before a held key repeats; repeats per second. */
+    kbRepeatDelay: number
+    kbRepeatRate: number
+    touchpadNaturalScroll: boolean
+    touchpadTap: boolean
+}
+
+export type InputKey = keyof InputSettings
+
+/** One monitor as Settings configures it. */
+export interface MonitorSetting {
+    scale: number
+    /** wl_output transform, 0–7. */
+    transform: number
+    /** `WxH@Hz`; undefined = the monitor's preferred mode. */
+    mode?: string
+    /** Mirror this output onto another monitor's content (`mirror = "eDP-1"`); undefined = extend. Hyprland only — Hyalo has no mirror field and drops it (a setting the compositor lacks is a no-op). */
+    mirror?: string
+}
+
+/** A blur: kawase size and passes. */
+export interface BlurStrength { size: number; passes: number }
+
+/** What one compositor's settings can do and the other's cannot (yet). A caller does not
+ *  need to ask before calling — a setting the compositor lacks is a no-op there — but a page
+ *  that OFFERS one should. */
+export interface SettingsCaps {
+    /** Animations the compositor draws, which reduce motion turns off (Hyalo's: minimize, #724). */
+    animations: boolean
+    /** What VRR's third choice (2) means: "fullscreen" = any fullscreen window (Hyprland's
+     *  `misc:vrr = 2`; Hyalo's `vrr = "fullscreen"`, per output). VELTRIX fork (Phase 0
+     *  fix): the old "games" meaning — a game in fullscreen — is deleted with Game Mode. */
+    vrrOnDemand: "fullscreen"
+    /** The compositor draws the window controls over an app's header, on the side the user
+     *  chose (Hyalo, #708 point 5). Hyprland draws none: our windows keep their close button. */
+    windowControls: boolean
+    /** Whether the pointer is drawn into a screen recording has a switch (Hyalo's `[cursor]
+     *  recorded`). Hyprland always draws it: wf-recorder asks for it, and it has no setting. */
+    recordedPointer: boolean
+    /** Whether an output can mirror another's content (Hyprland's `mirror = "eDP-1"`;
+     *  Hyalo has no mirror field, so the choice is a no-op there and the UI hides it). */
+    mirror: boolean
+}
+
+/** Settings → Power: seconds without input before each step; 0 = never. */
+export interface IdleConfig {
+    screenOff: number
+    lock: number
+    suspend: number
+}
+
+export interface CompositorSettings {
+    readonly caps: SettingsCaps
+
+    /** Night light: the screens warmed to `kelvin`, or neutral with null. Live, not persisted:
+     *  the schedule and the switch are the shell's (NightLightSync.ts). */
+    setNightLight(kelvin: number | null): void
+
+    /** The window background the compositor draws (toolkit/PHASE1.md D6): the choice, reduce
+     *  transparency, and each level's opacity and blur — Hyalo's `[windows.background]`, kept
+     *  by AppearanceSync.ts. No-op on Hyprland, where no window declares one. Persists and
+     *  applies. */
+    setWindowBackgrounds(b: {
+        level: WindowBackground
+        reduceTransparency: boolean
+        levels: typeof WINDOW_BACKGROUNDS
+    }): void
+
+    /** `caps.windowControls` only: the side the window controls go on and the buttons they may
+     *  show (Hyalo's `[windows.controls]`). Kept equal to `button-layout` by WindowButtons.ts —
+     *  set it there, not here. Persists and applies. */
+    setWindowControls(side: "right" | "left", buttons: ("close" | "minimize" | "maximize")[]): void
+
+    /** The family of the title the compositor writes in the title bar it draws for apps that
+     *  leave their decorations to it (Hyalo's `[windows.title_bar] font`): the interface
+     *  font's, kept in step by AppearanceSync. A no-op where the compositor draws none. */
+    setWindowTitleFont(family: string): void
+
+    /** `caps.recordedPointer` only: whether the pointer is in screen recordings. Persists and
+     *  applies (the next frame of a recording in progress). */
+    readRecordedPointer(): boolean
+    setRecordedPointer(on: boolean): void
+
+    /** The idle steps in force (Hyprland: hypridle's file; Hyalo: its own `[idle]`). */
+    readIdle(): IdleConfig
+    /** Persists and applies them. */
+    setIdle(cfg: IdleConfig): void
+
+    /** The options in force (the user's own file included), `current` where one cannot be read. */
+    readInput(current: InputSettings): Promise<InputSettings>
+    /** `next` is the whole state; `changed` what to apply live. Persists. */
+    setInput(next: InputSettings, changed: readonly InputKey[]): void
+
+    /** 0 off, 1 on, 2 on demand (`caps.vrrOnDemand`). Synchronous: Display reads it right after `init`. */
+    readVrr(current: number): number
+    /** Live, NOT persisted: a mode the user has not confirmed must not reach the file. */
+    applyMonitor(name: string, m: MonitorSetting): void
+    applyVrr(vrr: number): void
+    /** Every monitor Settings knows and the VRR choice, to the compositor's file. */
+    saveMonitors(monitors: ReadonlyMap<string, MonitorSetting>, vrr: number): void
+
+    /** Persists the workspace modes; `Compositor.applyWorkspaceModes` applies them live. */
+    saveWorkspaceModes(defaultMode: "floating" | "tiling", overrides: Record<string, "floating" | "tiling">): void
+
+    /** Reduce motion. The compositor's own animation setting is the baseline: turning it
+     *  off restores that, never a hard-coded "on", and the backend re-asserts it on reload. */
+    setReduceMotion(reduce: boolean): void
+
+    /** The compositor's own blur, as its config sets it (Hyalo: the surface's, `GLASS_BLUR`). */
+    blurBaseline(): BlurStrength
+
+    /** The accent, where the compositor draws one (Hyprland's tab groups). */
+    setAccent(rgbaHex: string): void
+
+    /** For dumpState: the effective layout numbers, null where the compositor has none. */
+    effectiveLayout(): { gapsIn: number | null; gapsOut: number | null; rounding: number | null; borderSize: number | null }
+}

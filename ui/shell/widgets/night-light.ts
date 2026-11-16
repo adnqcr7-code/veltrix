@@ -1,0 +1,175 @@
+import Gtk from "gi://Gtk?version=4.0"
+import nightLight from "../core/NightLightManager"
+import { makeHSlider } from "../../lib/veltrix-kit"
+import { AtomicWidget, ContentBudget, WidgetSize, makeRoundTile, makeSplitCapsuleTile, panelRow, panelSeparator, panelSwitch, makeBarIcon } from "../common/widget-kit"
+import { t } from "../core/i18n"
+import { uiIcon } from "../core/Icons"
+import { safeDisconnect } from "../core/signals"
+
+const subscribe = (sync: () => void) => {
+    const id = nightLight.connect("changed", sync)
+    return () => safeDisconnect(nightLight, id)
+}
+
+function buildBarContent() {
+    return makeBarIcon({
+        // Dedicated icon (warm sunset) — distinct from dark-mode's moon/sun. On/off
+        // is conveyed by the toggle's active state, not an icon swap.
+        getIcon: () => uiIcon("nd-night-light"),
+        onAction: () => nightLight.setEnabled(!nightLight.enabled),
+        subscribe,
+    })
+}
+
+const getIcon = () => uiIcon("nd-night-light")
+const getSub = () => nightLight.enabled
+    ? `${nightLight.temperature}K`
+    : t("widget.night-light.sub.off")
+
+// SINGLE keeps the toggle (every platform's compact quick-toggle stays a
+// toggle — "open detail" is always a separate affordance, never a fallback on
+// the same tap target, and there's no room for a second hit-region at 1×1).
+// WIDE/SQUARE split: icon badge toggles, the rest of the capsule opens the
+// detail panel — see [[project_cc_capsule_alignment]].
+function buildContent(size: WidgetSize, budget: ContentBudget): Gtk.Widget {
+    const toggle = () => nightLight.setEnabled(!nightLight.enabled)
+    if (size === WidgetSize.SINGLE)
+        return makeRoundTile(getIcon, () => nightLight.enabled, toggle, subscribe)
+    return makeSplitCapsuleTile(getIcon, () => t("widget.night-light.name"), getSub, toggle, subscribe, budget)
+}
+
+// ── CC detail panel: on/off switch + temperature slider + schedule ────────────
+// Quick-access mirror of Settings → Appearance's Night Light group (same keys,
+// same NightLightManager) — no new backend, just a compact echo for the CC.
+
+const onChanged = (sync: () => void) => {
+    const id = nightLight.connect("changed", sync)
+    return () => safeDisconnect(nightLight, id)
+}
+
+// The master switch, on the CC detail's title line (contract.ts `ccDetailSwitch`).
+// Insensitive while a schedule drives the light — it follows its own `changed`.
+function buildMasterSwitch(): Gtk.Widget {
+    const sw = panelSwitch(() => nightLight.enabled, (on) => nightLight.setEnabled(on), onChanged)
+    const sync = () => { sw.sensitive = !nightLight.scheduleEnabled }
+    sync()
+    sw.connect("unrealize", onChanged(sync))
+    return sw
+}
+
+function buildDetailPanel(_onClose: () => void): Gtk.Widget {
+    const outer = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 0, hexpand: true })
+
+    const tempValueLabel = new Gtk.Label({ label: `${nightLight.temperature}K`, css_classes: ["slider-value-label"], width_chars: 5, xalign: 1.0 })
+    const tempSlider = makeHSlider({
+        min: 2700, max: 6500, value: nightLight.temperature,
+        onChange: (v) => nightLight.setTemperature(Math.round(v)),
+        onValueChanged: (v) => { tempValueLabel.label = `${Math.round(v)}K` },
+        onExtChange: (cb) => {
+            const id = nightLight.connect("changed", () => cb(nightLight.temperature))
+            return () => safeDisconnect(nightLight, id)
+        },
+        // Live: the screen warms with the thumb. A trailing 24 ms debounce fired only when the
+        // thumb rested, so a steady drag changed nothing until it stopped (owner-caught 2026-10-03).
+        debounce: 0,
+    })
+    const tempRow = new Gtk.Box({ spacing: 8, margin_top: 8, margin_bottom: 8 })
+    tempRow.append(new Gtk.Image({ gicon: uiIcon("nd-value-decrease"), pixel_size: 14, opacity: 0.5, css_classes: ["nd-icon"] }))
+    tempRow.append(tempSlider)
+    tempRow.append(new Gtk.Image({ gicon: uiIcon("nd-value-increase"), pixel_size: 14, opacity: 0.5, css_classes: ["nd-icon"] }))
+    tempRow.append(tempValueLabel)
+    outer.append(tempRow)
+    outer.append(panelSeparator())
+
+    const schedSwitch = panelSwitch(() => nightLight.scheduleEnabled, (on) => {
+        nightLight.setScheduleEnabled(on)
+        timeRow.visible = on
+    }, onChanged)
+    const schedRow = panelRow(t("settings.appearance.night-light-schedule"), schedSwitch)
+    schedRow.margin_top = 4          // air after the separator
+    outer.append(schedRow)
+
+    const makeSpin = (lo: number, hi: number, val: number) => {
+        const spin = new Gtk.SpinButton({
+            adjustment: new Gtk.Adjustment({ lower: lo, upper: hi, step_increment: 1, value: val }),
+            width_chars: 2, wrap: true, numeric: true, digits: 0,
+            valign: Gtk.Align.CENTER, css_classes: ["time-spin"],
+        })
+        spin.connect("output", () => { spin.set_text(String(Math.round(spin.value)).padStart(2, "0")); return true })
+        return spin
+    }
+
+    const timePicker = (label: string, initial: string, onChange: (v: string) => void) => {
+        const [ih, im] = initial.split(":").map(Number)
+        const hSpin = makeSpin(0, 23, isNaN(ih) ? 20 : ih)
+        const mSpin = makeSpin(0, 59, isNaN(im) ? 0 : im)
+        // Guarded: writing a spin to DISPLAY the schedule fires `value-changed`, which
+        // would commit it straight back — a save on every external change. Same reason
+        // the Settings twin guards its own (see pages/Appearance.tsx).
+        let syncing = false
+        const emit = () => {
+            if (syncing) return
+            onChange(`${String(Math.round(hSpin.value)).padStart(2, "0")}:${String(Math.round(mSpin.value)).padStart(2, "0")}`)
+        }
+        hSpin.connect("value-changed", emit)
+        mSpin.connect("value-changed", emit)
+
+        const col = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 4 })
+        col.append(new Gtk.Label({ label, halign: Gtk.Align.START, css_classes: ["veltrix-row-subtitle"] }))
+        const row = new Gtk.Box({ spacing: 4, valign: Gtk.Align.CENTER })
+        row.append(hSpin)
+        row.append(new Gtk.Label({ label: ":", css_classes: ["veltrix-row-subtitle"] }))
+        row.append(mSpin)
+        col.append(row)
+        return { col, sync: (v: string) => {
+            const [h, m] = v.split(":").map(Number)
+            if (isNaN(h) || isNaN(m)) return
+            syncing = true
+            hSpin.value = h
+            mSpin.value = m
+            syncing = false
+        } }
+    }
+
+    const from = timePicker(t("settings.appearance.night-light-from"), nightLight.scheduleFrom, (v) => nightLight.setScheduleFrom(v))
+    const to   = timePicker(t("settings.appearance.night-light-to"),   nightLight.scheduleTo,   (v) => nightLight.setScheduleTo(v))
+    const timeRow = new Gtk.Box({ spacing: 16, margin_top: 8, margin_bottom: 8 })
+    timeRow.append(from.col)
+    timeRow.append(to.col)
+    timeRow.visible = nightLight.scheduleEnabled
+    outer.append(timeRow)
+
+    const syncId = nightLight.connect("changed", () => {
+        timeRow.visible = nightLight.scheduleEnabled
+        from.sync(nightLight.scheduleFrom)
+        to.sync(nightLight.scheduleTo)
+    })
+    outer.connect("unrealize", () => safeDisconnect(nightLight, syncId))
+
+    return outer
+}
+
+const nightLightWidget: AtomicWidget = {
+    id: "night_light",
+    category: "system",
+    barOrder: 20,
+    name: t("widget.night-light.name"),
+    icon: uiIcon("nd-night-light"),
+    locations: ["bar", "cc"],
+    defaultSize: WidgetSize.SINGLE,
+    supportedSizes: [WidgetSize.SINGLE, WidgetSize.WIDE, WidgetSize.SQUARE],
+    buildContent,
+    buildBarContent,
+    buildCCDetail: buildDetailPanel,
+    ccDetailSwitch: buildMasterSwitch,
+    ccDetailRows: 4,
+    getActive: () => nightLight.enabled,
+    watchActive: subscribe,
+    // Active = on (by hand or by its schedule). Default "always": the bar icon is also
+    // how it gets turned on. Fixed in the CC, which is what lets the bar offer "When active" (contract.ts).
+    ccFixed: true,
+    barActive: () => nightLight.enabled,
+    watchBarActive: subscribe,
+}
+
+export default nightLightWidget

@@ -1,0 +1,2035 @@
+# Veltrix — State machine & IPC
+
+Read this when adding a new overlay, wiring a new keybind to a UI action, debugging "overlay won't close", or touching anything that previously used `globalThis`.
+
+## The contract: `core/Status.ts`
+
+All overlay visibility flows through one central GObject. **Widgets never flip each other directly.** A widget that wants to know whether the Control Center is open subscribes to `notify::cc-open` on `status` and reacts to that signal.
+
+### Mutually exclusive overlays
+
+Setting any of these to `true` closes all the rest:
+
+- `cc_open`
+- `nc_open`
+- `prism_open`
+- `system_menu_open`
+- `island_mode` (a STRING, not a bool — the Activity Island's open mode id, `""` = collapsed; modes today: `ISLAND_OVERVIEW` (`"overview"`) and `ISLAND_PLAYER` (`"player"`, the media panel). Replaced the old `overview_open` boolean when the overview became the island's first mode — see `surfaces/island/ActivityIsland.tsx`. Note `""` only means no mode is EXPANDED — the capsule's compact content mutates independently (dots ↔ media compact) and is not Status state.)
+
+The exclusion is implemented by the private `closeExclusive(keep, opts)` helper — each setter calls it on open.
+
+`closeOverlays()` is the public door to the same helper with nothing kept: every overlay, the island's modes and a bar expansion. Call it before presenting a **toplevel window that needs typing** (the Wi-Fi password dialog does). An open overlay holds the compositor's focus grab, and a window that appears beneath it paints on top yet never gets a keystroke — no error, the text just vanishes (2026-09-14, a whole password typed from the Control Centre).
+
+⚠️ **Adding a new exclusive overlay is THREE edits, and only the first one is obvious. The other two fail in SILENCE** (both shipped broken with the app grid's move, 2026-08-09 — `tech-debt.md` §18):
+
+1. The setter itself: add `_field → notify-name` to the `EXCLUSIVE` map and call `closeExclusive` from the new setter (don't touch the other setters).
+2. **`isAnyOverlayOpen`.** It is not the convenience getter it looks like: it is the FIRST line of the bar's empty-strip dismissal handler (`barStripClick` in `Bar.tsx`), so an overlay missing from it silently stops being dismissable from a pixel that dismisses every other one. It is also what stops `AgentService` popping the Assistant island over something the user opened.
+3. **`dismissOverlays()` in `Bar.tsx`** — required as soon as the new surface whitelists the BAR in its focus grab, because a grab peer is by definition a surface the compositor will not dismiss on. Skip it and the empty bar strip becomes the one press on screen that does nothing.
+
+None of the three produces an error, a warning or a failed build when missed. Two string-valued members are special-cased: `island_mode` is cleared explicitly inside `closeExclusive` (it can't live in the boolean `EXCLUSIVE` map), and `bar_expanded_id` (the pill expansion capsule) is a **one-way member**: setting it non-empty closes the overlays, and the overlay setters clear it via `opts.barExpanded`. `bar_overflow_open` (2026-09-25, the bar's `»` unfolded in line) rides the same `opts.barExpanded`, so every overlay folds it — but `bar_expanded_id` does NOT, on purpose: the panel of an unfolded widget hangs from a pill that exists only while the overflow is unfolded. It is in `isAnyOverlayOpen`, `dismissOverlays`, `onBarGrabCleared` and the bar's `barModal` (a press outside folds it through the bar's focus grab). New island MODES are NOT new Status fields — they're new ids for `island_mode`, registered in `ActivityIsland` (mode ids are exported from `Status.ts` so core/IPC/surfaces share one vocabulary).
+
+### Other tracked props
+
+- `about_open` — `AboutWindow` is create+destroy, not hide: `app.ts` listens on `notify::about-open` and creates/destroys the window. Flipped by `status.toggleAbout()` (the system-menu item, and the `toggleAbout` IPC action).
+- ~~`settings_open`~~ — **removed** (#571). `dumpState.overlays.settings` is read off Hyprland's client list (`isSettingsClient` in `app.ts`: class `veltrix-settings` + title `Veltrix Settings`), because a Settings window in its own process cannot write the shell's Status. A hidden Settings window is unmapped, so it is not a client.
+- `recording`
+- `cc_edit_mode`
+- `bar_expanded_id` — which Bar pill is currently expanded.
+- `bar_overflow_open` — the bar's widgets that did not fit are unfolded in line (`toggleBarOverflow()`; `dumpState.flags.barOverflowOpen`). See design-system.md → "The bar's overflow".
+- `bar_edit_mode` — the bar's right group is being reordered in place. In the boolean `EXCLUSIVE` map (opening it closes the rest, anything else opening ends it); `bar_overflow_open`'s setter KEEPS it, because edit mode unfolds the overflow itself. In `barModal` and `onBarGrabCleared` (a click outside = Done). See design-system.md → "The right group's order".
+- `cc_detail_id` — which CC detail panel is active.
+
+### Toggles
+
+`Status.ts` exposes typed togglers: `toggleCC`, `toggleNC`, `togglePrism`, `toggleSystemMenu`, `toggleIsland(id)` (+ `toggleOverview`, an alias for `toggleIsland(ISLAND_OVERVIEW)` — also still the IPC action name), `toggleAbout`. There's also `isAnyOverlayOpen` — treat it as load-bearing, not convenient: see the three-edit warning above. `dumpState` reports both `overlays.island` (the mode string) and the legacy `overlays.overview` boolean (back-compat for agents).
+
+### Example flow — opening the CC
+
+```
+user clicks bar pill
+  → ShellActions.toggleCC()
+    → status.toggleCC()
+      → cc_open = true
+        → notify::cc-open fires
+          → Bar.tsx (subscribed) shows CC inside the Bar window
+          → updates the layer-shell input region
+```
+
+This is the canonical pattern: **events go up through actions, state changes propagate down through `notify::` signals.**
+
+## IPC contract: `veltrix-ipc`
+
+**One door, one dispatcher.** `dispatchRequest(argv, res)` in `app.ts` is the function;
+`exportShellBusName()` publishes `org.veltrix.Shell`. It is a plain D-Bus method call, so it can be
+made with no client at all:
+
+```bash
+busctl --user call org.veltrix.Shell /org/veltrix/Shell \
+       org.veltrix.Shell Request as 1 dumpState
+```
+
+**Use `veltrix-ipc <cmd>`.** The installed client is Rust (`session/ipc/`), built
+with the session workspace by install.sh and PKGBUILD. Rust is the default (#1017).
+Explicit TS compatibility sends exact argv to `org.veltrix.Shell.Request(as) → s`,
+with verbatim reply plus newline. One leading `--`
+is still accepted. `bin/veltrix-ipc.c` remains only for the unchanged TS headless smoke fixture;
+installation no longer compiles it.
+
+### The native Rust routes (#959 B)
+
+Native owners are selected by default, including with no environment variable (#1017).
+`VELTRIX_SESSION=ts` or `--session=ts` explicitly selects compatibility; unknown
+environment values warn and use Rust. An explicit --session option overrides the environment. An invalid explicit --session value still exits 2.
+Never infer the session from HYALO_SOCKET (TS also runs on Hyalo),
+and never retry or fall back between TS and Rust after a failure. The Rust session launcher
+sets the mode and selects this checkout's built client on its private PATH. Missing services
+are not auto-activated: the client pins each D-Bus call to the resolved unique owner.
+
+Config reads/writes and wallpaper set/transition go directly to Config1 (Apply returns
+revision/canonical value); the wallpaper follower applies awww. Preview has no ephemeral
+API and returns Unavailable. Hyalo owns window/workspace operations, screenshot and reload;
+the CLI remains External, so the common `veltrix-access` policy from A applies at each effect.
+Window selectors are exact id/address or an unambiguous app/title, and focus is read back.
+Revocation is always free: `disableComputerControl` writes only false to the session's
+allow-computer-control GSettings and syncs, even without a renderer.
+
+The typed `org.veltrix.Shell1` contract lives in `crates/veltrix-shell-ipc/`: its renderer owns
+Available, per-function Capabilities and authoritative state, surface toggles/focus, Settings
+presentation and ShowOSD. The Rust shell serves Shell1 for its implemented surfaces; absent renderers return
+Unavailable. C may implement only volume/brightness OSD; no OSD over ext-session-lock.
+No broker, sessiond mirror, renderer registration, ACK or TS bridge. Applications1 is a
+separate service, enabled by default in sessiond (#1017); A2 routes listApps/launchApp directly to it, as External,
+with dispatch-only confirmation (never window/focus success). Native helper,
+agent and UI introspection routes lacking an implementation also explicitly refuse; B does
+not promise the helpers/MCP or full TS dumpState schema in Rust. See `session/ipc/README.md`
+for the exhaustive route inventory and `crates/veltrix-shell-ipc/README.md` for the wire members.
+
+B3.2 (`toolkit/shell/B3.2.md`) adds Shell1 `surface:nc`: `veltrix-ipc nc`,
+`toggleNC` and `toggleNotificationCenter` use that capability. The bar's clock
+uses the same hub state. GetState includes NC visibility; GetNotificationState
+also reports the selected output and history count (redacted while locked).
+Notifications1 Snapshot pairs List metadata with an ordered Changed sequence;
+register signals first, hydrate once, and discard queued changes at/before the
+snapshot barrier. Historical hydration never announces fresh popups. Runtime
+revisions and unique daemon ownership guard all actions, including restored ones.
+Bulk dismissal is one call and one removal operation, not a per-row call cascade.
+
+Native errors exit 1 with AccessDenied/Unavailable/Invalid/Failed on stderr; CLI usage exits 2.
+Successful payloads remain on stdout. TS retains its existing reply/exit behavior. Each bus
+or socket reply has a 15 s deadline, socket replies are capped at 4 MiB, and no timeout causes
+an effect to be retried. Wallpaper transition/current are separate per-key Apply calls:
+a later failure leaves a successful earlier transition in force. Missing transition retains
+the current selection. Wayland screencopy/image-copy-capture remains outside the ACL by the
+owner's decision; do not claim general capture protection.
+
+Local checks: `cargo test --manifest-path session/Cargo.toml -p veltrix-ipc`, Clippy on that
+package, and `scripts/dev/check-shell-ipc-headless.sh` (real private Hyalo/Config1 in cage,
+private bus/HOME/keyfile settings, no live session; evidence under target/shell-ipc).
+
+🪦 **The AGS door is CLOSED (owner, 2026-09-23 — tech-debt #76).** From the day the AGS host went
+(2026-08-18) the shell also served AGS's bus name `io.Astal.ags`, and `veltrix-ipc` fell back to
+it, so that keybinds written as `ags request …` kept working while ~35 consumers migrated one at a
+time. All three pieces went together — the door (`exportLegacyAgsBusName`), the client's fallback,
+and the smoke test's assertion that both doors answered identically — and
+`migrations/2026-09-23-ags-request-to-veltrix-ipc.sh` rewrote `ags request` → `veltrix-ipc` once in
+the user's own `hyprland-user.lua` (current and legacy locations, symlinks followed, word-bounded
+so `bags request` is not a call). Do not reopen it: the `ags` CLI itself has not been installed
+since 2026-08-18.
+
+⚠️ **Native on purpose; never put an interpreter back on a keybind.** Every other
+`veltrix-*` helper is GJS; this one is on a KEYBIND — `hyprland.lua` binds Super+Space, Super+A and
+five more to it, so it runs on every press. Measured 2026-08-18, cheapest possible request, per
+invocation:
+
+| `ags request` (then) | `gdbus` (C) | a GJS client |
+|---|---|---|
+| 2.9 ms | 3.1 ms | **30 ms** |
+
+The first version of this file WAS GJS and was rewritten the moment that number appeared: shipping
+it would have made every keybind ten times slower than the `ags request` it replaces. The other
+helpers stay GJS because an agent step already costs hundreds of milliseconds, so 27 ms is noise
+there and decisive here. The installed Rust client selects its session explicitly and never falls back. The retained
+C smoke fixture has the historical single-door list; neither path retries an answered call.
+
+Why a bus name of our own, beyond the CLI — and this half is now **finished**: `AstalIO.Daemon`
+used to **overwrite** the `applicationId` passed to `app.start()` with `io.Astal.<instance>`, and
+GTK hands the GApplication id to the compositor as the Wayland app-id, which is the entire reason
+Hyprland filed the Settings window as `io.Astal.ags` and the dock had to remap it. Owning the bus
+name was step one; the host went next, so the id is ours (`org.veltrix.desktop`) and application
+windows name themselves on top of it. See `architecture.md` → "Identity: one window, one app-id".
+
+**GJS gotcha, measured 2026-08-18:** the exported method is named `RequestAsync(params, invocation)`
+because that naming is how GJS knows to let us answer the invocation ourselves — without it, an
+async command (`listWindows`, which shells out to `hyprctl`) would reply before its Promise
+settled. And `Gio.DBusError` DOES work with `instanceof` in GJS (the opposite was assumed and was
+wrong); what actually bites is the error NAME — with `NO_AUTO_START` the bus answers a missing
+name with `NameHasNoOwner`, never `ServiceUnknown`.
+
+Hyprland keybinds call `hl.dsp.exec_cmd("veltrix-ipc <cmd>")` since 2026-08-18, and a user's own
+`hyprland-user.lua` was migrated to it on 2026-09-23.
+
+### The IPC surface is self-describing
+
+The commands live in a **declarative table** (`IPC_COMMANDS` in `app.ts`) — name, description,
+optional aliases, handler. `requestHandler` is a thin lookup over it; there is no switch.
+Two built-in commands make the surface introspectable, so scripts and agents never need to
+read source to discover it:
+
+- `veltrix-ipc listActions` → JSON describing every command (name, desc, aliases).
+- `veltrix-ipc dumpState` → JSON snapshot of live shell state: version, locale, dark mode,
+  monitor count, which overlays are open, edit/recording flags. Read state → act → re-read
+  to verify: that's the intended agent loop. (`veltrix-doctor` embeds this output in
+  its diagnostic report.)
+
+Current commands (run `listActions` for the live list): `toggleCC|toggleControlCenter`,
+`toggleNC|toggleNotificationCenter`, `togglePrism|toggleSearch`, `toggleAppGrid`,
+`openSettings` (alias `toggleSettings`), `settingsPage <pageId>`, `settingsApp <desktop-id>` (one app's own page, Apps › Installed apps › <app> — what the window menu's "App settings…" does; an app with no page leaves Settings on the list and says so), `toggleOverview`, `togglePlayer` (media island; errors if no MPRIS player is on the bus), `toggleAgent` (the built-in Assistant island; `Super+A`), `agentNewConversation` (ends the Assistant's conversation and starts an empty one — hidden from the Assistant itself, refuses mid-turn), `toggleAbout`, `toggleBarOverlay`,
+`openWindowMenu`, `hideForLock`, `showAfterLock`, `describeConfig`, `getConfig [key]`,
+`setConfig <key> <value>`, `screenshot [path]`, `queryUI [selector]`, `listApps`, `launchApp <id>`,
+`disableComputerControl`, `notifyComputerAction` (computer-use tools ping it so the bar's AI-control
+indicator pulses "active"), `agentPointer …` (drives the fake-AI-cursor visual — see the
+computer-use section), `setIsland <closed|agent|overview|player|battery>` (EXACT island state — use this
+over the ambiguous `toggle*` when you cannot see the current one), `yieldInput <begin|end>` (the helpers make the shell let go of the keyboard
+so their action can land — see "The shell has to step out of the way"), `listActions`, `dumpState`, plus the **window/workspace management**
+cluster (see below): `listWindows`, `listWorkspaces`, `focusWorkspace <id|±1|name>`,
+`focusDirection <l|r|u|d>`, `focusWindow <window>`,
+`closeWindow <window>`, `moveWindowToWorkspace <window> <wsId>`, `toggleFloat`/`toggleFullscreen`/
+`centerWindow`/`togglePin`/`togglePseudo` `<window>`, `toggleGroup [window]`,
+`moveWindowOutOfGroup <window>`, `sendWindowToSpecial [name] [window]`, `setLayout <dwindle|master>`.
+Aliases are intentional — Hyprland keybinds were renamed at one point and old names are kept.
+
+**One member of that cluster is GATED: `closeWindow`** (`ai.allowWindowClose`, default **true**).
+The rest stay ungated on purpose — focus, move, float, fullscreen, pin, group and layout are all
+reversible, so they are the shell driving its own compositor. Closing is the one that can destroy
+unsaved work, and "the model misread a sentence" is a realistic way to reach it (user's call
+2026-07-21). Default true because it *asks* the window to close rather than killing it, so an app
+with unsaved work still gets to prompt, and "close the browser" is a reasonable thing to ask an
+assistant. The gate is enforced in the SHELL's IPC handler like every other gate — never in the
+daemon.
+
+**Force Quit is a different verb from close, and is never labelled as one.** `compositor.killWindow`
+(`caps.kill`) SIGKILLs the process owning the window — no save prompt, unsaved work lost. Hyprland:
+`hl.dsp.window.kill` (wiki, Dispatchers), the same `_winSel` shape as `closeWindow`. Hyalo:
+the `kill-window` verb (`wm/actions.rs`), SIGKILL to the PID `wm::window_pid` reads from the
+window's own client credentials — a window with no PID is refused, not silently "killed" — and its
+socket operation maps to `CloseWindow`, so it rides the same `allow-window-close` gate as a close.
+The System Menu is the only UI that offers it ("Force Quit…", gated on `caps.kill`, through the
+menu's confirm page, killing the focused window read at click time — the menu is built once,
+focus moves). It is deliberately NOT an `app.ts` IPC command: a SIGKILL verb for agents is a
+separate decision, not a free addition to the close cluster. On Hyalo the native CLI route
+(`veltrix-ipc killWindow`, `session/ipc/src/native.rs`) exists and is consent-gated by Hyalo.
+
+
+
+`screenshot [path]` captures the focused monitor with grim and returns the PNG path
+(default `/tmp/veltrix-shot-<ts>.png`) — the visual-verification leg of the agent
+loop: open a surface (`toggleCC`, `settingsPage X`), wait ~1.5 s, `screenshot`, read the
+image. Gated by Settings → AI (`allowScreenshot`), separately from config writes —
+capturing the screen is privacy-sensitive. `dumpState` also reports the **effective**
+Hyprland config (gaps/rounding/border via `getoption` — includes `hyprland-user.lua`
+overrides) and the AI-governance flags.
+
+`queryUI [selector]` (`core/UITree.ts`) is the **assertion** leg — it turns "screenshot +
+eyeball" into a programmatic check. It walks every **mapped** toplevel and returns a FLAT
+JSON list of on-screen widgets carrying signal (a test-id, a CSS class, visible text, or an
+interactive GType), each with a `path` of ancestors and `bounds`. Read-only, **ungated** like
+`dumpState` (a diagnostic read), with one safeguard: text of password/masked entries is
+returned as `‹redacted›`. Selectors: `.cssClass`, `#id` (the widget's `set_name()`, not its
+GType), `Type` (substring, case-insensitive), optionally scoped `selector@window`.
+Two gotchas learned building it: (1) **overlays live under the `veltrix-bar` window**
+(commandment 5), so scope the CC/NC/menus with `@bar`, *not* `@control`; (2) `pageBox(id)`
+sets the id as a **CSS class**, so a Settings page is `.display-page`, not `#display-page`.
+Examples: `veltrix-ipc queryUI .bar-app-name` (assert the focused window's app name),
+`queryUI .veltrix-list-title@settings` (assert a Display monitor section rendered),
+`queryUI .veltrix-menu-row` (a flat menu's rows). It pairs with the deterministic show
+actions (`settingsPage X`, `toggleCC`) — open, then `queryUI` to assert — and avoids
+synthesizing clicks. Some surfaces only open on a click, so they get a **deterministic
+interaction hook**: an IPC action that invokes the *same handler* the click would, no
+synthetic input. The first is `openWindowMenu` (the AppTitle capsule menu — `veltrix-ipc
+openWindowMenu`, then `queryUI .veltrix-menu-label` for its rows). The pattern: the
+widget that owns the menu registers a `shellActions.openWindowMenu`-style fn (it needs the
+widget's local anchor/builder/state), and a thin IPC command calls it — see `ShellActions.ts`
+and `AppTitle.tsx`. The second is `toggleAbout` (the About window used to be reachable only
+by clicking the system-menu item): it flips `status.toggleAbout()` and the existing
+`notify::about-open` listener in `app.ts` creates/destroys the window — so About is openable,
+readable and closable agent-side (`toggleAbout`, then `queryUI .about-spec-val@about` — the
+window's name is `veltrix-about` — or check `dumpState` → `overlays.about`). Add more the same
+way (e.g. a dock context menu) when a click-only surface needs verifying. NB: menu **row text** lives on the child `.veltrix-menu-label`
+label, not the `.veltrix-menu-row` button container (queryUI reports own text, not
+descendant text), so assert against the label class.
+
+**Switches, toggles and check buttons report `active`** (added 2026-07-30). A `GtkSwitch`
+arrives with no id, no text and no CSS class of its own, so a Settings page used to read as a
+column of labels beside eight indistinguishable switches — and **a reader that cannot see a
+value does not always say so**: asked which AI permissions were on, an agent read the AI page
+plus the schema and reported one of the eight as off while it was on. A permissions page is the
+worst place to leave someone guessing. The field is **omitted, not `false`**, for everything
+that has no state — a missing field reads as "not applicable", a `false` reads as "off". Only
+`active`: there is no `value` to report because Veltrix has no `Gtk.Scale` (sliders are Cairo).
+
+**The node holding its window's keyboard focus reports `focused: true`** (added 2026-09-27, same
+omit-don't-false rule) — how a keyboard-navigation check asserts WHERE a Tab or an arrow
+landed: open a panel with `toggleCC keyboard`, send one key, `queryUI`, read the one node with
+`focused`. It asks the WINDOW (`toplevel.get_focus() === w`), never `w.has_focus()`: 🔴 **in GJS
+`has_focus` is the GTK4 PROPERTY `has-focus` (a boolean) shadowing the method**, so calling it
+throws — inside `safe()` that read as "nothing focused anywhere", and inside a key handler it was
+13 CRITICALs and an Enter that did nothing. Use `is_focus()` on a widget. `dumpState.keyboardFocus`
+(below) answers the other question — which WINDOW has the keys.
+
+🔴 **Driving keys by hand: a synthetic key with no shell grab lands in the focused WINDOW — the
+terminal your agent runs in.** A stray Esc interrupts the agent itself (it happened, 2026-09-27),
+a stray Return submits. One key per call, each preceded by `dumpState` confirming the overlay is
+still open; never chain Esc/Return blind.
+Beyond that, tier 1 is structure+text; the remaining semantic state (dock-item
+running/active) is a deferred opt-in tier the widgets would cooperate on, sharing
+the same node model the AT-SPI2 backend now fills for third-party apps (see "computer-use"
+below — `queryUI` is the shell's own toplevels; `query_app` is the same shape via AT-SPI).
+
+**That split is invisible from the outside, so both tools have to state it** (done 2026-07-30
+after measuring the cost). Until 2026-08-18 Veltrix's windows were not reachable through AT-SPI
+under any name an agent would try — the process registered as `gjs` with unnamed frames — so
+`query_app io.Astal.ags` and `query_app "Veltrix Settings"` both returned zero **with the
+window open in front of it**, which reads as "nothing there" rather than "wrong door". The host
+now sets `prgname`/application name, so `veltrix-a11y org.veltrix.desktop` answers (measured: 143
+nodes); the tools still state the split, because *which* door to use is the part a model gets
+wrong. A model
+asked to read its own Settings window spent three steps and ~15k tokens finding that out, then
+answered from `describe_settings` instead. `queryUI`'s `desc` now opens by naming whose windows
+it reads (that first clause is the entire line the daemon's action index carries, cut at the
+first `.`/`[`/`(` — so keep those characters out of it), and `query_app`'s says "OTHER apps
+only" plus where the inside door is, in the daemon and the MCP server both.
+
+Commands receive arguments: `requestHandler` passes `argv.slice(1)` to the handler
+(`run(args)`). `veltrix-ipc settingsPage bluetooth` opens the Settings window directly on
+that page (sidebar category ids) — the agent-friendly way to reach a Settings page without
+synthesizing clicks. **A rejection lists the valid ids** (`unknown page: AI — valid: network,
+bluetooth, appearance, …`, from `pageIds` published by the window) and lookup is
+case-insensitive: the ids are lowercase while the page NAMES are not, and the labels are
+translated, so neither the user nor an agent can derive an id from what is on screen. An error
+that only says "no" costs a whole step to re-guess — measured on `settings_page AI`, 2026-07-30.
+
+### Settings' widget catalogue (local control plane, #571)
+
+`widgetCatalog` reads a versioned snapshot or changes bar/CC placement and bar mode.
+Its verbs, validation, change signal and async client lifecycle are documented in
+`architecture.md` → "Widget catalogue over IPC". It goes through `ShellActions` and
+the existing `Request` door; it does not grant Assistant configuration-write permission.
+The Assistant's tool surface keeps using the gated `setConfig` path. Independent
+Settings also uses settingsWallpaper/settingsMonitor; its process lifecycle and
+lease ownership are in architecture.md → "Settings is its own application".
+
+### Window & workspace management (ungated, the shell driving its own compositor)
+
+Hyprland **is** Veltrix's compositor, so window-manager operations — switch
+workspace, focus/move/close a window, float/fullscreen/pin/group it, set the tiling layout —
+are a **first-class shell capability, not computer-use**. They are deterministic (they target
+the compositor by window address, no synthetic input, no focus race) and **ungated**, the same
+reasoning as `launchApp`: a WM op reaches into no third-party app's internals (the `allowComputerControl`
+gate stays on the things that DO — synthetic keyboard/pointer and AT-SPI actions). The MCP path
+still has its global `allowMcp` floor; local `veltrix-ipc` is always available.
+
+- **Reads** (ungated, like `dumpState`): `listWindows` (authoritative, async — reads `hyprctl
+  clients -j` via `HyprlandState.getClientsJson`; carries `floating`/`fullscreen`/`pinned`/`grouped`,
+  which the event-sourced cache in `HyprlandState` gets wrong) and `listWorkspaces`
+  (`HyprlandState.getWorkspacesJson`; `active` = focused, plus the window count and special flag).
+- **Actions**: `focusWorkspace <id|±1|name>` (absolute id, relative `+1`/`-1` → the cycle-incl-empty
+  `e±1` the wheel binds use, or a Hyprland workspace string like `previous`/`name:foo`),
+  `focusDirection <left|right|up|down>` (move focus spatially — benign), `focusWindow <window>`,
+  `closeWindow`, `moveWindowToWorkspace <window> <wsId>`, `getWorkspaceMode <id>`,
+  `setWorkspaceMode <id> <floating|tiling>`, `toggleWorkspaceMode [id]`, `toggleFloat`,
+  `toggleFullscreen`, `centerWindow`, `togglePin`, `togglePseudo`, `toggleGroup [window]`,
+  `moveWindowOutOfGroup`, `sendWindowToSpecial [name] [window]`, `setLayout <dwindle|master>` — one thin IPC command per
+  **already-built, live-verified** `HyprlandState` dispatch method (the same ones the AppTitle
+  window menu / dock / overview / arrow-key + wheel binds call). All of `focusWorkspace`/
+  `focusDirection`/`focusWindow` ride Hyprland's **one unified `hl.dsp.focus` dispatcher**
+  (`{ workspace | direction | window }`).
+- **`<window>` is resolved by `resolveWindow(arg)` in `app.ts`** — accepts an exact address
+  (`0x…`, what `listWindows` reports — precise) **or** a class/title substring (`firefox`). Every
+  window-targeting command shares it, so they all take the same flexible argument.
+- **`focusWindow` yields the shell's keyboard grab first, and VERIFIES.** While one of our layer
+  surfaces grabs, the dispatch is refused outright (next section), so the old handler returned
+  `focused <class>: <title>` for a focus that never happened — and the model believed it and kept
+  going. It now wraps the dispatch in `inputYield.begin()/end()`, waits 80 ms for the answer to
+  arrive by event, compares `HyprlandState.focusedClient` against the requested address, and reports
+  `focus refused by the compositor — still on <class>` when they differ. If you add another
+  focus-moving IPC command, do the same: a success string is a claim, and this one is checkable.
+- **`focusWindow` is ungated** (it used to be gated as the synthetic-keyboard precondition).
+  Focusing a window is benign — exactly what a dock click or `launchApp` already does ungated —
+  and the gates that matter (`type_text`/`press_key`/`click_*` + AT-SPI `do_app_action`) still
+  apply and still focus-verify. So there is now **one** focus path, shared by WM use and the
+  computer-use keyboard loop.
+- **MCP**: the two reads get dedicated tools (`list_windows`, `list_workspaces`, parity with
+  `dump_state`/`query_ui`); the actions go through `run_action` (the established pattern — action
+  verbs need no dedicated tool, their `listActions` description is the documentation).
+- IPC `run` may now return a **Promise** (`requestHandler` awaits it) so `listWindows`/`listWorkspaces`
+  can read authoritative async compositor state.
+- **Deliberately NOT built — directional window-move (`movewindow l/r/u/d`) and resize
+  (`resizeactive`)**: both classic dispatchers act on the **active window only** (no window
+  selector), so they're inherently focus-dependent (the focus-race class — see
+  `feedback_no_focus_dependent_scripting`) AND their `hl.dsp.*` Lua names aren't in our config to
+  copy (guessing risks a silent-fail `.catch` no-op — the lesson behind the four broken methods).
+  Low agent value too (moveWindowToWorkspace/float/fullscreen/center already cover relocation).
+  If wanted later: verify the Lua dispatcher name first (don't guess), and consider that they only
+  make sense right after a deterministic `focusWindow`.
+
+### Workspace modes: per-workspace floating/tiling mechanism (#513)
+
+Veltrix workspaces (1..5) are **floating by default**, and any single workspace can be set to **tiling**.
+Hyprland itself has no workspace mode primitive (`workspace = N, layout:floating` is ignored,
+`workspaceopt` is deprecated, and dynamic window rules skip static float/tile effects). The state is
+therefore ours, structured in three layers:
+
+1. **Persistence & Shell service (`ui/shell/core/WorkspaceModes.ts`)**:
+   - GSettings `org.veltrix.workspaces` (via `defineSettings`) stores `default-mode` ("floating") and an overrides map (`a{ss}`, `Record<string, WorkspaceMode>`). Changing the default does not rewrite per-workspace overrides.
+   - Emits GObject `changed` signal on any mutation. Registered in `ConfigRegistry` as `workspaces.defaultMode` and `workspaces.workspace1Mode`..`5Mode` with UI metadata, visible on the Settings → Desktop page (`manifest.ts`) under two groups: default mode (segmented floating/tiling) and per-workspace mode (segmented with three states: default [inherited], floating, tiling). External IPC changes (e.g. `setWorkspaceMode`) reactively synchronize the UI via ConfigEntry subscriptions.
+   - Generates `~/.config/veltrix/veltrix-workspaces.lua` containing the Lua table `VELTRIX_WS_MODES = { default = "floating", [2] = "tiling" }`.
+   - Hot-pushes changes live via `hs.evalLua("VELTRIX_WS_MODES[id] = '...'")` (sub-4 ms IPC), and re-pushes on boot or when Hyprland reloads its config.
+2. **Compositor lifecycle (`config/hypr/hyprland.lua`)**:
+   - Loads `veltrix-workspaces.lua` via `safe_require("veltrix-workspaces")` on startup/reload.
+   - `veltrix-float-all` window rule (`match = { class = ".*" }, float = true`): all windows spawn floating statically, preserving requested geometry (e.g. 800x600) from being tiled prematurely.
+   - `window.open`: inspects workspace mode; if tiling, tiles via `action = 'disable'`; if floating, applies `placeFloatingGuarded(w, true)` (clamp + cascade).
+   - `window.move_to_workspace`: synchronizes incoming window with target mode (floating -> float, tiling -> tile).
+   - **Special workspaces are exempt**: scratchpads and named workspaces (id < 0 or `special = true`) are never converted.
+   - If a window is manually floated inside a tiling workspace, it remains floating until explicitly moved across workspaces or toggled.
+3. **Switching & Reorganization**:
+   - Conmuting a workspace mode (`setWorkspaceMode <id> <mode>` or `toggleWorkspaceMode [id]`) immediately reorganizes open windows:
+     - Switching to tiling: invokes `HyprlandState.tileAllInWorkspace(id)` (`action = 'disable'`), letting dwindle cleanly tile existing windows.
+     - Switching to floating: invokes `HyprlandState.floatAllInWorkspace(id)` (`action = 'enable'`), which triggers `window.update_rules` and passes windows through `clampFloating` so they do not get stranded off-screen at `[-9,-109]`.
+
+### iPad Mode: the interface switch (`org.veltrix.interface`, 2026-11-12)
+
+Settings → Interface → iPad Mode is a live switch, OFF by default; the default desktop is literally macOS and nothing about it changes. The state is GSettings `org.veltrix.interface`, key `ipad-mode` (boolean, default false), via `defineSettings` in `ui/shell/core/InterfaceMode.ts`; the Bar subscribes and shows/hides the home panel with no reload. The panel (`ui/shell/surfaces/ipad-mode/IPadMode.tsx`) is a surface of the Bar's window and shows while the mode is ON **and** no overlay is open — it is the actual home screen, not an empty-workspace-only view (Adnan, Nov 12 20:51, fix pass #1): an app opened from it opens FULL SCREEN on top of it, like an iPad — Bar fullscreens the window the launch produces via the panel's `onLaunch` callback (one-shot, 5s window; a user who exits fullscreen by hand is never re-fullscreened). A windowed app sits behind the home screen while the mode is on; the fullscreen layering is Dell-gated. Its widgets are the next prayer (from `bin/veltrix-prayer-times`, never modified for this), the Verse of the Day (`VerseOfDay.ts` — seven verses, one per weekday, full Uthmani Arabic + Yusuf Ali English, byte-exact against the Tanzil Uthmani download itself, fix pass #1 — never re-verify against the AlQuran Cloud mirror, it differs on 94:6), and today's prayer checklist (`PrayerChecklist.ts` — `~/.local/share/veltrix/prayer-checklist.json`, today only, manual toggle, no streaks/points/history; the file is written 0600, and `refresh()` syncs the chips behind a `syncing` guard because GTK emits `toggled` on programmatic `set_active` — without it yesterday's checks resurrect under today's date; regression test `scripts/dev/prayer-checklist-rollover-test.ts`). The prayer-lock overlay fires over iPad Mode independently (separate process, own session-lock ladder — read `core/PrayerLock.ts`, never modify it for the mode). App icons are drawn SVGs + Papirus (`ui/shell/assets/apps/`, `ATTRIBUTION.md` — the dark-AI and colorful-AI sets were both superseded by Adnan, Nov 12), every icon on a black `#000` tile (eye protection; the dock is NOT tiled); `terminal.svg` is a drawn `>_` window and `browser.svg` a TEMPORARY neutral globe glyph — the Papirus cat and the Firefox fox are both banned as animals in icons, and Adnan's own browser will replace the glyph when it lands. The same drawn `>_` is seeded as the `kitty` icon override (Nov 14 2026), so the dock, app grid, overview and Settings show it instead of the cat the kitty package/WhiteSur theme ships for `Icon=kitty`. The panel resolves icons through the shipped file first with a fallback to AppService's override store (one icon path for panel and Launchpad). Launchpad shows the same icons via `AppService.seedShippedIconDefaults()` — a seed file wins over a theme icon, `.svg` beats a stale `.png` seed — and the Islamic apps' `.desktop` files must declare `Icon=veltrix-quran` (etc.) for the seed to take effect; the four Islamic apps have no `.desktop` entry yet, so their tiles carry a permanent "Soon" badge and are dimmed (the `unbuilt` field in `IPadApps.ts` is the source of truth — `launch()` checks it before the registry) and never fake-launch. The dim is label-only (`.ipad-tile-unbuilt .ipad-tile-label` in `_ipad-mode.scss`): an opacity dim on the icon widget bleeds the wallpaper through the black tile, because the tile background is painted by that same widget. A tile that is NOT Islamic and NOT Settings, and whose desktop ids NONE resolve on the machine (GNOME Calendar/Clocks are not installed on the Dell), instead renders dimmed at reduced opacity (`.ipad-tile-unavailable`, opacity 0.45) and insensitive, and a tap is a no-op with no hint — the "coming soon" hint belongs to the four Islamic tiles only. The translucency there IS the signal, where the unbuilt tiles keep their opaque tile and let the "Soon" badge do the talking. Availability is re-checked on every `refresh()` (the panel re-reads it whenever the home screen shows), and `resolveLaunchId()` / `isIPadTileUnavailable()` in `IPadApps.ts` are the one resolver for launch and for the dim decision (probe: `scripts/dev/ipad-tile-availability-probe.ts`). The verse card's wrapping labels are capped at `max_width_chars: 52` — a wrapping label's natural width is the whole unwrapped line, and the widgets row is homogeneous + FILL, so on a long-verse day (Monday's 24:30, 145 chars) the panel blew out to the full 1920px instead of the concept's centred ~1040px column; the cap makes long verses wrap inside the card. Widget glass is the compositor's blur on the bar surface, not CSS — under Xvfb the cards render as flat dark tint, a sandbox artifact; a Dell photo is the proof.
+
+### `HyprClient.fullscreen` is an INT, not a boolean (maximize ≠ fullscreen)
+
+`HyprClient.fullscreen` is Hyprland's **FSMODE int** (`0` none / `1` maximized / `2` fullscreen),
+NOT a boolean — a plain `!!client.fullscreen` is truthy for **maximize** (`Super+M`, FSMODE 1)
+too, not just real fullscreen (FSMODE 2). (It was `AstalHyprland.Client.fullscreen`, a
+`Fullscreen` enum over the same int, until 2026-08-18; the trap is identical either way, and
+`core/hypr-ipc.ts` says so on the field itself.) That mismatch used to make maximizing a window hide the
+dock, blank the bar and release its top reservation, because the bar/dock chrome-hiding watchers
+rode that truthy check. Chrome-hiding now keys off **`HyprlandState.isRealFullscreen(client)`**
+(true only for `FULLSCREEN`), so **maximize deliberately keeps all chrome visible + clickable**
+(fill-the-workspace, the Windows/GNOME maximize convention). Only real fullscreen hides the bar,
+and `Super+B` / `toggleBarOverlay` still promotes it to the OVERLAY layer above the fullscreen
+window. When you need the authoritative value instead of the cached one, read `HyprlandState.
+getClientJson(addr).fullscreen` (a live `hyprctl clients -j`) — same int, but read now rather
+than at the last event. Compare against `Hypr.FSMODE_FULLSCREEN`, never against a literal.
+
+### Hyprland reports "no active window" when OUR OWN layer surface drops a keyboard grab
+
+Read `HyprlandState.focusedClient`, **never the raw active-window read underneath it**
+(`Hypr.getActiveClientAddress()` in `core/hypr-ipc.ts`; it was
+`AstalHyprland.get_default().focused_client` before 2026-08-18, and swapping the library
+changed nothing) — the raw property lies, and it stays lying. `focusedClient` is the getter
+that reconciles it; nothing else should read the raw one.
+
+Measured on the Hyprland event socket (2026-07-26, one open/close of the island's overview):
+
+```
+  1.62  MARK   ==> OPEN overview        # taking an EXCLUSIVE grab emits NOTHING
+  4.25  MARK   ==> CLOSE overview
+  4.27  EVENT  activewindow>>,          # releasing it announces "no active window"
+  4.27  EVENT  activewindowv2>>
+  6.79  MARK   hyprctl activewindow = [kitty]     # …while the window is still right there
+```
+
+Releasing an EXCLUSIVE keyboard grab makes Hyprland announce that nothing is focused. Whether a
+restoring `activewindow>><class,title>` follows is **not guaranteed**: it depends on Hyprland's
+`refocusLastWindow()` succeeding, which needs an eligible last window still on the visible workspace
+and no keyboard-focusable layer under the cursor. When it does follow it lands within a millisecond
+(that is the normal case since the `ON_DEMAND` fix below); when it does not, AstalHyprland's
+`focused_client` goes null and **stays** null. The one thing that heals it then is an *unrelated*
+re-emission — Hyprland re-sends `activewindow>>class,title` when the focused window's **title**
+changes — which is why a terminal with a spinner recovers by itself within a second and an idle
+browser stays "unfocused" indefinitely. That intermittency is what makes this look like a rendering
+bug instead of a state bug. The trace above was captured while the dock still rested in `ON_DEMAND`,
+which suppressed the restore entirely; the reconciliation stays regardless, because the null is
+always emitted first and the restore is only usual, not certain.
+
+It is never only a cosmetic bug, because *everything* asks who is focused: the bar's title capsule
+falls back to the workspace name, `WindowMenu` finds no window to act on, `DockItem` loses its focus
+ring, and "screenshot the focused window" has no target.
+
+`HyprlandState._refresh` therefore reconciles focus before computing its state signature: it keeps the
+last address Hyprland genuinely reported as focused and re-validates it against the live client list —
+still open, **and still on the focused workspace**. Two consequences worth keeping:
+
+- The workspace check is what makes it correct rather than a patch. Without it, switching to an empty
+  workspace would keep showing the window you left behind on the previous one.
+- Reconciling *before* `_stateSignature()` means a grab release is not a structural change at all, so
+  nothing repaints and the capsule never even blinks.
+
+The rule this encodes, and the one to preserve if you touch `appTitleText` (AppTitle.tsx): **the workspace name is the
+fallback for an empty workspace, not for "the compositor went quiet".**
+
+#### The compositor's LIVE answer needs the same validation — it can be confidently wrong
+
+The reconciliation above only guarded the *null*. The mirror-image failure is a non-null lie: while a
+layer surface holds an EXCLUSIVE grab, Hyprland **refuses to move window focus at all** (`rawWindowFocus`:
+"Refusing a keyboard focus to a window because of an exclusive ls"). So switching workspace from the app
+grid's workspace strip — which switches *without* closing, keeping its grab — leaves `focused_client`
+naming a window on the workspace you LEFT. No event, no null, just a stale answer that the title capsule
+repeated back. Measured 2026-07-26: standing on ws4 with the grid open, `hyprctl activewindow` still named
+the ws1 terminal, while ws4's own `lastwindow` correctly named the browser.
+
+So `focusedClient` enforces one invariant on both halves: **the focused window is always on the focused
+workspace.** The compositor's live answer is used only if it satisfies it; otherwise the fallback chain is
+
+1. the remembered address, if still open **and** still here (the grab-release case above), then
+2. the focused workspace's own `last_client` — Hyprland's `lastwindow`, i.e. the window that workspace
+   *would* focus. Still the compositor's answer, not an invention, and it stays right while a grab blocks
+   the focus from actually moving. Re-validated against the live client list, since it can name a window
+   that has closed.
+3. nothing → `null` → the workspace name (an empty workspace, per the rule above).
+
+One exception is deliberate: a window on a **special (scratchpad) workspace** counts as here. Special
+workspaces overlay the active one and announce themselves on `activespecial`, never on `workspace`, so
+`focusedWorkspaceId` keeps naming the normal workspace underneath — without the exception, popping the
+scratchpad would blank the title.
+
+Note the door: the getter, not just `_refresh`. `_refresh` computes the fallback, but
+`get focusedClient()` is what consumers call, and it consults `hl.focused_client` live (so it stays fresh
+between refreshes) — the validation has to be *there* too, or the raw value walks straight past it.
+
+⚠️ **Both failures above are EXCLUSIVE-era, and no shell surface asks for EXCLUSIVE any more. The
+reconciliation stays anyway — audited 2026-08-07 — because it stopped being a patch and became the
+INPUT to the root fix.** Two things now depend on it, neither of which is a compositor lie:
+
+- The *remembered window* is who `restoreFocusAfterGrab` hands the keyboard back TO. Dropping a focus
+  grab makes Hyprland refocus **by pointer**, so dismissing with the cursor over the wallpaper still
+  leaves the session with nothing focused (measured 2026-08-05) — a different cause, the same null,
+  and with no memory of who was focused there is nobody to restore.
+- *Validating the live answer* is that repair's correctness guard: focusing a window that lives on
+  another workspace DRAGS THAT WORKSPACE over the user, so the repair relies on this accessor never
+  handing it one. That is a property of `focusWindow`, not of any grab.
+
+Consumers were swept in the same audit (AppTitle, both fullscreen watchers, `DockItem` ×3,
+`WindowMenu`, `widgets/screenshot.ts`, `app.ts` ×3): all **read-only**, none carrying a parallel
+workaround. Read the accessor; never re-derive focus yourself.
+
+#### The same release also UNDOES a workspace switch — and you cannot win that race by ordering
+
+Hyprland does not merely announce the null: it **refocuses the last window**, and focusing a window
+that lives on another workspace *takes the workspace with it*. So a surface that switches workspace
+and closes in the same gesture — the overview does exactly that — can put the user on an empty
+workspace and have the compositor yank them back a few milliseconds later. Only empty targets are
+affected: with a window of its own on the target, the refocus lands there and nothing moves. It read
+as "sometimes", which is what a race always reads as.
+
+**The obvious fix does not work, so do not re-try it.** Releasing the grab first and dispatching
+second changes nothing, because *asking* for the release is not performing it: layer-shell keyboard
+interactivity is **double-buffered state**, applied only on the surface's next commit. Measured with
+`scripts/dev/hypr-trace.py` against the shell's own log (2026-07-26):
+
+```
+t+0 ms    [shell]  set_keyboard_mode(NONE) requested, hyprctl dispatch spawned
+t+8 ms    [hypr]   workspace>>5      ← a whole SUBPROCESS lands first
+t+12 ms   [hypr]   activewindow>>,   ← our Wayland state only reaches the compositor now
+t+12 ms   [hypr]   workspace>>1      ← …and takes the workspace back with it
+```
+
+A `hyprctl` subprocess beats our own surface state by ~4 ms. Reordering the two calls left the bug at
+12 failures in 21 attempts; an idle tick between them changed nothing either.
+
+What works is waiting for the compositor to **announce** the release — that announcement is the same
+`activewindow` null above — which is what `HyprlandState.afterGrabRelease(cb)` does, with an 80 ms
+fallback for the case where nothing was focused and no announcement is coming.
+
+⚠️ **The workspace half of this is HISTORY (2026-08-05), the mechanism is not.** Every modal surface
+moved to `hyprland-focus-grab-v1`, whose release is *not* double-buffered and which never refused
+focus moves to begin with, so `focusWorkspaceOnGrabRelease` is deleted and
+`focusWorkspaceFromShell(id)` (the single door for the app grid's strip and the island's overview)
+just switches. `afterGrabRelease` stays, and still has two callers that genuinely need it —
+`restoreFocusAfterGrab` and `InputYield` below — because `refocus()` runs on the compositor's clock
+whether or not the request was buffered. Keep the measurement above: it is why nobody should
+"simplify" either of them into a timeout.
+
+### The shell has to STEP OUT OF THE WAY for computer-use: `core/InputYield`
+
+The same refusal has a second victim, and it is the one that made the built-in Assistant look
+useless. Read the compositor's own code (`FocusState.cpp`, `CFocusState::rawWindowFocus`, 0.56):
+
+```cpp
+if (!g_pInputManager->m_exclusiveLSes.empty()) {
+    Log::logger->log(Log::DEBUG, "Refusing a keyboard focus to a window because of an exclusive ls");
+    return;                       // ← a hard return: focus does NOT move, no event is posted
+}
+```
+
+The Assistant island holds a compositor focus grab the entire time it is open (as does every other
+modal surface — see `architecture.md` → "Focus grab"; the quote above is why the layer-shell
+`EXCLUSIVE` path it replaced was even worse). Therefore, from inside the Assistant:
+
+1. `focus_window <app>` is a **no-op**. Not slow, not racy — refused.
+2. `hyprctl activewindow` then correctly still names the old window, so every helper's focus check
+   (`veltrix-click`, `veltrix-type`) refuses. **That guard was right.** Do not "fix" it by sourcing
+   focus from the shell (`listWindows.focused`) instead: that only teaches the helper to approve an
+   action that cannot land, and for the keyboard it is actively harmful — the keys genuinely belong
+   to the island, so the text would be typed into the Assistant's own prompt box.
+3. Even with focus sorted, the click would be eaten: a grab **clamps pointer focus** to the grabbed
+   surface regardless of its input region, and the island spans the whole monitor.
+
+AT-SPI perception (`query_app`) and named actions (`do_app_action`) never look at focus, so those
+kept working throughout — which is why the failure looked like "the model is bad at clicking".
+
+**The fix is a scoped truce, `core/InputYield`.** `begin()` asks every grabbing surface to RELEASE
+its focus grab *and* stamp an EMPTY input region, waits for the compositor to announce it
+(`hyprlandState.afterGrabRelease`), and only then lets the caller act. `end()` gives the grab back.
+Things to keep if you touch it:
+
+- **The helpers drive it, not the agent daemon** (`yieldInput begin|end`, spawned like `visual`).
+  That way an external MCP client acting while the user has Prism or the app grid open is covered
+  by the same mechanism, instead of only the built-in Assistant.
+- **Dropping the grab is not enough on its own.** The grab is what makes Hyprland ignore input
+  regions; the region itself still covers the screen while a panel is open. Every grabbing surface
+  therefore goes click-through for the duration: `Bar.updateInputRegion` (the island and the app grid
+  included — they are panels of the bar) and both `DockAxis.buildInputRegion` bodies
+  return early on `inputYield.active`. In the dock that early return needs **its own region cache
+  key** (`"yield"`), or the restore matches the stale key and silently skips. ⚠️ Since 2026-08-09 the
+  dock's yield branch keeps its BLUR rect (only the input region is dropped): a yield changes who
+  gets the clicks, not what is drawn, and the only thing that used to paint outside that rect — the
+  app grid — left the dock's window that day.
+- **`registerHolder` exists so the common case costs nothing.** With no surface grabbing, `begin()`
+  resolves immediately instead of paying the 80 ms release wait on every single action.
+- **A watchdog (15 s) restores everything** if a helper dies between `begin` and `end`. Without it
+  a crash would leave the shell keyboard-less and click-through with no way back.
+- Restore by RE-ACQUIRING, never by replaying a remembered layer-shell mode. This used to need care
+  (the app grid dropped to `ON_DEMAND` for the life of a context-menu popover, so a blind restore to
+  `EXCLUSIVE` broke the menu); now `acquireFocusGrab` is the only thing to redo, and FocusGrab owns
+  the popup case by suspending the lease.
+
+- **`begin()` GIVES THE FOCUS BACK that the release takes away** (`_restoreFocus`, 2026-08-13). It
+  reads `focusedClient` *before* the notify and re-focuses that address once the release has landed.
+  Not defensive coding — without it computer-use is structurally broken on this desktop; the
+  mechanism is spelled out below.
+
+⚠️ **What the release refocuses TO is a property of this repo's own config, not of the grab.**
+`CSeatManager::setGrab(nullptr)` (Hyprland 0.56.1, `src/managers/SeatManager.cpp`) branches on
+`input:follow_mouse`: `0 || 2 || 3` → `refocusLastWindow(monitor-under-cursor)`, **anything else —
+i.e. 1 — → `g_pInputManager->refocus()`**, which focuses whatever the cursor is over.
+
+`config/hypr/hyprland.lua` shipped `follow_mouse = 1` until **2026-08-15 and now ships `2`** (pointer
+focus detached from keyboard focus — see the window-menu entry in `architecture.md` for why), which
+moves the default install onto the `refocusLastWindow` branch: the release now hands the keyboard to
+the last window the monitor had, which after a `focusWindow` IS the target. ⚠️ That does NOT retire
+`_restoreFocus` or `restoreFocusAfterGrab` — `follow_mouse` is one `hyprland-user.lua` line from being
+1 again, and neither repair costs anything when the compositor already answered correctly. Read the
+value, never assume it. Everything below is the measurement under `1`, kept because it is the only
+written record of the pointer branch (and because it is what a user who overrides will hit).
+
+That is why the sequence documented here until 2026-08-12 ("the release refocuses the last window,
+which is the target") was only ever true for the configs Veltrix does not ship. What actually
+happened, measured in a live Assistant run: `focusWindow org.gnome.TextEditor` succeeded and the
+compositor confirmed it by title; 3.2 s later the click was refused because the pointer had been
+resting over a terminal the whole time, and the yield's own release had handed it the focus. The
+caller was then told to focus the window it had already focused.
+
+🔑 **The repair is timed by the same event the yield already waits for.** The `activewindow` that
+`afterGrabRelease` listens for IS the wrong focus arriving (the refocus happens inside
+`setGrab(nullptr)`, before the event), so restoring in that callback needs no delay and no polling.
+And it is a ONE-SHOT: `follow_mouse` re-evaluates on pointer motion, so nothing undoes the restore
+while the pointer stays still. The dispatch is awaited to completion — `hyprctl` exiting means the
+compositor applied it — before `begin()` resolves, so the helper's own `hyprctl activewindow` (a
+separate process, spawned only after the IPC reply) cannot race it.
+
+⛔ **Do not "fix" this in the helpers instead** by moving the pointer to the target before the focus
+check. It looks equivalent and is not: it changes what the user sees (the pointer choreography in
+`surfaces/agent-pointer/` owns that), it does nothing for `veltrix-type`, which never moves the
+pointer, and it treats a defect of ours as an ordering detail of theirs.
+
+⚠️ **This is NOT the policy of `restoreFocusAfterGrab`**, which returns early when the compositor
+found *someone*. That is right for a dismissal — whatever the pointer is over is a fine answer when
+the user just clicked a panel away — and wrong here, because the caller has already chosen the
+window and the helpers verify focus before they inject. Two callers, two policies, one mechanism;
+they share `afterGrabRelease` and nothing else.
+
+Sequence that works, and why (verified against `rawSurfaceFocus`, which touches only
+`m_focusSurface` — a layer-shell grab never clears `m_focusWindow`): `focusWindow` yields → focus
+moves → grab comes back (window focus untouched) → the helper yields again → the release refocuses
+by pointer → **`begin()` puts it back before it answers** → `hyprctl activewindow` names the target
+→ the focus check passes.
+
+#### The same refusal has a THIRD victim: a window that MAPS while a surface grabs (2026-07-31)
+
+`InputYield` fixed the verbs — but a newly mapped window never asked for focus, so nothing yielded
+for it and Hyprland simply did not focus it. Verified by A/B with the variable isolated: island
+closed → the launched app is focused; island open in agent mode → the previously focused toplevel
+stays active. That is structural for the built-in Assistant, because the island is open **by
+definition** while the user is talking to it: every "open X and do Y" paid a refused pointer/keyboard
+verb plus a `focus_window` round trip. An external MCP client, with nothing grabbing, never sees it —
+which is why only the terminal bench could find it.
+
+So `launchApp` now **waits for the window and focuses it** (`focusLaunched` in `app.ts`), reusing the
+same `inputYield.begin()/end()` truce as `focusWindow`. Two properties worth keeping:
+
+- **Focusing a window while the island grabs does NOT take the keyboard from the island** (measured:
+  typed text still lands in `.agent-entry`, the focused app receives nothing). The conversation is
+  not disturbed by the shell putting the launched app in front.
+- `begin()` is a **no-op when nobody is grabbing**, so the ordinary dock-click case pays nothing and
+  Hyprland's own focus stands.
+
+`launchApp` also resolves a **name**, not just an exact desktop id (`launchApp calculator`), through
+the same `AppService.search()` Prism uses, and answers an ambiguous name with the CANDIDATES. The
+old exact-id-only version cost two steps and a 7 KB catalogue dump that then rode in `history` for
+the rest of the turn — the model asked for `calculator`, was told "see listApps", and obeyed. Same
+lesson as `settingsPage` (#68): **a reply that points at the catalogue costs the catalogue.**
+
+### What each surface's glass is wearing: `dumpState.glass`
+
+One entry per registered surface (`common/ShellGlass.ts`): `role`, `floor` (its slider), `skin`
+and where it comes from (`shell`, or `mode` for the dock and the app grid), and `mapped`. The glass
+itself is Hyalo's: `veltrix-hyalo msg layers` shows what each layer declared (references/hyalo.md).
+(`glassRemeasure` and the measured backdrop went with the adaptive glass, #762.)
+
+### How to find out who holds the keyboard: `dumpState.keyboardFocus`
+
+Two of the obvious routes are dead ends (2026-07-26): `hyprctl activewindow` reports the focused
+**window**, which stays put while a layer surface holds the keys, and `hyprctl layers` does not expose
+keyboard interactivity at all. The third — Hyprland's own log — is **not** a dead end, contrary to an
+earlier note here: the log looks empty of focus lines only because Hyprland's core logging is off by
+default (`debug:disable_logs` defaults to true; everything you see in `hyprland.log` is aquamarine
+backend spam, which logs separately). Turning it on is worth doing before theorising about focus, and
+there is one catch:
+
+```lua
+-- ~/.config/veltrix/hyprland-user.lua  (temporary, remove afterwards)
+hl.config({ debug = { disable_logs = false } })
+```
+
+```bash
+hyprctl reload                 # REQUIRED: the logger re-reads the flag only on a config reload,
+                               # so `hyprctl eval` alone sets the value and changes nothing
+hyprctl rollinglog -f          # then every focus change is announced:
+# DEBUG ]: Set keyboard focus to surface 0x…, with [Window 0x…: title: "…"]
+```
+
+Pair it with the event socket (`activewindow>>,` = the drop) and you can read the whole handover.
+
+Our side does know, because GDK marks a toplevel active when the compositor sends it
+`wl_keyboard.enter`. `dumpState.keyboardFocus` reports that per shell window:
+
+```bash
+veltrix-ipc dumpState | jq -c '.keyboardFocus'
+```
+
+```
+"veltrix-dock":   {"active": true,  "focusable": false, "focusWidget": null}   # ← keys go nowhere
+"veltrix-bar":    {"active": false, ...}
+```
+
+`active: true` on a shell surface means the keyboard is going **there**, not to the user's window.
+`focusWidget` is what would receive a keypress inside it — `GtkText.prism-search-entry` when Prism is
+up, `null` when a surface is holding the keyboard for nothing. **No surface active is ambiguous**: it
+means either the user's window has the keys or nobody does. Disambiguate with the event socket — the
+drop is announced as `activewindow>>,`.
+
+Repairs ruled out by measurement, so nobody re-tries them: `focusWindow` on the still-active window
+(Hyprland no-ops it — the dispatch emits nothing), `focus({ monitor })` (no effect),
+`focus({ last })` (works, but focuses a *different* window and can change workspace), and
+`cursor.move` nudges (warping the pointer generates no libinput motion, so focus-follows-mouse never
+fires — which is why moving the mouse *by hand* cures it and a synthetic move does not).
+
+### THE RULE: a shell surface rests in `NONE`, never in `ON_DEMAND`
+
+`ON_DEMAND` reads like "available but idle". It is not, and taking it literally cost a long hunt for a
+bug that looked like four different bugs (2026-07-26). Both halves are in Hyprland's
+`src/desktop/view/LayerSurface.cpp` — read them, don't reason from the protocol wording:
+
+- **`onMap`** grabs the seat for *any* interactivity other than `NONE`
+  (`GRABSFOCUS = ISEXCLUSIVE || interactivity != NONE`). A surface that maps `ON_DEMAND` takes the
+  keyboard **immediately**, so every shell reload left the dock holding it with `focusWidget: null` —
+  keys went nowhere until the user moved the mouse.
+- **`onCommit`** treats the two ways down from `EXCLUSIVE` completely differently:
+  `EXCLUSIVE → NONE` runs `rawSurfaceFocus(nullptr)` **and `refocusLastWindow()`**, which hands the
+  keyboard back to the last window; `EXCLUSIVE → ON_DEMAND` only calls `simulateMouseMovement()` — a
+  no-op when the pointer has not actually moved. So closing the app grid left the dock holding the
+  keyboard, and *that* was the "poisoning" that made every other surface look broken afterwards.
+
+🔴 **Since 2026-08-05 the rule is absolute: `NONE` is the ONLY value any shell surface ever sets,
+once, at init.** Modality comes from `hyprland-focus-grab-v1`, which needs no interactivity at all.
+The one exception that used to exist — dropping transiently to `ON_DEMAND` because a `Gtk.Popover`
+cannot take focus from under an `EXCLUSIVE` grab (the app grid's context menu) — is gone with the
+rest of the layer-shell path. If you are reaching for `set_keyboard_mode` outside a surface's setup,
+you are re-introducing `m_exclusiveLSes`.
+
+With every surface resting in `NONE`, the release is clean and measurable — `activewindow>>,`
+followed by `activewindow>><the window>` inside 1 ms, on all the grabbing surfaces (bar/Prism,
+island/overview+assistant, app grid — the last of which was the DOCK's surface until 2026-08-09). `dumpState.keyboardFocus` shows `{}` at rest, and a `{}`
+there now means the user's window has the keys, not that they are lost.
+
+**The trap on the way out, and why the previous attempt was abandoned.** Fixing the keyboard exposed a
+latent input-region bug that had been masked by it: the dock's layer surface is the size of the whole
+screen (`0 0 2560 1440` — it hosts the fullscreen app grid) and sits on `TOP` above the bar, so while
+the app grid is open its input region is stamped over everything. `DockAxis.buildInputRegion` dedupes
+by a shape key, and the open path used to call `set_input_region(null)` **directly**, bypassing that
+cache — so the key still described the *resting* region. On close, `buildInputRegion` recomputed the
+same resting key, matched the stale cache and **skipped the restore**, leaving a full-screen surface
+eating every click on the screen; only the island, on `OVERLAY`, still got any (which is exactly how
+the symptom reads: "the bar capsules are dead, but the Activity Island works"). It self-healed on dock
+hover, because magnification changes the key. What hid it before was the compositor's
+`simulateMouseMovement()` on the `EXCLUSIVE → ON_DEMAND` release: the fake motion re-entered the dock
+and changed the key for us. **Rule: never call `set_input_region` behind a dedupe cache's back** — go
+through the function that owns the key.
+
+### The agent config surface: `describeConfig` / `getConfig` / `setConfig`
+
+Settings are exposed to agents through a typed registry (`core/ConfigRegistry.ts`; entries
+registered in `config-entries.ts`):
+
+- `veltrix-ipc describeConfig` → JSON schema of every exposed setting: description, type,
+  enum values / min/max, writability, current value, and **`page` / `group`** — the Settings
+  page id the user sees it on (feed it straight to the `settingsPage` action) and, when the
+  group has a header, its i18n key. **Read this first** — never guess keys.
+  - `page` is **derived from the page manifest** (`surfaces/settings/configLocations.ts`,
+    injected in `app.ts` — `core/` must not import `surfaces/`), so it cannot drift from what
+    Settings draws. ⚠️ It is NOT the key's prefix: `nightlight.*` and `wallpaper.transition`
+    live on **appearance**, and guessing from the prefix is exactly the plausible lie this
+    field replaces.
+  - A key drawn in a SUBPAGE (the clock's Configure under Top bar) is declared on the page that
+    pushes it, in its custom group's `reaches` (`manifest.ts`): that gives it its `page`, puts it
+    in the Settings search (which never walks a subpage) and counts it for
+    `settings-config-contract`, which otherwise fails a key with `ui:` that no page declares.
+  - A key with **no** `page` is one no page draws (`recording.*`, `ai.brainBackend`). The field
+    is absent rather than invented — 55 of the 62 keys carry one.
+- `veltrix-ipc getConfig dock.iconSize` (one key) / `veltrix-ipc getConfig` (all values).
+- `veltrix-ipc setConfig appearance.accent cyan` → validates against the declared
+  type/constraints, applies through the owning service (persists + notifies the UI exactly
+  like Settings would), and echoes `{key, value}` back. Invalid input returns a
+  self-explanatory error, not a crash. (Any of the ten preset names is accepted —
+  cyan is the default; an arbitrary hex goes through `appearance.accentHex`.)
+
+Rules:
+- Writes are **gated by Settings → AI** (`AgentConfig.allowConfigWrite`, GSettings `org.veltrix.ai`). When
+  disabled, `setConfig` refuses with a pointer to the page. Reads are never gated.
+- **Every `ai.*` key that GRANTS something is visible but not writable via setConfig** — a gate
+  must not be flippable through the door it controls. The line is *grant*, not namespace:
+  `ai.assistantGlow` (the glow on the window the Assistant is working in, `AgentGlow.ts`) is
+  writable, because it turns a *signal* on and off and permits nothing. That also makes it
+  answerable — "stop glowing my windows" is a reasonable thing to ask the Assistant, and it is
+  the one thing on this page it can do about itself.
+- **Every gate in `org.veltrix.ai` must be registered here, `writable: false`** — all eight of them
+  (`allowConfigWrite`, `allowScreenshot`, `allowWindowClose`, `allowMcp`, `allowComputerUse`,
+  `allowComputerControl`, `allowFileRead`, `allowFileWrite`). The last four were added with the
+  computer-use and file layers and **not registered until 2026-07-30**, which made
+  `describeConfig` a half-truth rather than an omission: asked which permissions were on, the
+  Assistant read the registry honestly and answered **four of eight** with nothing marking the
+  list as partial. A gate the agent cannot see is one it cannot report, explain, or point the
+  user at — and an incomplete answer that looks complete is worse than a refusal. Registering a
+  gate is **not** making it writable: `writable: false` keeps `setConfig` refusing, and the
+  Settings → AI page stays the only door that flips one.
+- **Adding a setting:** register it in `config-entries.ts` (NOT in core/ — dock settings
+  import widget state) with a real `desc` (that string is the agent-facing documentation)
+  and delegate `set` to the owning service's setter. That's ALL it takes to appear in
+  `describeConfig`.
+- **Before adding a persisted setting, check whether the layer below ALREADY persists it.**
+  Library properties are not all in-memory: `AstalNotifd.dont_disturb` used to be a straight
+  accessor over GSettings (`io.astal.notifd dont-disturb`), so it survived logout and reboot in
+  dconf with no help from us. Veltrix had shadowed it anyway with a
+  `notifications.dndDefault` boolean in `notif-config.json` plus a "Enable on login" toggle in
+  Settings → Notifications, and a seeding block in `app.ts` `main()`. Two settings, one bit — and
+  the copy could only ever *set* it, never clear it, so its OFF position promised sessions would
+  start undisturbed while the persisted flag quietly kept DnD on. (Worse, `main()` runs on every
+  UI reload, not just at login.) All three were removed 2026-08-16; the registry key is now
+  `notifications.doNotDisturb`, reading and writing the live flag, and Settings shows the live
+  state like GNOME does. **The check is one command:** `gsettings list-recursively io.astal.<lib>`,
+  or read the `.vala` property — if the getter hits `settings.get_*`, it persists. A shadow copy
+  can only ever disagree with the real one.
+
+  ⚠️ **That flag is ours now** (2026-08-18, when `core/notifd.ts` replaced AstalNotifd): it lives
+  in `core/NotifConfig.ts` (GSettings `org.veltrix.notifications`, since #573), because DnD was never daemon behaviour —
+  AstalNotifd kept it in GSettings so its PROXIES could share the bit, and Veltrix has none. The
+  lesson survives its example: the question is still "who already stores this", and the answer is
+  still "exactly one place". ⚠️ And when a library that owned a GSettings schema goes, **never
+  read the old schema to migrate**: `Gio.Settings.new()` on a schema that is no longer installed
+  ABORTS the process (guard with `Gio.SettingsSchemaSource.get_default().lookup()` if you ever
+  must). Re-measured 2026-09-14: it is the C constructor that aborts; GJS's
+  `new Gio.Settings({ schema_id })` throws a catchable error instead — `defineSettings` uses
+  neither blind, it looks the schema up first. Users get the default once; a notification flag is not worth a crash loop.
+- **Reading an effective Hyprland option: READ IT THROUGH A TYPED READER, never off the raw
+  JSON.** A `getoption -j` payload carries EXACTLY ONE typed field, named after the option's
+  type — `int`, `bool`, `float`, `str` or `css` — and nothing alongside it, so naming the
+  wrong one yields `undefined` and every comparison against it is quietly false.
+  `HyprlandState` has one reader per type: `getOptionInt` / `getOptionBool` (sync) and
+  `getOptionIntAsync` / `getOptionBoolAsync` / `getOptionFloatAsync` / `getOptionStrAsync`
+  (async, for batch re-syncs). Each takes a `fallback`, so a failed read is never mistaken
+  for `false`/`0`/`""`. `getOptionJson` still exists and still hands back the raw shape;
+  reach for it only when you need a field the typed readers do not cover.
+  🔑 **This mistake has now been made twice, in both directions, and neither time did
+  anything report it.** 2026-08-16: the reduce-motion baseline read a bool with
+  `getOptionInt`, got `0` for `true`, and pinned Hyprland's animations off. 2026-08-31
+  (#338): `InputConfig` read all four of its booleans off the raw async JSON as
+  `.int === 1`, so natural scrolling, tap-to-click and numlock reported themselves OFF
+  however they were actually set — and because `applyAndSave` rewrites the whole config
+  file from those fields, the next change to any input setting **persisted the wrong
+  state to disk and applied it**. Both survived a clean typecheck and a clean build; only
+  a live A/B against `hyprctl` caught either.
+  ⚠️ In a batch re-sync, pass **the current field** as the fallback
+  (`this._tap = await hs.getOptionBoolAsync(name, this._tap)`): a re-sync that cannot
+  reach the compositor must leave the object as it found it, or "could not tell" turns
+  into a value that then gets persisted.
+- **Changing a Hyprland option live is `hs.evalLua`, and the shape comes from the SHIPPED
+  STUB.** `/usr/share/hypr/stubs/hl.meta.lua` declares the whole Lua config surface
+  (`HL.ConfigOpt.Animations.enabled`, etc.) — read it rather than guessing a
+  translation of the `hyprland.conf` key. `hyprctl keyword` is not an option: the Lua
+  parser answers "Use eval.", which costs nothing and changes nothing, so a `keyword`
+  call looks like it worked.
+- **A compositor-backed setting names its option ONCE — `option(hs, name, kind)` in
+  `core/hyprland-settings.ts`** (it was `compositorOption` in HyprlandState until #682 moved
+  every setting behind `CompositorSettings`; Hyalo's side is `core/hyalo-settings.ts`, see
+  `hyalo.md`).
+  Reading and writing such a setting are not symmetric with a JSON one: the effective value
+  is our file + `hyprland-user.lua` + defaults merged and only Hyprland computes that sum, so
+  the READ asks the compositor; the WRITE is two steps and both are required, because
+  `evalLua` changes the running session and does not survive a restart while the generated
+  `.lua` survives a restart and does not apply. In-memory state is a CACHE of the compositor,
+  not the source. `option` hands back `read(fallback)` — the
+  right typed reader, picked by `kind` — and `apply(value)`, so the two halves cannot come to
+  disagree about where the option lives or what its values look like. They HAD: `InputConfig`
+  typed its reads after #338 while its writer still named each option again as a bare string
+  and spelled booleans `1`, and `kb_variant` had a place in the reader and in the file but no
+  option path in the writer, so setting a layout smuggled it through a hook and evalled twice.
+  🔑 **The persisted file is rendered from the same table** (`INPUT` in hyprland-settings.ts, a
+  row per option, with its Hyalo path in hyalo-settings.ts' `INPUT`), so a new input option is one row
+  rather than an edit in three places that nothing checks. Miss the file and the setting
+  applies live and is gone at the next login; miss the re-sync and the next change to ANY
+  option in that file rewrites the whole thing from stale state.
+  ⚠️ The expression builders live in `core/hyprland-lua.ts`, a PURE module with no `gi` import,
+  and that is not tidiness: `HyprlandState` opens the compositor's event socket at import time,
+  so the half that can silently emit a wrong path or an unparseable file would otherwise be
+  untestable without a live desktop. `scripts/ci/hypr-lua-check.mjs` renders the real thing and
+  runs `luac -p` over it — with its own positive control first, because a `luac` that is absent
+  or misnamed would call every render fine, forever.
+- **A setting that overrides the user's Hyprland config must capture a BASELINE.** Reduce
+  motion pushes `animations.enabled = false`, and turning it back off restores what
+  `getOptionBool` reported before the shell ever pushed — not a hardcoded `true`, which
+  would overrule a `hyprland-user.lua` that disabled animations on purpose. Two traps
+  came with it: the baseline must NOT be read from the live option while the override is
+  already active (a shell reload would capture our own value as the user's), and a
+  `hyprctl reload` discards the eval, so re-assert on `config-reloaded` — which is also
+  the moment the live value is trustworthy as the baseline again. Both baselines (motion and
+  the blur) live in `core/hyprland-settings.ts` since #682: the modules say
+  only "reduce" / "the compositor's own blur" (nothing pushes a blur since 2026-10-11), and the backend keeps the baseline and
+  re-asserts on its own reload, from a handler connected at construction so it runs before any
+  module's reload handler reads `blurColour()`. ⚠️ No file is written in answer to
+  `config-reloaded` (`setGamingPolicy(p, reassert = true)` evals only): `hyprland.lua` requires
+  those files, and a write on reload is a reload loop.
+- **A `desc` should not restate the DEFAULT.** `value` sits in the same JSON object, so a
+  default is a second answer to the question the reader came with. (It was first suspected of
+  causing a misread of `ai.allowFileWrite`; removing it did not fix that — the cause was the
+  UI tree carrying no switch state, below — so this is hygiene, not a proven bug.) Put in the
+  desc only what the value cannot say: what the setting does, which other setting it implies,
+  where a human flips it.
+
+### The same registry on the bus: `org.veltrix.Config1`
+
+`core/ConfigService.ts` serves the registry to other processes under its own name,
+`org.veltrix.Config` (`/org/veltrix/Config`) — the native Settings of toolkit phase 1 is its
+client and carries no setting logic (`toolkit/PHASE1.md`, D1). Members, only ever ADDED to v1:
+
+- `Snapshot() → (t epoch, t revision, s)` — `{schemaVersion, keys}`: `describeConfig` plus each
+  key's `ui` (translated title/subtitle, control, option labels, slider with icon NAMES), the
+  WHOLE enum, `catalogue` (values offered, not enforced) and `available` (an unavailable key is
+  listed as `false`, not omitted). `Apply(s, v) → (t revision, v canonical)` — the value in
+  force after it and the revision that includes it; a no-op answers the current revision and
+  announces nothing. `Updated(t epoch, t revision, a{sv})`. The older `Describe`/`Get`/`Set`/
+  `Changed` stay for their clients.
+- Client order: subscribe to `Updated`, then `Snapshot`, drop revisions not above it; a new
+  epoch = the shell restarted → snapshot again, never replay.
+- **A key without `subscribe` never announces a change, and a `subscribe` must hear EVERY
+  writer** (#857: the wallpaper transition's shell setter emitted nothing; the window blur heard
+  only its own process). Its first call is synchronous and is the current value.
+- `enum` may be a FUNCTION, re-read on every use (themes installed meanwhile); `enumOf(e)` reads
+  it. String keys may `validate` (canonicalise: a `file://` URI → path) and offer a `catalogue`.
+- Appearance's own controls have keys since #852 [A2]: `wallpaper.current`,
+  `nightlight.scheduleFrom`/`scheduleTo` (HH:MM), `appearance.interfaceFont`/`monoFont`
+  (Pango "Family [Style] Size", unknown family refused).
+- Writes from the owner of `org.veltrix.SettingsNative` (followed with a name watch, not asked
+  per write) are the native Settings' path; any other sender is an agent's `setConfig`,
+  refused unless Settings → AI allows config writes. Read-only keys are refused for every
+  caller. Cooperative consent, not a security boundary (owner, 2026-10-18; #840).
+- Only the shell exports it; the Settings process registers the same entries and must not.
+- Checked in the Hyalo smoke by `scripts/ci/config-service-check.py` (13 assertions).
+- 🔴 `Get` takes a LIST (`as`) and answers `a{sv}`. A fixture or client written from memory as
+  `Get(s) → v` passes against itself and fails against the shell (#862's first fixture did).
+  The start-up slice's `toolkit/settings-slice/check.py` runs right after it in the same smoke,
+  against the real Config1 and portal, with `windowControls` seeded to `left` through
+  `button-layout` so the default-values control can be told apart.
+
+### The MCP server: `veltrix-mcp`
+
+The whole surface above is also served over MCP by `bin/veltrix-mcp` (installed to
+`/usr/bin`), a standalone GJS script — same no-Node pattern as `veltrix-portal` — speaking
+MCP over stdio. Two discovery paths, dev and user:
+- The repo's `.mcp.json` registers it for any agent working in this checkout.
+- `install.sh` always (re)writes `~/.config/veltrix/.mcp.json` — the one
+  installer-managed file in the config dir — pointing at the PATH binary. An agent opened
+  inside the config dir auto-discovers it; any other agent can be told to "register the MCP
+  server described in `~/.config/veltrix/.mcp.json`" (content:
+  `{"mcpServers": {"veltrix": {"command": "veltrix-mcp"}}}`). The Settings → AI
+  page shows this path to the user ("Connect Your Agent" row).
+
+It is a **thin adapter with mostly no logic of its own**: every shell-self-control tool shells
+out to `veltrix-ipc` (or `veltrix-doctor`), so the `IPC_COMMANDS` table stays the single
+source of truth — a new IPC command is reachable through the `run_action` tool with zero MCP
+changes. Tools: `list_actions`, `run_action(name, args)`, `list_apps`, `launch_app(id)`,
+`dump_state`, `query_ui(selector)`, `list_windows`, `list_workspaces`,
+`query_app(app)`, `do_app_action(app, node, action)`, `type_text(app, text)`,
+`press_key(app, key)`, `focus_window(window)` (ungated — a WM op), `click_app(app, node, button?)`, `click_at(app, x, y, button?)`,
+`hover_app(app, node)`, `hover_at(app, x, y)`,
+`scroll_app(app, node, direction, amount?)`, `scroll_at(app, x, y, direction, amount?)`,
+`drag_app(app, from_node, to_node)`, `drag_at(app, from_x, from_y, to_x, to_y)`,
+`describe_config`, `get_config`, `set_config`, `screenshot` (returns the PNG **inline as MCP image
+content** — the client sees it without a separate read), `doctor`.
+(Action verbs like `openWindowMenu` need no dedicated tool — they go through `run_action`; the
+dedicated tools are the read/introspection verbs and the computer-use verbs.)
+
+**App listing / launching** (`listApps` / `launchApp <id>` IPC, `list_apps` / `launch_app` MCP
+tools) is a first-class **shell capability**, not computer-use: it reuses `AppService`
+(`getAllApps()` for the list, `getLaunchArgv()` for launch — the SAME argv as a dock click:
+`sh -c 'cd "$HOME" && exec uwsm app -t service -- <id>.desktop'` — a systemd service, so the app gets
+the session's environment, not the shell's; `architecture.md` → "Launching an app"). It only *opens* an installed app; it
+does not drive it (that's the gated computer-use layer). **Ungated** by design (parity with a dock
+click; bounded to the installed set) — opening a window is low-risk, unlike driving one.
+
+`query_app`, `do_app_action`, `type_text` and `press_key` are the exceptions to "delegates to the
+shell": they are the **computer-use** layer's perception, AT-SPI-action and synthetic-keyboard
+legs, and they run `veltrix-a11y` / `veltrix-act` / `veltrix-type` directly (like `doctor` runs
+the doctor), **not** `veltrix-ipc` — because reaching into a *third-party* app is not
+shell-self-control and must not live in the shell process. See "The computer-use layer" below.
+
+Governance: `org.veltrix.ai allow-mcp` (Settings → AI → "Enable MCP Server") is re-read on **every**
+tool call, so the toggle applies live with no restarts; when off, every tool refuses with a
+pointer to the page. The finer gates (`allowConfigWrite`, `allowScreenshot`, `allowComputerUse`,
+`allowComputerControl`) are enforced downstream (by the shell, or by
+`veltrix-a11y`/`veltrix-act`/`veltrix-type` for the computer-use tools) — never duplicate them in
+the MCP layer beyond the live re-read the tool already does. Like the rest of `ai.*`, `allowMcp`
+is visible via `describeConfig` but not writable via `setConfig`.
+
+### The built-in Assistant: `bin/veltrix-agent` (the brain)
+
+The MCP server exposes the surface to EXTERNAL agents. `bin/veltrix-agent` is Veltrix's
+OWN conversational assistant — and for everything it does TO THE DESKTOP it is deliberately
+**just another client of the same gated surface**: those tools ARE `veltrix-ipc` calls, so
+Settings → AI gates (`allowConfigWrite` …) and the kill switch apply for free, and a new IPC
+action is usable with zero changes here (`run_action` is a passthrough — 100% coverage,
+exactly like MCP). The **file layer below is the one documented exception** to that rule.
+
+- **Standalone GJS** (same no-Node pattern as `veltrix-mcp`), but the INVERSE topology: it is a
+  long-running **stdio child of the shell** (spawned by `core/AgentService.ts` in the island
+  Agent mode — PR 2), speaking a tiny **JSON-lines protocol**, not MCP JSON-RPC:
+  - shell→daemon: `{t:"user",text}` · `{t:"cancel"}` · `{t:"reset"}`
+  - daemon→shell: `{t:"state",s:"thinking"|"acting"|"idle"}` · `{t:"delta",text}` ·
+    `{t:"tool",name,summary}` · `{t:"toolresult",ok,summary}` · `{t:"done",usage}` · `{t:"error",message}`
+- **Local Ollama only, ONE backend** (VELTRIX fork, Phase 0): the hosted providers
+  (Anthropic, OpenAI, Google, Mistral, Groq, OpenRouter), the "custom" endpoint escape hatch
+  and the whole API-key path were DELETED — API keys and undisclosed network calls are banned
+  by the security rubric. The single remaining backend is **OpenAI-compatible**
+  (`POST {endpoint}/chat/completions`, no `Authorization` header), pointed at a FIXED local
+  Ollama (`http://localhost:11434/v1`, enforced loopback by the daemon at request time).
+  Streamed via `curl -N` SSE as a `Gio.Subprocess` (the house HTTP pattern — zero new
+  deps); `cancel` = `force_exit()` the curl.
+- **Provider vs protocol** (`core/AgentProviders.ts`): the registry holds exactly ONE row
+  (Ollama, local). `AgentConfig.setBrainProvider(id)` writes `brainProvider` **and** the
+  derived `brainBackend` / `brainEndpoint` / `brainModel`, so **the daemon stays dumb** — it
+  never carries a provider table. `brainModels` is per-provider model memory. There is
+  deliberately NO `setBrainEndpoint`: the endpoint is derived, not editable.
+- **Config re-read from GSettings `org.veltrix.ai` every turn** (`brainProvider`/`brainBackend`/`brainModel`/
+  `brainEndpoint`, via `AgentConfig`), so a provider/model change takes effect live. There is
+  **no API key anywhere in this build** (VELTRIX fork, Phase 0: local Ollama only) — no
+  `org.veltrix.Assistant` keyring schema, no `password_store`/`password_lookup` in the daemon,
+  nothing for Settings → AI to save. The DE keyring still exists and is still unlocked at
+  login via PAM (`pam_gnome_keyring` in `/etc/pam.d/greetd`, wired by `veltrix-setup`), but it
+  serves Wi-Fi passwords (NetworkAgent) only — see "The login keyring" in `dev-workflow.md`.
+- **Token accounting has two rules, each learned from getting it wrong (2026-07-21).**
+  (1) **`done` carries the turn's cost and lives in the `finally`** — it used to sit on the success
+  path, so the expensive failures (a 25k-token turn that hit the step cap) reported *zero*. Usage is
+  also accumulated BEFORE any early return. (2) **`cached` is a SUBSET of input, never an
+  addition** — the island shows it as a percentage (`5.4k tokens · 74% cached`), because the useful
+  question is "is this being re-read cheaply", which a raw count doesn't answer. (A third rule used
+  to live here — normalising cached-token counting across the Anthropic and OpenAI-compatible
+  backends — and died with the multi-backend daemon in the Phase 0 fork.)
+- **Read tool calls from their PRESENCE, not from `finish_reason`** (measured 2026-07-21 against an
+  OpenAI-compatible endpoint): it streams a `tool_calls` delta and then
+  finishes with `"stop"`. The loop used to gate execution on `finish_reason === "tool_calls"`, so the
+  call was dropped, no tool ran, and the turn ended with nothing to say — **every conversation worked
+  once and then went dead on the first turn that needed a tool**. If tool calls accumulated, execute
+  them. The per-step log prints `stop=` (how the loop read it) next to `finish=` (the provider's raw
+  value) precisely so the next divergence shows up instead of being inferred.
+- **Carry the provider's opaque per-call extras back verbatim.** Some OpenAI-compatible
+  providers attach an opaque extra to every function call (e.g.
+  `tool_calls[].extra_content.google.thought_signature`) and answer the FOLLOWING request with
+  a **400** unless it is echoed back inside the assistant message's `tool_calls`. So `toolUses`
+  carries an `extra` blob straight from the stream into `toOpenaiMsgs()` — never interpreted,
+  never rebuilt, just relayed. Providers that don't send the field don't care. The step log
+  prints `sig=N/M` whenever a turn has tool calls. (The native-lane twin of this rule — echoing
+  Anthropic thinking blocks, and the `tsig=` half of the old `sig=`/`tsig=` pair — died with
+  the multi-backend daemon in the Phase 0 fork; the `thoughtSig`/`thinking` history fields were
+  removed with it. Tech-debt #38, which tracked the `sig=` misread, is retracted.)
+- **A failing tool call gets TWO strikes, then the turn is aborted.** Measured 2026-07-21: the model
+  called `run_action` with `{"args":[…]}` and no `action`, was told it was invalid, and repeated the
+  identical call **seven times** — the whole step budget and ~25k input tokens on one question. The
+  loop now compares `name + rawArgs` against the previous failure and stops on the repeat. Two
+  supporting rules: a rejection message must hand the model back **what it actually sent** (a bare
+  "needs an action name" told it nothing it didn't already believe), and `history` must receive the
+  tool results **before** any abort — every tool call needs its matching result or the next request
+  is malformed. Also read `arguments` permissively (string per spec, object from some compat
+  endpoints) and **log a JSON parse failure**: swallowing it makes a malformed call look identical to
+  "the model sent nothing", which is how this was misdiagnosed at first.
+- **Key streamed tool calls by index OR id — never `index ?? 0`.** OpenAI puts an `index` on every
+  chunk; **some OpenAI-compatible endpoints omit it entirely** and identify calls by `id`. Defaulting to 0
+  filed every call in one slot: two calls merged into one, arguments concatenated into invalid JSON
+  (`{"action":"listWindows"}{}`), name overwritten by the last, and the UI showed a `run_action ?`
+  chip for a call the model never made that way. This was the real cause of what looked like a dumb
+  model. Resolution order: explicit `index` → call `id` → continue the slot being filled (a pure
+  continuation chunk carries neither). Keep the slots insertion-ordered so multiple calls execute in
+  the order asked for.
+- **Tools offered to the model.** The `veltrix-ipc` five — `run_action(action, args?)` for every
+  desktop action, plus the settings/state cluster `set_config(key, value)`, `get_config(key?)`,
+  `dump_state()`, `describe_settings()` — with gates enforced by the SHELL (a refusal comes back as
+  the tool-result STRING; the daemon never re-checks those). Two groups do not go through
+  `veltrix-ipc` and enforce their own gates in the daemon: the **file layer** and the
+  **computer-use tools** (both below).
+- **Every desktop action goes through ONE `run_action` tool whose DESCRIPTION carries a name index**
+  — `snake_name — first clause of the action's description`, one per line — instead of one first-class
+  tool schema per action. The index is GENERATED from `listActions` in `buildToolset()` (cached per
+  session), so a new IPC action still appears for free — the self-maintaining property. Measured
+  2026-07-23 against the live 42-action shell, same method (the daemon's `body=… tools=Nb` log): the
+  whole tool block **8,819 → 3,808 bytes (−57%)**, and the full fixed prefix re-sent on EVERY step
+  (`sys`+`tools`) **10,426 → 5,495 bytes (~halved)**. The 32-action index is ~1,600 chars (~450 tok)
+  where the same 32 as JSON schemas were ~2,000 tok.
+  **Why an index and not 32 first-class tools** (that was tried and committed briefly in `cd459db`,
+  then reverted 2026-07-23 at the user's request to cut fixed cost): a text index buys the same two
+  things the first-class tools were adopted for, at ¼ the weight. (1) **No discovery round-trip** —
+  names + summaries are always in front of the model, so it never spends a request on a `list_actions`
+  lookup before acting; the *earlier* run_action design paid that round-trip only because the names
+  lived BEHIND a lookup, and moving them into the description is what removes it. (2) **No invented
+  names** — the index is snake_case, `run_action` takes a snake_case `action`, and `execTool` maps it
+  back (accepting camelCase too). Keep descriptions in the index, not bare names: `toggle_cc` /
+  `toggle_nc` / `toggle_prism` are ambiguous, and that one clause is what lets "open control center"
+  land in one step.
+- **Settings stay their own tools, deliberately.** `describe_settings()` gates a ~4 KB schema whose
+  size-to-lookup ratio genuinely pays for on-demand loading, and the model must call it once before a
+  `set_config`/targeted `get_config` (never guess a key). `run_action` resolves ONLY the visible
+  actions in `actionMap` — the config door is these dedicated tools, and hidden plumbing stays
+  unreachable, so run_action opens no gate the tool list doesn't already advertise. The static core
+  also carries a one-line **capability summary** + an explicit rule to answer "what can you do?" from
+  it (never a tool) — a reply built from 42 raw IPC names is a worse answer than one from a curated
+  summary; costs ~50 tok on every request, worth it for the better answer as much as the cheaper one.
+- **The cost of the index design is compliance** — a model that ignores the list will invent a name.
+  Three defences, keep all three: the core rules are imperative ("pick a name from the list, never
+  invent one, never look actions up"), the `run_action` description repeats "this list is the
+  COMPLETE set", and its rejection hands back the exact name it sent. If a model is seen guessing,
+  strengthen those before reverting to fatter tool schemas. Side benefit: `buildSystemPrompt()` never
+  calls `veltrix-ipc`, so the daemon doesn't depend on the shell being up at spawn.
+- **Two lossless squeezes stay** (both still in `buildToolset`/`execTool`): **`compactJson()`** strips
+  the pretty-printing the shell emits for humans (tool results ride in `history` and are re-sent every
+  later step, so this matters more there than in the prompt), and **`HIDDEN_ACTIONS`** is a denylist
+  keeping out actions already offered as dedicated tools (`getConfig`/`setConfig`/`dumpState`/
+  `describeConfig`), the redundant `listActions`, and shell-internal plumbing (`hideForLock`,
+  `agentPointer`, the kill switch). Denylist on purpose: a NEW action still appears in the index for
+  free.
+- **`HIDDEN_ACTIONS` is also the AUTHORITY boundary, not only a token squeeze** — and the distinction
+  matters when adding to it. Two of its three categories are about cost or redundancy; the third is
+  about what the Assistant may not be able to do at all. It holds because the list is **enforcing,
+  not advisory**: `run_action` resolves only through `actionMap`, built with the same filter, so a
+  hidden name is UNREACHABLE — a model that guesses it, or one steered by a prompt injection in a
+  window title it just read, is stopped by the resolver and not merely left uninformed. Pinned in
+  `scripts/ci/agent-loop-test.py` ("hidden actions: unreachable, not just unlisted"), which asserts
+  BOTH halves, because either alone is a false sense of safety. The stub `ags` serves the hidden name
+  from `listActions` on purpose — a stub that omitted it would pass without the denylist.
+  **`agentNewConversation` is the first entry of that third kind** (see below).
+- **`agentNewConversation` — the one verb deliberately out of the Assistant's reach.** It ends the
+  conversation and starts an empty one, dropping BOTH halves (`transcript.json` and the daemon's
+  `session.json`, in memory and on disk) via `AgentService.reset()`. Reachable from a terminal
+  (`veltrix-ipc`) and from MCP, whose `run_action` is an unfiltered passthrough by design — its
+  client is a person's agent, not this daemon. NOT reachable from the built-in Assistant: a reset
+  mid-turn would strand the `tool_call` whose `tool_result` the next request has to carry, and
+  "start over" belongs to the user or to whoever drives an eval, never to a move inside a turn.
+  It **refuses while a turn is in flight** rather than resetting under it, and the refusal names
+  something pollable — `dumpState` grew `ai.assistant` (`configured`/`busy`/`state`/`turns`) for
+  exactly that reason, an addition the Assistant itself never pays for (`dumpState` is hidden too).
+  No alias: aliases are a FIELD in `listActions`, never a key, so they never enter the index and the
+  denylist would never see one — a second name would look covered without being it.
+  **Why it had to exist:** deleting the two state files under a live shell does nothing, because the
+  shell holds the conversation in memory and rewrites them at the next turn end. Before this verb,
+  a fresh conversation meant restarting the shell, which every bench run had to do.
+- **Token/cache is a PARKED topic (user, 2026-07-22) — don't reopen it with experiments.** What is
+  known and stable: `cached` is a SUBSET of input shown as a percentage on the island; the cost driver
+  is STEP COUNT, not prompt size (an 8-step turn is ~25k input tokens); prompt caching is whatever
+  the local Ollama server does — nothing in the daemon configures it per provider any more, and the
+  `cached` number is read from the usage object when the server reports it. (The Anthropic
+  `cache_control` and Google implicit-cache notes that lived here died with the multi-backend
+  daemon in the Phase 0 fork.) `ai.brainProvider`/`brainBackend`/`brainModel` are visible read-only
+  via `describeConfig`; there is no key to expose.
+- **Test headless with `scripts/dev/fake-brain.py`** (a scripted OpenAI-compatible SSE mock) — see
+  `dev-workflow.md`. GOTCHA proven 2026-07-20: the write gate lives in the SHELL (it reads the
+  user's REAL settings), so pointing the daemon at a test config with `allowConfigWrite:false` does
+  NOT block a write — a `set_config` E2E hits the live shell for real. Test the daemon's
+  rejection-surfacing non-destructively with an INVALID value instead (the validator refuses, nothing
+  mutates), or flip the real gate in Settings.
+
+- **A turn NEVER ends in silence — treat this as an invariant, not a nicety** (the worst bug of the
+  first live run, tech-debt #39). Every abnormal end has to reach the island: provider error, curl
+  failure, empty completion, the `MAX_STEPS` cap, and — shell-side — the daemon dying mid-turn or a
+  failed spawn/write. `Turn.error` is a field of its OWN (not appended to `text`) precisely so an
+  error that lands AFTER some text already streamed still shows; `AgentService.failTurn()` is the one
+  door for all of it, and it re-opens the island when the failure happened with it closed. If you add
+  a code path that can end a turn, it must end it through text or through `failTurn`.
+- **Telemetry: both halves land in `veltrix-ui.log`.** The daemon logs to **stderr, which it inherits
+  from the shell** (`Gio.Subprocess` is spawned with STDIN/STDOUT pipes only — do NOT pipe stderr, that
+  would swallow it), prefixed `[veltrix-agent]`; `AgentService` logs `[AgentService]`. Together they
+  cover: spawn (argv) → turn start (provider/backend/model, prompt LENGTH) → each HTTP leg (host, body
+  size, whether a key was found) → each step's result shape → each tool + outcome → turn end (duration,
+  tokens) → daemon death **with exit status or signal**. `grep -E '\[(veltrix-)?[aA]gent' veltrix-ui.log`
+  reads a whole session. **Never log the prompt or the reply** (a desktop log is not the conversation's
+  home) and never the key — shape only. Without this a user's "it did nothing" is unreconstructible,
+  which is exactly how the 2026-07-21 silent death was lost.
+
+**UI wiring (the face).** `core/AgentService.ts` owns the daemon subprocess + the transcript and
+exposes `send`/`cancel`/`reset` + `subscribe` (see `architecture.md`). The chat lives in the Activity
+Island as the **`agent` mode** (`surfaces/island/AgentIsland.tsx`, `ISLAND_AGENT`,
+`needsKeyboard:true`) with a matching **`agent` activity** (priority 25 — the "working pill"). IPC:
+**`toggleAgent`** → `status.toggleIsland(ISLAND_AGENT)`, bound to **`Super+A`** in `hyprland.lua`.
+Two behaviours worth knowing: (1) the agent activity `isLive` = `busy || island_mode===ISLAND_AGENT`,
+so closing the island mid-turn does NOT cancel (the pill keeps working) and reopening shows the same
+transcript; (2) **expand-on-finish** — when a turn ends with the desktop otherwise idle (`!isAnyOverlayOpen`),
+AgentService pops the island open so a background answer surfaces. Being the island's first TEXT mode,
+its `handleKey` claims only Escape (everything else falls through to the entry); the keyboard comes
+from the island's own focus grab, which it takes for any open mode. The empty state (no provider) routes to Settings → AI.
+
+**Bubble anatomy — an assistant turn is NOT one reply (2026-07-29).** A multi-step turn narrates
+between calls ("I'll check whether Nautilus is focused first"), and every provider does it. Measured
+live on a 5-step turn: 0 / 148 / 109 / 0 / 79 chars, so the actual answer was 79 of 336 — the other
+257 were expired status reports, one of them announcing something that had not happened yet.
+
+- **`Turn.text` is the FINAL answer only; narration lives on `ToolCall.interim`,** the chip it
+  preceded. **Nothing marks it as interim on the wire and nothing should.** The daemon streams a
+  step's deltas and only then emits that step's `tool` events, so **arrival order already carries the
+  interleaving**: `AgentService`'s `case "tool"` moves whatever text is still unclaimed onto the new
+  chip and clears `text`. Text with a chip behind it was narration; text unclaimed at the end is the
+  answer. Deriving it means the two views cannot disagree — and it is why this needed **no daemon
+  change and no transcript version bump** (an older transcript simply has no `interim` and renders
+  as it always did).
+- **Only the ANSWER is bubbled. The work is bare on the glass.** An assistant turn renders as
+  pulse → `toolsBox` (narration + chips, unbubbled) → `bubble` (the answer, or the error that
+  replaced it). A bubble says "one utterance" and a six-call turn is not one, so wrapping the lot in
+  a single bubble was what made the steps read as one block. **The background is the differentiator**
+  — the reply is the only part of the turn wearing one — which separates the answer no matter how
+  many steps ran and costs no chrome. Same model as Claude Code / Cursor: an assistant turn is a
+  stream of blocks and the reply is the last one. A USER turn is one utterance and keeps the plain
+  bubble.
+- **Chips render BEFORE the answer.** Chronology (the tools ran first), and also why the answer
+  lands where the transcript auto-scrolls to. Text-then-chips put the answer above the cut on any
+  turn with more than a few steps. **Do not re-order these two.**
+- **Narration is dim but FULL SIZE (`$fs-small`).** The first cut used `$fs-mini` and that was the
+  real mistake in it: the opening sentence of a turn is not the caption of whatever chip happens to
+  follow, and 11px prose labelled it as one. The chip pill is `halign START` for the same reason —
+  bare on glass a full-width pill reads as a band, not a marker.
+- The interim move is **not** a reflow. Streaming text sits in `textLabel` at the bottom; when a chip
+  arrives the text becomes that chip's `interim`, the same position on screen (the chip is appended
+  below it). It dims in place rather than jumping.
+- **`bubble.visible` is gated on `text || error`**, not on the turn existing — otherwise an empty
+  rounded rectangle sits under the chips for the whole length of a working turn.
+- Rejected alternatives, each for a reason worth keeping: a ChatGPT-style collapsible step list
+  (hides exactly what explains a failure, and here the user is watching an agent touch their own
+  desktop); discarding interim text (loses the *why* — "Nautilus wasn't focused" was the most useful
+  sentence of the run it came from); per-step cards and a left rail (both buy differentiation with
+  chrome the 300px panel cannot spare, and the unbubbled form gets it by removing chrome instead).
+
+#### Session persistence — the conversation survives a reload (2026-07-27)
+
+The daemon is a **child** of the shell, so `Super+Shift+R` took it down and the model's context with
+it. Both halves are now written to disk at the same turn boundary, each by whoever owns the data:
+
+| File | Owner | Holds |
+|---|---|---|
+| `$XDG_STATE_HOME/veltrix/agent/session.json` | `bin/veltrix-agent` | the neutral `history` (model context) |
+| `$XDG_STATE_HOME/veltrix/agent/transcript.json` | `core/AgentService.ts` | the `transcript` (bubbles) |
+
+**Not `~/.config/veltrix/`, and this overrides the house "all user state is JSON under
+`~/.config/veltrix`" convention** — that directory is a git repo now (the write tools' undo history),
+so a conversation persisted there gets committed permanently into a repo the user never asked for. A
+conversation is not configuration; the shell log already lives outside `~/.config` for the same
+reason. Directory is 0700; the content is plaintext.
+
+Three details that are load-bearing:
+- **Written at the turn boundary only.** Mid-turn the history is inconsistent (a `tool_use` without
+  its result), and a provider rejects that on restore.
+- **The persisted history is the STUBBED view** (`historyForRequest()`), so prior turns' tool results
+  are not stored at full size — they are already omitted from every request. `load_skill` results are
+  exempt, so a restored conversation keeps its rules instead of silently losing them.
+- **`reset()` deletes BOTH files from the shell side.** The daemon clears its own on `{t:"reset"}`,
+  but it is spawned lazily, so "New conversation" on an idle desktop reaches a daemon that is not
+  running — `writeLine` returns false, the UI empties, and the next message resurrects the thread the
+  user just discarded. The shell owns the session LIFECYCLE; the daemon owns its file's contents.
+
+A turn **in flight** is still lost — see `tech-debt.md` #37(g); fixing that means making the daemon a
+systemd sibling rather than a child, and is deferred until tier 2 needs it.
+
+#### The file layer ("tier 1") — the ONE thing that is not `veltrix-ipc`
+
+Added 2026-07-27. Six tools implemented **inside the daemon** with GLib/Gio rather than as IPC
+actions: `read_file` · `list_dir` · `search_files` · `edit_file` · `write_file` · `load_skill`.
+
+**Why it breaks the "everything through the gated surface" rule, deliberately:** external MCP
+clients already bring their own file tools, so there is nothing for `veltrix-mcp` to inherit; and
+pushing file contents through the `ags` socket would put blocking I/O on the shell's main loop for
+no gain. Do not "fix" this by promoting them to IPC actions.
+
+**No bash, and this is not a step towards it.** Reading a file is a syscall — five of the six touch
+no subprocess at all. `search_files` spawns `grep` with a **fixed argv**; `Gio.Subprocess.new()`
+takes an array and never invokes a shell, so the model supplies data, never a command.
+
+**Two frontiers, different shapes on purpose** (`resolvePath(raw, mode)` is the single door):
+
+| | |
+|---|---|
+| **READ** — prefix roots | `~/.config/veltrix`, `~/.config/uwsm`, `~/.config/hypr`, `/usr/share/veltrix`, plus the shell log (both spellings of `veltrix-ui`'s `${XDG_RUNTIME_DIR:-/tmp}` fallback). NOT the rest of `$HOME`: whatever it reads goes to the model provider, so this is a privacy boundary too. Symlinks ARE followed — in `--dev`, `/usr/share/veltrix/config/hypr/hyprland.lua` is a symlink into the repo. |
+| **WRITE** — exact 3-file allowlist | `~/.config/veltrix/hyprland-user.lua` (+ the legacy `~/.config/hypr/` one), `~/.config/veltrix/hypridle.conf`. Symlinks refused here. |
+
+Paths are `GLib.canonicalize_filename`'d **before** the prefix check, so `~/.config/veltrix/../../.ssh`
+resolves and is refused rather than sneaking past.
+
+**The write frontier grants DEFERRED EXECUTION and there is no way around it** —
+`hyprland-user.lua` exists to hold `hl.exec_cmd(…)`, `hypridle.conf` holds `on-timeout` commands. That
+is inherent to "add me a keybind", not a hole, but it means tier 1's property is **"nothing
+invisible"**, not "cannot execute": everything scheduled is legible plain text, gated, and revertible.
+Hence `allowFileWrite` defaults **OFF** (like computer-use) while `allowFileRead` defaults **ON** (like
+screenshot — Veltrix reading Veltrix). Write implies read; revoking read revokes write.
+**`~/.config/uwsm/env` is readable and deliberately NOT writable**: `LD_PRELOAD` there is straight
+privilege escalation.
+
+**Every settings JSON is absent from the write list, and the reason is a real bug class:**
+`AgentConfig.save()` serialises the whole in-memory `_settings` on every change and **no config JSON
+has a `FileMonitor`** — so a hand-edit survives until the next settings change and is then silently
+overwritten. `set_config` is the only correct door. This is also why `skills/customize/SKILL.md` leads
+with it.
+
+**Three invariants enforced in code, not documented and hoped for:**
+- The `-- @autostart start/end` block of `hyprland-user.lua` belongs to Settings → Apps → Autostart
+  (`Autostart.tsx:writeEntries` re-reads from disk and splices only that region). Both write tools diff
+  the block before/after and refuse — an edit inside it would vanish days later with nothing linking
+  cause to effect.
+- `write_file` refuses to overwrite a file not read this session (`readThisSession`, cleared on
+  `reset`). `edit_file` needs no such check: knowing the exact text to replace IS having read it.
+- `edit_file` requires a **unique** match; an ambiguous anchor edits a line nobody was looking at.
+
+**Git-backed undo.** `~/.config/veltrix` becomes a git repo on the first assistant write; every write is
+a commit; identity passed per-invocation so it works with no global git config; failures are logged and
+never fail the write. **The baseline commit MUST happen before the file is written** — the first
+implementation initialised after, which committed the already-changed file as the baseline and made the
+assistant's very first action the one thing that could never be undone.
+
+**Skills** (`skills/<name>/SKILL.md`, resolved dev-checkout-first via the `.dev` marker exactly like
+`readShellVersion`, else `/usr/share/veltrix/skills`). Progressive disclosure is mandatory, not a
+refinement: this very skill is ~100k tokens across its references — right for a developer's agent,
+unusable where every token rides on every step of every turn. So `load_skill`'s description carries
+only names + one-line descriptions and the body is fetched on demand. **Shipped by BOTH install paths**
+— `install.sh` and `packaging/veltrix/PKGBUILD`; forgetting the PKGBUILD line leaves `load_skill`
+quietly absent for every package user while working perfectly on the maintainer's machine.
+
+**`reloadHyprland`** (`HyprlandState.reloadConfig`) exists because a config edit previously had no way
+to be applied: the shell listened for `configreloaded` and nothing could provoke it. It bypasses
+`_dispatch` on purpose — `reload` is a top-level `hyprctl` command, not a dispatcher.
+
+**Cost, measured 2026-07-27** — the fixed per-request prompt roughly doubled: `sys` 1687→2688 b,
+`tools` 3893→7543 b, i.e. **≈ +1163 tokens on every step of every turn**. Mostly recovered by the
+existing cache breakpoints, but the compat path was observed at `cached=0` on the first step of each
+turn (implicit cache expiring between turns). The two path lists inside `read_file`/`edit_file`
+descriptions are the biggest single addition and are the first dial to turn if this needs shrinking —
+they buy the absence of a guess-and-retry round-trip.
+
+#### Computer-use — the same helpers, but only while the gate is on (2026-07-27)
+
+The Assistant reaches third-party apps through the **same four helpers** MCP uses
+(`veltrix-a11y`/`veltrix-act`/`veltrix-type`/`veltrix-click`, see the next section), with the **same
+tool names and parameters** (one addition: `query_app` takes a `match` — see the projection below).
+One vocabulary for the project: a verb added to the wrapper lands in both consumers with the same
+shape, and the section below documents both.
+
+Five things are specific to this consumer and are the whole content of the work:
+
+- **The gates decide what is OFFERED, not only what is refused.** `buildToolset()` appends
+  `query_app` only while `allowComputerUse` is on, and the ten action tools only while
+  `allowComputerControl` is too. Both ship OFF, so the common case pays nothing — measured on the
+  CI shell: fixed prefix **8,472 b → 9,384 b** with perception (+912 b), **→ 17,400 b** with control
+  (**+8,928 b ≈ +2,200 tokens on every step**). That number is the reason for the conditioning, not
+  a footnote to it. Perception-without-control is a real state and is offered as one: look at an
+  app and report, touch nothing.
+- **The gate is re-read at the TURN BOUNDARY** (`syncComputerGate()` in `runTurn`), which drops the
+  cached toolset AND system prompt when it changed. Without that, a user who grants permission
+  mid-conversation keeps talking to an assistant that was never told. Deliberately not mid-turn:
+  rebuilding between two steps of one request chain produces a `tool_result` for a tool the
+  provider was never offered.
+- **`helperResult()` marks a refusal as a FAILED result.** Every helper prints one JSON object
+  (`{error}` / `{ok:false}` / `{ok:true}`); MCP relays it as text, but three things here read `ok`
+  and all three are wrong otherwise — the island's tool chip (it would settle as success), the
+  two-strike repeat guard, and the model.
+- **A real accessibility tree does not fit in a chat, and `query_app` is projected because of it.
+  This was proven by a live failure, not predicted.** Asked to toggle Nautilus's sidebar, the
+  Assistant queried the window, never found the control, and invented an action name. The button
+  was there and perfectly described — `id:"Show Sidebar"`, `role:"toggle button"`,
+  `actions:["click"]` — at **node 157 of 175, byte 55,313 of 60,367**: past the cap.
+  **A positional cut loses the wrong end** — GTK walks content first and chrome last, so a file
+  list fills the budget and the header bar, where the buttons worth pressing live, is what falls
+  off. Four changes, none of which makes anything unreachable:
+  - **`match`** (substring over name/text/role) — the lever the truncation notice names. An empty
+    match reports how many nodes WERE scanned, so "nothing matched" is distinguishable from "the
+    window is empty". A matched look costs **~256 b**.
+  - **`match` takes alternation** — `"a|b"` keeps a node matching either, so the two ends of a drag
+    are one call. Added because the model wrote `match:"cs.svg|Trash"` unprompted and got five
+    empty results against the old plain-substring test (live, 2026-07-29). A literal `|` in a name
+    loses; that is the trade.
+  - **`showing` on a match with ≤ 8 hits, plus the PRICE of the alternative.** A filtered query
+    that found little is one step from the whole-window dump, and the model cannot see what that
+    costs: measured 2026-07-29, one such fallback on Telegram put 37 KB into the history and rode
+    every later step — **~78k of a 125k-token turn**, spent to learn that the button is called
+    *"Buscar mensajes"* (the UI is in Spanish; the model had matched `"search"`). So the result now
+    carries the on-screen labels and a hint naming the dump's size in KB, instead of the old hint
+    that recommended `without match` while saying nothing about its cost. **Control-first, not
+    document order** — same head-cut trap one level up: on the live Telegram tree, document order
+    spends 18 of its first 19 slots on table cells, while a role filter gives 16 names, all
+    controls, 401 b, target second. **But control-first is an ORDERING, not a filter** — the
+    remaining slots fill with everything else labelish, because in a chat window the content is
+    noise while in a **file manager the content is the target** (Nautilus draws items as
+    `table cell`/`table row`; a role-only list offered "Open Trash" and not the file to drag onto
+    it, and the model paid a 21 KB dump for the other half). Filling costs Nautilus 406 → 729 b
+    and Telegram 401 → 743 b. MCP clients are unaffected — this lives in the daemon's projection,
+    and they get the raw tree.
+  - **Leaned nodes** — drop what carries no targeting information: `window` (the same string on all
+    175 nodes; hoisted to the top), `type` (a duplicate of `role` in every node observed),
+    `visible` (already in `states`), and the states every node has (`sensitive`/`showing`/…).
+  - **`path` trimmed** to its last two links, each capped at 48 chars. It is the heaviest field —
+    51 KB of Nautilus's 102, **348 KB of Telegram's 503** — because the chain repeats for every
+    sibling and an ancestor's name can BE the content (a Telegram list item's accessible name is
+    the whole message, ~900 chars, echoed down every descendant). This consumer never navigates by
+    path; it targets name + role + occurrence.
+  - **Repeated siblings collapse** — first 3 of each `path`+`role` run, then a count. A file
+    manager's hundred rows are one *kind* of thing. Document order is preserved: reordering would
+    cost the model the only spatial information a flat list still carries.
+
+  Measured after: **Nautilus 102 KB → 27 KB, Telegram 503 KB → 19 KB, both arriving WHOLE** instead
+  of cut at the header bar. Orientation fields (`window`, `count`, `of_nodes`, `match`, `hint`) are
+  emitted FIRST — a notice appended after 30 KB of nodes sits behind everything else in the result.
+  The cap here is its own (`MAX_A11Y_RESULT`, 32 KB, sized from those measurements) because a
+  window's controls are the whole point of the tool. MCP clients keep the raw tree — they have the
+  context and pay once per call.
+- **A tool description must not model the thing it forbids.** The same live failure had a second
+  half: `do_app_action` was sent `win.toggle-sidebar` — a plausible GTK action name the model had
+  never seen — aimed at a panel whose `actions` array was empty. The description had offered *"or
+  an app action like `view.show-hidden-files`"* as an example, which is an invitation to invent
+  one. It now says the action must be COPIED from that node's own `actions`, and that a node with
+  none is `click_app`'s job.
+- **The descriptions are re-authored, not copied, and the reason is not brevity.** THIS CLIENT HAS
+  NO EYES. The MCP wording sends an agent to a screenshot to read what the tree cannot show; here
+  that is advice to stare at a PNG it will never receive. So `hover_app` says a tooltip's text is
+  unreachable *and to say so*, the `*_at` tools say coordinates come from a node's bounds and never
+  a guess, and the gated prompt block states once that `run_action screenshot` returns a **path**,
+  not a picture. Cross-cutting rules (focus first, preference order do_app_action → keyboard →
+  pointer → coordinates) live in that prompt block instead of being repeated in eleven schemas.
+
+Covered by CI (`agent-loop` scenario 4): both gate states, the positional argv handed to
+`veltrix-click` (`role` omitted + `occurrence` given must pad with `""`, or the occurrence lands in
+the role slot and filters for a control whose role is `"2"`), the refusal-honesty flag, and every
+half of the projection. Its stub tree is the shape that broke it live — a long run of identical
+rows FIRST and the control the user asked for LAST — and the load-bearing assertion is that **the
+control after the list survives**. Each assertion was verified to FAIL when its line is removed,
+which is the only reason to believe any of them.
+
+### The computer-use layer (third-party perception + action)
+
+The agent surface above is the shell controlling **itself**. The computer-use layer is the jump
+to perceiving and driving **any** third-party app. **Two consumers, one surface:** `veltrix-mcp` for
+external agents and the built-in Assistant (above) — both spawn the same helpers with the same
+verbs, and the helpers are where every gate, focus check and kill-switch re-check lives. Add a verb
+here and it is one wrapper mode + one tool in each consumer. Phase 1 — perception, read-only:
+
+> 🔑 **The helpers ask the compositor through `bin/veltrix-wm`, never `hyprctl`** (#682, since
+> 2026-10-01): `veltrix-wm activewindow|clients|monitors|cursorpos` answers in Hyprland's JSON
+> shapes from whichever compositor runs — on Hyalo, built from its IPC — so the helpers did not
+> change what they read. Where the text below says `hyprctl activewindow` (most of it was
+> measured on Hyprland), read `veltrix-wm activewindow`. The injectors are protocol clients and
+> work on both: `veltrix-input` (zwlr_virtual_pointer_v1, implemented by Hyalo in
+> `protocols/virtual_pointer.rs`) and `wtype` (zwp_virtual_keyboard_v1, Smithay's). CI's
+> compositor-boundary check fails any script in bin/ that runs `hyprctl` (only veltrix-wm, and
+> veltrix-doctor's version line, may).
+
+- **`bin/veltrix-a11y`** (standalone GJS, `gi://Atspi`; same no-Node pattern as
+  `veltrix-mcp`/`veltrix-portal`) reads an app's **AT-SPI2 accessibility tree** and prints
+  it in the **same flat `UINode` shape as `queryUI`** (additive a11y fields: `role`, `states[]`,
+  `actions[]`, and `shortcuts[]` when present). `veltrix-a11y` (focused window, resolved via
+  `hyprctl activewindow`) or `veltrix-a11y <app-name>`. Read-only: it lists available action
+  *names* but invokes none. **`shortcuts[]`** = the AT-SPI key bindings (accelerators) of a
+  control's actions, e.g. `["Control+X"]` — often the *only* semantic handle on a label-less
+  control: **GTK4 popover-menu items expose no accessible name/text** (verified: `name`/`text`/
+  child node all empty), but they DO carry their accelerator, so `Control+X`⇒Cut, `F2`⇒Rename,
+  `Delete`⇒Move to Trash. Items with no accelerator (e.g. "Move to…") still need vision —
+  this is the **hybrid** at work (AT-SPI for structure + shortcuts + the `focused` state for
+  navigation tracking; screenshots read the labels AT-SPI hides). Carries `UITree.ts`'s password
+  redaction; caps nodes/depth + a soft deadline (AT-SPI calls are sync D-Bus and can hang — that's
+  why it's a separate process, never the shell's main loop).
+- ⚠️ **Every helper reads its gate through `aiSetting(key)`, six standalone copies** (`veltrix-a11y/act/click/type/mcp/agent`), each a fresh `Gio.Settings` so a gate flipped a moment ago answers. No schema installed reads as `undefined` = every gate OFF (fail-closed since the Phase 0 fix; a missing schema never grants a capability). `scripts/ci/same-app-check.mjs` fails when one copy differs.
+- **Gate: `org.veltrix.ai allow-computer-use`** (Settings → AI → "Allow Agents to See Other Apps"), the
+  **only gate that defaults OFF** — it reaches outside the shell (privacy-sensitive, ≈ the
+  screenshot gate). Enabling it (via `AgentConfig.setAllowComputerUse`) also turns on
+  `toolkit-accessibility`, since the capability is useless while a11y is globally off. Re-read
+  live by both `veltrix-a11y` and the `query_app` MCP tool.
+- 🔑 **Targets are resolved WITHOUT enumerating the desktop** (2026-09-07, #476 / #419 / #420).
+  Resolving *any* child of the AT-SPI desktop opens a peer-to-peer D-Bus connection to that
+  application, and the app's ATK bridge refs it into `spi_global_app_data->direct_connections`
+  and **never registers a disconnect handler** (`at-spi2-core 2.60.6`, `atk-adaptor/bridge.c:684`;
+  the list is only freed when the app exits). So each connection strands **3 pidfds in the queried
+  app, for life** — `libdbus` opens one via `SO_PEERPIDFD` and dups it twice during the SASL
+  handshake. It is **upstream and we cannot close them: we can only not open them.** The old
+  `selectTargets()` compared the filter in the innermost loop, so five queries for an app that does
+  not exist still cost +15 fds in the polkit agent and +5 `AtSpiAdaptor` warnings from Telegram.
+  The three AT-SPI binaries now discover candidates over **raw D-Bus instead**: `GetChildren` on
+  the registry root for the bus names, then `GetConnectionUnixProcessID` — **answered by the bus
+  daemon, not by the application** — and the PID is crossed with `hyprctl clients -j` (class) and
+  `/proc/<pid>/{cmdline,comm}`. Only the app that matches is ever resolved through `Atspi`. Same
+  five queries now cost **+0 fds and +0 warnings**. `veltrix-click` needs no discovery at all: its
+  focus gate already ran `hyprctl activewindow -j`, so it looks up the index for that one PID.
+  `bin/veltrix-type` never touches AT-SPI (its `hyprctl` code is the focus HINT, not resolution).
+- ⚠️ **Two things that follow from it, and both bite.** (1) `desktop.get_child_at_index(i)` sends
+  `GetChildAtIndex` to the same registry array `GetChildren` returned, so the index is right — but
+  an app registering or dying between the two calls shifts it, and you would walk the neighbour's
+  tree under the requested app's name. The guard is `app.get_process_id()`, which asks the **bus
+  daemon** and therefore costs 0 fds; on mismatch the fast path is abandoned and the classic
+  enumeration runs. (2) 🔑 **The filter no longer compares against AT-SPI names at all** — only
+  Hyprland classes and process names — because reading an app's AT-SPI name up front is exactly
+  the round-trip that opens the leaking connection. `sameApp()` is what bridges the spellings, and
+  `apps[]` on a miss is built from the same three passive sources.
+- ⚠️ **The 500-node cap is a TRAP when you are using the tree as an instrument.** `MAX_NODES` is
+  the whole dump, not per window, and a `GtkListBox` allocates every row whether or not it is
+  scrolled into view: the installer's 249-country list alone is ~500 nodes, so everything built
+  after it — the card below the list, the footer's buttons — simply is not in the output. Measured
+  2026-09-03, and it cost a wrong conclusion: "no combo boxes and no Continue button" read as a
+  half-built page, while the screenshot showed both. **Absent from the dump is not absent from the
+  screen.** Cross-check with `veltrix-ipc screenshot` before believing a negative.
+- ⚠️ **When a click at those bounds does nothing, drive the control with the keyboard instead.**
+  Same session: the footer button and its label were both reported at the same origin, and clicks
+  landed a few pixels outside it while the tall list rows in the same window took clicks perfectly.
+  `veltrix-type key <app> Tab` in a loop, reading `focused` from the tree after each press, then
+  `Return` — it reaches the control by the same route a person without a mouse would.
+- **Coverage caveat**: GTK4 exposes its tree on Wayland regardless; Qt needs `QT_ACCESSIBILITY=1`
+  (which `allowComputerUse` triggers via `toolkit-accessibility`, so Qt shows a "screen-reader
+  mode" banner); Chromium/Electron need `--force-renderer-accessibility`; the rest fall back to
+  `screenshot` (vision). AT-SPI screen coords are unreliable on Wayland → bounds are
+  **window-relative**.
+- **Terminals: the EMULATOR publishes the tree, not the program inside it.** A VTE terminal
+  (`gnome-terminal`) exposes its visible screen as ONE node, `role: "terminal"`, whose `text` is
+  the screen — so an agent can read a TUI, including another coding agent's session. **kitty
+  publishes no tree at all** (absent from the registry, not empty), so there is nothing to read
+  there and no filter will find it. **No scrollback** either way: only the visible grid.
+  Three things about that node that are not guessable and cost real time:
+  - **The cap cuts by the TAIL for grid roles** (`TAIL_FIRST_ROLES`), because a terminal's newest
+    output and its prompt are at the BOTTOM. Head-first truncation is the same
+    positional-truncation failure as the node budget losing Nautilus's header bar: it returns a
+    stale screen and no way to tell. The notice states the loss and names no lever — there is none.
+  - **⚠️ `get_character_count` OVER-REPORTS on VTE** (measured 5535 against a `get_text(0, n)`
+    returning 4925: it counts screen CELLS, the text drops per-line trailing blanks). Usable as
+    the upper bound of a range request and **nothing else** — an offset derived from it lands past
+    the real end and AT-SPI answers with an **EMPTY STRING, not an error**, i.e. `text: null` with
+    a silent stderr. Take a tail by fetching the node whole and slicing in JS.
+  - **Grid text is per-line rstripped** (1402 of 5432 chars on one screen were width padding).
+    Lossless on a grid, so it buys back a quarter of the budget; **not** applied to plain text
+    widgets, where a trailing space can be something someone typed.
+- **A control ADOPTS the value it displays (`foldValueCarriers`).** GTK4 puts a control's text in a
+  CHILD — a combo box's entry, a spin button's field — so flattened it lands as `text: null` on the
+  control plus a separate anonymous node, tied to it by nothing but geometry. Any role filter then
+  keeps the control and drops the carrier: `match:"combo box"` answered with seven nameless boxes and
+  the value nowhere, the model reported the text "not available through the accessibility interface"
+  with it ONE NODE AWAY, and recovering cost a 23 KB whole-window dump (bench, 2026-08-01). A control
+  with nothing to read now adopts the text/value of a descendant that fills it, and that descendant is
+  dropped.
+  - **Containment, NOT equality** — the same lesson as `collapseContained`, and getting it wrong cost
+    a debugging pass here too: a combo box is 405 px wide and its entry 369, because the arrow takes
+    the rest. The test is "inside the host and ≥ half its area"; the area floor is what stops a list
+    item in a scroll pane from being read as the pane's value.
+  - Only ANONYMOUS descendants fold (one with an accessible name is addressable in its own right),
+    and the action helpers walk the live AT-SPI tree themselves — nothing here can make a control
+    unreachable.
+  - **It does not manufacture coverage.** A plain `GtkDropDown` showing "Left" is, verified raw,
+    panels all the way down with no name and no text anywhere: the value is simply not in AT-SPI.
+    There the honest answer really is "I cannot see it", and that is what the model will get.
+- **A name-addressed tool must name the coordinate-addressed one.** `do_app_action` aims by accessible
+  name, and an app can be full of controls that have none (GTK4's own widget factory: nameless
+  switches, combo boxes, tabs). No wording about picking a *better* name can rescue that — on the
+  bench the model spent three steps here, twice sending an EMPTY node name. Both the miss and the
+  omitted-node case now point at `click_at` + the `bounds` from `query_app`. An omitted argument is a
+  SIGNAL (the caller had nothing to give), not a slip; restating the signature just buys a third try.
+- **ONE APP WEARS THREE NAMES, and every helper must answer to all three.** Hyprland's class
+  (`org.gtk.WidgetFactory4` — what `list_windows` and `launch_app` hand back), AT-SPI's app name
+  (`gtk4-widget-factory` — what `query_app` sees) and the `.desktop` name (`Widget Factory`). The
+  invariant is **`sameApp()`, duplicated verbatim in `bin/veltrix-{a11y,act,click,type}`** (they are
+  standalone scripts, each copied to `/usr/bin` on its own — there is no shared module, so the
+  comment marks them as copies; change one, change all four). `AppService.nameTokens` in the shell
+  is the same rule in TypeScript. It runs as a **rescue after a strict substring miss**, so an exact
+  filter keeps meaning exactly what it meant, and app selection is decided on NAMES BEFORE the tree
+  is walked — the rescue never costs a second walk.
+  - Order: exact/substring → **token-set subset** → bare-letters containment.
+  - **Tokenize the ORIGINAL string, never a lowercased one.** The word breaks of `WidgetFactory`
+    live in its capitals; lowercasing first fuses it to one token and the match fails. This is the
+    bug the deterministic test caught while writing the fix — `sameApp` had it internally.
+  - Subset, not equality, is what makes a **superset query** work (`GTK Widget Factory` ⊇
+    `Widget Factory`) — which is how users and window titles actually name things.
+  - The bare-letters pass exists because `hyprctl activewindow` hands us an **already-lowercased**
+    class, where the camelCase seams are gone for good.
+  - Why it matters, measured on the bench 2026-08-01: `query_app` accepted only the AT-SPI name and
+    `click_at` only the Hyprland class, so **no single string drove both halves** and the model tried
+    four names for one app — six wasted steps in one turn. Perception and action must be aimable by
+    the same string or the loop cannot close.
+- **A perception result is a SNAPSHOT and the tool has to say so** — measured twice with the
+  same model, which is what rules out model tier. Fresh conversation: it called `query_app` and
+  answered correctly. Same question with an earlier `query_app` in history: **`steps=1 tools=0`**,
+  no call at all, answered from the stale copy while the answer sat on the live screen. Reusing it
+  is *reasonable* — a file read stays true until something writes, and the daemon models exactly
+  that (`readThisSession`, invalidated in `writeFile`). A screen has **no write to hook**: it goes
+  stale on its own, so no mechanism can mark it and the DESCRIPTION carries the rule ("snapshot of
+  one instant, call it again before answering about now"). Kept in parity in `veltrix-agent` and
+  `veltrix-mcp`. **Any new volatile perception tool needs the same sentence** — and note the shape
+  of the lesson: the truncation notice that named a lever the tool did not have made things worse,
+  so a caveat must always name the lever that works.
+
+Phase 2a — **action, deterministic only (built)**:
+
+- **`bin/veltrix-act`** (standalone GJS, `gi://Atspi`; SEPARATE binary from `veltrix-a11y` so
+  perception stays read-only) invokes a **named AT-SPI action on a named accessible** via
+  `atspi_action_do_action(i)` — `veltrix-act <app> <node-name> <action> [role] [occurrence]`.
+  **No coordinates, no synthetic input**: it targets the accessible directly, so it is auditable
+  and **not focus-dependent** (sidesteps the focus-race class of bug). The agent perceives a node
+  (name + `actions[]`) with `query_app`, then acts by name with `do_app_action`. GTK4 exposes
+  rich actions (incl. its GActions: `win.go-home`, `view.show-hidden-files`…); Qt often exposes
+  only `SetFocus` (focus yes, click no — clicking Qt waits for synthetic input, Phase 2b).
+- **Gate: `org.veltrix.ai allow-computer-control`** (Settings → AI → "Allow Agents to Control Other
+  Apps"), a **second** default-OFF gate distinct from perception. Enabling it (via
+  `AgentConfig.setAllowComputerControl`) also enables `allowComputerUse` — you can't drive what
+  you can't see. The effective check is `allowComputerControl && allowComputerUse`, re-read live
+  by `veltrix-act` and the `do_app_action` MCP tool.
+- **CC banner** (the bar badge is GONE, see below): the model + its consumer live in
+  `surfaces/bar/StatusIndicators.tsx` (`ccStatusBanner`). Since 2026-08-02 the registry
+  holds **AI control only** — it is the home of PERMISSIONS THE CC HOLDS THE SWITCH FOR (mic,
+  camera, screen-share when they get source detection), not of activities. Recording left in two
+  steps and both are the same lesson: **the badge means "the Control Center has something for
+  you", so an indicator whose CC surface may not exist must not light it.** A capture is fully told
+  by the Activity Island (pill + ticking clock, always on screen), and the only CC thing about it
+  is the screenrecord tile, which is opt-in (`defaultInCc: false`) and can live in the BAR ONLY —
+  the badge was pointing at a panel that might say nothing, and it even brightened armed→active
+  when a capture started, promising an escalation with nothing behind it.
+  Until 2026-09-27 a small red **badge** on the bar's Control-Center button signalled it (subtle
+  armed, full active). The owner removed it: AI control is told ONLY by the CC banner until what
+  the bar should show is decided — no platform has prior art for it. The CC button is to gain a
+  small second icon for PRIVACY instead (sensors, location), macOS-style: ONE mark beside the
+  Control Centre, camera > system audio > mic by priority, an arrow for location, the detail at
+  the top of the CC (Apple Support, "Use Control Centre on Mac"). The banner card is a **Cairo
+  SquircleContainer** (`Shape.CAPSULE`, BaseIsland's padding/border/inset numbers, `GRID_WIDTH`
+  size request on the CAPSULE and `halign END` to share the grid's right edge), NOT a CSS card, and
+  it is deliberately not given `.cc-island` — that class carries
+  `.cc-island button { @include veltrix-reset }`, which matches `button.veltrix-btn` at EQUAL
+  specificity and, `_control-center` being imported after `_components`, would strip the Stop
+  button's background and border. The action tools (`veltrix-act`/`veltrix-type`/`veltrix-click`)
+  ping `veltrix-ipc notifyComputerAction` on success → `AgentConfig.pulseComputerAction()` flips the
+  transient `computerActing` flag (auto-decays). Opening the CC shows a **status banner above the
+  widgets** (`ControlCenter.tsx`) with a row per active indicator + a **Stop** button — **that is the
+  kill switch**. Mouse-revoke is **2 clicks** (open CC → Stop) by design; the one-key kill switch is
+  `Super+Shift+Esc` (`config/hypr/hyprland.lua` → `veltrix-ipc disableComputerControl`). ⚠️ With
+  the badge gone, nothing OUTSIDE the CC says the agent may act while control is granted — a known
+  gap the owner accepted on 2026-09-27 while the bar's mark for it is undecided (tech-debt #17).
+Phase 2b-i — **synthetic keyboard (built)**, for controls AT-SPI can't reach (Qt text fields;
+Qt buttons that only expose `SetFocus` → focus then press Enter/Space):
+
+- **`bin/veltrix-type`** (standalone GJS; wraps **`wtype`**, the Wayland-native
+  `zwp_virtual_keyboard`, no daemon; SEPARATE binary, synthetic input never lives in the perceive
+  or AT-SPI-action helpers). `veltrix-type text <app> <string>` /
+  `veltrix-type key <app> <keyspec>` (`Return`, `Tab`, `ctrl+a`, `ctrl+shift+t`; `super`→`logo`).
+  MCP: `type_text` / `press_key`. The loop: `query_app` → `focus_window` →
+  `type_text`/`press_key`. **Two different kinds of focus, and confusing them cost a step in a
+  live run (2026-07-28):** the WINDOW must be Hyprland's active one and `focus_window` is the only
+  verb for that — `do_app_action … SetFocus` cannot do it. Focusing the CONTROL with `SetFocus`
+  works only where the toolkit exposes that action (Qt usually does; **GTK4 usually does not** — it
+  dropped ATK, `Component.GrabFocus` returns false and many nodes carry an empty action list). To
+  put a NUMBER in a field, don't aim a keyboard at all: `do_app_action … set-value=N`.
+- **Same gate as 2a** (`allowComputerControl` + the 2a indicator/kill switch) — no new toggle.
+- **SAFETY — focus-dependent**: `wtype` types into whatever window has focus (unlike `do_action`).
+  So `<app>` is **required** and `veltrix-type` **verifies it is Hyprland's active window**
+  (`hyprctl activewindow`) before injecting, refusing otherwise — a keystroke can only land in the
+  named app while it is actually focused. This is the deliberate mitigation for the focus-race
+  class of bug.
+- **`focusWindow <window>` IPC + `focus_window` MCP tool** — raise/focus a window (by address or
+  class) so it becomes the active window (the **precondition** for the keyboard). Unlike the other
+  computer-use tools, this is a **shell IPC command** (it reuses `HyprlandState.focusWindow`, the
+  same path the dock uses on a running-app click — `hl.dsp.focus({ window = 'address:…' })` via
+  `hyprctl dispatch`; the classic `hyprctl dispatch focuswindow class:X` is rejected by our Lua
+  config). **Ungated** — it's a window-manager op (see "Window & workspace management" above), as
+  benign as a dock click; the keyboard/pointer tools it feeds stay gated and focus-verified. The
+  full autonomous loop:
+  `focus_window telegram` → `do_app_action telegram "<field>" SetFocus` → `type_text telegram "…"`
+  (the middle step is the **Qt** case; on GTK4 it usually fails — go straight from `focus_window`
+  to `type_text`, or use `set-value` for a number). A refusal from `veltrix-type`/`veltrix-click`
+  now carries the target window's **address** in `focus`, so recovery is one `focus_window` call
+  and not the `list_windows` → `focus_window` → retry that a live run spent three steps on.
+
+Phase 2b-ii — **synthetic pointer (click, right-click, scroll, drag), built**, for what AT-SPI/keyboard
+can't reach (canvas, no-a11y surfaces, list items/tabs that need a real click, context menus,
+scrolling off-screen content, drag-and-drop / rubber-band selection / sliders):
+
+- **`bin/veltrix-input`** — a tiny **C** Wayland client (`zwlr_virtual_pointer_v1`, no daemon/uinput)
+  compiled by `install.sh` (`wayland-scanner` + `cc` on `wlr-protocols`' XML; only the `.c` is
+  committed, the binary is git-ignored). A **dumb injector**, verbs:
+  `move|click|rightclick <x> <y> <w> <h>`, `scroll <x> <y> <w> <h> <dx> <dy>` (signed wheel notches,
+  `dy>0`=down, `dx>0`=right — emitted as `axis_source(WHEEL)`+`axis`+`axis_discrete` frames, 15
+  units/notch, the wlroots wheel convention), and `drag <x> <y> <w> <h> <x2> <y2>` (press at (x,y),
+  glide to (x2,y2) over interpolated motion steps with small real-time gaps, release — the gradual
+  travel is what trips drag-threshold/DnD detection; a press→jump→release does NOT register). All
+  output-relative logical coords + the output's logical extent. All protocol verbs are available at
+  manager **version 1** (what we bind) — adding right-click/scroll/drag needed **no install.sh /
+  protocol-version change**.
+- **`bin/veltrix-click`** (GJS, sibling of veltrix-act/veltrix-type) owns the smarts: gate +
+  focus-verify, AT-SPI node resolution (centre) or a window-relative point, then the **coordinate
+  mapping** — `global = window.at + rel` (AT-SPI window coords are logical, like Hyprland's `at`);
+  `output_rel = global − monitor.xy`; `extent = monitor.{w,h} / monitor.scale` (hyprctl `w/h` are
+  physical). **Every verb has both forms** — `*-app` names an AT-SPI node, `*-at` takes a
+  window-relative point: `app`/`at` (left-click), `rclick-app`/`rclick-at` (right-click),
+  `hover-app`/`hover-at` (pointer move, no button), `scroll-app`/`scroll-at` (scroll, with
+  `<dx> <dy>` notches), `drag-app`/`drag-at` (two nodes / two points). The CLI mode name is the
+  wrapper's vocabulary and `MODES[mode].action` is the injector's — they differ where the
+  user-facing verb is clearer (`hover-*` → the C verb `move`). MCP: `click_app`/`click_at` take a
+  `button` (`"left"`/`"right"`); `scroll_app`/`scroll_at` take `direction` (up/down/left/right) +
+  `amount` (notches, default 3), mapped to dx/dy by the server; `drag_app(app, from_node, to_node)`
+  with per-end `from_role`/`from_occurrence`/`to_role`/`to_occurrence`, `drag_at(app, from_x,
+  from_y, to_x, to_y)`.
+  **`hover-*` is not a lesser click.** It is the only way to reach state that does not exist until
+  the pointer is there — tooltips, hover-revealed controls, submenus that open on hover — so the
+  a11y tree cannot show it to you in advance. Read the tree AFTER hovering, **with one measured
+  exception: a GTK tooltip is drawn on screen but is not an accessible at all.** Verified live on
+  GTK4 (Nautilus, 2026-07-27): hovering its Back button rendered the tooltip in a screenshot while
+  the AT-SPI tree held **zero** tooltip-role nodes before *and* after. So a hover can reveal state
+  that a client without vision still cannot read — `screenshot` is the only way to that text.
+  Controls a hover *reveals* are ordinary widgets and do appear in the tree.
+  **Two more measured facts, 2026-07-29 (tech-debt #38 (l)) — a hover HOLDS, and what it reveals
+  may not exist for AT-SPI.** The pointer is never moved back: `hyprctl cursorpos` still reported
+  the target seconds after the helper exited, and the revealed panel stayed open indefinitely. But
+  a hover is not a state we keep — it is a consequence of **which surface owns the pointer**, so
+  the moment a full-screen shell region returns the app gets a pointer LEAVE and the popup closes.
+  That is exactly what the **Activity Island's input region** does when it comes back, re-stamped by
+  `InputYield`'s `end()` (until 2026-08-05 the same job was done by a full-screen dismissal catcher;
+  the surface still owns the pointer either way). Hence the
+  sequence the agent is taught: **`setIsland closed` → `hover_app` → `query_app` → `setIsland
+  agent`**. And the second fact: **a Qt popup is as invisible as a GTK tooltip** — Telegram's emoji
+  panel, open on screen, was absent from two independent walks of its tree (398 → 401 nodes, all
+  four new ones unrelated, one window throughout). This is why `hover_app` does NOT read the tree
+  inside the truce: it would have returned nothing.
+  **Correction (2026-07-27):** this file used to justify the absence of `drag-app` with *"a
+  two-ended gesture doesn't map cleanly to the single-node `*-app` shape"*. It maps fine — the
+  wrapper resolves both ends through the same `resolveNode()` before anything is pressed, and a
+  half-resolved drag is precisely what that ordering prevents. The real reason it was missing was
+  that nobody had written it.
+- **A control and the label INSIDE it are ONE candidate, not two** (`collapseContained`,
+  2026-07-31). GTK gives a labelled button two accessible nodes with the same name in the same
+  place; `resolveNode` counted both and refused — so on the bench **every** key press in
+  gnome-calculator (`8`, `×`, `=`) came back `ambiguous: 2 nodes … pass a role and/or occurrence`
+  and cost a round trip to re-ask, on a tree the model had already read. The collapse is by
+  **containment, not proximity**: a hit whose centre falls inside an earlier hit's bounds is part
+  of it (the walk is parent-first, so the control is the one kept). Verified both ways — the four
+  calculator keys now land first try, and the `=` in the display vs the `=` key, which do not
+  contain one another, are still correctly reported as two. `occurrence` therefore indexes DISTINCT
+  targets now, which is what a caller meant by it. `centreOf` carries `w`/`h` for this and they are
+  stripped before any candidate list is emitted, so the `{x, y, role}` shape is unchanged.
+  **Not covered by CI**: it needs a live AT-SPI tree, and `agent-loop`'s stub helpers never reach
+  the resolver.
+- **A keyspec failure now says what to do instead** (2026-07-31). `wtype`'s own `Unknown key '*'`
+  names what broke and not the next move, so the caller pays a round trip guessing — measured on
+  the bench, `press_key *` failed and the recovery (`type_text "*"`) was a whole extra step. The
+  key-mode failure appends that keysyms are NAMES (`asterisk`, not `*`) and that a literal
+  character goes through text mode. Same principle as the two above and as `settingsPage` (#68):
+  **an error that only names the failure costs a step; one that names the next move costs nothing.**
+- **A refusal states what it KNOWS, never what it inferred** (2026-08-01). The focus refusal used to
+  end `; it is not open — run_action list_windows to see what is` whenever it failed to find a
+  matching window. That is an inference from *our own* matcher missing, and on the bench it was
+  **flatly false**: the window was open AND focused, under another of its names. The model obeyed the
+  sentence — `focus_window`, then `list_windows`, both no-ops — and failed again, two steps. It now
+  says `no open window answers to that name`, which is the fact. Generalises past this one string:
+  **an error that names the next move is worth nothing if the move is wrong**, and a diagnostic
+  derived from a failed lookup must describe the lookup, not the world.
+- **Same gate + indicator + kill switch + focus verification** as the keyboard (clicking/scrolling
+  is position/stacking-dependent, so geometry is read FRESH right before injecting). First slice is
+  single-monitor.
+- **Coord mapping**: the **same logical-coordinate convention as the overview minimap**
+  (`common/WorkspaceSchematic.ts` — `logical = physical/scale`, position − monitor origin), which
+  is the in-shell, battle-tested reference incl. fractional scale (`veltrix-click` mirrors it
+  because it's a separate process). Verified exact here (scale 1: measured via `hyprctl cursorpos`;
+  AT-SPI window bounds align 1:1 with Hyprland's `at`, no CSD offset). Still **measure** on
+  fractional-scale / multi-monitor before trusting (per [[feedback_debug_verify_before_theory]]).
+- **Deferred (not built)**: multi-monitor output targeting (`create_virtual_pointer_with_output`) —
+  needs a second display to verify the per-output coordinate mapping.
+- **Still deferred (beyond drag + multi-monitor above)**: a per-app allowlist; the Prism assistant
+  as the perceive→act orchestration surface (Phase 3).
+
+**The agent-pointer visual (fake AI cursor)** — pointer actions are no longer invisible: a
+Cairo-painted cursor arrow (live accent fill + glass "AI" badge, `t("agentPointer.badge")`)
+plays the choreography on an OVERLAY layer-shell window per monitor
+(`surfaces/agent-pointer/AgentPointer.ts` — see architecture.md for the window-model exception).
+Only visible **during actions**: pop-in at the REAL cursor's position (MATERIALIZE hold so the
+eye locks on before anything moves), ease-in-out travel on a gently bowed bezier (~0.3-1 s,
+distance-scaled — deliberately hand-like, never a robotic zip), an effect keyed to the verb, then
+a ~4 s linger with a pulsing accent **halo** around the tip before fading (persistent state is
+already the bar's AI badge). **The effect must not lie about what the machine did**: a click
+ripples OUTWARD ("something left here — a button went down"); a **hover** gets the same ring run
+backwards, contracting onto the tip and docking into the halo's radius ("something arrived here"),
+and its halo skips the 250 ms ramp so the accent never blinks out at the moment of landing.
+
+**The real cursor is HIDDEN for the length of a choreography** (`cursor:invisible` via
+`hs.setRealCursorVisible()`), and this is not polish — it is the only available fix. The hardware
+cursor plane paints above every layer surface, so the fake arrow cannot be drawn over the real
+one; the halo was the first attempt and a live session rejected it (2026-07-27): what the eye
+follows is the cursor, and you saw the ordinary black pointer land on top of the arrow and then
+teleport between chained actions. There is no way to raise a layer above the cursor plane, so the
+other one goes. **The SHELL owns the hide, never `veltrix-click`** — that helper is short-lived and
+a crash between hide and restore would leave the user with no pointer. Every ending already passes
+through `hardHide` (fade complete, kill switch, `hideForLock`, 3 s orphan timeout), which is where
+the restore lives; `syncRealCursor()` derives the state from `isAgentPointerActive()` rather than
+counting calls, so a burst across monitors cannot strand it; and the factory restores once per
+shell start as unconditional insurance against a shell that died mid-action.
+**Consequence that made a latent bug expensive:** every `cancel` from `veltrix-click` must be sent
+with `wait`. An abort emits its JSON and returns, so a fire-and-forget spawn dies with the process
+and the choreography only ends on the orphan timeout. Measured: moving the mouse mid-action left
+the user with **no cursor for 5.3 s**, against 343 ms once the cancel is delivered, and ~1.1 s end
+to end (the remaining second is the travel — the wrapper only checks the physical cursor once the
+fake one has landed). During the linger the overlay polls `hyprctl cursorpos`
+(~2 Hz, idle phase only): if the user moves the real cursor > 24 px off the landing point it
+fades early — the user always wins, also during the linger. Visible over fullscreen. Key
+properties:
+
+- **Land→confirm protocol — the visual never lies**: `veltrix-click` reads `hyprctl cursorpos`
+  (baseline), then blocks on `veltrix-ipc agentPointer <kind> <gx> <gy> [gx2 gy2] [from bx by]`
+  — the request resolves when the fake cursor **lands** (~0.45-1.2 s incl. pop-in; inside the
+  helper's `timeout 2` bound). It then **re-checks the
+  gate** (the kill switch can fire mid-animation and now stops the injection inside that window)
+  and re-reads `cursorpos`: if the user moved the mouse **> 10 logical px** (euclidean), it
+  aborts with a readable `{ok:false}` error and sends `agentPointer cancel` **synchronously**
+  (fade, NO ripple) — **the user always wins**. Only if it actually injects does it send
+  `agentPointer confirm` (async, right before the injector spawns) → the ripple ≈ the real click;
+  a drag glides the fake cursor concurrently with the real 24-step drag (small cosmetic skew
+  accepted). `confirm` survives being async only because the injector spawns after it; if that
+  order ever changes it has to wait too, for the reason above.
+- **The visual is an ENHANCEMENT, never a gate**: `visual()` in `veltrix-click` is
+  try/catch + `timeout 2` — shell down or pre-agentPointer shell = silent no-op, injection
+  proceeds. Abort authority lives ONLY in `veltrix-click` (gate re-check + user-wins); the shell
+  overlay adds a 3s orphan timeout (helper died between land and confirm → fade out anyway).
+- **Gate parity (defense in depth)**: action kinds of the `agentPointer` IPC check
+  `allowComputerControl` in the shell too; `confirm`/`cancel` are ungated (they only finish an
+  animation). The kill switch (`disableComputerControl` / bar indicator / Settings → AI /
+  `Super+Shift+Esc`) hard-hides the overlay instantly via an `agentConfig.onChange` hook in the
+  factory; `hideForLock` cancels it too.
+- Verify with `dumpState.flags.agentPointer` (true while travelling/effecting/fading) and
+  `hyprctl layers` (`veltrix-agent-pointer` listed only while acting — unmapped at rest).
+
+### Adding a new IPC command
+
+1. Add the action to the typed `core/ShellActions` registry.
+2. Wire it inside `app.ts main()` (where the registry is populated).
+3. Add an entry to the `IPC_COMMANDS` table in `app.ts` — **with a real description**; that
+   string is the command's documentation (it's what `listActions` serves). Never grow a
+   parallel switch or a second command list elsewhere.
+4. Use it from `hyprland.lua` as `hl.dsp.exec_cmd("veltrix-ipc <yourCmd>")`.
+
+## `ShellActions` replaces `globalThis`
+
+Widget code uses the typed `core/ShellActions` registry. **Do not reintroduce `globalThis` coupling** — there used to be a pattern of stashing functions on the global object, and it's been intentionally removed. If you find yourself reaching for `globalThis` to break a dependency, the fix is almost always to add a typed entry to `ShellActions` and populate it from `app.ts main()`.
+
+## `hideForLock` / `showAfterLock`
+
+The lockscreen needs the shell out of the way while it's active. These two IPC commands hide all shell windows and restore them afterwards. Keep them symmetric — every code path that calls `hideForLock` must have a corresponding `showAfterLock` on the other side, or the shell becomes invisible after an aborted lock.
+
+## Overlay placement: inside the Bar window
+
+This is commandment #5 in `SKILL.md` but it's worth restating here because it's load-bearing for the whole state model:
+
+Overlays (CC, NC, Prism, SystemMenu, the Activity Island — capsule, chips and every mode — and the app grid) **live as children of the Bar's window** via `Gtk.Overlay`. They are NOT separate `gtk4-layer-shell` windows, with **no exceptions** since #708 point 3 (owner, 2026-10-06). Reasons:
+
+- Hyalo draws each surface's glass on its own, under all of that surface's content: pieces can only melt into one silhouette (capsule ↔ panel morphs, fusion, #705) within one surface, and a panel on a surface of its own over the bar is glass on glass.
+- Show/hide animations stay GTK-side via `common/ScaleRevealer.ts` / `common/MorphRevealer.ts`; on Hyalo the compositor paints the glass from the shapes they declare.
+- One window's input region and ONE focus grab (`barModal`), not one per surface fighting over a single compositor slot.
+
+If you find yourself making a new overlay its own window, stop and ask why. The few exceptions (Settings, About) are full top-level windows for separate reasons and don't follow the overlay state machine.
+
+**The island and the app grid had layers of their own until #708 point 3** — `veltrix-island` (2026-07-26, so its modes could blur the bar's capsules under them: Hyprland blurs what was composited BEHIND a surface) and `veltrix-app-grid` (2026-08-09, because Hyprland charged a layer's blur by its BOX). Neither reason holds on Hyalo. What the separation had cost, and is gone with it: two input regions (and the capsule's, measured, failing in ways the bar's constant strip cannot), two grabs whitelisting each other, CSS scoped to two windows, hiding the island by NAME for fullscreen and lock, and re-asserting the island's layer above the bar in overlay mode. **What replaced the island's reason** is the reference material's own rule — no glass on glass: a mode that grows over the bar's row fades the groups it covers (`ActivityIsland.coveredBy`, `MorphRevealer` companions).
+
+**Move the capsule WITH the modes — still load-bearing.** A first cut (2026-07) kept the capsule on the bar's surface and the modes on the island's: `compute_bounds` stopped resolving (it works inside one hierarchy only), and mid-morph both surfaces painted glass over the same pixels. Today the capsule's row (`islandHost`) and every mode revealer are children of the same `masterOverlay`.
+
+What you inherit when touching it:
+
+- **The capsule's row is centred, not full-width**: it is stacked ABOVE barBox, and GTK picks a box anywhere in its allocation — a full-width row would eat the groups' presses. A press on the row's own box, or on a chip faded to nothing while a mode is open, is the empty strip: `dismissOverlays()`.
+- **With the app grid open, the dock is a grab peer** (`gridPeers`, from `app.ts`), and only then: a peer is a surface the compositor will NOT dismiss on. The peer set changing under a held grab re-acquires it (`syncKeyboardMode`).
+- **The app grid over a fullscreen window** lifts the bar's surface to OVERLAY with the row hidden (`liftForGrid`), and drops it back once the grid has shrunk away.
+
+**Bar.tsx owns ALL overlay geometry**, not the surfaces themselves. `syncPanelMargins` in `Bar.tsx` sets each overlay's `margin_top`/`margin_start`/`margin_end` (and re-runs on dock-side changes); the surface modules just build content and align to a corner. Because each overlay is wrapped in a `ScaleRevealer`, **the wrapper IS the `cc`/`nc`/`systemMenu`/... variable**, so margins/alignment/input-region all operate on the wrapper transparently. Conventions: panels sit `SIDE_GAP` (4 px) from the screen edge — the CC is a panel whose CONTENT sits a further `CC_PANEL_PAD` in (design-system.md, "The Control Center is a PANEL") — (inset from the strip's edge, which reaches the screen; the capsules the panels used to hang flush with are gone since the strip, 2026-11-12). Gotcha: **the system menu must dodge a left-side dock** (`margin_start += dock.width`) and CC/NC/popups dodge a right-side dock — because the **dock is its own layer-shell window stacked ABOVE the bar window**, so an un-dodged overlay slides under it. Don't move positioning logic back into a surface module.
+
+**Panels are content-sized — never force a wrapper's height.** The layer-shell input region is unioned from these allocations, so any wrapper forced taller than its visible content (an old `height_request` on `nc`/`cc` did this) puts the empty remainder into the region — and the compositor then reads a press there as INSIDE the grab instead of dismissing. It bit identically in the catcher era for a different reason (GTK4 picking is geometric, so a transparent Box above the catcher still won the pick): one bug, both mechanisms. Also remember `height_request` can only RAISE a minimum — it never caps, so it's the wrong tool for a height budget anyway. The vertical budget (bar→dock gap, `applyPanelHeights`) is pushed into the surface and enforced by an internal `Gtk.ScrolledWindow` with `propagate_natural_height: true` + `max_content_height` (NC does this via a `setMaxHeight` function attached to its returned widget, the same pattern as WorkspaceOverview's `onOpen`): the panel hugs its content until the list overflows, then scrolls.
+
+**Outside-click dismissal is the COMPOSITOR's**, via `hyprland-focus-grab-v1` (`common/FocusGrab.ts`; mechanism and traps in `architecture.md` → "Focus grab"). The invisible full-screen `overlay-catcher` buttons that used to fake it are deleted (2026-08-05) and there is no fallback — a refused grab is a loud `console.error`, not a degrade. The bar's capsules stay clickable while a surface is open because the bar's own surface is inside the grab's whitelist, so clicking another capsule switches in ONE click; a press on the EMPTY strip between capsules is inside the whitelist too, so that dismissal is GTK's job (a bubble-phase gesture on `masterOverlay`). The pill guards in `Bar.tsx`/`AppTitle.tsx` check `cc_edit_mode` (pills inert while editing the CC), NOT `cc_open`.
+
+**Input-region staleness gotcha (CC edit mode).** `updateInputRegion` reads `widget.get_allocation()`, which only reflects a size change **after the next layout pass**. Nothing backs the region up any more (the full-screen catcher rect used to hide this by accident), so every panel needs an exact rect — and CC edit mode is the hardest case, because it is the one open state that takes NO grab at all (other windows stay interactive while editing), leaving the region as literally the only thing deciding what is clickable. Toggling edit mode also *resizes* the CC (content-height grid ↔ full 8-row board + Done pill), so a naive allocation-based stamp uses the pre-toggle size and everything the grid grows into — the Done pill included — is click-through (clicks fall to whatever window is underneath). Three pieces make it correct, and all three matter:
+
+1. **`measure()`, not just allocation**: in edit mode `updateInputRegion` unions the CC's *measured natural height* (reflects the resize synchronously) with its allocation, so the grown grid is clickable in the same frame.
+2. **`IslandGrid` flips `status.cc_edit_mode` AFTER its `rebuild()`** — measure() can only see the new size if the height requests were already updated when the notify fires. Keep that ordering.
+3. **Wayland input regions are double-buffered** — `set_input_region` only takes effect on the surface's **next commit**. A stamp that doesn't ride a visual change would sit pending until some incidental repaint (this read as "the Done pill stays dead for a while"), so `updateInputRegion` ends with `win.queue_draw()`. The `notify::cc-edit-mode` handler also re-stamps on a deferred one-shot (defer-a-frame idiom, as `showExpansion`) to settle the shrink direction when leaving edit mode.
+
+If you add another state change that both resizes an overlay and relies on per-widget region rects, follow the same recipe.
+
+**Keyboard focus for a keyboard-driven overlay → a FOCUS GRAB. Never `EXCLUSIVE`, never `ON_DEMAND`.** ⚠️ This section used to instruct the opposite; the layer-shell keyboard path was replaced wholesale by `hyprland-focus-grab-v1` (2026-08-06, `common/FocusGrab.ts`). **Every shell surface now rests AND opens in `KeyboardMode.NONE`** — bar, island, dock, app grid, agent-pointer — and takes the keyboard by acquiring a grab instead. Wiring an `EXCLUSIVE↔NONE` toggle into a new overlay does not merely duplicate a mechanism: `EXCLUSIVE` re-adds the surface to `m_exclusiveLSes`, and that list makes Hyprland **refuse to move window focus at all**, handing back the exact bug the migration removed (`tech-debt.md` §53).
+
+**Keyboard INSIDE the bar's panels (CC, NC, system menu, the pill expansions) — 2026-09-27.**
+The grab only hands the WINDOW the keys; a widget still has to receive them, and until this date
+none did — the panels could only be driven with the pointer. What `Bar.tsx` now does, and what a
+new bar panel joins by being passed to the same two helpers:
+
+- `focusPanel(panel)` on open: `win.set_focus(null)` then `panel.child_focus(TAB_FORWARD)`, in an
+  idle (a widget takes focus only once mapped). The null first matters: `child_focus` CONTINUES
+  from the current focus, so a control left focused in a closed panel shifts the start.
+- `keepFocusIn(panel)`: a BUBBLE-phase key controller on the panel for Tab/Shift+Tab/arrows.
+  Tab wraps inside the panel, an arrow with nowhere to go stops. Without it GTK walks on through
+  the whole window — measured: past the CC's last control Tab landed on the TRAY icons, behind a
+  panel still open. Bubble so a slider or an entry keeps its own arrows; still ahead of the
+  window's move-focus binding, which is the one that escapes. It sets `focus_visible` itself,
+  because it swallows the key GTK would have used to turn the ring on.
+- One window-level Esc closes whichever panel is open (bubble: an inner control, a CC detail,
+  the two edit modes each keep their own Esc first).
+- **CC edit mode entered from the KEYBOARD keeps the grab** (`Status.ccEditFromKeyboard`, set by
+  IslandGrid's Edit pill on Enter/Space). Edit mode deliberately releases the grab so the desktop
+  stays usable while tiles are dragged — right for the pointer, but a keyboard user lost the keyboard
+  on the spot (measured: focus → nothing). Esc in edit mode is "Done" (IslandGrid), not "close".
+- On grab release `win.set_focus(null)`: a closing panel hands GTK's focus to the next focusable
+  widget, which is a bar icon, and with the window still focus-visible it kept the ring.
+- **Opened from a key bind** (`veltrix-ipc toggleCC keyboard`, Super+C / Super+N): the Super+…
+  went to Hyprland and never reached GTK, so the window is not focus-visible and the first
+  control would hold the focus with no ring. `status.keyboardEntry` (a plain field, not a
+  property) carries "this open came from the keyboard" for one turn; `focusPanel` reads it,
+  clears it and sets `focus_visible`.
+
+**The bar itself — Super+Ctrl+B (`veltrix-ipc focusBar`, `Status.bar_keyboard`).** A walk of the
+bar's items, macOS's Ctrl+F2 with the desktop's modifier (Ctrl is the APPS' modifier in Linux:
+VS Code, JetBrains and LibreOffice all bind Ctrl+F2, and a compositor bind would swallow it).
+`barModal()` counts the walk, so the same grab carries its keys. The focus lands on the first
+item; ←/→/Tab move along `barBox`, wrapping; Enter/Space/↓ run the item's action (`barItem`'s
+`onKey` → `onClick` → the kit icon's `barKeyAction`; `setBarItemKey` for an action that exists
+only after the item is built — AppTitle's window menu). An item with nothing to do is not a stop
+(the CPU/memory rings). The ring is GTK's, round the item's HOVER PILL: `.bar-item-veil` (the Cairo
+layer painting that pill) has the pill as its BOX — `BAR_VEIL_INSET` margins, full width — so
+`.bar-item:focus-visible > .bar-item-veil` with a pill radius follows the hover shape. An outline on
+the item itself came out a circle round the 32px square (owner-caught). A tray icon's stop is its
+ITEM too (`btn.focusable = false`, `onKey` emits the click). Two rules that are easy to get backwards:
+- **Only an Esc returns to the walk.** `escPending` is set in the window's CAPTURE phase and
+  cleared at idle; a panel that closes WITHOUT it (Prism launched an app, a CC row opened
+  Settings) ENDS the walk, or the grab stays on the bar and the window that just opened gets
+  none of the keys — the 2026-09-14 Wi-Fi password bug again. `closeOverlays()` ends it too.
+- The walk ends on Esc with no panel open, and on ANY loss of the grab (`onBarGrabCleared`).
+`dumpState.overlays.barKeyboard` reports it — check it before sending each synthetic key.
+
+**The dock — Super+Ctrl+D (`veltrix-ipc focusDock`, `Status.dock_keyboard`).** macOS's Ctrl+F3.
+The dock on the FOCUSED monitor answers; an auto-hidden one slides in and `setRevealed(false)`
+refuses while `walking`. It takes its OWN focus grab (`acquireFocusGrab([win])`, the surface stays
+`NONE`) and registers with InputYield (a yield simply ends the walk). The arrows ALONG the dock and
+Tab move, wrapping; the icon's controller (DockItem) runs the click on Enter/Space — and ENDS the
+walk first, because what it starts is a window that needs the keys — and opens the app menu on
+the Menu key, Shift+F10 or the arrow pointing away from the screen edge (↑ on a bottom dock). The
+menu takes the focus on its first row; Esc there closes it and the focus is back on the icon; a
+second Esc leaves. `dumpState.overlays.dockKeyboard` reports it.
+Until this date the dock set `can_focus: false` on its window, every item and every icon box —
+which shut the whole subtree out of the keyboard, menus included (the #657 CRITICAL). They now
+let the focus ENTER; `focus_on_click: false` on the icon keeps a click from leaving one focused.
+
+🔴 **A focusable `Gtk.Box` is NOT a keyboard stop.** `grab_focus()` on it works, but GtkBox's
+focus vfunc only hands the focus on to its children, so `child_focus()` — i.e. Tab, the arrows, a
+panel's `focusPanel` — returns false on it and moves past (measured on GTK 4.22: the dock walk found
+nothing to land on with `iconBox` focusable, while `iconBox.grab_focus()` returned true). Put the
+stop on a leaf or on a `Gtk.Grid` (the bar items and CC tiles are Grids, and they work). A probe that
+calls `grab_focus()` to "check it is focusable" will pass and prove nothing.
+
+🔴 **Checking before a synthetic key: the STATE is not the grab.** `dockKeyboard: true` was reported
+while nothing in the dock held the focus, and the keys went to the window the owner had focused.
+Check that the surface also has a focus widget (`dumpState.keyboardFocus[<window>].focusWidget`).
+
+In the CC grid a tile whose tap opens a detail is itself a keyboard stop
+(`SquircleContainer({ keyboardStop: true })` + GTK's CSS ring, see design-system.md): Enter/
+Space opens the detail, the Menu key or Shift+F10 opens the tile's context menu, focus moves into
+the detail and Esc there returns to the grid with the focus back on the tile. A FILL tile (volume,
+brightness: `makeVerticalFillTile`) is a stop for the same reason even with no detail — its slider
+is an invisible hit-region, so the TILE is the stop, wears the ring and hands ↑/↓ to the slider
+through `sliderKeyHandler` (the slider itself is `focusable: false`). 🔴 A slider takes only the
+arrows ALONG its axis: taking all four made it a trap — in the CC nothing but Tab could leave it,
+and Esc (which closes the whole panel) looked like the only way out (owner-caught 2026-09-27). A
+thumb slider shows focus as a 2px accent ring on its thumb, painted in Cairo — a DrawingArea gets
+no ring from CSS, so its focus was real and invisible.
+
+🔴 **GTK's ring is drawn OUTSIDE the widget, so every ancestor that clips can cut it.** In the CC
+three did, on the grid's edges (owner-caught 2026-09-27): the `ScaleRevealer` (now
+`unclipAtRest: true` for the CC — it clips only while animating), the `Gtk.ScrolledWindow` that
+clamps the grid's WIDTH and its `Gtk.Viewport` (the clip was a side effect; both `overflow:
+VISIBLE`), the `Gtk.Stack` (crossfade only — no clip needed) — and the one that was missed on the
+first pass, the tiles' own `Gtk.Fixed`: **GtkFixed clips by default**. Don't guess the chain: walk
+the ring's widget up to the window logging `get_overflow()` for each ancestor, with the panel AT REST
+(a ScaleRevealer mid-animation reports HIDDEN on purpose) — that is how the Fixed was found. The bar's visible region already
+pads each panel by `PANEL_PAD`, so what paints past a box is shown. A new panel whose controls reach
+its edges needs the same audit.
+
+🔴 **A control revealed on hover is never a keyboard stop.** The clipboard's per-row ✕ sat at
+opacity 0 but stayed focusable, so every ↓ through the list stopped twice, once on an invisible
+button. It is `focusable: false`; the row takes Delete, shows the ✕ while it has the focus, and a
+keyboard delete hands the focus to the row that takes its place. Buttons INSIDE a tile had the same blind
+spot: `.cc-island button { veltrix-reset }` clears `outline`; the rule now re-declares the ring. GTK orders Tab by
+GEOMETRY (it sorts children by position, not by insertion order), so reordering the layout list
+does not change it.
+
+So, for a new keyboard-driven overlay: leave `set_keyboard_mode` at `NONE` and call `acquireFocusGrab([win, …peers], onCleared)` when it opens, `releaseFocusGrab(token)` when it closes. The grab grants keyboard focus the instant it takes, which is what a text caret needs (a widget-side `entry.grab_focus()` alone is not enough — the toplevel must be compositor-active for the caret to render), and it brings outside-click dismissal with it. `Bar.tsx` does this in `syncKeyboardMode()` for everything it owns (`barModal()`), `IslandWindow` for every open island mode, `AppGridWindow` for the grid (it was `DockCore` until the grid got its own surface on 2026-08-09).
+
+Key routing is unchanged and still worth copying: the Overview owns no text field — it exposes `onOpen()`/`handleKey()` on its widget, `ActivityIsland` routes them per-mode, and `Bar.tsx` adds a CAPTURE-phase `Gtk.EventControllerKey` on `win` that forwards keys to `island.handleKey` while `island_mode` is set (←/→ move a `.keyboard-focus` cursor, Enter switches + closes, Esc closes) — the exact pattern the app grid uses on its own window.
+
+*Historical, and the reason the old advice existed:* under layer-shell, `ON_DEMAND` made **Hyprland withhold keyboard focus from the surface until the pointer entered or clicked it**, so Prism's caret wouldn't blink until you moved the mouse — hence "EXCLUSIVE, not ON_DEMAND". The app grid was the last surface stuck on it, because an `EXCLUSIVE` layer won't let a child `Gtk.Popover` take keyboard focus and its context menus needed one; FocusGrab's popup SUSPEND (see `architecture.md` → "Focus grab") is what finally freed it. `ON_DEMAND` remains wrong for an unrelated reason — see "THE RULE: a shell surface rests in `NONE`, never in `ON_DEMAND`" above for what it does to the seat.
+
+
+## Proposed Applications1 and Rust dock contract (#959)
+
+The revised design in `session/design/APPLICATIONS1-DOCK.md` covers the next independent
+Applications1/dock block: catalogue/launch/foreground usage, ordinary Apps and
+default Files pins, typed folders, and the required toolkit/Hyalo seams. It is
+**design documentation, not implemented behavior or permission to program**.
+Its closure section records Claude's #688 review and the relayed owner decisions,
+including dock-before-usage ordering, GNOME-style idle cutoff, no timed new marker,
+uniform shrink without a size floor/scroll strip, and healthy-catalogue-only pin
+pruning. A1–A3 are implemented as an explicitly opted-in service; their actual capabilities
+and validation are in `session/daemon/src/applications/README.md`, `A2.md` and `A3.md`.
+A2 uses literal ExecStartEx transient services or org.freedesktop.Application,
+revalidates original sender/generation before effects, and never retries ambiguous
+delivery. Autostart writes preserve effective XDG preferences; the existing session
+runner remains the only executor. The standalone A2 Cargo integration test builds
+its sibling CLI first; CARGO_TARGET_DIR relocates build artifacts, while fixture
+evidence stays in the source worktree's target/applications1. Other stages
+remain design until individually authorized.
+The existing TS model documented above is unchanged; IPC B is separate.
+
+**Apps (D4) is a LAYER of `veltrix-shell`, not an app window** (owner, 2026-11-02, overriding
+the design's `veltrix-apps` window): `toolkit/shell/src/launcher.rs`. Its entry
+`config/applications/org.veltrix.Apps.desktop` runs `veltrix-ipc toggleAppGrid`, i.e. Shell1
+`ToggleSurface("app-grid")`, which the Rust shell answers (`surface:app-grid`) by opening
+or closing the layer. Gotcha: in the Hyalo preview the TS shell owns `org.veltrix.Shell`, so
+there the same entry opens the TS grid — only a Rust-only session (or the nested check,
+`toolkit/shell/check-dock-headless.sh`) reaches the Rust layer. Dragging from it uses
+nk-wayland's drag source (`Window::start_drag`, `Event::DragEnded`, `toolkit/CONTRACT.md`).
+
+### Applications1 A3 observation rules
+
+A3 consumes H1 focus_transition at its monotonic boundary, preserving every
+focus/lock/idle/seat/sleep split. Never account from coalesced focus_changed or
+from the client's receipt time. Snapshot + serial/epoch validation are mandatory;
+on loss discard the tentative watch and resync with a fresh connection identity.
+Only committed aggregate seconds persist. Idle caps the current watch at its
+start +30 s, including across checkpoints; no last-input or wall-time accrual.
+
+New markers use a durable healthy catalogue baseline, not installation timestamps
+or a timer. Metadata changes and degraded roots cannot re-mark old apps. Clear
+on confirmed foreground use or scoped AppAcknowledge only. UI counts/progress
+read Launcher from app records and Changed(launcher), with independent revision.
+One snapshot session owns both Apps and WindowMatches continuations: read both
+domains before CloseSnapshot; closing ANY token frees that session.

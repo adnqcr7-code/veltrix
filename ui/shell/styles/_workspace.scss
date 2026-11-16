@@ -1,0 +1,155 @@
+@use 'base' as *;
+
+/* ==========================================================================
+   WORKSPACE COCKPIT
+   ==========================================================================
+
+   The schematic is drawn by `common/WorkspaceSchematic.ts`, which has TWO
+   callers: the overview (an island mode) and the app grid's workspace strip.
+   Both live in the bar's window since #708 point 3, so this file has one scope.
+
+   ⚠️ It had two until then — and before that the grid's was `#veltrix-dock`. Each
+   time a caller changed window, a schematic rule left in the old scope would
+   have stopped painting in silence: nothing errors, the strip just goes flat.
+   If a caller ever leaves the bar's window, split the scope again. */
+
+/* --- The schematic itself (island overview + app grid strip) -------------- */
+#veltrix-bar, .veltrix-bar-window {
+    /* Cairo canvas reads 'color' to get the tile fill color */
+    .wo-schematic-canvas {
+        color: var(--veltrix-surface);
+    }
+
+    /* Transparent overlay for icons only */
+    .wo-schematic-icons,
+    .wo-schematic-icon {
+        background: transparent;
+    }
+
+    /* The app icon is BOTH the placeholder and the identity mark: the captured
+       texture lands behind it (common/WindowThumbnail.ts), so a slow or failed
+       capture leaves the tile exactly as it opened — nothing swaps, nothing jumps.
+       Once a texture lands the icon does NOT disappear, it shrinks to a badge on the
+       bottom edge (geometry in applyIconLayout): at this scale the content says which
+       DOCUMENT a tile is, and only the icon says which APP. Same call GNOME and KDE
+       both make. */
+    .wo-schematic-icon.has-thumb image {
+        /* The badge sits over arbitrary window content — light UIs, photos, video —
+           so it needs its own contrast floor rather than trusting the backdrop. */
+        -gtk-icon-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+    }
+}
+
+/* --- Overview only: the panel and its cards ------------------------------- */
+#veltrix-bar, .veltrix-bar-window {
+    .cockpit-window-content {
+        background: transparent;
+        // Show/hide animation comes from the bar's ScaleRevealer wrapper (GTK-side
+        // grow+fade, common/ScaleRevealer.ts) — no CSS opacity transition here.
+    }
+
+    /* --- Overview Panel ---
+       🔑 NO PADDING HERE, AND THAT IS DELIBERATE — do not "restore" it. The overview's
+       card size is SOLVED from the monitor width so the panel lands 8px from each
+       screen edge (previewWidthFor in surfaces/overview/WorkspaceOverview.tsx), and a
+       layout computed in JS cannot read a CSS padding. Declaring it here would mean
+       duplicating it there, and a mirror drifts silently. So this file owns what CSS
+       is uniquely good at — fill, border, radius, states — and the spacing is applied
+       as GTK margins from the one place that also does the arithmetic. */
+    .workspace-overview {
+        background: transparent;
+        border: none;
+        box-shadow: none;
+    }
+
+    /* --- Workspace Items ---
+       Inset comes from WO_CARD_PAD (a margin on the inner box); the border width
+       below is the one number the arithmetic still reads from CSS, as WO_CARD_BORDER. */
+    .wo-item {
+        border-radius: $veltrix-radius-lg;
+        background-color: var(--veltrix-surface-back);
+        border: 1px solid var(--veltrix-border);
+        transition: background-color 0.2s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .wo-label {
+        font-size: $fs-subtitle;
+        font-weight: $fw-semibold;
+        color: var(--veltrix-text);
+        transition: color 0.2s ease;
+
+        // NB: this file used Adwaita NAMED colors (@accent_bg_color) — they resolve
+        // to Adwaita's blue, never the user's accent token. Migrated to --veltrix-*.
+        // Active state is shown by .wo-item.active (accent bg + border) — the label
+        // stays theme-coloured for legibility (never accent on text).
+        &.active {
+            color: var(--veltrix-text);
+        }
+    }
+
+    /* The workspace's mode (#513): a glance, not a label. It sits on the card's
+       title line, dim by default so it never competes with the workspace name,
+       and lights up on hover to say it is a control and not a decoration. The
+       words are in its tooltip and, in full, in the bar's window menu. */
+    .wo-mode-badge {
+        padding: 2px 4px;
+        border-radius: $veltrix-radius-sm;
+        opacity: 0.45;
+        transition: opacity 0.2s ease, background-color 0.2s ease;
+
+        &:hover {
+            opacity: 1;
+            background-color: var(--veltrix-surface-hover);
+        }
+    }
+
+    .wo-count {
+        font-size: $fs-caption;
+        font-weight: $fw-medium;
+        color: var(--veltrix-text-dim);
+        margin-bottom: 8px;
+    }
+
+    .wo-item.active {
+        background-color: rgba(var(--veltrix-accent-rgb), 0.05);
+        border: 1px solid rgba(var(--veltrix-accent-rgb), 0.6);
+    }
+
+    /* Keyboard cursor (←/→ navigation): stronger accent tint + solid accent border,
+       matching the app grid's .ws-strip-item.keyboard-focus language (no box-shadow
+       ring) so both overviews signal the keyboard cursor the same way. Layers over
+       .active (source-order wins at equal specificity) → the current ws reads as the
+       stronger, focused variant. */
+    .wo-item.keyboard-focus {
+        background-color: rgba(var(--veltrix-accent-rgb), 0.15);
+        border-color: var(--veltrix-accent);
+    }
+
+    /* (.bar-ws-dot deleted — orphaned; the live bar dots are .workspace-dot in _bar.scss)
+       (.wo-schematic-win deleted 2026-08-07 — orphaned; no widget has ever carried
+        that class, verified against every `wo-*` string in the source.) */
+
+    /* --- Buttons --- */
+    .wo-btn {
+        @include veltrix-reset;
+        padding: 0;
+        border-radius: $veltrix-radius-lg;
+
+        &:focus,
+        &:active {
+            outline: none;
+            box-shadow: none;
+            border: none;
+        }
+
+        &:hover .wo-item {
+            background-color: var(--veltrix-surface-back);
+            border-color: var(--veltrix-surface-hover);
+
+            &.active {
+                background-color: rgba(var(--veltrix-accent-rgb), 0.08);
+                border-color: rgba(var(--veltrix-accent-rgb), 0.8);
+            }
+        }
+    }
+}

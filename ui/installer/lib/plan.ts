@@ -1,0 +1,330 @@
+// Assembles the final installation plan from base.json + user answers + live session defaults.
+//
+// Generates the JSON configuration consumed by archinstall and the credentials object
+// consumed via `--creds`. Passwords are hashed with `openssl passwd -6` before
+// being placed in the credentials object.
+
+import Gio from "gi://Gio"
+import GLib from "gi://GLib"
+import { exec } from "../../lib/process"
+import { readBaseConfig, type BaseConfigResult, type BaseConfig } from "./base-config"
+import { wrapCommandForLog } from "./command-log"
+import { entireDiskConfig, manualDiskConfig } from "./disk-config"
+import { getNvidiaDriverPackages } from "./graphics"
+import type { Answers } from "./answers"
+
+export interface LocaleConfig {
+  kb_layout: string
+  sys_enc: string
+  sys_lang: string
+}
+
+export interface LiveDefaults {
+  hostname: string
+  timezone: string
+  localeConfig: LocaleConfig
+}
+
+export interface ArchinstallUser {
+  username: string
+  sudo: boolean
+  enc_password: string
+}
+
+export interface ArchinstallCreds {
+  users: ArchinstallUser[]
+  encryption_password?: string
+}
+
+export interface AssembledPlan {
+  config: BaseConfig
+  creds: ArchinstallCreds
+}
+
+/**
+ * Hashes a plaintext password using sha512 crypt (`openssl passwd -6`).
+ * Plaintext is piped over stdin and never stored on disk.
+ */
+export function hashPassword(password: string): string {
+  const proc = Gio.Subprocess.new(
+    ["openssl", "passwd", "-6", "-stdin"],
+    Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE,
+  )
+  const [ok, out] = proc.communicate_utf8(password + "\n", null)
+  if (!ok || !proc.get_successful() || !out) {
+    throw new Error("Failed to generate password hash with openssl")
+  }
+  return out.trim()
+}
+
+/**
+ * Reads live session defaults (timezone, locale, keymap, hostname).
+ *
+ * Cached: three synchronous subprocesses, and on the only medium where the
+ * installer is armed they can only ever return the same three values — the ISO
+ * generates `en_US.UTF-8` and nothing else, symlinks /etc/localtime to UTC, and
+ * Hyprland's kb_layout defaults to `us`. It was being called once per step
+ * factory and again on every map and every language change of the summary.
+ */
+let _liveDefaults: LiveDefaults | null = null
+
+export function getLiveDefaults(): LiveDefaults {
+  if (_liveDefaults) return _liveDefaults
+  let timezone = "UTC"
+  try {
+    const tz = exec(["timedatectl", "show", "-p", "Timezone", "--value"]).trim()
+    if (tz) timezone = tz
+  } catch {}
+
+  let sysLang = "en_US"
+  let sysEnc = "UTF-8"
+  let kbLayout = "us"
+
+  try {
+    const raw = exec(["localectl", "status"])
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith("System Locale:")) {
+        const match = /LANG=([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_-]+))?/.exec(trimmed)
+        if (match) {
+          sysLang = match[1]
+          if (match[2]) sysEnc = match[2]
+        }
+      } else if (trimmed.startsWith("VC Keymap:")) {
+        const match = /VC Keymap:\s+([a-zA-Z0-9_-]+)/.exec(trimmed)
+        if (match && match[1] !== "(unset)") {
+          kbLayout = match[1]
+        }
+      } else if (trimmed.startsWith("X11 Layout:") && kbLayout === "us") {
+        const match = /X11 Layout:\s+([a-zA-Z0-9_-]+)/.exec(trimmed)
+        if (match && match[1] !== "(unset)") {
+          kbLayout = match[1]
+        }
+      }
+    }
+  } catch {
+    const langEnv = GLib.getenv("LANG")
+    if (langEnv) {
+      const match = /([a-zA-Z0-9_]+)(?:\.([a-zA-Z0-9_-]+))?/.exec(langEnv)
+      if (match) {
+        sysLang = match[1]
+        if (match[2]) sysEnc = match[2]
+      }
+    }
+  }
+
+  let hostname = "veltrix"
+  try {
+    const h = exec(["hostname"]).trim()
+    if (h && h !== "archiso" && h !== "localhost") {
+      hostname = h
+    }
+  } catch {}
+
+  _liveDefaults = {
+    hostname,
+    timezone,
+    localeConfig: {
+      kb_layout: kbLayout,
+      sys_enc: sysEnc,
+      sys_lang: sysLang,
+    },
+  }
+  return _liveDefaults
+}
+
+/**
+ * Assembles the full plan from base.json + answers + live defaults.
+ * Rewrites SUDO_USER in custom_commands with the selected user account.
+ */
+export function assemblePlan(
+  answers: Answers,
+  baseResult: BaseConfigResult | null = readBaseConfig(),
+  measuredMirrors: readonly string[] = [],
+): AssembledPlan {
+  if (!baseResult) {
+    throw new Error("Cannot assemble plan: base.json is missing or invalid")
+  }
+  if (!answers.account) {
+    throw new Error("Cannot assemble plan: user account is not configured")
+  }
+
+  const live = getLiveDefaults()
+  const account = answers.account
+  const username = account.username
+
+  // Deep copy base config
+  const config: BaseConfig = JSON.parse(JSON.stringify(baseResult.config))
+
+  config.hostname = account.hostname?.trim() || live.hostname || "veltrix"
+  config.timezone = answers.timezone?.timezone || live.timezone
+  config.locale_config = {
+    // The CONSOLE keymap, not the xkb layout. archinstall's `kb_layout` ends up in
+    // /etc/vconsole.conf, and the two namespaces disagree for several of our rows —
+    // see the `keymap` field on KeyboardLayout in lib/keyboards.ts for what that
+    // costs.
+    //
+    // ⚠️ The xkb layout the person actually chose does NOT travel through here. It
+    // goes to `/etc/X11/xorg.conf.d/00-keyboard.conf` after archinstall finishes
+    // (lib/keyboard-config.ts), because this field cannot carry it: it is one
+    // string in a namespace with no variants, and reading the layout back out of it
+    // is what sent 36 of 55 keyboards to the desktop wrong (#498).
+    //
+    // ⚠️ Three cases, in order, and the region page has already said which one this
+    // keyboard is in: its own console keymap · the base layout's, when it has none
+    // (`de-neo` → `de`, which is what every installer outside Debian does) · the
+    // medium's `us`, when even that is missing. archinstall accepts an unknown name,
+    // logs and leaves the console unset anyway, so guessing further would buy
+    // nothing and hide it. See resolveKeymap() in ui/lib/keyboards.ts.
+    kb_layout: answers.keyboard?.keymap
+      || answers.keyboard?.fallbackKeymap
+      || live.localeConfig.kb_layout,
+    sys_enc: answers.language?.sysEnc || live.localeConfig.sys_enc,
+    sys_lang: answers.language?.sysLang || live.localeConfig.sys_lang,
+  }
+
+  // Rewrite SUDO_USER in custom_commands so the first-boot setup runs for the chosen user
+  const originalCommands = Array.isArray(config.custom_commands)
+    ? (config.custom_commands as string[])
+    : []
+
+  // …then wrap each one so what it prints is kept: archinstall throws a
+  // successful command's output away (lib/command-log.ts).
+  //
+  // Typed once here: `config.custom_commands` is `unknown` in the plan
+  // type, so the iPad command below pushes onto this local instead.
+  const customCommands = originalCommands.map(cmd => {
+    return cmd.replace(/\bSUDO_USER=[a-zA-Z0-9_-]+/, `SUDO_USER=${username}`)
+  }).map(wrapCommandForLog)
+  config.custom_commands = customCommands
+
+  // ── The interface choice: iPad Mode, when that is what was picked ─────────
+  //
+  // macOS needs no command: the schema default for `org.veltrix.interface
+  // ipad-mode` is already false, so an install that never mentions it boots
+  // into the classic desktop. iPad Mode appends one command that sets the
+  // key for the new user, as that user, inside a throwaway D-Bus session
+  // (there is no user session inside the chroot to talk to): `runuser`
+  // switches to the account archinstall just created, `dbus-run-session`
+  // gives `gsettings set` a bus to write the dconf database through.
+  // It runs through the same `wrapCommandForLog` as every other command,
+  // so a failure lands in /var/log/veltrix-install-commands.log instead of
+  // vanishing — and a failure here must never fail the install: the machine
+  // is complete and usable either way, and Settings → Interface flips the
+  // same bit afterwards. (Live-medium-gated: no chroot exists in this VM
+  // to run it in; the step, the answer and the summary are verified here.)
+  if (answers.interface?.mode === "ipad") {
+    customCommands.push(wrapCommandForLog(
+      `runuser -u ${username} -- dbus-run-session gsettings set org.veltrix.interface ipad-mode true`,
+    ))
+  }
+
+  // ── Who owns the disk, and it is no longer us ─────────────────────────────
+  //
+  // Both modes now hand archinstall the layout and let it partition, format and
+  // mount: the same numbers we used to run by hand, written in its schema (see
+  // lib/disk-config.ts). `pre_mounted_config` is gone, and with it the last
+  // reason for `steps/run.ts` to touch a disk — a plan that describes a layout
+  // while our own partitioner also ran would write the disk twice, ours first
+  // and archinstall's over the top (#310).
+  if (answers.disk?.mode === "entire_disk") {
+    config.disk_config = entireDiskConfig(answers.disk)
+  } else if (answers.disk) {
+    config.disk_config = manualDiskConfig(answers.disk)
+  }
+
+  // ── The mirrors this machine measured, on top of the ones it had ──────────
+  //
+  // `mirror_config.custom_servers` and nothing else (see lib/mirrors.ts for why
+  // the region key is the wrong one): archinstall PREPENDS these to the
+  // mirrorlist and leaves what was underneath, so the measurement wins and the
+  // medium's own list is still the floor.
+  //
+  // ⚠️ An empty measurement writes NOTHING, and that is not the same as writing
+  // an empty list. `base.json` ships `custom_servers: []`; overwriting it with
+  // another empty array would be harmless, but the branch says out loud that a
+  // failed measurement leaves the install exactly as it was before #311.
+  if (measuredMirrors.length > 0) {
+    const mirror = (config.mirror_config ?? {}) as Record<string, unknown>
+    config.mirror_config = { ...mirror, custom_servers: measuredMirrors.map(url => ({ url })) }
+  }
+
+  // ── Multilib repository (#492) ────────────────────────────────────────────
+  //
+  // Enables 32-bit software (Steam, Wine, lib32-*) on the target system.
+  // archinstall's `mirror_config.optional_repositories` uncomments [multilib] in
+  // the target /etc/pacman.conf during installation.
+  const mirrorConf = (config.mirror_config ?? {}) as Record<string, unknown>
+  const existingOpt = Array.isArray(mirrorConf.optional_repositories)
+    ? (mirrorConf.optional_repositories as string[])
+    : []
+  if (!existingOpt.includes("multilib")) {
+    mirrorConf.optional_repositories = [...existingOpt, "multilib"]
+  }
+  config.mirror_config = mirrorConf
+
+  // ── Kernel selection (#311) ───────────────────────────────────────────────
+  //
+  // Defaults to "linux", or uses the user's explicit choice (linux, linux-lts, linux-zen).
+  const kernel = answers.system?.kernel || "linux"
+  config.kernels = [kernel]
+
+  // ── Hardware graphics drivers (#495) ──────────────────────────────────────
+  //
+  // Archinstall's Minimal profile ignores `gfx_driver` entirely. Instead of
+  // relying on an inert key in base.json, we install the required packages
+  // ourselves. For NVIDIA Turing+ GPUs with open drivers requested, we inject
+  // the kernel-matching driver package + utilities.
+  if (config.profile_config && typeof config.profile_config === "object") {
+    delete (config.profile_config as Record<string, unknown>).gfx_driver
+  }
+
+  if (answers.system?.installNvidiaOpen) {
+    const driverPkgs = getNvidiaDriverPackages(kernel)
+    const existingPkgs = Array.isArray(config.packages) ? (config.packages as string[]) : []
+    const merged = new Set([...existingPkgs, ...driverPkgs])
+    config.packages = [...merged]
+  }
+
+  // ── Root is left as Arch leaves it, and that is a decision ────────────────
+  //
+  // No `root_enc_password`. archinstall only touches root when that field is
+  // present (`scripts/guided.py`), so omitting it means the account keeps what
+  // `filesystem` ships in /etc/shadow — measured: `root:*:14871::::::`, an
+  // asterisk no password can ever match. The person administers with sudo, and
+  // recovery is the live medium we already hand out.
+  //
+  // What it replaces was never chosen: root carried the SAME hash as the user, so
+  // whoever knew that password had a root console without passing through sudo —
+  // one credential doing two jobs, silently. Ubuntu and Fedora both lock root and
+  // give sudo instead; this is that, and it is also plain Arch's own default.
+  const creds: ArchinstallCreds = {
+    users: [
+      {
+        username,
+        sudo: true,
+        enc_password: hashPassword(account.password),
+      },
+    ],
+  }
+
+  if (answers.disk?.mode === "entire_disk" && answers.disk.encryption?.enabled) {
+    if (!answers.disk.encryption.passphrase) {
+      throw new Error("Disk encryption is enabled but no passphrase was provided")
+    }
+    creds.encryption_password = answers.disk.encryption.passphrase
+  }
+
+  // Dump support for debugging/inspection
+  const dumpPath = GLib.getenv("VELTRIX_INSTALLER_DUMP")
+  if (dumpPath) {
+    try {
+      GLib.file_set_contents(dumpPath, JSON.stringify(config, null, 2) + "\n")
+      console.log(`[installer] Assembled plan dumped to ${dumpPath}`)
+    } catch (e) {
+      console.error(`[installer] Failed to dump plan to ${dumpPath}:`, e)
+    }
+  }
+
+  return { config, creds }
+}

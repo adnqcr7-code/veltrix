@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-prayer-times — print prayer times for London, Ontario (offline).
+#
+#   veltrix-prayer-times [--date YYYY-MM-DD]
+#   →  Fajr 05:52
+#      Dhuhr 12:09
+#      Asr 14:43
+#      Maghrib 17:04
+#      Isha 18:25
+#   veltrix-prayer-times --json [--date YYYY-MM-DD]
+#   →  {"date": "2026-11-12", "method": "ISNA", "madhab": "Shafi",
+#       "timezone": "America/Toronto",
+#       "latitude": 42.9849, "longitude": -81.2453,
+#       "offsets": {"Dhuhr": -1, "Asr": 2}, "config": null,
+#       "times": {"Fajr": "2026-11-12T05:52:00-05:00", ...}}
+#   veltrix-prayer-times --next [--now ISO-8601]
+#   →  Fajr 2026-11-12T05:52:00-05:00        (next upcoming prayer)
+#   veltrix-prayer-times --due [--now ISO-8601] [--grace-seconds 300]
+#   →  Fajr                                   (a prayer time in [now-grace, now])
+#   →  exit 1, no output, when nothing is due
+#
+# Called by the shell's PrayerLock scheduler (ui/shell/core/PrayerLock.ts),
+# which polls --due once a minute and spawns veltrix-prayer-lock when a prayer
+# is due. The selector lives HERE, not in the shell, so it is unit-testable
+# without a shell (scripts/dev/prayer-lock-test.py drives --due/--next with
+# --now across every prayer and boundary).
+#
+# Calculation is `al-falak` (PyPI, MIT, zero runtime deps, fully offline):
+# pure solar math (Jean Meeus, Astronomical Algorithms); needs only lat/lon/
+# date/timezone (zoneinfo handles DST). Default method ISNA (Fajr/Isha
+# 15°/15°), Asr Shafi'i (shadow factor 1) — the North American standard, and
+# the method the local mosque (ICSWO, islamiccentre.ca) publishes with.
+#
+# METHOD + MADHAB ARE CHANGEABLE WITHOUT EDITING CODE (fix pass #1, Nov 12):
+#   ~/.config/veltrix/prayer.json   (or $VELTRIX_PRAYER_CONFIG, or --config)
+#   {"method": "MWL", "madhab": "Hanafi",
+#    "offsets": {"Fajr": 0, "Dhuhr": 0, "Asr": 0, "Maghrib": 0, "Isha": 0}}
+# Every key is optional; anything absent falls back to the compiled-in
+# default below. CLI flags (--method/--madhab) beat the config file, which
+# beats the defaults. An unknown method/madhab in the file is an error
+# (exit 2) — a user's explicit choice must never be silently ignored.
+# Full Settings UI for these lands in v0.14; this file is the v1 mechanism.
+# Location is still the compiled-in London default — reading lat/lon/tz from
+# config lands in v0.14, not here.
+#
+# MOSQUE CALIBRATION — READ THIS BEFORE "FIXING" THE OFFSETS (fix pass #1):
+# The defaults carry per-prayer minute offsets, Dhuhr −1 and Asr +2. These
+# are a CALIBRATION against the local mosque (ICSWO), not a computation fix,
+# and not a rounding artifact. Diagnosed Nov 12, 2026 (see
+# docs/prayer-lock-fix-report-1.md §1):
+#   * Dhuhr +1: al-falak's NORTH_AMERICA preset adds a +1 min "method
+#     adjustment" to solar transit (alfalak/calculation/MethodsParameters.py).
+#     True transit is 12:09; every independent source publishes 12:09.
+#     The −1 offset cancels that adjustment.
+#     METHOD-CONDITIONAL (fix pass #2, halal #1): the −1 applies ONLY when
+#     the selected method's al-falak preset carries method_adjustments
+#     dhuhr=+1 — ISNA, MWL, Egypt, Singapore (verified in the installed
+#     al-falak 1.2.1 MethodsParameters.py, Nov 12, 2026). Umm al-Qura,
+#     Kuwait, Qatar carry NO dhuhr adjustment, and Turkey is built from
+#     method=None — under those the −1 would fire Dhuhr at 12:08, one
+#     minute BEFORE true zawal, so the default there is 0. A user-set
+#     Dhuhr offset in prayer.json always wins over the default.
+#     Re-verified Nov 12, 2026: Dhuhr 12:09 under ALL 8 methods.
+#   * Asr −1.5 to −2.5 min: al-falak computes the Asr shadow angle from the
+#     solar declination frozen at 0h UT (SolarCoordinates(julian_date)) and
+#     seeds its hour-angle from the same stale value, while the declination
+#     is falling ~0.25°/day in mid-November. Two independent implementations
+#     — PrayTimes.js (praytimes 2.3.2, event-time sun position) and astral
+#     3.2 (solar-elevation binary search at the actual instant) — both land
+#     68–93 s later than al-falak's raw 14:41:27 on Nov 12 and agree with
+#     ICSWO (14:43) and timesprayer (14:44). Coordinates were ruled out
+#     (searchtruth's 43.02/−81.15 moves al-falak's Asr by 0 min), as were
+#     timezone (every other prayer matches) and madhab (Shafi factor 1
+#     confirmed in both libraries). The +2 offset moves Asr onto the
+#     consensus (14:43 Nov 12) — the safe direction, at or after the
+#     consensus, never before it.
+#   * The builder's v1 "truncation" explanation was wrong: al-falak rounds
+#     half-up (CalendarUtil.rounded_minute), and the raw unrounded Asr
+#     (14:41:27) is already 93–153 s before the mosque/timesprayer times.
+# Re-verified Nov 12, 2026 after calibration: 7 days (Nov 12–18) × 5 prayers
+# vs ICSWO, searchtruth and timesprayer — every prayer within ±2 min of
+# every source, max |dev| 2 min (Asr vs searchtruth, Nov 13/16, in the LATE
+# direction). Aladhan was tried a third time the same day and is still
+# HTTP 403 from this environment — re-run it from the Dell or another
+# reachable machine; it is not a data disagreement.
+#
+# Location is the compiled-in London, Ontario default (42.9849, -81.2453,
+# America/Toronto, ARCHITECTURE.md §5 I1/I8) with --lat/--lon/--tz overrides
+# for testing. Reading the location from ~/.config/veltrix/config.json is
+# a follow-up for when that file carries a location; v1 must not invent a
+# location from anywhere else, and must never send one anywhere (offline).
+#
+# Install: al-falak lives in the same per-user venv as hijridate (see
+# bin/veltrix-hijri-date for why: Arch blocks system pip, PEP 668). install.sh
+# and bin/veltrix-setup create ~/.local/share/veltrix/venv with
+# `al-falak==1.2.1` pinned (verified 2026-11-12 against the ICSWO timetable
+# + searchtruth + timesprayer — see docs/prayer-lock-fix-report-1.md).
+# This helper re-execs itself under that venv python when the system python
+# lacks the import (see _try_venv); a future packaged venv at
+# /usr/share/veltrix/venv is the second candidate. No Arch package name is
+# recorded here on purpose: no `python-al-falak` package could be verified
+# against a live source.
+#
+# Exit codes: 0 = printed times / a prayer is due (for --due); 1 = nothing
+# due (only --due); 2 = bad arguments / bad config (argparse or config
+# validation); 3 = `al-falak` is not installed — the shell treats this as
+# "no prayer data" and never fires a lock, never a fake time; 4 = the date
+# is outside al-falak's range.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import argparse
+import json
+import os
+import sys
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+DEFAULT_LAT = 42.9849
+DEFAULT_LON = -81.2453
+DEFAULT_TZ = "America/Toronto"
+AL_FALAK_VERSION = "1.2.1"
+
+# Default method/madhab: ISNA + Shafi'i — the North American standard and
+# what ICSWO publishes with. Changeable via prayer.json / --method / --madhab.
+DEFAULT_METHOD = "ISNA"
+DEFAULT_MADHAB = "Shafi"
+# Mosque calibration offsets (minutes, applied AFTER al-falak's rounding).
+# See the header: Dhuhr −1 cancels al-falak's +1 ISNA method adjustment;
+# Asr +2 corrects al-falak's stale-declination Asr model against ICSWO.
+# A user whose mosque differs overrides these in prayer.json (including 0).
+# DEFAULT_OFFSETS is the default under a method whose preset carries
+# dhuhr=+1 (the ISNA default); default_offsets(method) below is what the
+# program actually applies — Dhuhr −1 only for those methods, 0 otherwise
+# (fix pass #2, halal #1). Asr +2 is method-independent (the Asr model
+# error does not depend on the method, only the madhab).
+DEFAULT_OFFSETS = {"Dhuhr": -1, "Asr": 2}
+# Methods whose al-falak 1.2.1 preset carries method_adjustments dhuhr=+1
+# (alfalak/calculation/MethodsParameters.py, verified Nov 12, 2026):
+# NORTH_AMERICA (ISNA), MUSLIM_WORLD_LEAGUE (MWL), EGYPTIAN (Egypt),
+# SINGAPORE. Umm al-Qura, Kuwait, Qatar carry none; Turkey is built from
+# method=None, so it carries none either.
+METHODS_WITH_DHUHR_PLUS_ONE = frozenset(
+    {"ISNA", "MWL", "Egypt", "Singapore"})
+# A config offset outside this range is a typo, not a calibration:
+# ±120 min (2 h) is far past any plausible mosque adjustment, and a
+# 10000-for-10 typo must be refused, not silently applied (fix pass #2,
+# security N2). load_config exits 2 outside it, like every other bad
+# config value.
+MAX_OFFSET_MINUTES = 120
+# Top-level keys prayer.json may carry. Anything else (e.g. a typo'd
+# "methd") is refused with exit 2, not silently ignored (fix pass #2,
+# code #2 — the function's docstring already promised this).
+CONFIG_KEYS = frozenset({"method", "madhab", "offsets"})
+
+
+def default_offsets(method):
+    """The compiled-in calibration offsets for one method.
+
+    Asr +2 always (method-independent model error). Dhuhr −1 only when
+    the method's al-falak preset adds +1 to solar transit; 0 otherwise,
+    so Dhuhr never fires before true zawal under Umm al-Qura / Kuwait /
+    Qatar / Turkey. User-set offsets in prayer.json override these.
+    """
+    offsets = {"Asr": 2}
+    if method in METHODS_WITH_DHUHR_PLUS_ONE:
+        offsets["Dhuhr"] = -1
+    return offsets
+
+PRAYERS = ("Fajr", "Dhuhr", "Asr", "Maghrib", "Isha")
+METHODS = ("ISNA", "MWL", "Egypt", "Umm al-Qura", "Kuwait", "Qatar",
+           "Singapore", "Turkey")
+MADHABS = ("Shafi", "Hanafi")
+CONFIG_DEFAULT_PATH = os.path.expanduser("~/.config/veltrix/prayer.json")
+
+
+def _try_venv():
+    """Re-exec this helper under the Veltrix venv python.
+
+    Called only when the system python cannot import `al-falak`. The venv
+    candidates, in order: the per-user venv install.sh / veltrix-setup
+    create, then a future packaged venv (Phase 11). The
+    VELTRIX_PRAYER_VENV_TRIED guard stops a loop if the venv python lacks
+    the import too — in that case this returns False and the caller exits 3
+    (no prayer data), never a fake time.
+    """
+    if os.environ.get("VELTRIX_PRAYER_VENV_TRIED"):
+        return False
+    candidates = [
+        os.path.expanduser("~/.local/share/veltrix/venv/bin/python"),
+        "/usr/share/veltrix/venv/bin/python",
+    ]
+    for py in candidates:
+        if os.path.isfile(py) and os.access(py, os.X_OK):
+            os.environ["VELTRIX_PRAYER_VENV_TRIED"] = "1"
+            os.execv(py, [py, sys.argv[0], *sys.argv[1:]])
+    return False
+
+
+def load_config(path):
+    """Read ~/.config/veltrix/prayer.json (or --config path).
+
+    Returns (settings dict, path-used-or-None). Missing file → defaults,
+    no error. Malformed JSON, an unknown top-level key, an unknown
+    method/madhab/offset key, or an offset outside ±120 min → exit 2:
+    an explicit user choice must never be silently ignored.
+    A corrupt file that cannot be parsed at all warns to stderr and falls
+    back to defaults — prayer times must keep working rather than die on
+    a typo'd config — but the warning names the file, so it is findable.
+    """
+    if path is None:
+        path = os.environ.get("VELTRIX_PRAYER_CONFIG") or CONFIG_DEFAULT_PATH
+    if not os.path.isfile(path):
+        return {}, None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"veltrix-prayer-times: WARNING: cannot parse {path} ({exc}) "
+              f"— using defaults", file=sys.stderr)
+        return {}, path
+    if not isinstance(cfg, dict):
+        print(f"veltrix-prayer-times: {path} must hold a JSON object — "
+              f"using defaults", file=sys.stderr)
+        return {}, path
+    unknown = sorted(set(cfg) - CONFIG_KEYS)
+    if unknown:
+        print(f"veltrix-prayer-times: unknown key(s) {', '.join(repr(k) for k in unknown)} "
+              f"in {path} (valid: {', '.join(sorted(CONFIG_KEYS))}) — "
+              f"a typo'd key would otherwise be silently ignored",
+              file=sys.stderr)
+        sys.exit(2)
+    out = {}
+    if "method" in cfg:
+        if cfg["method"] not in METHODS:
+            print(f"veltrix-prayer-times: unknown method {cfg['method']!r} "
+                  f"in {path} (valid: {', '.join(METHODS)})",
+                  file=sys.stderr)
+            sys.exit(2)
+        out["method"] = cfg["method"]
+    if "madhab" in cfg:
+        if cfg["madhab"] not in MADHABS:
+            print(f"veltrix-prayer-times: unknown madhab {cfg['madhab']!r} "
+                  f"in {path} (valid: {', '.join(MADHABS)})",
+                  file=sys.stderr)
+            sys.exit(2)
+        out["madhab"] = cfg["madhab"]
+    if "offsets" in cfg:
+        if not isinstance(cfg["offsets"], dict):
+            print(f"veltrix-prayer-times: 'offsets' in {path} must be an "
+                  f"object of prayer → minutes", file=sys.stderr)
+            sys.exit(2)
+        offsets = {}
+        for name, mins in cfg["offsets"].items():
+            if name not in PRAYERS:
+                print(f"veltrix-prayer-times: unknown prayer {name!r} in "
+                      f"offsets in {path}", file=sys.stderr)
+                sys.exit(2)
+            if not isinstance(mins, int) or isinstance(mins, bool):
+                print(f"veltrix-prayer-times: offset for {name} in {path} "
+                      f"must be whole minutes, got {mins!r}",
+                      file=sys.stderr)
+                sys.exit(2)
+            if not -MAX_OFFSET_MINUTES <= mins <= MAX_OFFSET_MINUTES:
+                print(f"veltrix-prayer-times: offset for {name} in {path} "
+                      f"is {mins} min — outside ±{MAX_OFFSET_MINUTES} min; "
+                      f"a calibration that large is a typo, not an offset",
+                      file=sys.stderr)
+                sys.exit(2)
+            offsets[name] = mins
+        out["offsets"] = offsets
+    return out, path
+
+
+def build_params(method, madhab):
+    """al-falak CalculationParameters for a method + madhab name.
+
+    Turkey (Diyanet: Fajr 18°, Isha 17°) has no preset in al-falak, so it
+    is built from method=None with the angles set after construction —
+    _set_parameters_using_method() overwrites constructor angles, so the
+    angles must be assigned AFTER, not passed in.
+    """
+    from alfalak import CalculationMethod, CalculationParameters, Madhab
+    by_method = {
+        "ISNA": CalculationMethod.NORTH_AMERICA,
+        "MWL": CalculationMethod.MUSLIM_WORLD_LEAGUE,
+        "Egypt": CalculationMethod.EGYPTIAN,
+        "Umm al-Qura": CalculationMethod.UMM_AL_QURA,
+        "Kuwait": CalculationMethod.KUWAIT,
+        "Qatar": CalculationMethod.QATAR,
+        "Singapore": CalculationMethod.SINGAPORE,
+    }
+    if method == "Turkey":
+        params = CalculationParameters(method=None)
+        params.fajr_angle = 18.0
+        params.isha_angle = 17.0
+    else:
+        params = CalculationParameters(method=by_method[method])
+    params.madhab = Madhab.SHAFI if madhab == "Shafi" else Madhab.HANAFI
+    return params
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        description="Print prayer times for London, Ontario (ISNA, offline).")
+    p.add_argument("--date", default=None, metavar="YYYY-MM-DD",
+                   help="Gregorian date to compute for (default: today)")
+    p.add_argument("--json", action="store_true",
+                   help="print times as JSON with ISO-8601 datetimes")
+    p.add_argument("--next", action="store_true",
+                   help="print the next upcoming prayer and its time")
+    p.add_argument("--due", action="store_true",
+                   help="print the prayer due within --grace-seconds of now; "
+                        "exit 1 when nothing is due")
+    p.add_argument("--now", default=None, metavar="ISO-8601",
+                   help="reference instant for --next/--due (default: now; "
+                        "for testing)")
+    p.add_argument("--grace-seconds", type=int, default=300,
+                   help="how far after a prayer time it still counts as due "
+                        "(default: 300)")
+    p.add_argument("--lat", type=float, default=DEFAULT_LAT)
+    p.add_argument("--lon", type=float, default=DEFAULT_LON)
+    p.add_argument("--tz", default=DEFAULT_TZ)
+    p.add_argument("--method", default=None, choices=METHODS,
+                   help="calculation method (default: ISNA; overrides "
+                        "prayer.json)")
+    p.add_argument("--madhab", default=None, choices=MADHABS,
+                   help="Asr juristic method: Shafi (default) or Hanafi; "
+                        "overrides prayer.json")
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help="prayer config file (default: "
+                        "~/.config/veltrix/prayer.json, or "
+                        "$VELTRIX_PRAYER_CONFIG)")
+    args = p.parse_args(argv)
+    if args.next and args.due:
+        p.error("--next and --due are mutually exclusive")
+    if args.now is not None and not (args.next or args.due):
+        p.error("--now only applies to --next/--due")
+    if args.date is None:
+        args.day = date.today()
+    else:
+        try:
+            y, m, d = (int(part) for part in args.date.split("-"))
+            args.day = date(y, m, d)
+        except ValueError:
+            p.error("--date must be YYYY-MM-DD")
+    if args.now is None:
+        args.instant = datetime.now(ZoneInfo(args.tz))
+    else:
+        try:
+            parsed = datetime.fromisoformat(args.now)
+        except ValueError:
+            p.error("--now must be ISO-8601")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo(args.tz))
+        args.instant = parsed.astimezone(ZoneInfo(args.tz))
+    # Precedence: CLI flags > prayer.json > compiled-in defaults.
+    cfg, cfg_path = load_config(args.config)
+    args.method = args.method or cfg.get("method", DEFAULT_METHOD)
+    args.madhab = args.madhab or cfg.get("madhab", DEFAULT_MADHAB)
+    # Method-conditional defaults (fix pass #2, halal #1): Dhuhr −1 only
+    # under a method whose preset carries dhuhr=+1; user-set offsets in
+    # prayer.json always win over these defaults.
+    args.offsets = default_offsets(args.method)
+    args.offsets.update(cfg.get("offsets", {}))
+    args.config_path = cfg_path
+    return args
+
+
+def compute_times(day, lat, lon, tzname, method=DEFAULT_METHOD,
+                  madhab=DEFAULT_MADHAB, offsets=None):
+    """All five prayer datetimes for one Gregorian day (timezone-aware).
+
+    al-falak's result (rounded to the minute, half-up) plus the calibration
+    offsets — applied after rounding, in whole minutes, so the offsets are
+    exactly what the user configured and exactly what --json reports.
+    """
+    from alfalak import Coordinates, Prayer, PrayerTimes
+    coords = Coordinates(lat, lon)
+    params = build_params(method, madhab)
+    tz = ZoneInfo(tzname)
+    pt = PrayerTimes(coords, day, calculation_parameters=params, time_zone=tz)
+    prayer_enum = {"Fajr": Prayer.FAJR, "Dhuhr": Prayer.DHUHR,
+                   "Asr": Prayer.ASR, "Maghrib": Prayer.MAGHRIB,
+                   "Isha": Prayer.ISHA}
+    times = {name: pt.time_for_prayer(prayer_enum[name]) for name in PRAYERS}
+    for name, mins in (offsets or {}).items():
+        if mins:
+            times[name] = times[name] + timedelta(minutes=mins)
+    return times
+
+
+def select_next(times_today, times_tomorrow, now):
+    """The next upcoming prayer: (name, datetime). Never null — after Isha
+    the next prayer is tomorrow's Fajr."""
+    for name in PRAYERS:
+        if times_today[name] > now:
+            return name, times_today[name]
+    return "Fajr", times_tomorrow["Fajr"]
+
+
+def select_due(times_today, times_yesterday, now, grace_seconds):
+    """The prayer due at `now`: the earliest prayer time in [now-grace, now].
+
+    Yesterday's Isha is included so a Fajr-adjacent check just after
+    midnight does not mistake it for today's (it cannot be due: it is hours
+    old, outside any sane grace — but the candidate set is explicit rather
+    than assumed). Two prayers can never both be due astronomically (the
+    closest pair, Maghrib→Isha, is ~80 min apart at 43°N); if a clock jump
+    ever put two inside the window, the earliest due wins and the choice is
+    deterministic, not whichever the dict yields first.
+    """
+    candidates = [(name, times_yesterday[name]) for name in PRAYERS]
+    candidates += [(name, times_today[name]) for name in PRAYERS]
+    due = [(name, when) for name, when in candidates
+           if when <= now and (now - when).total_seconds() <= grace_seconds]
+    if not due:
+        return None
+    due.sort(key=lambda item: item[1])
+    return due[0][0]
+
+
+def main(argv):
+    args = parse_args(argv)
+    try:
+        times = compute_times(args.day, args.lat, args.lon, args.tz,
+                              args.method, args.madhab, args.offsets)
+    except ImportError:
+        _try_venv()  # re-execs under the venv python; returns only if none exists
+        print(f"veltrix-prayer-times: python package 'al-falak' is not installed "
+              f"(create the venv: python3 -m venv ~/.local/share/veltrix/venv && "
+              f"~/.local/share/veltrix/venv/bin/pip install 'al-falak=={AL_FALAK_VERSION}')",
+              file=sys.stderr)
+        return 3
+    except Exception as exc:
+        print(f"veltrix-prayer-times: cannot compute times for "
+              f"{args.day.isoformat()}: {exc}", file=sys.stderr)
+        return 4
+
+    if args.next or args.due:
+        # The reference instant may belong to a different day than --date
+        # (the scheduler passes today for both, but --now in tests can be
+        # any day): recompute around the instant, not around --date.
+        today = args.instant.date()
+        kw = dict(lat=args.lat, lon=args.lon, tzname=args.tz,
+                  method=args.method, madhab=args.madhab,
+                  offsets=args.offsets)
+        times_today = compute_times(today, **kw)
+        if args.next:
+            times_tomorrow = compute_times(
+                today + timedelta(days=1), **kw)
+            name, when = select_next(times_today, times_tomorrow, args.instant)
+            print(f"{name} {when.isoformat()}")
+            return 0
+        times_yesterday = compute_times(
+            today - timedelta(days=1), **kw)
+        name = select_due(times_today, times_yesterday, args.instant,
+                          args.grace_seconds)
+        if name is None:
+            return 1
+        print(name)
+        return 0
+
+    if args.json:
+        print(json.dumps({
+            "date": args.day.isoformat(),
+            "method": args.method,
+            "madhab": args.madhab,
+            "timezone": args.tz,
+            "latitude": args.lat,
+            "longitude": args.lon,
+            "offsets": args.offsets,
+            "config": args.config_path,
+            "times": {name: times[name].isoformat() for name in PRAYERS},
+        }))
+        return 0
+    for name in PRAYERS:
+        print(f"{name} {times[name].strftime('%H:%M')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

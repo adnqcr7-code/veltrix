@@ -1,0 +1,435 @@
+@use 'base' as *;
+
+/* ==========================================================================
+   VELTRIX DESIGN SYSTEM — SHELL-SIDE SHARED COMPONENTS
+   ========================================================================== */
+// The GLOBAL layer that is still the shell's own. The kit's half moved to
+// `ui/lib/veltrix-kit/styles/_components.scss` on 2026-08-10 so that more than one bundle
+// can compile it — read that file's header for the rule that decided the split
+// (a rule goes there iff the widget wearing it is built in `ui/lib/`).
+//
+// So a `veltrix-*` name here is NOT a leftover to sweep. `.veltrix-menu*`,
+// `.veltrix-confirm-*`, `.veltrix-tooltip`, `.veltrix-switch`
+// and `.veltrix-seg-btn` are all worn by widgets built in `ui/shell/common/` or
+// `widgets/`: universal ACROSS THIS BUNDLE'S WINDOWS, which is what the prefix
+// promises, but not yet part of the kit. They cross over when a component does,
+// in the same change — never ahead of it. `.veltrix-circle-btn` did exactly that
+// on 2026-08-26 and is the worked example.
+//
+// Still global, still unscoped, and still the deliberate exception to
+// commandment 2: an atomic widget is placed by the USER (bar today, CC grid
+// today, wherever the plugin system lands it next), so its vocabulary cannot
+// belong to any one surface's sheet. That is why `.bar-popover-*` lives here
+// despite the `bar-` prefix.
+
+
+/* Small/large "A" endpoints for a text-size slider — real text (crisp at any
+   size) instead of a tiny SVG glyph that loses detail. */
+.slider-text-endpoint {
+    color: var(--veltrix-text-dim);
+    font-weight: $fw-medium;
+    &.is-sm { font-size: 11px; }
+    &.is-lg { font-size: 18px; }
+}
+
+
+/* `.veltrix-menu` itself moved to ui/lib/veltrix-kit/styles/_components.scss on 2026-09-20 —
+   the kit builds that box (`veltrix-kit/menu.ts`) and only the shell compiled its
+   look, so any other bundle got the component with no rule at all (kit-style-check,
+   tech-debt #59). What stays here is everything the SHELL builds around it. */
+
+.veltrix-menu-row {
+    // Text colour follows --veltrix-text via the base layer's `button` rule
+    // (ui/lib/veltrix-kit/styles/_base-layer.scss) — no per-row override needed.
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    // Padding lives on the row (single source) — makeRow inner boxes only set the
+    // icon↔label spacing, no ad-hoc margins. Generous like the clipboard list so
+    // the hover reads roomy, and radius-sm so the rounded hover sits comfortably
+    // inside the menu's squircle instead of fighting its corner.
+    padding: 7px 12px;
+    border-radius: $veltrix-radius-sm;
+    @include veltrix-row-states;
+
+    // The row you are about to choose takes the ACCENT, at full strength, and its text
+    // and icons the accent's own ink (owner, 2026-10-06). The neutral hover of every
+    // other row in this DE (`veltrix-row-states`, white at 12 %) barely showed in a menu
+    // over glass. This is the one place the accent marks a hover rather than a
+    // selection — the shell's menus: system, dock, tray, window, CC, app grid. The
+    // KIT's dropdown and Settings keep the rule, and are reviewed apart.
+    // Keyboard focus is the same "this one", so it shows the same fill instead of a
+    // ring. A full-colour app icon (no `.nd-icon`) keeps its colours.
+    &:hover:not(:disabled),
+    &:focus-visible {
+        background-color: var(--veltrix-accent);
+        color: var(--veltrix-accent-fg);
+        outline: none;
+        label, .nd-icon { color: var(--veltrix-accent-fg); }
+    }
+    &:active:not(:disabled) {
+        background-color: color-mix(in srgb, var(--veltrix-accent) 85%, black 15%);
+    }
+}
+
+
+/* Destructive row (menuRow({ danger: true }), the system menu's confirm action).
+   The label keeps the normal text colour — NO red text (user call, 2026-08-03): red
+   lettering in a flat list reads as an error message, and it fires before the user
+   has done anything wrong. The destructive signal is the HOVER instead: the tint the
+   row takes under the pointer turns red, i.e. it only speaks at the moment the click
+   is actually being aimed. Beats veltrix-row-states on specificity so the neutral
+   hover doesn't win. This class was applied in three places (CC context menu
+   "Remove", the system menu confirm, and now the clipboard) while being defined
+   NOWHERE — those rows had been rendering as ordinary rows.
+   Since the rows' hover became the accent (2026-10-06) a destructive row keeps its
+   red TINT and the normal ink — never a filled red row (design-system.md → "Context
+   menus") — so it beats the accent rule above on specificity, focus included. */
+.veltrix-menu-row.danger-action {
+    &:hover:not(:disabled),
+    &:focus-visible {
+        background-color: rgba(var(--veltrix-danger-rgb), 0.14);
+        color: var(--veltrix-text);
+        label, .nd-icon { color: var(--veltrix-text); }
+    }
+    &:active:not(:disabled) { background-color: rgba(var(--veltrix-danger-rgb), 0.22); }
+}
+
+.veltrix-menu-label {
+    font-size: $fs-small;
+    font-weight: $fw-medium;
+}
+.veltrix-menu-header {        // dim section/submenu header inside a menu
+    font-size: $fs-caption;
+    font-weight: $fw-regular;
+    color: var(--veltrix-text-dim);
+}
+.veltrix-menu-sep {
+    background: var(--veltrix-surface);
+    min-height: 1px;
+}
+
+// ── Bare GTK nodes we build and must therefore draw ──────────────────────────
+// Commandment 11: a GTK widget arrives WITH its rules, or it does not ship. With no
+// GTK theme under us, a node no rule of ours names is not "default-styled" — it is
+// blank. `separator` is the one that hides best: every separator this bundle builds
+// today carries a class that paints it (`.veltrix-menu-sep`, `.about-sep`), so the
+// hole only opens the day somebody appends a plain `new Gtk.Separator()` and sees
+// nothing, with no error anywhere to say why. This is that default, and every class
+// above out-ranks it.
+separator {
+    background: var(--veltrix-surface);
+    min-width: 1px;
+    min-height: 1px;
+}
+
+// ── Inline confirmation view ──────────────────────────────────────────────────
+// Confirm view buttons = veltrix-menu-row (geometry + hover) + an emphasis tone.
+// UNIVERSAL (veltrix-*), not the system menu's own: any flat list that needs a
+// destructive confirm swaps its row for a cancel/confirm pair in place rather than
+// opening a dialog — a modal over a popover dismisses the surface it is asking
+// about. Shared by the bar system menu (logout/restart/shutdown) and the clipboard
+// widget's "Clear history".
+// Lived in _bar.scss until 2026-08-10; a veltrix-* class belongs to the kit, and
+// leaving it there is what made _bar.scss look like it had to stay unscoped.
+.veltrix-confirm-secondary {
+    background: var(--veltrix-surface-back);
+    color: var(--veltrix-text-dim);
+    font-size: $fs-caption;
+    &:hover { color: var(--veltrix-text); }
+}
+
+.veltrix-confirm-primary {
+    background: var(--veltrix-surface);
+    color: var(--veltrix-text);
+    font-size: $fs-caption;
+    font-weight: $fw-semibold;
+}
+
+/* The glass menu POPOVER (`.veltrix-menu-popover`) moved to
+   ui/lib/veltrix-kit/styles/_components.scss on 2026-09-20 with `.veltrix-menu` — both are built
+   by `veltrix-kit/menu.ts`, so their rules belong to the kit's sheet. The rows below
+   are the SHELL's: it builds them (renderMenuModel), the kit does not. */
+
+/* The unified overlay entrance lives in common/ScaleRevealer.ts (GTK-side
+   grow+fade with asymmetric easing) — there is no CSS overlay fade anymore. */
+
+/* --- Toggles (Switches) --- */
+/* MOVED to ui/lib/veltrix-kit/styles/_components.scss on 2026-09-20. The rules lived here,
+   in the SHELL's half of the components, while `VeltrixToggleRow` lives in the
+   kit — so every other bundle got the component and none of its appearance. The
+   installer loads no GTK theme at all (commandment 11, ui/lib/veltrix-kit/platform/gtk-theme.ts), so an
+   unstyled switch is an INVISIBLE one: the installer's
+   system page has had an NVIDIA toggle nobody could see since it was written,
+   and it only appears on Turing-or-newer hardware, which is why it went
+   unreported. Same shape as the hole `token-contract-check` was born from — a
+   kit widget borrowed into a bundle that had nothing to draw it with — except
+   this one was the rules, not the tokens. */
+
+/* The veltrix button system (single source of truth) lives further down under
+   "VELTRIX BUTTON SYSTEM" — button.veltrix-btn + --primary/--danger/--ghost/--pill.
+   The old "Premium Veltrix" block with a `.accent` modifier was superseded by it
+   (the `.accent` modifier was unused) and has been removed. */
+
+/* (The `popover.veltrix-popover` block was deleted with its widget — the VeltrixPopover
+   class had no consumers in any bundle, so these rules styled a node that never existed.
+   The --veltrix-popover-* tokens stay: the `dropdown popover` block below uses them.) */
+
+button.settings-action-row {
+    @include veltrix-reset;
+    border-radius: 0;
+    padding: 0;
+    transition: background 0.15s ease;
+
+    &:hover  { background: var(--veltrix-surface-hover); }
+    &:active { background: var(--veltrix-surface-active); }
+}
+
+/* --- Segmented mode buttons (screenshot / screenrecord) --- */
+/* Unselected state; selected is handled by panel-level .suggested-action rules */
+button.veltrix-seg-btn {
+    background: var(--veltrix-surface);
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    border-radius: $veltrix-radius-xs;
+    padding: 5px 10px;
+    font-size: $fs-small;
+    font-weight: $fw-medium;
+    color: var(--veltrix-text-dim);
+    transition: background 0.15s ease, color 0.15s ease;
+
+    &:hover  { background: var(--veltrix-surface-hover); color: var(--veltrix-text); }
+    &:active { background: var(--veltrix-surface-active); }
+
+    &.suggested-action {
+        @include veltrix-reset;
+        background: var(--veltrix-accent);
+        color: var(--veltrix-accent-fg);
+
+        &:hover  { background: rgba(var(--veltrix-accent-rgb), 0.82); color: var(--veltrix-accent-fg); }
+        &:active { background: rgba(var(--veltrix-accent-rgb), 0.65); }
+        // veltrix-reset clears `outline` too, and the SELECTED segment is where the
+        // focus lands when its panel opens — it took the ring away from exactly the
+        // control holding the keyboard (measured in the CC's capture detail, 2026-09-27).
+        &:focus-visible { @include veltrix-focus-ring; }
+    }
+}
+
+// ── Dim modifier ─────────────────────────────────────────────────────────────
+// Secondary text: a read-only value at the end of a row (`staticLabel` in
+// SettingsHelpers), the save-path in the screen-recorder's settings. It had NO
+// rule anywhere — the class named an intent nobody implemented, so those labels
+// rendered at full text colour, in both Settings and the CC (2026-08-10). A
+// modifier, deliberately unqualified by element and by window: it says one thing
+// and says it everywhere.
+//
+// It used to be paired with `.settings-row-status`, which carried no
+// declarations at all and has been dropped from its four call sites. A class
+// that promises styling and delivers none is how `.accent-label` ended up on
+// MenuRow's tick.
+.dimmed {
+    color: var(--veltrix-text-dim);
+}
+
+// (.slider-value-label moved to ui/lib/veltrix-kit/styles/_components.scss 2026-08-16: the kit's
+// VeltrixSliderRow now builds one, so the rule has to be in the sheet the kit ships or
+// a non-shell window gets an unstyled readout. The shell's own six call sites keep it
+// — the shell compiles both sheets.)
+
+// ── "Default" badge ──────────────────────────────────────────────────────────
+// The accent pill marking the current default audio device. TWO surfaces build
+// it from the same two classes: the CC's audio detail page (`widgets/volume.ts`)
+// and Settings → Audio (`pages/Audio.tsx`). It lived inside
+// `#veltrix-bar .veltrix-detail-panel` in _control-center.scss, so the Settings copy
+// rendered as plain text — the same defect as the media panel, one surface's
+// sheet owning a component two surfaces wear (2026-08-10).
+//
+// Qualified `label` on purpose: this is a TEXT badge, and the unqualified class
+// is what let a Gtk.Image pick the whole pill up — MenuRow's tick wore
+// `accent-label` hoping to be tinted accent (impossible on an nd-icon) and got a
+// background instead. Keep the element qualifier.
+label.accent-label {
+    color: var(--veltrix-text);
+    background: rgba(var(--veltrix-accent-rgb), 0.14);
+    border-radius: $veltrix-radius-pill;
+    padding: 2px 8px;
+    font-size: $fs-caption;
+    font-weight: $fw-semibold;
+}
+
+// ── Atomic-widget popover vocabulary ─────────────────────────────────────────
+// The key/value/readout row and its inline icon button, worn by the widgets in
+// widgets/ (wifi, ethernet, battery, night-light, focus, bluetooth, volume,
+// brightness). Global on purpose: a widget is placed by the USER — today the bar
+// and the Control Center grid, tomorrow wherever the plugin system lands one —
+// so its vocabulary cannot belong to a surface's sheet. `-value` and `-icon-btn`
+// joined their siblings here on 2026-08-10; they had been sitting unscoped in
+// _bar.scss, which is what made the family look like two different things.
+// The Wi-Fi panel (widgets/wifi.ts), in the bar AND the CC. A network row is fixed
+// columns — [badge] name … status [lock] [chevron] — so nothing moves between rows
+// (owner's review, 2026-09-28). The row is a button, except the CURRENT network's: that
+// one is a box holding two (the badge leaves, the rest opens the details), and the hover
+// is the box's, so it still reads as one row.
+.wifi-net {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 5px 12px;
+    border-radius: $veltrix-radius-sm;
+    @include veltrix-row-states;
+}
+// GTK marks the focus-visible state along the whole focus CHAIN, so the current row's
+// box drew the row ring around the badge's focus too: the ring is its children's.
+.wifi-net.is-current:focus-visible { outline: none; }
+.wifi-current-main,
+.wifi-leave {
+    background: none;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+    min-width: 0;
+    min-height: 0;
+    &:hover, &:active { background: none; }
+    &:focus-visible { @include veltrix-focus-ring(-2px); }
+}
+.wifi-leave { border-radius: $veltrix-radius-pill; }
+.wifi-current-main { padding-left: 4px; border-radius: $veltrix-radius-sm; }
+.wifi-badge {
+    min-width: 24px;
+    min-height: 24px;
+    border-radius: $veltrix-radius-pill;
+    background-color: var(--veltrix-surface);
+    transition: background-color 0.12s ease;
+    // The network you are on: filled with the accent — the "connected" mark itself.
+    &.is-on {
+        background-color: var(--veltrix-accent);
+        color: var(--veltrix-accent-fg);
+    }
+}
+// The badge that LEAVES says so under the pointer: it darkens as a button does.
+.wifi-leave:hover .wifi-badge { background-color: var(--veltrix-surface-active); }
+.wifi-leave:hover .wifi-badge.is-on { background-color: rgba(var(--veltrix-accent-rgb), 0.8); }
+.wifi-dim { opacity: 0.5; }
+// Under the name: 12 (row padding) + 24 (badge) + 10 (gap) = 46.
+.wifi-details {
+    margin: 2px 12px 8px 46px;
+}
+
+.bar-popover-key {
+    font-size: $fs-small;
+    color: var(--veltrix-text-dim);
+}
+
+.bar-popover-val {
+    font-size: $fs-small;
+    font-weight: $fw-medium;
+    color: var(--veltrix-text);
+}
+
+.bar-popover-value {
+    font-size: $fs-small;
+    font-weight: $fw-medium;
+    color: var(--veltrix-text);
+    min-width: 40px;
+}
+
+.bar-popover-icon-btn {
+    background: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    padding: 4px;
+    border-radius: $veltrix-radius-xs;
+    transition: background-color 0.15s ease, box-shadow 0.15s ease;
+
+    @include veltrix-tile-states;
+}
+
+
+
+// (image.accent-icon deleted — dead: `color` has no effect on our icons, which are
+// Gio.FileIcon → raw SVG outside GTK's symbolic-icon recolor pipeline. Its one
+// consumer, Settings → Power's profile checkmark, now draws in Cairo instead.)
+
+
+
+// ── Icon-only action button ───────────────────────────────────────────────────
+// Compact, transparent, rounded — for mute/remove/add inline actions.
+// Originally scoped to .veltrix-detail-panel; promoted here so settings pages
+// get the same treatment without needing a parent class.
+button.settings-icon-btn {
+    background: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    border-radius: $veltrix-radius-sm;
+    padding: 4px;
+    color: var(--veltrix-text-dim);
+    min-width: 28px;
+    min-height: 28px;
+
+    // Tints are NEUTRAL and one step DEEPER than the row's own, on purpose.
+    // This button lives inside a `.veltrix-row`, which is already wearing
+    // `--veltrix-surface-hover` (0.12) by the time the pointer reaches the button —
+    // an equal tint would read as dead. So: row 0.12 → button hover 0.16 → press 0.20.
+    // It used to reach for `--veltrix-accent-10` to win that contrast, which spent the
+    // accent on a hover; the accent means ACTIVE/SELECTED (see design-system.md), and
+    // a neutral rung of the same ladder buys the same visibility without the meaning.
+    &:hover  { background: var(--veltrix-surface-active); color: var(--veltrix-text); background-image: none; }
+    &:active { background: var(--veltrix-surface-raised); background-image: none; }
+}
+
+
+// (.veltrix-tooltip lives in the kit's sheet, ui/lib/veltrix-kit/styles/_components.scss — this
+//  file had an identical second copy until tech-debt #107 step 6.)
+
+/* ── Cross-window pieces, moved out of _control-center.scss (2026-08-07) ──────
+   These three lived there because that is where they were first needed, and they
+   worked everywhere only because that sheet was unscoped. They are rendered by
+   SHARED components and by Settings pages, so scoping the CC to the bar's window
+   would have silently unstyled them outside it. The kit is where a class used by
+   more than one window belongs. */
+
+/* (.veltrix-atomic-scale-native DELETED 2026-08-16. It turned `background: transparent`
+   off on "the native Gtk.Scale trough", and there has been no Gtk.Scale since the
+   unified Cairo slider landed (d9dca37f) — the class rode along in `cssClasses` and
+   spent the time being applied to a Gtk.DrawingArea, which has no background to
+   suppress. Removed rather than promoted into the kit's sheet along with the slider
+   row that carried it.) */
+
+/* (.slider-fill-value moved to ui/lib/veltrix-kit/styles/_components.scss 2026-08-15, with the
+   slider itself: makeVerticalFillTile builds that label, and the label's sheet goes
+   where its builder goes. .slider-text-endpoint stays here — Settings' Accessibility
+   page builds those two "A"s, not the component. .slider-value-label followed the
+   slider ROW to the kit on 2026-08-16.) */
+
+/* (.veltrix-circle-btn moved to ui/lib/veltrix-kit/styles/_components.scss on 2026-08-26,
+   with its widget: common/IconButton.ts is now a thin wrapper over the kit's
+   VeltrixCircleButton, so by this sheet's own test the rule belongs to the kit.
+   The installer needed the same button and copying it would have given one
+   process two definitions of one class.) */
+
+/* Time spin buttons — Settings (Night Light schedule) AND the CC's night-light
+   widget (widgets/night-light.ts) render the same control in two windows.
+   Moved out of _settings.scss on 2026-08-07 when that sheet was scoped. */
+spinbutton.time-spin {
+    background: var(--veltrix-surface);
+    border: 1px solid var(--veltrix-border);
+    border-radius: var(--veltrix-radius-sm);
+    box-shadow: none;
+    min-height: 32px;
+
+    text { min-width: 28px; }
+
+    button {
+        background: transparent;
+        border: none;
+        box-shadow: none;
+        min-width: 18px;
+        padding: 0;
+        color: var(--veltrix-text-dim);
+
+        &:hover { color: var(--veltrix-text); background: var(--veltrix-surface-hover); }
+    }
+}

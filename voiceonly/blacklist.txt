@@ -1,0 +1,47 @@
+# Halal Audio filter -- blacklist
+# One word or phrase per line. Lines starting with # are comments.
+# Matching is case-insensitive. Single words match on word boundaries,
+# so "class" will never match "ass". Multi-word phrases match as a substring.
+# Edit this file freely: add words you want flagged, remove words you don't.
+# Songs containing any word on this list are flagged "This is haram" --
+# the user is warned but may still choose to play the song.
+# Clean songs are added to whitelist.json and never scanned again.
+
+# --- Profanity ---
+fuck
+fucking
+fucked
+fucker
+motherfucker
+shit
+shitty
+bitch
+bitches
+bastard
+damn
+dammit
+hell
+ass
+asshole
+crap
+piss
+dick
+cock
+cunt
+whore
+slut
+hoe
+pussy
+porn
+sex
+sexy
+nigga
+nigger
+
+# --- Explicit / suggestive ---
+booty
+naked
+horny
+orgasm
+blowjob
+handjob

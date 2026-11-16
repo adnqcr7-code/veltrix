@@ -1,0 +1,250 @@
+// Common helpers for installer step pages.
+import Gtk from "gi://Gtk?version=4.0"
+import GLib from "gi://GLib"
+import Pango from "gi://Pango"
+import { VeltrixPickList, VeltrixScrolled, VeltrixSelectionCheck, VeltrixEmptyRow } from "../../lib/veltrix-kit"
+import { searchFold } from "../../lib/locale-names"
+import { ROW_HEIGHT, WIZARD_LAYOUT } from "../../lib/veltrix-kit/platform/tokens"
+import { t } from "../lib/i18n"
+
+// Moved to `lib/` so `manualProblems` can print a size in a refusal: `lib/` is the
+// half of this bundle that imports no Gtk, which is what lets the probe reach it.
+// Re-exported because the nine call sites in `steps/` are asking a step-level
+// question — "how do I show this to somebody" — and that is what this file is.
+export { formatSize } from "../lib/format-size"
+export { formatDuration, formatLiveTimer } from "../lib/duration"
+
+export function heading(text: string): Gtk.Label {
+  return new Gtk.Label({
+    label: text,
+    css_classes: ["installer-heading"],
+    halign: Gtk.Align.FILL,
+    hexpand: true,
+    xalign: 0,
+  })
+}
+
+export function prose(text: string, extraClass?: string): Gtk.Label {
+  return new Gtk.Label({
+    label: text,
+    css_classes: extraClass ? ["installer-prose", extraClass] : ["installer-prose"],
+    halign: Gtk.Align.FILL,
+    hexpand: true,
+    xalign: 0,
+    wrap: true,
+    wrap_mode: Pango.WrapMode.WORD_CHAR,
+  })
+}
+
+/**
+ * A searchable list of things to pick one of.
+ *
+ * Second use in this bundle (the country list was the first, the language list is
+ * this one), which is why it is factored out here rather than copied. It is a
+ * candidate for `ui/lib/veltrix-kit/` — a third use, or the first one outside the
+ * installer, is what should promote it; Settings has no long pick-one list today.
+ *
+ * ⚠️ A plain `Gtk.Entry`, never a `Gtk.SearchEntry`. The installer's sheet styles
+ * `entry`; a SearchEntry draws on `entry.search` with its own icon and clear
+ * button, none of which is styled here, and on glass it arrives as an unstyled
+ * native control.
+ *
+ * ⚠️ The filter runs over rows that already exist rather than rebuilding them, so
+ * the list keeps its selection and its scroll position while somebody types.
+ *
+ * ⚠️ There is no `scrollTo`, and there was one. Scrolling a 328-row list to the
+ * selected row is the wrong answer to "where is my language?" — it was also three
+ * failed attempts (a stale `upper`, a guard on the row height, a `map` handler
+ * one frame later, each of which left the list at the top). The right answer is
+ * the one Anaconda and GNOME Initial Setup already use: put the current choice in
+ * a SUGGESTED group at the top, where it needs no scrolling to be seen. The
+ * caller orders `items`; this widget just draws them.
+ * `haystack` returns everything a row should match — which is more than what it
+ * DISPLAYS: a Spanish list showing "España" that matched only "Spain" is the bug
+ * this signature exists to prevent.
+ *
+ * ⚠️ Both sides of the match are folded through `searchFold` (accents off, case
+ * off), so "espana" finds España. The caller does not have to fold anything: what
+ * it hands over is folded here, once, at construction — which is also why
+ * `haystack` is called once per item rather than once per item per keystroke. It
+ * used to run 249 ICU lookups on every letter typed.
+ *
+ * ⚠️ And the matches are RANKED, because a two-letter query is usually a code:
+ * an exact hit first, then what starts with the query, then what merely contains
+ * it — ties keep the caller's order, so an empty search box shows exactly the list
+ * that was passed in, suggested rows and all.
+ */
+export function searchableList<T>(opts: {
+  placeholder: string
+  items: T[]
+  /** The row for one item; the check widget is handed in so the caller can place it. */
+  row: (item: T, check: Gtk.Widget) => Gtk.ListBoxRow
+  haystack: (item: T) => string[]
+  isSelected: (item: T) => boolean
+  onActivate: (item: T) => void
+  /** Whole rows the list may be squeezed to. Defaults to the wizard's law. */
+  minRows?: number
+}): { widget: Gtk.Widget; repaint: () => void } {
+  const search = new Gtk.Entry({ placeholder_text: opts.placeholder, hexpand: true })
+  // A placeholder is not a name: it disappears the moment somebody types, and it
+  // was never in the accessibility tree at all, so a screen reader met an unnamed
+  // text field on three of the six steps (#403, D-30). The account step has done
+  // this correctly for all five of its entries since it was written; this is the
+  // same call.
+  search.update_property([Gtk.AccessibleProperty.LABEL], [opts.placeholder])
+
+  // ⚠️ Built directly rather than through `VeltrixList()`, for two reasons that
+  // both matter: this list is a PICK LIST — one tab stop, arrows inside (see
+  // VeltrixPickList; before it, walking the 249-row country list to the footer was
+  // 249 presses) — and `VeltrixList` returns a listbox already parented to a box
+  // this caller throws away, which then has to be unparented before a
+  // ScrolledWindow will take it (`gtk_scrolled_window_set_child: assertion …
+  // failed`, and nothing drawn). The card's own material comes from the frame
+  // below, so the class list here is all `VeltrixList` was contributing.
+  const listBox = new VeltrixPickList({
+    css_classes: ["veltrix-list"],
+    selection_mode: Gtk.SelectionMode.NONE,
+  })
+
+  const rowOf = new Map<T, Gtk.ListBoxRow>()
+  const checkOf = new Map<T, Gtk.Widget>()
+  const itemOf = new Map<Gtk.ListBoxRow, T>()
+  const orderOf = new Map<T, number>()
+  const foldedOf = new Map<T, string[]>()
+
+  for (const [i, item] of opts.items.entries()) {
+    const check = VeltrixSelectionCheck(16)
+    check.visible = opts.isSelected(item)
+    const row = opts.row(item, check)
+    if (check.visible) row.add_css_class("is-selected")
+    rowOf.set(item, row); checkOf.set(item, check); itemOf.set(row, item)
+    orderOf.set(item, i)
+    foldedOf.set(item, opts.haystack(item).map(searchFold))
+    listBox.append(row)
+  }
+
+  // A list that filters down to nothing has to SAY so — an empty card reads as a
+  // list that failed to load. GTK shows the placeholder exactly when the box has
+  // no visible child, and a filtered-out row is not a visible child, so this
+  // covers the empty search without any counting of our own.
+  listBox.set_placeholder(VeltrixEmptyRow(t("searchNoMatches")))
+
+  const repaint = () => {
+    for (const [item, row] of rowOf) {
+      const on = opts.isSelected(item)
+      row[on ? "add_css_class" : "remove_css_class"]("is-selected")
+      const c = checkOf.get(item)
+      if (c) c.visible = on
+    }
+  }
+
+  // How well an item answers the current query: 0 exact, 1 prefix, 2 anywhere,
+  // NO_MATCH filtered out. Computed once per keystroke for the whole list rather
+  // than inside the sort comparator, which GTK calls O(n log n) times.
+  const NO_MATCH = 3
+  const rankOf = new Map<T, number>()
+  const rerank = () => {
+    const q = searchFold((search.get_text?.() ?? "").trim())
+    for (const item of opts.items) {
+      let rank = NO_MATCH
+      for (const h of foldedOf.get(item) ?? []) {
+        if (h === q) { rank = 0; break }
+        if (h.startsWith(q)) rank = Math.min(rank, 1)
+        else if (h.includes(q)) rank = Math.min(rank, 2)
+      }
+      rankOf.set(item, rank)
+    }
+  }
+  rerank()
+
+  listBox.set_filter_func((row) => {
+    const item = itemOf.get(row as Gtk.ListBoxRow)
+    if (!item) return true
+    return (rankOf.get(item) ?? NO_MATCH) < NO_MATCH
+  })
+  // With an empty box every row ranks 1 (everything starts with ""), so the tie
+  // break is what shows: the caller's own order, untouched.
+  listBox.set_sort_func((a, b) => {
+    const ia = itemOf.get(a as Gtk.ListBoxRow), ib = itemOf.get(b as Gtk.ListBoxRow)
+    if (!ia || !ib) return 0
+    return ((rankOf.get(ia) ?? NO_MATCH) - (rankOf.get(ib) ?? NO_MATCH))
+        || ((orderOf.get(ia) ?? 0) - (orderOf.get(ib) ?? 0))
+  })
+  search.connect("changed", () => {
+    rerank()
+    listBox.invalidate_filter()
+    listBox.invalidate_sort()
+  })
+  listBox.connect("row-activated", (_l, row) => {
+    const item = itemOf.get(row)
+    if (item) { opts.onActivate(item); repaint() }
+  })
+
+  // ⚠️ The list asks for a FLOOR in whole rows and then vexpands. It used to ask
+  // for a pixel height picked to fit a window that was itself a flat 760 — layout
+  // adapted to a size instead of the size following the layout — which left
+  // 300 ÷ 72 = 4.2 rows and a row cut in half at the bottom of every list.
+  //
+  // Two statements, and GTK does the arithmetic:
+  //   minContentHeight  how far it may be squeezed before the page scrolls
+  //   vexpand           the page's leftover is the LIST's, so a taller window
+  //                     means more rows and never dead space — and a page that
+  //                     puts more under the list (the region page's card) takes
+  //                     that room from the list rather than from the window
+  //
+  // What the list opens with is not decided here: the window adds the rows on top
+  // of this floor when it measures itself, so that the budget is stated once, in
+  // WIZARD_LAYOUT, for every page at once. `propagateNaturalHeight: false` is what
+  // keeps this scroller's natural height AT the floor — the child's own natural is
+  // every row in the list, 249 countries and 18 000px of them.
+  //
+  // ⚠️ And the CARD is outside the scroller, with the rows scrolling inside it.
+  // `VeltrixList` puts the card's material on the LISTBOX itself (`.veltrix-list`
+  // in ui/lib/veltrix-kit/styles/_components.scss), so scrolling the listbox scrolls its own
+  // rounded top and bottom out of view — the card appeared to be sliced off at
+  // both ends, which is what it was. The frame has to stay still while the
+  // content moves; that is the whole idea of a frame.
+  const { widget: scroller } = VeltrixScrolled({
+    child: listBox,
+    minContentHeight: (opts.minRows ?? WIZARD_LAYOUT.minListRows) * ROW_HEIGHT.double,
+    propagateNaturalHeight: false,
+    reserveLane: false,
+  })
+  scroller.vexpand = true
+
+  const card = new Gtk.Box({
+    orientation: Gtk.Orientation.VERTICAL,
+    css_classes: ["installer-list-frame"],
+    hexpand: true,
+    vexpand: true,
+  })
+  // ⚠️ In code, not in CSS. GTK4's CSS has no `overflow` property — the sheet
+  // says so at the top of style.scss and it still cost a `CSS Error … No property
+  // named "overflow"`. Clipping to the rounded corners is a WIDGET setting.
+  card.overflow = Gtk.Overflow.HIDDEN
+  card.append(scroller)
+
+  const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 12, hexpand: true, vexpand: true })
+  box.append(search)
+  box.append(card)
+
+  // The page arrives with the caret already in the search box (#403). Without it
+  // a step reached by keyboard opened with the focus NOWHERE — measured: arriving
+  // at Region by pressing Return on Continue left `get_focus()` null, so the first
+  // thing typed went into the void and the first arrow key did nothing. It is
+  // also simply what a search-driven list wants: type to filter, Down to enter the
+  // list, Return to choose.
+  //
+  // ⚠️ Deferred, like the account step's own grab: on `map` the widget exists but
+  // GTK has not settled focus yet, and a grab there is overwritten a frame later.
+  // ⚠️ One searchable list per page. Two would fight over this, and the last one
+  // mapped would win.
+  box.connect("map", () => {
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
+      search.grab_focus()
+      return GLib.SOURCE_REMOVE
+    })
+  })
+
+  return { widget: box, repaint }
+}

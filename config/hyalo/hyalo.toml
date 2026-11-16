@@ -1,0 +1,336 @@
+# Hyalo's shipped configuration — installed as /usr/share/veltrix/hyalo/hyalo.toml.
+#
+# Your own settings go in ~/.config/veltrix/hyalo.toml: it is read on top of this file, key
+# by key, so you only write what you change. Both are watched; an edit applies at once.
+# `veltrix-hyalo msg` changes things for the running session without touching either file.
+#
+# Every key, with its meaning: hyalo/compositor/src/config.rs.
+
+# Run once the compositor is up, in order, through `sh -c` — only in a real session
+# (`veltrix-hyalo --session`, which is how the greeter's session entry starts it), never in
+# a development window.
+autostart = [
+  # Tell uwsm the compositor is ready: it exports WAYLAND_DISPLAY, DISPLAY (Xwayland) and the
+  # IPC socket to the session's services and activates graphical-session.target. Must come first — uwsm ends
+  # the session if this does not arrive.
+  "uwsm finalize HYALO_SOCKET VELTRIX_SESSION",
+  # One Rust shell (bar, dock, panels), restarted on failure, after all session services.
+  # No TS shell or separate dock in Hyalo (#1017).
+  "/usr/lib/veltrix-hyalo/start-shell",
+  # The wallpaper: awww draws it; the user's choice is in ~/.config/veltrix/wallpaper.
+  "uwsm app -s b -- awww-daemon",
+  "/usr/lib/veltrix-hyalo/restore-wallpaper",
+  "uwsm app -s b -- /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1",
+  # Completes the keyring PAM unlocked at login (see config/hypr/hyprland.lua for why this
+  # line is not a formality).
+  "uwsm app -s b -- gnome-keyring-daemon --start --components=secrets",
+  # The clipboard history (the Control Center's clipboard panel): wl-paste watches through
+  # data-control and hands every copy to cliphist. TWO watchers, one per type: with no --type
+  # wl-paste prefers any text flavour, so a browser's "Copy image" (image/png plus the URL as
+  # text) stored the URL every time and no image ever reached the history. A copy with both
+  # lands twice, one row each. 50 items, not cliphist's 750: our panel is a list with no
+  # search, and images are what costs (eighteen items over 1 MB were 50 of 60 MB measured).
+  # Trimmed on the next store, all at once.
+  "uwsm app -s b -- wl-paste --type text --watch cliphist -max-items 50 store",
+  "uwsm app -s b -- wl-paste --type image --watch cliphist -max-items 50 store",
+]
+
+# How windows are laid out — the Hyprland session's numbers, so the bar's ends line up with
+# the windows the same way in both sessions.
+[layout]
+tiling = "dwindle"   # the only tiling layout for now (#682)
+gaps_in = 2          # each side, so 4 between two windows
+gaps_out = 4         # = the bar's margin (ui/shell/surfaces/bar/capsule.ts BAR_MARGIN)
+border = 1
+
+# Floating or tiling, per workspace; Settings writes `modes` in hyalo-settings.toml.
+[workspaces]
+default_mode = "floating"
+
+# Window rules, by name (hyalo/compositor/src/wm/rules.rs). A rule applies to a window ONCE,
+# the first time it matches: when it opens, or later when it renames itself — so our windows
+# are matched by the app id they stamp when shown, which Hyprland's rules never see (#679,
+# item 13; config/hypr/hyprland.lua matches About by its title for that reason). `match` is
+# regexes searched in app_id / title / initial_app_id / initial_title. Rule
+# effects: float, center, workspace ("3", "special:NAME" or
+# "name:NAME") with silent; rounding = false (square corners), backdrop = false (no blur
+# behind it), follow_level = true (its blur is the window style the user chose), title_bar = false (no Hyalo title bar), controls = ["close"] (the only buttons
+# its window controls may show) and animate = false (it opens and closes at once). Your
+# hyalo.toml can add a rule, replace one by its name, or switch one off with `enabled = false`.
+# (The rest of hyprland.lua's rules wait for XWayland, #683.)
+[rules.about]
+match = { app_id = "^veltrix-about$" }
+float = true
+center = true
+
+[rules.display-selector]
+match = { app_id = "^veltrix-display-selector$" }
+float = true
+center = true
+
+# What a call may share of the screen (ui/shell/surfaces/screenshare/): it has no parent
+# window to sit on — the portal's chooser is a process of its own — so it opens centred.
+[rules.share-picker]
+match = { app_id = "^veltrix-share$" }
+float = true
+center = true
+
+# Our own GTK windows (Settings, About, consent, the share picker, the installer) make their window translucent at the
+# window style chosen in Settings → Appearance → Windows (the kit's WINDOW_BACKGROUNDS) but
+# cannot declare it to Hyalo the way a toolkit app does (veltrix-material-v1): without this they
+# would get another app's blur, the translucent one, in Tinted too.
+[rules.veltrix-apps]
+match = { app_id = "^(veltrix-about|veltrix-consent|veltrix-installer|veltrix-settings|veltrix-share|org\\.veltrix\\.installer)$" }
+follow_level = true
+
+[rules.installer]
+match = { app_id = "^(org\\.veltrix\\.installer|veltrix-installer)$" }
+center = true
+
+# A window with no app id — a client's popup made a toplevel — stays square and appears at
+# once, as Hyprland's `general-popups` kept it.
+[rules.no-app-id]
+match = { app_id = "^$" }
+rounding = false
+animate = false
+
+# How windows are drawn (hyalo/compositor/src/render/window.rs): what Hyprland drew for Veltrix.
+# Corners: `rounding` px, the desktop's one corner (`rounding_power` is read and shapes nothing;
+# 16 covers what Hyprland's 24 did, the corner reaching 1.5 radii); never on a
+# fullscreen window, nor on one that draws its own decoration with a shadow. The backdrop: the
+# blur behind every translucent window — the WINDOW material, apart from the shell's glass:
+# Hyprland's `decoration:blur`, its numbers (size, passes, contrast, brightness, vibrancy,
+# noise). Settings → Appearance → Windows switches it (`backdrop.enabled`); a rule with
+# `backdrop = false` takes it from one app.
+[windows]
+rounding = 16
+rounding_power = 3.2
+
+# The window controls (close, minimize, maximize) Hyalo draws over an app's header, where the
+# app reserved room for them: `side` "right" or "left", and the `buttons` the user wants (close
+# is always shown; a window that cannot do one does not show it — no minimize on a dialog, no
+# maximize on a window that cannot change size). The
+# shell keeps both equal to org.gnome.desktop.wm.preferences button-layout, which Settings →
+# Appearance → Windows writes and the apps that draw their own title bar read. `glass`: the
+# capsule on the shell's glass (a `control` pane of the token export, the face following the
+# app's ink); false draws the plain capsule.
+[windows.controls]
+side = "right"
+buttons = ["minimize", "maximize", "close"]
+glass = true
+
+# The title bar Hyalo draws for an app that leaves its decorations to the compositor (kitty, Qt
+# apps, Chrome with "Use system title bar and borders"): one piece with the window — the colour
+# of the app's top row — with the controls above and the title (hyalo/compositor/src/render/
+# title_bar.rs). `font` is the title's family; the shell keeps it in step with the interface
+# font (Settings → Appearance). A rule with `title_bar = false` takes the bar from one app.
+# Arabic fallback, declared: `font` names ONE family on purpose — Hyalo passes it to Pango's
+# set_family, which takes a single family, so a comma list here would name a font that does
+# not exist. Arabic in a window title is covered by Pango's per-glyph fallback instead: the
+# title layout falls back through fontconfig, and the 65-0-veltrix-noto-arabic rule pins that
+# fallback to Noto Sans Arabic (config/fontconfig/65-0-veltrix-noto-arabic.conf). The live
+# value comes from the Settings portal (AppearanceSync syncTitleFont), not from this file —
+# this is the shipped default only.
+[windows.title_bar]
+font = "Inter"
+
+# The background a window of ours declares (veltrix-material-v1 `set_window_background`): its
+# colour is the app's; how it shows is a level — opaque, tinted (heavily blurred, subtle) or
+# translucent (less opaque, less blurred). The shell keeps all of it in step with Settings →
+# Appearance → Windows and Accessibility → Reduce transparency, from the kit's
+# WINDOW_BACKGROUNDS (provisional numbers). Another app's translucent window gets the
+# translucent blur (ours too, unless a rule says `follow_level`). An app may ask for its own level.
+[windows.background]
+level = "opaque"
+reduce_transparency = false
+tinted = { opacity = 0.92, size = 6, passes = 4 }
+translucent = { opacity = 0.78, size = 3, passes = 3 }
+
+# The blur's finishing (Hyprland's `decoration:blur`); how far it blurs is the level's above.
+[windows.backdrop]
+enabled = true
+contrast = 1.2
+brightness = 1.0
+vibrancy = 0.4
+vibrancy_darkness = 0.1
+noise = 0.01
+
+# The line around every window, outside its box and following its corners — Hyprland's for
+# Veltrix: a light gradient (`active`, from the first colour to the second at `angle` degrees)
+# on the focused window, a faint grey on the others. `#rrggbb` or `#rrggbbaa`; width 0 = none.
+# Its room is `[layout] border` (hyalo/compositor/src/render/decor.rs).
+[windows.border]
+width = 1
+active = ["#ffffff4d", "#ffffff1a"]
+angle = 45
+inactive = "#59595933"
+
+# The shadow under every window: deeper under the focused one. `range` how far it reaches past
+# the edge and `offset` how far it falls, logical px; it fades as (1 - t)^power. Not on a
+# fullscreen window, nor where a rule took the corners (a window with no app id).
+[windows.shadow]
+enabled = true
+power = 2
+active = { range = 20, offset = 4, color = "#00000059" }
+inactive = { range = 12, offset = 2, color = "#00000033" }
+
+# Key and pointer bindings: modifiers + key = a command (hyalo/compositor/src/binds.rs for
+# the syntax, wm/actions.rs for the commands). The same set as the Hyprland session
+# (config/hypr/hyprland.lua). No binding ends the session on purpose — one stray chord must
+# never lose everything; log out from the system menu. (Ctrl+Alt+Backspace, built in, is
+# the preview's way out until it is not a preview.)
+[binds]
+# The shell.
+"Super+Shift+R" = "spawn systemctl --user restart veltrix-rust-shell.service"
+"Super+L" = "spawn veltrix-lock"
+"Super+S" = "spawn veltrix-ipc openSettings"
+# macOS muscle memory: Cmd+, is Settings there, so Super+, opens it too.
+"Super+comma" = "spawn veltrix-ipc openSettings"
+"Super_L" = { action = "spawn veltrix-ipc toggleAppGrid", release = true }
+"Super+A" = "spawn veltrix-ipc toggleAgent"
+"Super+B" = "spawn veltrix-ipc toggleBarOverlay"
+# The kill switch and the way back from an app that holds the shortcuts (a VM, a remote
+# desktop) work even then: `dont_inhibit` (hyalo/compositor/src/shortcuts.rs).
+"Super+Shift+Escape" = { action = "spawn veltrix-ipc disableComputerControl", dont_inhibit = true }
+"Super+Escape" = { action = "toggle-shortcuts-inhibit", dont_inhibit = true }
+"Super+Space" = "spawn veltrix-ipc togglePrism"
+"Super+C" = "spawn veltrix-ipc toggleCC keyboard"
+"Super+N" = "spawn veltrix-ipc toggleNC keyboard"
+"Super+Ctrl+B" = "spawn veltrix-ipc focusBar"
+"Super+Ctrl+D" = "spawn veltrix-ipc focusDock"
+"Super+W" = "spawn veltrix-ipc toggleOverview"
+# Apps, launched as the shell launches them (uwsm app -t service: the session's
+# environment, and a unit name the portal can identify the app by).
+"Super+E" = "spawn uwsm app -t service -- org.gnome.Nautilus.desktop"
+"Super+T" = "spawn uwsm app -t service -- kitty.desktop"
+# Windows.
+"Super+Q" = "close-window"
+# Hide = the real minimize (Hyalo has one; Hyprland hides onto special:veltrix-dock
+# instead). The app keeps running; the dock icon brings it back.
+"Super+H" = "minimize"
+"Super+Left" = "focus left"
+"Super+Right" = "focus right"
+"Super+Up" = "focus up"
+"Super+Down" = "focus down"
+"Alt+Tab" = "cycle next"
+"Alt+Shift+Tab" = "cycle prev"
+# macOS muscle memory: Cmd+Tab is the app switcher there, so Super+Tab cycles
+# windows too (same action as Alt+Tab, which stays the documented one).
+"Super+Tab" = "cycle next"
+"Super+Shift+Tab" = "cycle prev"
+"Super+MouseLeft" = "move-with-pointer"
+"Super+MouseRight" = "resize-with-pointer"
+"Super+Shift+Right" = { action = "resize 30 0", repeat = true }
+"Super+Shift+Left" = { action = "resize -30 0", repeat = true }
+"Super+Shift+Up" = { action = "resize 0 -30", repeat = true }
+"Super+Shift+Down" = { action = "resize 0 30", repeat = true }
+# Centre the focused window at its current size (same chord as Hyprland's
+# Super+Alt+C). The Super+Alt+arrow halves are Hyprland-only for now: they need
+# an absolute-move action Hyalo does not have yet.
+"Super+Alt+C" = "center"
+"Super+P" = "display-selector"
+"Super+Shift+P" = "pseudo"
+"Super+F" = "toggle-floating"
+"Super+Shift+F" = "fullscreen"
+"Super+M" = "maximize"
+# Workspaces.
+"Super+1" = "workspace 1"
+"Super+2" = "workspace 2"
+"Super+3" = "workspace 3"
+"Super+4" = "workspace 4"
+"Super+5" = "workspace 5"
+"Super+Shift+1" = "move-to-workspace 1"
+"Super+Shift+2" = "move-to-workspace 2"
+"Super+Shift+3" = "move-to-workspace 3"
+"Super+Shift+4" = "move-to-workspace 4"
+"Super+Shift+5" = "move-to-workspace 5"
+"Super+WheelDown" = "workspace e+1"
+"Super+WheelUp" = "workspace e-1"
+"Super+Ctrl+Right" = "workspace e+1"
+"Super+Ctrl+Left" = "workspace e-1"
+"Super+Ctrl+Shift+Right" = "move-to-workspace e+1"
+"Super+Ctrl+Shift+Left" = "move-to-workspace e-1"
+# Screenshots.
+"Print" = "spawn grim -g \"$(slurp -d)\" - | wl-copy --type image/png"
+"Shift+Print" = "spawn grim -g \"$(slurp -d)\" ~/Pictures/Screenshot_$(date +'%Y-%m-%d_%H-%M-%S').png && notify-send \"Captura\" \"Guardada en Imágenes\""
+# Full screen (no region select): Super+Print to the clipboard, Super+Shift+Print
+# to a file — the same two destinations as the region binds above.
+"Super+Print" = "spawn grim - | wl-copy --type image/png"
+"Super+Shift+Print" = "spawn grim ~/Pictures/Screenshot_$(date +'%Y-%m-%d_%H-%M-%S').png && notify-send \"Captura\" \"Guardada en Imágenes\""
+# Hardware and media keys; `locked` = they keep working on the lock screen.
+"XF86AudioRaiseVolume" = { action = "spawn wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+", locked = true, repeat = true }
+"XF86AudioLowerVolume" = { action = "spawn wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-", locked = true, repeat = true }
+"XF86AudioMute" = { action = "spawn wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle", locked = true }
+"XF86AudioMicMute" = { action = "spawn wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle", locked = true }
+"XF86PowerOff" = { action = "spawn veltrix-power-key", locked = true, repeat = false, dont_inhibit = true }
+"XF86KbdBrightnessUp" = { action = "spawn veltrix-kbd-light up", locked = true, repeat = true }
+"XF86KbdBrightnessDown" = { action = "spawn veltrix-kbd-light down", locked = true, repeat = true }
+"XF86MonBrightnessUp" = { action = "spawn veltrix-display-brightness up", locked = true, repeat = true }
+"XF86MonBrightnessDown" = { action = "spawn veltrix-display-brightness down", locked = true, repeat = true }
+"XF86AudioPlay" = { action = "spawn veltrix-media-key play-pause", locked = true }
+"XF86AudioPause" = { action = "spawn veltrix-media-key pause", locked = true }
+"XF86AudioNext" = { action = "spawn veltrix-media-key next", locked = true }
+"XF86AudioPrev" = { action = "spawn veltrix-media-key previous", locked = true }
+
+# When nobody touches the computer: seconds before each step, 0 = never (idle.rs). Settings →
+# Power writes the user's choice in hyalo-settings.toml; these are the defaults.
+[idle]
+screen_off = 300
+lock = 600
+suspend = 0
+suspend_battery = 0
+suspend_ac = 0
+dim_before_off = 10
+
+# What Hyalo animates, in milliseconds — the Hyprland session's animations, so nothing changes at
+# the switch. A minimized window shrinks into its place in the dock and grows back out of it,
+# `minimize` (wm/minimize.rs; `windowsOut`, 400). A window opening grows out of its middle,
+# `open`, overshooting a little (`windows`, 700, myBezier); closing, it shrinks to 80 %,
+# `close` (`windowsOut` popin 80%, 400); it fades in and out over `fade` (`fade`, 400). Going to
+# another workspace, the one shown slides out sideways and the other in, `workspace`
+# (`workspaces`, 600, slide) (wm/motion.rs). Settings → Accessibility → Reduce motion switches
+# `enabled` off: then nothing moves. A rule's `animate = false` takes opening and closing from
+# one app.
+[animations]
+enabled = true
+minimize = 400
+open = 700
+close = 400
+fade = 400
+workspace = 600
+
+# How frames reach the screen (backend/tty.rs). direct_scanout: an opaque fullscreen window (a
+# game) goes on the display as it is, with no composition — less latency. Set it to false if a
+# fullscreen window shows wrong on your hardware (Hyprland's render:direct_scanout). Overlay
+# planes are never used: the hardware blends them its own way.
+[render]
+direct_scanout = true
+
+# X11 apps — Steam and most games — through Xwayland, with Hyalo as their window manager. Read
+# when Hyalo starts; off, no X11 app runs.
+[xwayland]
+enabled = true
+
+# The keyboard follows the system's (localectl set-x11-keymap) unless set here.
+[input.keyboard]
+repeat_delay = 600
+repeat_rate = 25
+
+[input.touchpad]
+tap = true
+natural_scroll = true
+disable_while_typing = true
+
+# Virtual machines: QEMU advertises a small or high-refresh preferred mode; the same default
+# the Hyprland session uses (config/hypr/hyprland.lua).
+[outputs.Virtual-1]
+mode = "1920x1080@60"
+
+# Outputs, by connector name (`veltrix-hyalo msg outputs` lists them):
+#
+# [outputs.DP-1]
+# mode = "2560x1440@144"
+# scale = 1.25
+# position = [0, 0]
+# transform = "normal"
+# vrr = false            # true = always; "fullscreen" = only while a window is fullscreen here

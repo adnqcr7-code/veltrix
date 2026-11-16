@@ -1,0 +1,227 @@
+@use 'base' as *;
+
+/* ==========================================================================
+   IPAD MODE — the whole-screen iPad-style home screen
+   ========================================================================== */
+
+/* A panel of the BAR's window since this feature (commandment 5), like the
+   app grid. Scoped to the bar window, like every other panel's sheet. */
+
+#veltrix-bar,
+.veltrix-bar-window {
+    .ipad-home {
+        /* The middle of the screen: the bar is above, the dock below. No
+           backdrop of its own — the wallpaper shows through, as on the
+           Launchpad concept. */
+    }
+
+    .ipad-grid {
+        /* The grid sizes itself; Bar centres the whole home screen. */
+    }
+
+    /* ── Tiles ── */
+    .ipad-tile {
+        /* A plain button around the icon + label: no chrome of its own.
+           Never `transform: scale` on a clickable (commandment 9). */
+        background: none;
+        border: none;
+        box-shadow: none;
+        padding: 0;
+        margin: 0;
+    }
+
+    .ipad-tile-icon {
+        /* Black tile (v5, Adnan 2026-11-12 19:28, eye protection): every
+           icon sits on #000, the SVG/PNG centred inside with 10px of
+           black showing around it — the concept's tile is ~110px with an
+           ~84px icon. The literal #000 is the spec he named, not a
+           theme token: the tile is black in every skin. */
+        background: #000;
+        padding: 10px;
+        border-radius: 20px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    }
+
+    .ipad-tile:hover .ipad-tile-icon {
+        /* Cyan-only accent, used for the active/selected state: a hovered
+           tile gets the cyan ring. */
+        box-shadow: 0 0 0 2px rgba(var(--veltrix-accent-rgb), 0.6), 0 8px 24px rgba(0, 0, 0, 0.5);
+    }
+
+    /* A tile with no program behind it on this machine (no desktop id
+       resolves — GNOME Calendar/Clocks are not installed on the Dell):
+       dimmed and inert, never a dead-end hint. Reduced opacity is the
+       whole signal — no badge, no new component. The button is also
+       insensitive (see IPadMode.tsx), so no hover ring and no press.
+       Unlike the unbuilt tiles below, the translucency here IS the
+       signal: the black tile going see-through at 0.45 is what reads
+       as not-ready, where the unbuilt tiles keep their opaque tile
+       and let the "Soon" badge do the talking. */
+    .ipad-tile-unavailable {
+        opacity: 0.45;
+    }
+
+    .ipad-tile-unavailable:hover .ipad-tile-icon {
+        /* Belt and braces with the insensitive button: no cyan ring on
+           a tile that cannot launch. */
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    }
+
+    .ipad-tile-label {
+        font-size: $fs-small;
+        color: var(--veltrix-text);
+    }
+
+    /* Permanent "Soon" badge on unbuilt tiles (fix pass #1, UI #2):
+       the four Islamic apps have no program behind them yet, and the
+       badge — not a 4-second hint — is what says so at a glance. It
+       sits on the icon's top-right corner; the tile is dimmed so the
+       whole tile reads as not-launchable, not just labelled. */
+    .ipad-tile-soon-wrap {
+        /* The overlay around the icon: the badge anchors to its corner. */
+    }
+
+    .ipad-tile-soon {
+        background: rgba(0, 0, 0, 0.65);
+        border: 1px solid rgba(255, 255, 255, 0.25);
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 11px;
+        font-weight: $fw-semibold;
+        letter-spacing: 0.5px;
+        color: var(--veltrix-text-dim);
+        /* Pull the badge onto the tile corner, not floating beside it. */
+        margin-top: 4px;
+        margin-right: 4px;
+    }
+
+    .ipad-tile-unbuilt .ipad-tile-label {
+        /* The tile itself stays opaque black (an opacity dim on the
+           icon widget would bleed the wallpaper through the tile);
+           the badge + the dimmed label are the not-launchable signal. */
+        color: var(--veltrix-text-dim);
+    }
+
+    .ipad-hint {
+        font-size: $fs-small;
+        color: var(--veltrix-text-dim);
+        /* Reserved space even while transparent, so a hint never pushes
+           the grid and the widgets down (see IPadMode.tsx). */
+        min-height: 20px;
+    }
+
+    /* ── Top pill ── */
+    .ipad-pill {
+        /* The mode label at the top of the home screen, as the concept
+           draws it: a translucent rounded pill, centred. It names the
+           mode so a person landing on the home screen knows what they
+           are looking at — and that it is still their computer. */
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 999px;
+        padding: 8px 20px;
+        font-size: $fs-small;
+        color: var(--veltrix-text);
+    }
+
+    /* ── Widgets ── */
+    .ipad-widgets {
+        /* Three cards, as wide as the grid. */
+    }
+
+    .ipad-widget-card {
+        /* Frosted glass is the COMPOSITOR's job (the bar surface's blur
+           layer rule), not CSS — GTK has no backdrop-filter. Under Xvfb
+           there is no compositor blur, so these read as flat dark tint
+           there; a Dell photo is the proof (see IPadMode.tsx). The tint
+           + border below is the no-blur fallback, not the design. */
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 18px;
+        padding: 14px 16px;
+        min-width: 280px;
+        /* 100px, down from 118px (fix pass #1, UI #6): with the 32px
+           prayer time the content fills the card instead of sitting in
+           its top half. */
+        min-height: 100px;
+    }
+
+    .ipad-widget-head {
+        font-size: $fs-mini;
+        font-weight: $fw-semibold;
+        letter-spacing: 1px;
+        color: var(--veltrix-text-dim);
+    }
+
+    .ipad-widget-time {
+        font-size: 32px;
+        font-weight: $fw-bold;
+        color: var(--veltrix-text);
+    }
+
+    /* (.ipad-widget-main, 19px, deleted fix pass #1: the prayer card
+       uses .ipad-widget-time now, and a dead class is a value that
+       drifts — UI review #6.) */
+
+    .ipad-widget-sub {
+        font-size: $fs-caption;
+        color: var(--veltrix-text-dim);
+    }
+
+    .ipad-widget-verse {
+        /* Quranic Arabic: a proper Naskh face, never a generic sans. */
+        font-family: "Amiri", "Noto Naskh Arabic", serif;
+        font-size: 15px;
+        color: var(--veltrix-text);
+    }
+
+    /* ── Prayer checklist ── */
+    .ipad-checklist {
+        /* A plain row under the widgets: title left, chips centred,
+           count right. The panel centres it; it sizes to its content.
+           The bar background is the concept's full-width dark bar —
+           the same glass as the widget cards, so the row reads as one
+           strip, not five floating chips. */
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 18px;
+        padding: 12px 20px;
+    }
+
+    .ipad-checklist-title {
+        font-size: $fs-mini;
+        font-weight: $fw-semibold;
+        letter-spacing: 1px;
+        color: var(--veltrix-text-dim);
+    }
+
+    .ipad-checklist-chip {
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 999px;
+        padding: 6px 12px;
+    }
+
+    .ipad-checklist-chip:checked {
+        border-color: rgba(var(--veltrix-accent-rgb), 0.8);
+        box-shadow: 0 0 0 1px rgba(var(--veltrix-accent-rgb), 0.8);
+    }
+
+    .ipad-checklist-mark {
+        color: var(--veltrix-text-dim);
+    }
+
+    .ipad-checklist-chip:checked .ipad-checklist-mark {
+        color: var(--veltrix-accent);
+    }
+
+    .ipad-checklist-name {
+        font-size: $fs-small;
+        color: var(--veltrix-text);
+    }
+
+    .ipad-checklist-note {
+        font-size: $fs-caption;
+        color: var(--veltrix-text-dim);
+    }
+}

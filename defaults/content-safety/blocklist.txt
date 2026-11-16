@@ -1,0 +1,101 @@
+# VELTRIX — Content Safety hosts blocklist (curated subset)
+#
+# Source: StevenBlack/hosts, "porn-only" alternate
+#   https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts
+#   (76,801 domains, updated 08 November 2026 03:21:07 UTC at the time of derivation)
+# Licence of the source list: MIT — Copyright (c) 2026 Steven Black
+#   https://github.com/StevenBlack/hosts/blob/master/license.txt
+#   (the porn-only file's own header also notes one merged source under MIT:
+#   https://github.com/Clefspeare13/pornhosts/blob/master/LICENSE)
+#
+# Why a subset, not the whole 76,801-domain file: this list is the HOSTS-file
+# layer, the second of two layers — CleanBrowsing Family DNS (185.228.168.168 /
+# 185.228.169.168) covers the long tail. A 76k-line /etc/hosts slows every name
+# lookup and is unreadable; the hosts layer only needs the most-visited adult
+# domains, which are the ones a hosts entry actually helps with (it blocks even
+# when DNS is bypassed, e.g. DNS-over-HTTPS in the browser).
+#
+# Every domain below was verified present in the StevenBlack porn-only list
+# (apex and www.) on 2026-11-12 — none was invented. To regenerate / extend:
+#   curl -sS https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts \
+#     -o /tmp/sb-porn-hosts.txt
+# then check membership of any candidate domain in that file before adding it
+# here, and keep this header's date + count honest.
+#
+# One domain per line. Comments (#) and blank lines are ignored by the helper.
+pornhub.com
+www.pornhub.com
+xvideos.com
+www.xvideos.com
+xnxx.com
+www.xnxx.com
+xhamster.com
+www.xhamster.com
+redtube.com
+www.redtube.com
+youporn.com
+www.youporn.com
+brazzers.com
+www.brazzers.com
+chaturbate.com
+www.chaturbate.com
+onlyfans.com
+www.onlyfans.com
+stripchat.com
+www.stripchat.com
+livejasmin.com
+www.livejasmin.com
+bongacams.com
+www.bongacams.com
+spankbang.com
+www.spankbang.com
+eporner.com
+www.eporner.com
+hqporner.com
+www.hqporner.com
+txxx.com
+www.txxx.com
+beeg.com
+www.beeg.com
+youjizz.com
+www.youjizz.com
+motherless.com
+www.motherless.com
+tube8.com
+www.tube8.com
+pornhd.com
+www.pornhd.com
+tnaflix.com
+www.tnaflix.com
+empflix.com
+www.empflix.com
+upornia.com
+www.upornia.com
+sunporno.com
+www.sunporno.com
+hclips.com
+www.hclips.com
+porntrex.com
+www.porntrex.com
+cam4.com
+www.cam4.com
+camsoda.com
+www.camsoda.com
+myfreecams.com
+www.myfreecams.com
+manyvids.com
+www.manyvids.com
+clips4sale.com
+www.clips4sale.com
+xhamsterlive.com
+www.xhamsterlive.com
+porn300.com
+www.porn300.com
+efukt.com
+www.efukt.com
+nhentai.net
+www.nhentai.net
+xhamster2.com
+www.xhamster2.com
+pornhubpremium.com
+www.pornhubpremium.com

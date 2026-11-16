@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-weather — print the current weather for the menu bar.
+#
+#   veltrix-weather [--lat 42.9849] [--lon -81.2453] [--timeout 15]
+#   →  {"temp_c": 14.2, "condition": "partly-cloudy", "is_day": 1}
+#
+# Called by the shell's WeatherService (ui/shell/core/WeatherService.ts)
+# every 15 minutes, by bare name, like the shell's other helpers
+# (veltrix-hijri-date, veltrix-language). Installed to /usr/bin by the
+# package (PKGBUILD bin list) and by install.sh.
+#
+# Source: Open-Meteo (https://open-meteo.com), free, no API key, documented
+# JSON. Default location London, ON (42.9849, -81.2453) — Adnan's city; a
+# Settings location picker is a later phase (Phase 6), the helper takes
+# --lat/--lon so the service can pass a stored location one day. Temperature
+# is Celsius (Canada). `is_day` picks the day/night icon.
+#
+# `condition` is the WMO weather code mapped to one of seven names (the full
+# documented 0–99 set is mapped below). A code outside that set means
+# Open-Meteo changed its contract: the helper exits 3 rather than guessing
+# an icon — a wrong icon is worse than no weather, and the service retries
+# in 15 minutes. The bar shows icon + temperature only when this succeeds;
+# on any failure the widget hides itself, never a placeholder.
+#
+# Live-test note (2026-11-12): Open-Meteo's free tier is 10,000 calls/day
+# per IP, and this VM's shared egress IP had exhausted its day's quota, so
+# the helper was verified end-to-end against a local mock serving the
+# documented success shape (see docs/phase1-fix-report.md). At one call per
+# 15 minutes (96/day) a real home IP has two orders of magnitude of headroom.
+#
+# Exit codes: 0 = printed weather; 2 = bad arguments (argparse); 3 = the
+# fetch failed, the response was not usable JSON, a field was missing or
+# the weather code is unmapped — stderr says which.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+# London, ON — Adnan's city (ARCHITECTURE.md §5: 42.9849, -81.2453).
+DEFAULT_LAT = 42.9849
+DEFAULT_LON = -81.2453
+DEFAULT_TIMEOUT_S = 15
+
+# WMO weather codes (Open-Meteo `weather_code`, documented 0–99 set).
+CONDITIONS = {
+    0: "clear",
+    1: "partly-cloudy", 2: "partly-cloudy",
+    3: "cloudy",
+    45: "fog", 48: "fog",
+    51: "rain", 53: "rain", 55: "rain", 56: "rain", 57: "rain",
+    61: "rain", 63: "rain", 65: "rain", 66: "rain", 67: "rain",
+    80: "rain", 81: "rain", 82: "rain",
+    71: "snow", 73: "snow", 75: "snow", 77: "snow", 85: "snow", 86: "snow",
+    95: "thunderstorm", 96: "thunderstorm", 99: "thunderstorm",
+}
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        description="Print the current weather as JSON (Open-Meteo).")
+    p.add_argument("--lat", type=float, default=DEFAULT_LAT,
+                   help="latitude (default: London, ON)")
+    p.add_argument("--lon", type=float, default=DEFAULT_LON,
+                   help="longitude (default: London, ON)")
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S,
+                   help="fetch timeout in seconds (default: 15)")
+    args = p.parse_args(argv)
+    if not (-90 <= args.lat <= 90 and -180 <= args.lon <= 180):
+        p.error("--lat must be -90..90 and --lon -180..180")
+    return args
+
+
+def main(argv):
+    args = parse_args(argv)
+    # Test seam (same spirit as veltrix-hijri-date's --date): VELTRIX_WEATHER_BASE_URL
+    # points the request at a mock server instead of api.open-meteo.com. The
+    # service never sets it; it exists so the helper can be verified without
+    # the live API (whose free tier is per-IP — a shared egress IP can exhaust
+    # its day's quota, as this VM's did on 2026-11-12).
+    base = os.environ.get("VELTRIX_WEATHER_BASE_URL", "https://api.open-meteo.com")
+    url = (f"{base}/v1/forecast"
+           f"?latitude={args.lat}&longitude={args.lon}"
+           "&current=temperature_2m,weather_code,is_day"
+           "&temperature_unit=celsius")
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "VELTRIX/1.0 (menu-bar weather)"})
+    try:
+        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+            payload = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.load(exc).get("reason", "")
+        except Exception:
+            detail = ""
+        print(f"veltrix-weather: Open-Meteo HTTP {exc.code}"
+              + (f" ({detail})" if detail else ""), file=sys.stderr)
+        return 3
+    except Exception as exc:  # timeout, DNS, no network, bad JSON
+        print(f"veltrix-weather: fetch failed: {exc}", file=sys.stderr)
+        return 3
+    if payload.get("error"):
+        print(f"veltrix-weather: Open-Meteo error: "
+              f"{payload.get('reason', 'unknown')}", file=sys.stderr)
+        return 3
+    cur = payload.get("current") or {}
+    temp = cur.get("temperature_2m")
+    code = cur.get("weather_code")
+    is_day = cur.get("is_day")
+    if not isinstance(temp, (int, float)) or not isinstance(code, int) \
+            or is_day not in (0, 1):
+        print("veltrix-weather: response is missing current temperature, "
+              "weather code or is_day", file=sys.stderr)
+        return 3
+    condition = CONDITIONS.get(code)
+    if condition is None:
+        print(f"veltrix-weather: unmapped WMO weather code {code} "
+              "(Open-Meteo changed its contract)", file=sys.stderr)
+        return 3
+    print(json.dumps({"temp_c": round(float(temp), 1),
+                      "condition": condition, "is_day": is_day}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,540 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The desktop's own settings (#573). Every schema here is read and written through
+  `defineSettings` (ui/shell/core/configFile.ts), which maps each camelCase field of a
+  store's DEFAULTS to the kebab-case key of the same name below.
+
+  ⚠️ THE TS DEFAULTS AND THESE DEFAULTS MUST AGREE. `defineSettings` compares them at
+  start and logs a JS error on drift, which fails the headless smoke. A default that
+  is COMPUTED at run time (recording's `hardware` and `save-dir`) is declared in the
+  store's `computed` list instead; its default here is a placeholder that nothing
+  reads, and the store answers with the computed value while the user has not set
+  one.
+
+  Ranges and choices are the same bounds as the store's validators. They are here as
+  well so that `gsettings set` from a terminal refuses what the shell would refuse,
+  instead of accepting it and leaving the store to fall back silently.
+
+  Installed to /usr/share/glib-2.0/schemas by the PKGBUILD (glib2's pacman hook
+  compiles it) and by install.sh in both modes. Editing this file changes nothing
+  until it is installed and compiled again.
+-->
+<schemalist>
+  <!-- Native Audio1 preferences. WirePlumber retains mixer and routing state. -->
+  <schema id="org.veltrix.audio" path="/org/veltrix/audio/">
+    <key name="overamplification" type="b"><default>false</default><summary>Allow volume up to 150 percent</summary></key>
+    <key name="alerts-enabled" type="b"><default>true</default><summary>Play alert sounds</summary></key>
+    <key name="alert-volume" type="d"><range min="0.0" max="1.0"/><default>0.5</default><summary>Alert volume in cubic scale</summary></key>
+    <key name="volume-feedback" type="b"><default>false</default><summary>Play feedback on a volume gesture</summary></key>
+    <key name="switch-on-connect" type="b"><default>true</default><summary>Prefer a newly available headset or external output</summary></key>
+  </schema>
+
+
+  <schema id="org.veltrix.notifications" path="/org/veltrix/notifications/">
+    <key name="popup-timeout" type="i">
+      <default>6</default>
+      <summary>Seconds a notification banner stays on screen</summary>
+    </key>
+    <key name="do-not-disturb" type="b">
+      <default>false</default>
+      <summary>Suppress banners; notifications still reach the notification centre</summary>
+    </key>
+    <key name="last-update-check-date" type="s">
+      <default>""</default>
+      <summary>Date (YYYY-MM-DD) the update check last answered</summary>
+      <description>Local only. The shell checks GitHub releases on boot and at most once a day afterwards; a failed check (offline, rate-limited) leaves this unchanged so the next hourly tick retries.</description>
+    </key>
+    <key name="dismissed-update-version" type="s">
+      <default>""</default>
+      <summary>Release version the user dismissed the update notification for</summary>
+      <description>Local only. Dismissing version X suppresses only X; a newer release Y is still announced.</description>
+    </key>
+    <key name="notified-update-version" type="s">
+      <default>""</default>
+      <summary>Release version the live update notification announces</summary>
+      <description>Local only. Cleared when the notification is dismissed or the installed version catches up.</description>
+    </key>
+    <key name="notified-update-id" type="u">
+      <default>0</default>
+      <summary>Daemon id of the live update notification (0 = none)</summary>
+      <description>Local only. Re-posting with this id replaces the same notification instead of stacking a duplicate.</description>
+    </key>
+  </schema>
+
+  <schema id="org.veltrix.night-light" path="/org/veltrix/night-light/">
+    <key name="enabled" type="b">
+      <default>false</default>
+      <summary>Night light is on</summary>
+    </key>
+    <key name="temperature" type="i">
+      <range min="2700" max="6500"/>
+      <default>4000</default>
+      <summary>Colour temperature in kelvin</summary>
+    </key>
+    <key name="schedule-enabled" type="b">
+      <default>false</default>
+      <summary>Turn night light on and off on a schedule</summary>
+    </key>
+    <key name="schedule-from" type="s">
+      <default>"20:00"</default>
+      <summary>Schedule start, HH:MM</summary>
+    </key>
+    <key name="schedule-to" type="s">
+      <default>"07:00"</default>
+      <summary>Schedule end, HH:MM</summary>
+    </key>
+  </schema>
+
+  <schema id="org.veltrix.bar" path="/org/veltrix/bar/">
+    <key name="show-app-title" type="b">
+      <default>true</default>
+      <summary>Show the focused application's name in the bar</summary>
+    </key>
+    <key name="launcher-icon" type="s">
+      <default>"veltrix"</default>
+      <summary>Launcher icon: a built-in name or an absolute path to an image</summary>
+    </key>
+    <key name="chip-opens-panel" type="b">
+      <default>false</default>
+      <summary>A click on an Activity Island chip also opens its panel, once the chip has fused into the capsule</summary>
+    </key>
+  </schema>
+
+  <!--
+    Which interface the desktop shows. The macOS desktop is the default and
+    stays exactly as it is; iPad Mode is the opt-in alternative (Settings →
+    Interface, or the installer's "Choose your interface" screen): the whole
+    screen becomes an iPad-style home screen — the macOS bar on top, the
+    macOS dock at the bottom, a big app grid with widgets in the middle —
+    still a computer, mouse and keyboard, no phone frame. Default OFF
+    (Adnan, 2026-11-12).
+  -->
+  <schema id="org.veltrix.interface" path="/org/veltrix/interface/">
+    <key name="ipad-mode" type="b">
+      <default>false</default>
+      <summary>Show the iPad-style home screen instead of the macOS desktop</summary>
+    </key>
+  </schema>
+
+  <schema id="org.veltrix.dock" path="/org/veltrix/dock/">
+    <key name="icon-size" type="i">
+      <range min="32" max="96"/>
+      <default>64</default>
+      <summary>Icon size in pixels</summary>
+    </key>
+    <key name="magnification" type="b">
+      <default>true</default>
+      <summary>Magnify icons under the pointer</summary>
+    </key>
+    <key name="max-icon-size" type="i">
+      <range min="64" max="128"/>
+      <default>128</default>
+      <summary>Largest magnified icon size in pixels</summary>
+    </key>
+    <key name="show-indicators" type="b">
+      <default>true</default>
+      <summary>Show a dot under running applications</summary>
+    </key>
+    <!-- `screen-gap` was here until 2026-10-13: the dock's gap is fixed at 4 (DOCK_SCREEN_GAP,
+         the windows' gaps_out). A value left in dconf is simply unread. -->
+    <key name="auto-hide" type="b">
+      <default>false</default>
+      <summary>Hide the dock until the pointer reaches its edge</summary>
+    </key>
+    <key name="hide-delay" type="i">
+      <range min="0" max="2000"/>
+      <default>500</default>
+      <summary>Milliseconds before an auto-hidden dock hides</summary>
+    </key>
+    <key name="position" type="s">
+      <choices>
+        <choice value="bottom"/>
+        <choice value="left"/>
+        <choice value="right"/>
+      </choices>
+      <default>"bottom"</default>
+      <summary>Screen edge the dock sits on</summary>
+    </key>
+    <key name="layout-version" type="u">
+      <default>0</default>
+      <summary>Native dock typed layout version; zero imports legacy desktop ids once</summary>
+    </key>
+    <key name="layout" type="as">
+      <default>[]</default>
+      <summary>Native dock typed app/folder targets; never shared with the TS dock</summary>
+    </key>
+    <key name="pinned" type="as">
+      <default>['veltrix-settings', 'kitty', 'veltrix-installer']</default>
+      <summary>Ordered legacy dock desktop ids; native Applications1 imports once without writing this key</summary>
+    </key>
+    <key name="native-preview" type="b">
+      <default>false</default>
+      <summary>Hyalo preview only: the native (Rust) dock in place of this one, from the next login</summary>
+      <description>Read once at login by /usr/lib/veltrix-hyalo/start-shell. Removed when the native dock replaces this one for everybody (#959 D4).</description>
+    </key>
+  </schema>
+
+  <schema id="org.veltrix.workspaces" path="/org/veltrix/workspaces/">
+    <key name="default-mode" type="s">
+      <choices>
+        <choice value="floating"/>
+        <choice value="tiling"/>
+      </choices>
+      <default>"floating"</default>
+      <summary>Window mode of a workspace with no override</summary>
+    </key>
+    <key name="workspaces" type="a{ss}">
+      <default>{}</default>
+      <summary>Per-workspace mode overrides: workspace number to "floating" or "tiling"</summary>
+    </key>
+  </schema>
+
+  <schema id="org.veltrix.recording" path="/org/veltrix/recording/">
+    <key name="audio-source" type="s">
+      <default>"@system"</default>
+      <summary>Audio source: @system, @mic, or a PulseAudio source name</summary>
+    </key>
+    <key name="quality" type="s">
+      <choices>
+        <choice value="low"/>
+        <choice value="balanced"/>
+        <choice value="high"/>
+      </choices>
+      <default>"balanced"</default>
+      <summary>Encoding quality</summary>
+    </key>
+    <key name="framerate" type="i">
+      <range min="0" max="240"/>
+      <default>0</default>
+      <summary>Frames per second; 0 follows the compositor</summary>
+    </key>
+    <key name="hardware" type="b">
+      <default>false</default>
+      <summary>Encode on the GPU. Unset: on when a render node exists</summary>
+    </key>
+    <key name="format" type="s">
+      <choices>
+        <choice value="mp4"/>
+        <choice value="mkv"/>
+        <choice value="webm"/>
+      </choices>
+      <default>"mp4"</default>
+      <summary>Container format</summary>
+    </key>
+    <key name="save-dir" type="s">
+      <default>""</default>
+      <summary>Folder recordings are saved to. Unset: the XDG videos folder</summary>
+    </key>
+  </schema>
+
+  <!--
+    The Assistant and every agent client. The allow-* keys are GATES: read by the
+    shell, by bin/veltrix-agent every turn, by bin/veltrix-mcp and by the four
+    computer-use helpers (veltrix-a11y/act/click/type), each of which refuses to act
+    when its gate is off. A helper that cannot find this schema treats EVERY gate
+    as OFF (fail-closed): a missing schema never grants a capability. All eight
+    gates default OFF — each capability needs its own explicit opt-in in
+    Settings → AI; turning on Ollama alone grants none of them.
+  -->
+  <schema id="org.veltrix.ai" path="/org/veltrix/ai/">
+    <key name="allow-config-write" type="b">
+      <default>false</default>
+      <summary>Agents may change desktop settings</summary>
+    </key>
+    <key name="allow-screenshot" type="b">
+      <default>false</default>
+      <summary>Agents may take screenshots</summary>
+    </key>
+    <key name="allow-window-close" type="b">
+      <default>false</default>
+      <summary>Agents may close windows</summary>
+    </key>
+    <key name="allow-mcp" type="b">
+      <default>false</default>
+      <summary>The MCP server answers</summary>
+    </key>
+    <key name="allow-computer-use" type="b">
+      <default>false</default>
+      <summary>Agents may see other applications (AT-SPI)</summary>
+    </key>
+    <key name="allow-computer-control" type="b">
+      <default>false</default>
+      <summary>Agents may act on other applications. Requires allow-computer-use</summary>
+    </key>
+    <key name="allow-file-read" type="b">
+      <default>false</default>
+      <summary>The Assistant may read files in its read roots</summary>
+    </key>
+    <key name="allow-file-write" type="b">
+      <default>false</default>
+      <summary>The Assistant may edit its three writable files. Requires allow-file-read</summary>
+    </key>
+    <key name="brain-provider" type="s">
+      <default>""</default>
+      <summary>Assistant provider id; empty = off</summary>
+    </key>
+    <key name="brain-backend" type="s">
+      <choices>
+        <choice value=""/>
+        <choice value="openai"/>
+      </choices>
+      <default>""</default>
+      <summary>Wire protocol, derived from the provider</summary>
+    </key>
+    <key name="brain-model" type="s">
+      <default>""</default>
+      <summary>Model id of the active provider</summary>
+    </key>
+    <key name="brain-endpoint" type="s">
+      <default>"http://localhost:11434/v1"</default>
+      <summary>Base URL of the active provider</summary>
+    </key>
+    <key name="brain-models" type="a{ss}">
+      <default>{}</default>
+      <summary>Last model used, per provider id</summary>
+    </key>
+    <!-- No brain-endpoints key (Phase 0 fix): the per-provider endpoint dict
+         died with the custom-endpoint escape hatch. The single brain-endpoint
+         above is derived, pinned by setBrainProvider() to localhost Ollama. -->
+    <key name="assistant-glow" type="b">
+      <default>true</default>
+      <summary>Glow the focused window's border while the Assistant works</summary>
+    </key>
+  </schema>
+
+
+  <!--
+    The appearance keys only Veltrix has (#573). The ones the desktop standard
+    already names — accent, colour scheme, GTK/icon/cursor theme, fonts — live in
+    org.gnome.desktop.interface, where every app reads them. Applications (and our
+    own installer and lock screen) never read THIS schema: bin/veltrix-portal serves
+    it as the org.veltrix.appearance portal namespace, under these same key names,
+    and the shell writes the greeter's mirror from it. What a material MEANS — the
+    opacity per surface and the compositor blur — is GLASS_FLOORS / GLASS_BLUR
+    (ui/lib/veltrix-kit/platform/theme-tokens.ts), read by every process the same.
+  -->
+  <schema id="org.veltrix.appearance" path="/org/veltrix/appearance/">
+    <!--
+      RETIRED 2026-10-11: the glass material (clear / regular / frosted, #674) is no longer
+      a choice — it predated measuring the reference and only confused the two. Nothing
+      reads it but migrations/2026-09-30-glass-material-from-opacities.sh, which still
+      writes it on an install upgrading from before then; it stays so that migration can.
+    -->
+    <key name="glass-material" type="s">
+      <choices>
+        <choice value="clear"/>
+        <choice value="regular"/>
+        <choice value="frosted"/>
+      </choices>
+      <default>'regular'</default>
+      <summary>Retired: glass material of the desktop</summary>
+    </key>
+    <key name="reduce-transparency" type="b">
+      <default>false</default>
+      <summary>Reduce transparency</summary>
+      <description>Every glass surface becomes solid, whatever the glass material.</description>
+    </key>
+    <key name="window-background" type="s">
+      <choices>
+        <choice value="opaque"/>
+        <choice value="tinted"/>
+        <choice value="translucent"/>
+      </choices>
+      <default>'opaque'</default>
+      <summary>Window background</summary>
+      <description>Veltrix's own windows: opaque; tinted (the colour of what is behind comes through, heavily blurred: subtle); or translucent (less opaque, less blurred). Each one opacity and one blur (WINDOW_BACKGROUNDS in the kit), drawn by the compositor. Not the interface's glass. Replaces window-transparency (2026-10-18).</description>
+    </key>
+    <key name="accent-hex" type="s">
+      <default>"#00E5FF"</default>
+      <summary>Accent colour as #RRGGBB</summary>
+      <description>The exact accent the shell paints (owner, 2026-11-15: the accent is a real setting again — any hex, picked in Studio or set with `veltrix-ipc setConfig appearance.accentHex`). Cyan #00E5FF is the default; a custom accent is opt-in per theme. The named preset nearest to this hex is what `appearance.accent` reports and what org.gnome.desktop.interface accent-color publishes (GNOME's enum has no cyan, so cyan publishes as blue). An invalid value is ignored and the preset's hex is painted instead.</description>
+    </key>
+    <!--
+      RETIRED 2026-09-30 (#674): the four glass opacities the sliders wrote. Nothing
+      reads them but migrations/2026-09-30-glass-material-from-opacities.sh, which
+      turns them into a glass-material once and resets them; they stay in the schema
+      so that migration (and 2026-09-14c before it, on an install upgrading from
+      before then) can still read and write them.
+    -->
+    <key name="bar-opacity" type="d">
+      <range min="0.24" max="0.8"/>
+      <default>0.48</default>
+      <summary>Retired: glass opacity of the bar</summary>
+    </key>
+    <key name="overlay-opacity" type="d">
+      <range min="0.24" max="0.8"/>
+      <default>0.48</default>
+      <summary>Retired: glass opacity of the panels that open from the bar</summary>
+    </key>
+    <key name="dock-opacity" type="d">
+      <range min="0.24" max="0.8"/>
+      <default>0.24</default>
+      <summary>Retired: glass opacity of the dock</summary>
+    </key>
+    <key name="window-opacity" type="d">
+      <range min="0.24" max="0.8"/>
+      <default>0.48</default>
+      <summary>Retired: glass opacity of Veltrix's own windows</summary>
+    </key>
+    <!-- `shell-appearance` (the shell pin) was here until 2026-09-29. Removed (#676).
+         A value left in dconf is simply unread. -->
+    <!--
+      The icon theme Veltrix's OWN surfaces draw from (#587) — a different thing
+      from org.gnome.desktop.interface icon-theme, which is the theme for
+      APPLICATION icons and is what the dock, the tray and the app grid resolve
+      against. Empty means the drawings shipped with the shell, which is the
+      default and what every install has today. Not served by the portal yet:
+      the greeter and the lock screen still carry their own copies of these
+      icons (ui/lib/veltrix-kit/platform/icons.ts), and they join when the migration reaches them.
+    -->
+    <key name="interface-icon-theme" type="s">
+      <default>""</default>
+      <summary>Icon theme for Veltrix's own interface icons; empty = the shipped drawings</summary>
+    </key>
+  </schema>
+
+  <!--
+    Which widgets show where. Keyed by widget id — the keys ARE the data, so the
+    map only holds what differs from, or was saved over, the code's first-run
+    placement (DEFAULT_PLACEMENT in ui/shell/widgets/index.ts, merged underneath).
+  -->
+  <schema id="org.veltrix.widgets" path="/org/veltrix/widgets/">
+    <key name="placement" type="a{s(bb)}">
+      <default>{}</default>
+      <summary>Widget id to (shown in the bar, shown in the Control Centre)</summary>
+    </key>
+    <key name="bar-mode" type="a{ss}">
+      <default>{}</default>
+      <summary>Widget id to how it shows in the bar: "always", or "active" (only while it is active)</summary>
+      <description>Only for widgets that can say they are active. A widget not named here uses its own default.</description>
+    </key>
+    <!-- The bar's right group, left to right (core/BarOrder.ts). Empty = the default order. -->
+    <key name="bar-order" type="as">
+      <default>[]</default>
+      <summary>The order of the bar's right group: "widget:ID", "tray:ID" (the app's StatusNotifierItem Id) and "shell:search"</summary>
+      <description>Left to right, the Control Centre and the clock excluded (they are fixed at the end). Empty means the default order. An item this list does not name appears at its left end.</description>
+    </key>
+    <key name="bar-hidden" type="as">
+      <default>[]</default>
+      <summary>Items kept out of the bar's right group, by their order key ("tray:ID", "shell:search")</summary>
+      <description>A widget is shown or not through "placement"; this holds the rest.</description>
+    </key>
+    <key name="tray-known" type="a{s(sss)}">
+      <default>{}</default>
+      <summary>Tray icons seen so far: StatusNotifierItem Id to (title, icon, desktop app id)</summary>
+      <description>Written by the shell when an app shows a tray icon, so Settings can list it while the app is closed — only while the app it belongs to is still installed. The icon is a theme name or a file path; the app id is empty when no installed app could be matched.</description>
+    </key>
+  </schema>
+
+  <!-- The Control Centre grid. Empty = the default layout (CC_DEFAULT_ORDER). -->
+  <schema id="org.veltrix.control-center" path="/org/veltrix/control-center/">
+    <key name="positions" type="a{s(ii)}">
+      <default>{}</default>
+      <summary>Widget id to its grid cell (column, row)</summary>
+    </key>
+    <key name="sizes" type="a{ss}">
+      <default>{}</default>
+      <summary>Widget id to its footprint ("1x1", "2x1", "1x2", "2x2", "4x1") where it is not the widget's default</summary>
+    </key>
+  </schema>
+
+  <!--
+    How the clock reads. NOT the timezone (the system's, set through timedatectl)
+    and NOT the regional format (LC_* in ~/.config/environment.d/veltrix-locale.conf,
+    read at login): each of those already has a home, and a copy here was a second
+    one. The shell mirrors these three to /var/tmp/veltrix/region.json for the greeter.
+  -->
+  <schema id="org.veltrix.region" path="/org/veltrix/region/">
+    <key name="time-format" type="s">
+      <choices>
+        <choice value="24h"/>
+        <choice value="12h"/>
+      </choices>
+      <default>"12h"</default>
+      <summary>24- or 12-hour clock</summary>
+    </key>
+    <key name="date-format" type="s">
+      <choices>
+        <choice value="none"/>
+        <choice value="short"/>
+        <choice value="short-year"/>
+        <choice value="long"/>
+        <choice value="numeric"/>
+        <choice value="iso"/>
+      </choices>
+      <default>"short"</default>
+      <summary>Date shown beside the clock in the bar</summary>
+      <description>The bar's only. The lock screen and the login screen show the long date whatever this says: a lock screen keeps its own clock.</description>
+    </key>
+    <key name="show-seconds" type="b">
+      <default>false</default>
+      <summary>Show seconds in the clock</summary>
+    </key>
+    <key name="hijri-offset" type="i">
+      <range min="-1" max="1"/>
+      <default>0</default>
+      <summary>Hijri date adjustment in days for local moon sighting</summary>
+      <description>The bar's Hijri date comes from the Umm al-Qura table, which is
+      calculated; a real month can start a day earlier or later than the table
+      says. −1, 0 or +1 day, set from Settings → Top bar → Clock → Configure.</description>
+    </key>
+  </schema>
+
+  <schema id="org.veltrix.safety" path="/org/veltrix/safety/">
+    <key name="content-filter" type="b">
+      <default>true</default>
+      <summary>Block adult websites (CleanBrowsing Family DNS + hosts blocklist)</summary>
+      <description>Settings → Safety. Default ON (Adnan, 2026-11-12): the DNS
+      layer points the system resolver at CleanBrowsing Family and the hosts
+      layer blocks the curated adult-domain list in /etc/hosts. Both layers
+      are applied and removed together by bin/veltrix-content-safety.</description>
+    </key>
+    <key name="last-nudge-date" type="s">
+      <default>""</default>
+      <summary>Date (YYYY-MM-DD) the re-enable reminder was last shown</summary>
+      <description>Local only, no account, no telemetry. The reminder is shown
+      at most once a day while the protection is off.</description>
+    </key>
+    <key name="turned-off-date" type="s">
+      <default>""</default>
+      <summary>Date (YYYY-MM-DD) the protection was last turned off</summary>
+      <description>Local only. The reminder waits until the next day after
+      the user turned the protection off — the day they chose is not the
+      day to ask again.</description>
+    </key>
+  </schema>
+  <schema id="org.veltrix.halal-audio" path="/org/veltrix/halal-audio/">
+    <key name="enabled" type="b">
+      <default>true</default>
+      <summary>Audio Filter (playback-time filter)</summary>
+      <description>Settings → Audio Filter. Default ON (Adnan, 2026-11-12):
+      with it off, the play/save actions refuse; with it on, the user picks
+      one audio file and bin/veltrix-halal-audio plays it through the
+      VoiceOnly Fast vocal filter (mostly voice) after scanning its words
+      against a local list — a flagged song warns "This is haram" and plays
+      only on the user's explicit choice. Turning it off opens the halal
+      interstitial (An-Nur 24:30 + a 60-second pause) first. A filtered
+      copy can also be saved next to the original (warns, never mutes). The
+      original is never modified. No live filtering, no network at
+      scan/play time.</description>
+    </key>
+    <key name="last-processed" type="s">
+      <default>""</default>
+      <summary>One-line summary of the last Audio Filter run</summary>
+      <description>Local only, no account, no telemetry. Shown on the
+      Audio Filter page; "" = no run yet.</description>
+    </key>
+  </schema>
+  <schema id="org.veltrix.media" path="/org/veltrix/media/">
+    <key name="lock-screen-controls" type="b"><default>true</default></key>
+    <key name="pause-on-headphones-disconnect" type="b"><default>true</default></key>
+  </schema>
+  <schema id="org.veltrix.power" path="/org/veltrix/power/">
+    <key name="automatic-saver" type="b"><default>true</default><summary>Power preference</summary></key>
+    <key name="show-percentage" type="b"><default>true</default><summary>Power preference</summary></key>
+    <key name="power-button-action" type="s"><default>'menu'</default><choices><choice value="menu"/><choice value="suspend"/><choice value="poweroff"/><choice value="nothing"/></choices><summary>Power action</summary></key>
+    <key name="lid-action-on-battery" type="s"><default>'suspend'</default><choices><choice value="suspend"/><choice value="lock"/><choice value="nothing"/></choices><summary>Power action</summary></key>
+    <key name="lid-action-on-ac" type="s"><default>'suspend'</default><choices><choice value="suspend"/><choice value="lock"/><choice value="nothing"/></choices><summary>Power action</summary></key>
+    <key name="auto-sleep-timeout" type="u"><default>1800</default><summary>Auto-sleep timeout</summary><description>Seconds of inactivity before auto-sleep suspends the computer, when auto-sleep is on. The Settings toggle, not this key, decides whether auto-sleep is on at all — turning it off never resets this timeout.</description></key>
+  </schema>
+</schemalist>

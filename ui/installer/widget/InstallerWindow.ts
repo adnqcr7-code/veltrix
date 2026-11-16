@@ -1,0 +1,492 @@
+import Gtk from "gi://Gtk?version=4.0"
+import Gio from "gi://Gio"
+import GLib from "gi://GLib"
+import app from "../../lib/veltrix-kit/platform/host"
+import {
+  VeltrixButton, VeltrixCircleButton, VeltrixClamp, VeltrixWindow,
+  VeltrixScrolled, VeltrixSidebar, VELTRIX_WINDOW_RADIUS,
+  showVeltrixAlert,
+  type VeltrixWindowResult,
+} from "../../lib/veltrix-kit"
+import { ndIcon } from "../../lib/veltrix-kit/platform/icons"
+import { Flow, type Step } from "../lib/flow"
+import { WelcomeStep } from "../steps/welcome"
+import { RegionStep } from "../steps/region"
+import { InterfaceStep } from "../steps/interface"
+import { DiskStep } from "../steps/disk"
+import { AccountStep } from "../steps/account"
+import { SystemStep } from "../steps/system"
+import { SummaryStep } from "../steps/summary"
+import { RunStep } from "../steps/run"
+import { WINDOW_LAYOUT, WIZARD_LAYOUT, ROW_HEIGHT, minWindowWidthFor } from "../../lib/veltrix-kit/platform/tokens"
+import { t, onLocaleChange } from "../lib/i18n"
+import { isPreview } from "../lib/preview"
+import { initGeoIpLookup } from "../lib/geoip"
+
+function header(onClose: () => void): {
+  start: Gtk.Widget
+  end: Gtk.Widget
+  set: (title: string) => void
+  setCanClose: (can: boolean) => void
+} {
+  const title = new Gtk.Label({
+    css_classes: ["installer-title"],
+    halign: Gtk.Align.START,
+    hexpand: true,
+    xalign: 0,
+    can_target: false,
+  })
+
+  const closeBtn = VeltrixCircleButton({
+    icon: ndIcon("nd-window-close"),
+    iconName: "window-close-symbolic",
+    accessibleLabel: t("a11yClose"),
+    variant: "danger",
+    valign: Gtk.Align.CENTER,
+    halign: Gtk.Align.END,
+    onClick: onClose,
+  })
+  closeBtn.name = "installer-close"
+
+  return {
+    start: title,
+    end: closeBtn,
+    set: (t: string) => { title.label = t },
+    setCanClose: (can: boolean) => { closeBtn.sensitive = can },
+  }
+}
+
+export function InstallerWindow(): Gtk.Window {
+  initGeoIpLookup()
+  const steps: Step[] = [
+    WelcomeStep(),
+    RegionStep(),
+    InterfaceStep(),
+    DiskStep(),
+    AccountStep(),
+    SystemStep(),
+    SummaryStep(),
+    RunStep(),
+  ]
+  const flow = Flow(steps)
+
+  const canExit = () => flow.current().busy?.() !== true
+  // Set by the confirmation dialog so the close it then asks for is not questioned
+  // a second time by the very hook that raised it.
+  let confirmedQuit = false
+
+  // ⚠️ `themeFallback` is what draws when the Veltrix asset tree is not found
+  // (`ndIcon` → null). It only fires with the whole tree missing, so it is a belt
+  // — but a belt made of a name no theme draws is worse than none: the row goes
+  // blank and nothing is logged. Every name here was MEASURED, not guessed
+  // (`scripts/dev/icon-fallback-audit.js`, 64 themes) and then LOOKED AT, because
+  // existing is not drawing: `help-about-symbolic` is an ⓘ in Adwaita and a STAR
+  // in Colloid/MacTahoe/Qogir, `user-available-symbolic` is a speech bubble
+  // everywhere. #603 transliterated three of these from their `nd-` names
+  // (`hand-symbolic`, `clipboard-list-symbolic`, `cpu-symbolic`) — Lucide names
+  // that exist in no icon theme at all; `cpu-symbolic` reaches only Papirus and
+  // Tela, not Adwaita, which is what a clean Arch install has.
+  const sidebarDefs = [
+    { id: "welcome", titleKey: "welcomeTitle", iconName: "nd-hand", themeFallback: "go-home-symbolic" },
+    { id: "region", titleKey: "regionTitle", iconName: "nd-globe", themeFallback: "globe-symbolic" },
+    { id: "interface", titleKey: "interfaceTitle", iconName: "nd-view-grid", themeFallback: "view-grid-symbolic" },
+    { id: "disk", titleKey: "diskTitle", iconName: "nd-drive-harddisk", themeFallback: "drive-harddisk-symbolic" },
+    { id: "account", titleKey: "accountTitle", iconName: "nd-avatar-default", themeFallback: "avatar-default-symbolic" },
+    { id: "system", titleKey: "systemTitle", iconName: "nd-cpu", themeFallback: "computer-symbolic" },
+    { id: "summary", titleKey: "summaryTitle", iconName: "nd-clipboard-list", themeFallback: "view-list-symbolic" },
+    { id: "run", titleKey: "runTitle", iconName: "nd-rocket", themeFallback: "system-run-symbolic" },
+  ]
+
+  const sidebar = VeltrixSidebar(
+    sidebarDefs.map(d => ({
+      id: d.id,
+      label: t(d.titleKey as any),
+      icon: ndIcon(d.iconName) as any,
+      iconName: d.themeFallback,
+    })),
+    (id) => {
+      if (flow.current().id === "run") return
+      flow.goTo(id)
+    },
+  )
+  sidebar.widget.set_name("veltrix-installer-sidebar-list")
+
+  function updateSidebarLabels() {
+    for (let i = 0; ; i++) {
+      const row = sidebar.widget.get_row_at_index(i)
+      if (!row) break
+      const id = row.get_name()
+      const def = sidebarDefs.find(d => d.id === id)
+      if (def) {
+        const box = row.get_child() as Gtk.Box
+        if (box) {
+          let child = box.get_first_child()
+          while (child) {
+            if (child instanceof Gtk.Label) {
+              child.label = t(def.titleKey as any)
+            }
+            child = child.get_next_sibling()
+          }
+        }
+      }
+    }
+  }
+
+  const back = VeltrixButton({ label: t("back"), variant: "secondary" })
+  const next = VeltrixButton({ label: t("continue"), variant: "primary" })
+  const closeActionBtn = VeltrixButton({ label: t("runClose"), variant: "secondary" })
+  const restartActionBtn = VeltrixButton({ label: t("runRestart"), variant: "primary" })
+
+  let isShowingAlert = false
+
+  back.connect("clicked", () => flow.back())
+  next.connect("clicked", () => {
+    if (isShowingAlert) return
+    const step = flow.current()
+    if (step.ready && !step.ready()) return
+    // The last click before the install is a different kind of click, and it used
+    // to be the same one — same button, same corner, same word as the six pages
+    // before it (#436). A step that has something irreversible to say says it
+    // here; everything else advances untouched.
+    const confirm = step.confirmNext?.()
+    if (!confirm) {
+      flow.next()
+      return
+    }
+    isShowingAlert = true
+    next.sensitive = false
+    showVeltrixAlert({
+      parent: win,
+      heading: confirm.heading,
+      body: confirm.body,
+      responses: [
+        { id: "cancel", label: confirm.cancelLabel },
+        { id: "proceed", label: confirm.confirmLabel, suggested: true },
+      ],
+      onResponse: (id) => {
+        isShowingAlert = false
+        next.sensitive = true
+        if (id === "proceed") flow.next()
+      },
+    })
+  })
+  closeActionBtn.connect("clicked", () => shell.close())
+  restartActionBtn.connect("clicked", () => {
+    // Reachable in preview, because preview walks the flow to its end — and there
+    // the last button on the last page reboots the machine you are working on.
+    if (isPreview()) {
+      console.log("[PREVIEW] not executed: systemctl reboot")
+      return
+    }
+    try {
+      Gio.Subprocess.new(["systemctl", "reboot"], Gio.SubprocessFlags.NONE)
+    } catch {}
+  })
+
+  const navBox = new Gtk.Box({
+    orientation: Gtk.Orientation.HORIZONTAL,
+    spacing: 10,
+    halign: Gtk.Align.END,
+  })
+  navBox.append(back)
+  navBox.append(next)
+  navBox.append(closeActionBtn)
+  navBox.append(restartActionBtn)
+
+  const position = new Gtk.Label({
+    css_classes: ["installer-position"],
+    halign: Gtk.Align.START,
+    valign: Gtk.Align.CENTER,
+    can_target: false,
+  })
+
+  const footer = new Gtk.Box({
+    orientation: Gtk.Orientation.HORIZONTAL,
+    hexpand: true,
+    halign: Gtk.Align.FILL,
+    css_classes: ["installer-footer"],
+  })
+  footer.append(position)
+  const footerSpacer = new Gtk.Box({ hexpand: true })
+  footer.append(footerSpacer)
+  footer.append(navBox)
+
+  flow.widget.add_css_class("installer-body")
+  // ⚠️ `propagateNaturalHeight` is what makes the window's size follow the LAYOUT
+  // instead of the other way round. Without it this scroller reports no natural
+  // height of its own, the window falls back to the two-pane default of 760, and
+  // every list inside it has to be given a pixel height that fits — which is
+  // exactly the tail wagging the dog that WIZARD_LAYOUT exists to end. With it,
+  // the page's own natural height (heading, prose, six whole rows, whatever sits
+  // under them) is what the window asks for, and the scroller goes back to being
+  // what a scroller is for: the case where the window is smaller than that.
+  const { widget: scrolledContent, scrolled } = VeltrixScrolled({
+    child: VeltrixClamp(flow.widget, WINDOW_LAYOUT.wizardContent, true, WINDOW_LAYOUT.contentFloor),
+    reserveLane: false,
+    hscrollPolicy: Gtk.PolicyType.AUTOMATIC,
+    propagateNaturalHeight: true,
+    cornerRadius: VELTRIX_WINDOW_RADIUS,
+    cssClasses: ["installer-page-scroll"],
+  })
+  scrolled.hexpand = true
+  scrolled.vexpand = true
+  scrolledContent.hexpand = true
+  scrolledContent.vexpand = true
+
+  let shell: VeltrixWindowResult
+  const head = header(() => shell.close())
+  const sidebarIcon = ndIcon("nd-sidebar-show") ?? Gio.ThemedIcon.new("sidebar-show-symbolic")
+
+  // The banner is the whole reason preview is allowed to look like the installer:
+  // a screenshot of a preview must never be mistakable for a screenshot of an
+  // install. It sits above the content rather than in the header so it survives
+  // the sidebar being collapsed, and it is the first thing in the reading order.
+  const rootContent = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, hexpand: true, vexpand: true })
+  if (isPreview()) {
+    const banner = new Gtk.Label({
+      label: t("previewBanner"),
+      css_classes: ["installer-preview-banner"],
+      halign: Gtk.Align.FILL,
+      xalign: 0,
+      wrap: true,
+      can_target: false,
+    })
+    rootContent.append(banner)
+  }
+  rootContent.append(scrolledContent)
+
+  shell = VeltrixWindow({
+    app,
+    title: "Veltrix Installer",
+    name: "veltrix-installer",
+    appId: "veltrix-installer",
+    cssClasses: ["veltrix-installer-window"],
+    glassClasses: ["installer-root"],
+    content: rootContent,
+    sidebar: {
+      widget: sidebar.widget,
+      toggleIcon: sidebarIcon as any,
+      toggleLabel: t("a11ySidebarToggle"),
+      width: WINDOW_LAYOUT.sidebar,
+      contentWidth: WINDOW_LAYOUT.wizardContent,
+    },
+    footer,
+    header: { start: head.start, end: head.end },
+    closeOnEscape: true,
+    // Refused while the install is running (that has always been true), and now
+    // also questioned once anything has been answered.
+    //
+    // Veltrix had never implemented an "are you sure" on any window, and both
+    // halves of one were already sitting here: VeltrixWindow's `onClose` hook
+    // refuses a close by returning true, and the kit ships `showVeltrixAlert`.
+    // Nothing had wired them together, so the X and Escape threw away a filled-in
+    // form — a chosen disk, a typed password — on one stray click, with no undo
+    // and nothing on screen to suggest one was possible.
+    //
+    // Past the welcome page is the test, which is where Calamares draws the same
+    // line: before that there is nothing to lose and a confirmation is just a
+    // second click.
+    onClose: () => {
+        if (!canExit()) return true
+        if (confirmedQuit || flow.currentIndex() === 0) return false
+        // Once the install step is reached and finished, closing requires no confirmation
+        if (flow.current().id === "run") return false
+        if (isShowingAlert) return true
+
+        isShowingAlert = true
+        showVeltrixAlert({
+            parent: win,
+            heading: t("quitHeading"),
+            body: t("quitBody"),
+            responses: [
+                { id: "stay", label: t("quitStay"), suggested: true },
+                { id: "quit", label: t("quitConfirm"), destructive: true },
+            ],
+            onResponse: (id) => {
+                isShowingAlert = false
+                if (id !== "quit") return
+                confirmedQuit = true
+                shell.close()
+            },
+        })
+        return true
+    },
+    // No WIDTH of our own. VeltrixWindow derives it from WINDOW_LAYOUT — an opening
+    // width that keeps the sidebar docked at the pane's full width, and a minimum
+    // at the distress floor. This asked for 960×760 by hand, which is 108px wider
+    // than its own layout needs (250 sidebar + 600 pane + 2 rim = 852) and 280px
+    // taller than the minimum two cards and a header require. A 1366×768 laptop
+    // could not fit the window it was being handed. Closes #312.
+    //
+    // And no HEIGHT of our own either, now: -1 turns off the two-pane default of
+    // 760 so that the measurement below is what decides. See WIZARD_LAYOUT.
+    defaultHeight: -1,
+    resizable: true,
+  })
+
+  const win = shell.window
+
+  // ── The opening height is MEASURED, not chosen ───────────────────────────────
+  // The width comes from a law (sidebar + pane + rim); the height used to come
+  // from a literal 760 that the lists were then cut to fit. It comes from the same
+  // place now: ask the layout, open at what it says.
+  //
+  //   glass          the footer and the card's own padding
+  // + contentColumn  the header, and the page under it with its list at the FLOOR
+  // + the rows       the difference between that floor and WIZARD_LAYOUT.listRows
+  //
+  // Only the last term is a number somebody chose. The other two are GTK adding up
+  // a heading, a paragraph wrapped in whatever language this is, a search box and
+  // whatever the page puts below the list — none of which can be written down
+  // honestly, because a paragraph's height is a property of the language.
+  //
+  // ⚠️ The list is measured at its FLOOR on purpose, and the rows are added back
+  // here rather than asked for down there. That way a page carrying more than a
+  // list — the region page has a card and a keyboard test box under it — still
+  // fits inside this height: its extra content eats into the list's share instead
+  // of pushing the page into a scroll. The list is the only thing on the page that
+  // vexpands, so it is the only thing that gives.
+  //
+  // ⚠️ Measured before `present()`: the widgets exist, so GTK can add them up, and
+  // the window has not been sized yet. And measured through `contentColumn`, not
+  // through the window — see VeltrixWindowResult for why the window cannot see its
+  // own content.
+  //
+  // ⚠️ The cap uses the SMALLEST monitor. A window has no monitor before it is
+  // mapped and the compositor decides where it lands, so a height computed for a
+  // 1440p screen would open a window that does not fit the 1366×768 laptop beside
+  // it — and Hyprland CENTRES what does not fit rather than clipping it, which
+  // puts the header above the top edge with no way to reach it.
+  //
+  // ⚠️ The WIDTH is read back from the window, never recomputed. VeltrixWindow has
+  // already derived it — the breakpoint plus WINDOW_LAYOUT.openGutter, which is
+  // the air on either side of the pane — and a second copy of that derivation is
+  // a copy that can disagree with the first. Mine did, on the day it was written:
+  // it left the gutter out and the window opened 852 instead of 898, with the page
+  // flush against the sidebar on one side and the glass rim on the other.
+  const openWidth = win.default_width
+  const minFloorWidth = minWindowWidthFor(WINDOW_LAYOUT.contentFloor)
+  const monitorWidths = app.get_monitors().map(m => m.get_geometry().width).filter(w => w > 0)
+  const monitorHeights = app.get_monitors().map(m => m.get_geometry().height).filter(h => h > 0)
+
+  if (monitorWidths.length > 0) {
+    const minMonWidth = Math.min(...monitorWidths)
+    const maxAllowedWidth = Math.round(minMonWidth * WIZARD_LAYOUT.maxMonitorFraction)
+    if (openWidth > maxAllowedWidth) {
+      win.default_width = Math.max(minFloorWidth, maxAllowedWidth)
+    }
+  }
+
+  const cap = Math.round(
+      Math.min(...(monitorHeights.length ? monitorHeights : [WINDOW_LAYOUT.minHeight]))
+      * WIZARD_LAYOUT.maxMonitorFraction,
+  )
+  const [, chromeHeight] = shell.glass.measure(Gtk.Orientation.VERTICAL, win.default_width)
+  const [, columnHeight] = shell.contentColumn!.measure(Gtk.Orientation.VERTICAL, Math.min(WINDOW_LAYOUT.wizardContent, win.default_width))
+  const listBudget = (WIZARD_LAYOUT.listRows - WIZARD_LAYOUT.minListRows) * ROW_HEIGHT.double
+  const effectiveMinHeight = Math.min(WINDOW_LAYOUT.minHeight, cap)
+  const DESIRED_INSTALLER_HEIGHT = 780
+  const measuredHeight = chromeHeight + columnHeight + listBudget
+  const targetHeight = Math.max(DESIRED_INSTALLER_HEIGHT, measuredHeight)
+  win.default_height = Math.max(
+      effectiveMinHeight,
+      Math.min(targetHeight, cap),
+  )
+  win.connect("destroy", () => app.quit())
+
+  let lastStepIndex = -1
+
+  function sync() {
+    const step = flow.current()
+    const index = flow.currentIndex() + 1
+
+    // Only reset scroll position when transitioning between different steps.
+    // Resetting on every sync() breaks form entry: any keystroke that triggers
+    // validation (notifyReady) would scroll the page to top and steal focus.
+    if (index !== lastStepIndex) {
+      lastStepIndex = index
+      if (scrolled?.vadjustment) {
+        scrolled.vadjustment.value = 0
+      }
+    }
+    const title = typeof step.title === "function" ? step.title() : step.title
+    const nextLabel = typeof step.nextLabel === "function" ? step.nextLabel() : step.nextLabel
+
+    const isRunStep = step.id === "run"
+    const isBusy = step.busy?.() === true
+    const maxIdx = flow.maxReachedIndex()
+
+    sidebarDefs.forEach((def, i) => {
+      if (isRunStep || isBusy) {
+        sidebar.setItemSensitive(def.id, false)
+      } else {
+        sidebar.setItemSensitive(def.id, i <= maxIdx && def.id !== "run")
+      }
+    })
+
+    sidebar.select(step.id)
+    updateSidebarLabels()
+
+    head.set(title)
+    position.label = `${index} ${t("of")} ${steps.length}`
+
+    if (step.id === "run") {
+      position.visible = false
+      back.visible = false
+      next.visible = false
+      // ⚠️ Both stay ON SCREEN for the whole run, insensitive while it works.
+      // They used to be hidden while busy, and a footer that empties itself for
+      // twenty minutes reads as the window breaking, not as "wait" (owner,
+      // 2026-09-22). The same goes for Restart after a failure: greyed, not gone.
+      //
+      // Restart only after a success. After a failure the one thing to do is
+      // close and start again, so Close is the primary button there.
+      const busy = step.busy?.() === true
+      const failed = step.outcome?.() === "failure"
+      closeActionBtn.visible = true
+      restartActionBtn.visible = true
+      closeActionBtn.sensitive = !busy
+      restartActionBtn.sensitive = !busy && !failed
+      closeActionBtn[failed ? "add_css_class" : "remove_css_class"]("veltrix-btn--primary")
+      closeActionBtn[failed ? "remove_css_class" : "add_css_class"]("veltrix-btn--secondary")
+      restartActionBtn[failed ? "add_css_class" : "remove_css_class"]("veltrix-btn--secondary")
+      restartActionBtn[failed ? "remove_css_class" : "add_css_class"]("veltrix-btn--primary")
+    } else {
+      position.visible = true
+      closeActionBtn.visible = false
+      restartActionBtn.visible = false
+      back.visible = flow.canBack()
+      next.visible = true
+      next.set_label(nextLabel)
+      back.set_label(t("back"))
+      next.sensitive = step.ready ? step.ready() : true
+      if (index === steps.length) next.sensitive = false
+    }
+
+    closeActionBtn.set_label(t("runClose"))
+    restartActionBtn.set_label(t("runRestart"))
+    head.setCanClose(canExit())
+  }
+  flow.onChange(sync)
+  // A language change invalidates every page, because a page translates itself
+  // once, inside build(). The frame and the summary were the only two things
+  // subscribed here; the other six steps held 72 strings frozen at whatever the
+  // language happened to be when each was first reached.
+  //
+  // ⚠️ Deferred to an idle, and it has to be: the only thing that changes the
+  // language is activating a row on the language page, so this fires from inside
+  // that row's own "row-activated" handler — and the rebuild destroys the list
+  // that handler is still running on. Let the emission finish first.
+  onLocaleChange(() => {
+    GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+      lastStepIndex = -1
+      flow.invalidate()
+      sync()
+      return GLib.SOURCE_REMOVE
+    })
+    sync()
+  })
+  sync()
+
+  return win
+}

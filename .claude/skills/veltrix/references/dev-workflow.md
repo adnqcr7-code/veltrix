@@ -1,0 +1,4241 @@
+# Veltrix — Dev workflow, installer, persistence, keybinds
+
+Read this when running the installer, debugging a reload that won't take, looking for where a setting is persisted, or adding a new keybind.
+
+## Installer (`install.sh`)
+
+Arch-only provisioning.
+
+⚠️ **It installs a DEVELOPMENT copy, and nothing else, since 2026-09-02 (#378 → step 3).** The
+system path is gone: a bare `./install.sh` prints the package commands and exits 1. Installing the
+desktop is `pacman -S veltrix` from `[veltrix]`, which is now first-class in the README —
+one way in, and pacman owns the files. What went with the system path: the release-tag jump, the
+`[veltrix]` registration and key import (nothing a dev install needs comes from that repo — all 74
+derived dependencies are core/extra, checked), the 62-line package branch of §4, `DEV_LIKE`, and
+`veltrix-update`'s STABLE path, which used to migrate a script-era install by cloning a release and
+running this script on it. Migrating IS installing the package now, so that branch prints the
+commands rather than being a second implementation of them.
+
+⚠️ **It is also INTERACTIVE, and declining aborts it** (#378). Step 1 needs the system
+up to date before it can install anything — Arch does not support partial upgrades — so it runs
+`sudo pacman -Syu` and shows you the transaction instead of the `--noconfirm` it used to pass. The
+script runs on a machine the project does not own (`nidara-iso`'s `PRODUCT.md`, "What does NOT
+change"), and one unattended run of it upgraded 44 packages and both kernels on a maintainer's
+desktop. Declining stops the install with nothing written, rather than continuing into the
+partial-upgrade state the `-Syu` exists to prevent. **Do not wrap this in anything that expects it
+to be silent** — and nothing does today: its only non-human caller is `veltrix-update`'s dev
+path, which runs with a user at a terminal.
+
+Two modes:
+
+- ~~**`--system` (default)**~~ — **retired 2026-09-02 (#378 → step 3).** It installed the
+  `veltrix` package, jumping to the newest release tag first and registering `[veltrix]` on
+  the way. All of that is what `pacman -S veltrix` does natively, which is why the path went
+  rather than being kept as a wrapper around it.
+
+- **`--dev`:** installs system binaries **and** writes `~/.config/veltrix/.dev` pointing at the source tree. The UI launcher will then run `scripts/run.sh app.ts` from source instead of running the bundle. Registers the developer's own clone in `.source` (no managed copy). Dev installs keep the **direct-copy** flow (§3 build + §4 copies into /usr) — and **remove the desktop package first if present** (BOTH names — a machine that has not taken the renaming upgrade still carries `veltrix`), so a later `pacman -Syu` can't clobber the dev copies (this also makes the dev↔system toggle safe: going back to system reinstalls the package fresh). Iterating on the UI runs from source, so Super+Shift+R reload suffices; re-run `install.sh --dev` only when you touch system files (`bin/`, `config/`, native C libs, portals, `.desktop`) or the install flow.
+- **`veltrix-setup`** (`/usr/bin/veltrix-setup`): the idempotent first-time/system setup that *packaging can't do* — GI env in `/etc/environment`, per-user config seeding under `~/.config/veltrix` plus a default `~/.config/kitty/` (never overwrites), the Files "Move to Trash…" Nautilus extension seed (with a one-time Files restart, tracked by a `~/.config/veltrix/.nautilus-ext-restarted` marker — Nautilus loads extensions only at startup and stays resident, so a seeded extension is invisible until it restarts), uwsm env files + NVIDIA autodetect, greetd/DM setup (only when recognizably ours or no DM at all), service enablement (pipewire/wireplumber user units, power-profiles-daemon, bluetooth). System-environment detection (keyboard layout / timezone / locale) lives here too, next to its consumers. Reads payloads from `/usr/share/veltrix/{defaults,config}` — shipped identically by the veltrix package and by install.sh §5, so it behaves the same after `pacman -S veltrix` and after a script install. Called by install.sh §5 and by `veltrix-update`'s package path; a pacman-only user runs it once by hand: `sudo pacman -S veltrix && veltrix-setup`. (The old `--dev-repo` flag is gone — it symlinked hypridle.conf into the dev repo, but Settings → Power writes that file now, so UI changes were dirtying the repo working tree; it's seeded as a per-user copy like everything else, with a migration that preserves the old link's content. Idle-suspend default: the hypridle.conf seed gets a 30-min suspend listener appended ONLY when a battery is present — desktops default to never; Settings → Power overrides either way.) **`--user` mode = the first-login bootstrap** (issue #23): runs ONLY the per-user steps (config seeding incl. `.mcp.json`, uwsm env + NVIDIA autodetect, user services) and never touches sudo. `bin/veltrix` (the session entry) invokes it at session start whenever `~/.config/veltrix` is missing — so a user created AFTER install time (Settings → Users, `useradd`, archinstall, Calamares) gets seeded on first login, before Hyprland loads its config, and a deleted config dir self-heals. Fail-soft by design (`|| true`, log at `${XDG_RUNTIME_DIR:-/tmp}/veltrix-first-login.log`): a seeding hiccup must never block the session. GTK/dconf theming for that new user then converges at shell boot (ThemeManager reconciles appearance.json → settings.ini + gsettings).
+- **`veltrix-update`** (`/usr/bin/veltrix-update`): three paths, tried in order.
+  **Dev** — a dev install updates from its own registered clone (`.dev`/`.source`), when that tree is a git checkout: `veltrix-update` hands over to `install.sh --update`, which refuses on a dirty tree, fetches, fast-forwards the dev branch, then re-execs `--update-apply`.
+  **GitHub** — a release-tarball install (bootstrap.sh from a GitHub release: `.dev` points at an extracted tree with no `.git`, or a `.release` marker exists): fetches the latest GitHub release, and when a newer one exists downloads that release's `bootstrap.sh` + tarball, verifies the tarball against the hash GitHub publishes for it (the API's asset digest, or the release's `.sha256` sidecar as fallback), and re-runs the bootstrap — the same install that put the system here. Refuses, loudly, when the release has no tarball, no `bootstrap.sh`, or no verifiable hash for the tarball, and does nothing when no newer release exists. The sidecar is still worth uploading with every release (belt and braces, and the bootstrap's own `${TARBALL_URL}.sha256` fallback reads it). **Fast update (2026-11-14):** when the release also carries a delta asset for the installed version (`veltrix-<latest>-delta-from-<current>.tar.gz`, built by `scripts/build-delta.sh`, plus its `.sha256` sidecar), `veltrix-update` tries the delta FIRST — it downloads only the files that changed, and the bootstrap applies it in place against a `MANIFEST` of the full new tree, verifying the whole tree before `install.sh` runs. Any delta failure (no asset, no verifiable hash, a delta the bootstrap rejects) falls back to the full tarball, which converges the tree and is the same result, just slower. The release parser picks the full tarball by exact name and excludes delta assets (`-delta-from-` in the name): GitHub's API lists assets newest-first, so the delta comes before the tarball and a plain `veltrix-*.tar.gz` match mistook it for the full tarball — that broke the 1.2 → 1.2.1 update. And even the full-tarball update is incremental now: the bootstrap syncs the new tree INTO the registered tree with `rsync -a --checksum --delete` (build caches and generated outputs excluded, so they survive), which leaves every unchanged file's mtime alone — so cargo rebuilds only the crates whose sources changed, and `install.sh` §4 syncs whole trees the same way (`sync_tree`) instead of `rm -rf` + `cp -r`. The installed release is recorded in `~/.config/veltrix/.release` (bootstrap.sh writes it; `veltrix-update` writes the tag as well). Since 1.2 the release version is the plain version in `VERSION` (1.2, 1.3, …); the old 0.13.0-vN releases shared one `VERSION`, 0.13.0, so the marker was what told them apart — it is kept as the tag the install came from. The version comparison (`veltrix_release_newer` in the script, `isNewerVersion` in `UpdateCheck.ts` / About) understands BOTH schemes, so a machine on 0.13.0-v7 is correctly offered 1.2, and future plain versions compare numerically (1.10 > 1.2). This path deliberately sits AFTER the `.patches` guard, like the package path: a blind reinstall would silently drop carried patches.
+  **Package** (system installs since the packaging switch) — when `pacman -Qq veltrix` (or, pre-rename, `veltrix`) says the package is installed, the update is just `sudo pacman -Syu` (interactive on purpose: it's a full system upgrade) — the `[veltrix]` repo serves new releases — followed by `veltrix-setup` (re-applies the idempotent setup: new config seeds, greetd refresh, new services) and, only if the package version actually changed, a `veltrix.service` restart plus one `hyprctl reload` — the package replace of `/usr/share/veltrix/config/hypr/hyprland.lua` kills Hyprland's inode-based config watch mid-extract and leaves a stuck "cannot open … hyprland.lua" banner otherwise (install.sh §5 does the same reload after its package install, covering the handoff/rerun cases; both gated on `HYPRLAND_INSTANCE_SIGNATURE`). **No git anywhere.** This path deliberately sits AFTER the `.patches` guard: a patched install is a locally built package, and a blind `-Syu` would silently replace it with pure upstream.
+  A pre-package install (no package, no dev clone, no release marker) has no path left: `veltrix-update` prints the package-install commands and exits 1 — migrating IS installing the package.
+  The apply pass behaves like `--system` but (a) writes **no** source marker, and (b) skips the pacman sync when the package list is unchanged (`/usr/share/veltrix/pins-pacman`; the upstream pin file it used to consult went with the Astal stack in 0.8.0 — there is nothing left to rebuild from source). It restarts `veltrix.service` at the end. Settings → About carries the one always-visible update button (Software update row, present whether or not the check has answered): it checks the latest GitHub release itself, and when one is newer the button becomes "Download update" — one tap starts the background download (see the background updater below); when the download is ready the button becomes "Update now" and applies through the privileged helper, no terminal, no password. The one case the button still opens a terminal is an update that changes the system packages (the helper refuses it as needs-interactive) — then the button becomes "Update in terminal" and runs `veltrix-update`, no commands to type. The update notification is a second path, not the only one. **Carried local patches:** if `~/.config/veltrix/.patches` exists (an agent keeps not-contributed repo fixes for this user — clone path inside; see `agent-contribution.md`, "Carrying a GLOBAL fix locally"), `veltrix-update` refuses both blind paths and defers to the agent's flow (rebase `local/patches` onto the new tag → `install.sh --update-apply`, which builds a local package from the patched tree); `install.sh --update` likewise refuses to `checkout` a release over local-only commits instead of silently dropping them.
+- **Background updater (1.0, the primary path)** — the update runs with no terminal, no sudo password prompt, no yes/no, and no reboot. Three pieces, split by privilege:
+  - `bin/veltrix-update-download` (unprivileged, Python stdlib): `check` / `download` / `status` / `cancel`. The shell spawns `download`; it fetches the delta asset first (`veltrix-<new>-delta-from-<current>.tar.gz`, when the release ships one and rsync exists) else the full tarball, into `~/.local/share/veltrix-update/staged/` (mode 0700), verifies SHA-256 against the API digest (or the `.sha256` sidecar) and size against the API asset, and writes progress to `~/.local/share/veltrix-update/status.json` (states: `idle | checking | downloading | verifying | ready | failed | applying | applied | needs-interactive`). The API URL is pinned in code; test overrides exist but are honoured only outside pkexec.
+  - `bin/veltrix-update-helper` (root via pkexec, `apply` only): re-verifies the staged release **itself** — it fetches `releases/latest` from the pinned `api.github.com/repos/adnqcr7-code/veltrix`, checks the staged version is the API's latest and strictly newer than installed, and re-checks the tarball hash and size; fails closed on any mismatch. It then runs the new tree's `bootstrap.sh --local-file <staged> <sha> --no-install` as the user, then `install.sh --dev` as root with `SYNC_PACMAN=no`, writes `.release`, and restarts only the shell service (`veltrix-rust-shell.service` if active, else `veltrix.service`) — never the machine. One gate routes to the terminal instead of failing silently: when the staged tree's dependency list (from its PKGBUILD, via install.sh's own snippet) does not match `/usr/share/veltrix/pins-pacman`, or `/etc/veltrix/apps.json` is missing, the helper exits 2 (`needs-interactive`) and the UI offers "Update in terminal" — a full `pacman -Syu` is never run silently (the unattended-kernel-upgrade lesson, #378). "Apply on next login" is a flag file (`~/.local/share/veltrix-update/apply-on-login`), consumed before install.sh runs so the restarted shell cannot re-apply in a loop. The full threat model is the header comment of the helper: **no sudo password exists anywhere** (not in a file, a keyring, an env var, not even briefly), so a compromised unprivileged side can at most trigger the install of an already-published release — it cannot substitute a tarball, downgrade, run arbitrary commands, or pass paths or URLs. A malicious *published* release is a repo-compromise event, out of scope (same as the terminal updater).
+  - `config/polkit/org.veltrix.update.policy`: action `org.veltrix.update.apply`, `allow_active=yes` (no prompt for the active local session), `allow_any`/`allow_inactive=auth_admin`. pkexec + polkit, not a D-Bus service — the same shape as the Content Safety action, and no always-on root daemon for a job that runs once per update. `bootstrap.sh` gained two additive flags for the helper: `--local-file <PATH> <SHA256>` (use a tarball already on disk) and `--no-install` (stop after placing the tree; the helper runs install.sh and writes `.release` itself).
+  - No systemd unit for either side: the shell spawns the downloader on demand and pkexec spawns the helper on demand. The UI wiring is `ui/shell/core/UpdateCheck.ts` (notification cards: downloading / ready / installing / failed / needs-interactive, with Download / Update now / On next login / Cancel / Try again / Update in terminal actions; a 5 s poll of status.json, re-posting only when the state changes) and Settings → About (2 s poll of the same status while a download or apply is in flight; the button is available → download, ready → apply, needs-interactive → terminal, failed → retry the phase that failed). The terminal `veltrix-update` above stays as the fallback — it is not deleted. Probes: `scripts/dev/update-download-probe.sh`, `update-helper-probe.sh`, `update-delta-probe.sh`, `update-bootstrap-probe.sh` (all local, fake GitHub server + fixture trees; the live polkit prompt behaviour, real D-Bus activation, and the actual shell-service restart still need the Dell).
+- **App Manager (Settings → Apps)** — the hub is the front door: a Shortcuts group (the user's most-used apps from `core/AppFrequency` — the same decayed scores Prism ranks by — then the essentials: default file manager, default browser, terminal) above the Installed Apps / Default Apps / Autostart subpages. Each app's detail page (Installed Apps) has an Uninstall group, driven by `ui/shell/core/AppUninstall.ts`: `describeUninstall` works out the removal from the app's origin — a pacman package (`pacman -Qo` on the launcher, removed with `pkexec pacman -Rns --noconfirm`), a Flatpak (`flatpak uninstall`, user installs unprivileged, system installs via pkexec; app data is NOT deleted), or a hand-placed launcher in `~/.local/share/applications` (the .desktop file is deleted — the launcher goes, the app's own files stay). A protected list (`veltrix`, `veltrix-kit`, the compositor, the session plumbing) is refused upfront with "part of the system"; Snaps and apps with no owner and no launcher file are refused with a reason instead of a button that fails after a password prompt. pacman itself is the second safety net — it refuses a removal that would break another installed package, and its stderr is shown verbatim. No new helper binary: privileged runs go through `pkexec` + `spawn()`/`execAsync` (`ui/lib/process.ts`), the same pattern as Users (`pkexec chpasswd`) and Region (`pkexec veltrix-language`).
+
+### Upstream dependencies
+
+**Zero external Astal dependencies (since 2026-08-20).**
+Previous Astal services were absorbed into native TypeScript (`core/`); notifications now live in the Rust session daemon (`session/`, #819), the application host and bundler are native (`ui/lib/veltrix-kit/platform/host.ts`, `scripts/bundle.sh`), and PAM authentication is native C (`lib/veltrix-auth/`, `gi://VeltrixAuth`).
+
+⚠️ **The layer-shell preload goes to `gjs` alone, never `export`ed by a launcher.** The bundle
+`scripts/bundle.sh` writes and `scripts/run.sh` both put `LD_PRELOAD=libgtk4-layer-shell.so` on
+the `gjs` line itself. A launcher that exports it makes every child load GTK: measured 2026-10-12,
+`dirname` goes from 0 to 17 ms and `node -e 0` from 20 to 42 ms. `bin/veltrix-lock` did, and
+Super+L took ~0.9 s to lock in dev mode, half of it that.
+
+### Binary repo (`veltrix-repo`) & packaging
+
+`github.com/adnqcr7-code/veltrix-repo` publishes `veltrix` itself as a signed pacman package (`https://adnqcr7-code.github.io/veltrix-repo/$arch`). The PKGBUILD lives inside this repository (`packaging/veltrix/PKGBUILD`), which compiles and packages the shell bundles, shims, assets, and both native C libraries (`libveltrix-wl` and `libveltrix-auth`).
+
+### The operating system's identity is NOT this repo's job (`veltrix-release`)
+
+`install.sh` runs on an Arch someone already uses and **must not rename their operating
+system** — on that machine About correctly reads "Arch Linux" for the OS and "VELTRIX"
+for the environment, and both are true. The product's identity travels in a **separate package
+in a separate repo**: `veltrix-release` (in `nidara-iso`) owns `/etc/os-release` and carries the
+PRODUCT's version, which is declared by cutting an image, not derived from anything here. The
+decision record is `nidara-iso/PRODUCT.md`; do not re-derive it.
+
+**Two numbers, neither derived from the other**, and About is the one screen that shows both:
+
+| number | comes from | reaches About via |
+|---|---|---|
+| the product's ("Veltrix …") | `veltrix-release` → `/etc/os-release` `PRETTY_NAME` | the "Operating system" row |
+| this repo's ("VELTRIX …") | `VERSION` → `readShellVersion()` | the "VELTRIX" row under it |
+
+⚠️ Neither number is written here on purpose — read `VERSION` and the published
+`veltrix-release`. A version restated in prose is a version that goes stale silently; this table
+carried "0.8.1" into a release that was not.
+
+⚠️ And the product's half is changing: `nidara-iso/PRODUCT.md` decided on 2026-08-30 that a
+Veltrix machine is **rolling and carries no version**, so `PRETTY_NAME` becomes `"Veltrix"` with no
+number and images are named by date. `readShellVersion()` and the desktop's own semver are
+untouched — About's "Operating system" row simply stops carrying a number the day
+`veltrix-release` drops it, with no shell change, exactly as the paragraph below describes.
+
+So the OS name in About **changes by itself** the day that package lands — no shell change is
+needed, and none should be added.
+
+⚠️ **Nothing but the desktop's name goes under the mark.** The OS used to be printed there, as a
+second line under "Veltrix", and the stacking made a claim the layout had no business making: on
+somebody's Arch it read "Veltrix / Arch Linux" as if the two were one product, and on our own image
+it said the word twice. Both are labelled rows now, adjacent, each saying what it counts — which
+is the only arrangement where two different numbers under one brand are not a contradiction.
+
+⚠️ **Two facts about `/etc/os-release` that were MEASURED (2026-08-25), because both look the
+other way round from the outside** (`pacman -U` into a scratch root under `fakeroot`, and
+`systemd-tmpfiles --root=`, each with a positive control):
+
+1. **No package owns `/etc/os-release`** — `filesystem` ships only `/usr/lib/os-release`. But
+   the path is *not free*: systemd's `/usr/lib/tmpfiles.d/etc.conf` puts a symlink there. A
+   package shipping the real file therefore hits **"exists in filesystem"** on a machine that
+   already booted, which is why the installer passes `--overwrite /etc/os-release` for exactly
+   that one path (it is a no-op when the file is already ours).
+2. Once the real file is in place, **tmpfiles leaves it alone forever**: the line is `L`, not
+   `L+` (contrast `/etc/mtab` two lines below, which IS `L+` and would clobber). So no pacman
+   hook is needed — which is the EndeavourOS mechanism, and it is worse: theirs overwrites a
+   file `filesystem` owns and leaves `pacman -Qkk filesystem` dirty for good.
+
+### Install steps (in order)
+
+1. `pacman` dependencies (from official Arch repos).
+2. Configure GObject Introspection (`ldconfig`).
+3. Build — **dev-like installs only**: `npm install` + SCSS compile + `scripts/bundle.sh` × 3 (shell, greeter, lockscreen). Still THREE, not four: `install.sh` does not build the installer bundle, because it must not install one (see "The fourth bundle" below). System installs skip this step: the build happens inside makepkg (or comes prebuilt) — and makepkg DOES build all four.
+4. Install system files — **system**: the veltrix *package* (prebuilt from veltrix-repo, else local makepkg). **Dev**: direct copies of binaries/configs/session entry/portals into `/usr` + compilation and installation of native C libraries (`libveltrix-wl` and `libveltrix-auth`) and `/etc/pam.d/veltrix-lock`. Every dev copy sets its mode explicitly — `install -Dm755` for executables, `install -Dm644` for data, `sync_tree` (rsync `--checksum --delete`, then `fix_tree_perms` — exactly 644/755) for whole trees — never a bare `sudo cp`: the repo's working-tree modes are restrictive (data 660, scripts 770) and root-owned once copied, which on 2026-11-13 left `/usr/bin/veltrix-*` unreadable and the systemd units invisible on the Dell, a desktop that silently never started. At the end of step 4 `install.sh` runs `scripts/verify-installed-perms.sh` (`--dev` skips the installed shell bundle, which dev runs from source); it asserts every installed file is world-readable (executables world-executable) and aborts the install naming the file on any failure. An update REPLACES, never accumulates: `bootstrap.sh` stages the download and syncs the new tree into the registered one (it no longer wipes `~/Downloads/veltrix-install` first), the `/var/tmp/veltrix-backup-*` snapshots are pruned to the two newest, whole trees are replaced wholesale by `sync_tree` (defaults, skills, assets, wallpapers, voiceonly, settings-data, migrations, veltrix-kit/js — only changed files are copied, orphans are deleted), and §4 sweeps orphans — `/usr/bin/veltrix-*` files this tree no longer ships (bin/veltrix-* plus the five built binaries), application entries not in `config/applications/`, and native hosts not in `lib/veltrix-host/hosts` (veltrix-installer is in that file, so the installer package's copy is never touched). The installed shell bundle in dev mode is deliberately NOT removed: `veltrix-ui` falls back to it when the dev tree's app.ts is missing. `bootstrap.sh` (repo root) is the one-shot Dell installer around it — preflight, tarball download + SHA-256 against the published `.sha256` sidecar (refuses without one), `./install.sh --dev`, then the same verification (`veltrix-setup` used to run a second time after `install.sh` here; it no longer does — `install.sh` §5 already runs it unconditionally, so the second pass was a pure duplicate. Set `VELTRIX_OS_SETUP_SECOND_PASS=1` to restore it) — so the user's install is two commands (download the bootstrap, run it with the tarball URL), three with the `pacman.conf` backup; never `curl | bash`.
+5. First-time setup via **`veltrix-setup`**: seeds `~/.config/veltrix/` (**never overwrites existing user config**), uwsm env + NVIDIA, greetd (**only if recognizably ours or no other DM is enabled**), enables pipewire/wireplumber (user), power-profiles-daemon + bluetooth (system — incl. `rfkill unblock bluetooth` first, and a warning when the daemon is not active afterwards: a soft-blocked radio stays blocked after the service starts). `install.sh` itself only writes the install-mode markers (`.dev`/`.source`).
+
+Between steps 4 and 5, on a fresh `--dev` install only, `install.sh` asks the extra-apps question in the install terminal (Nov 12 2026, Adnan's flow: clone → `./install.sh --dev` → packages ready → apps question → first login). It is NOT a GUI step, NOT a first-boot prompt, and never re-asked: updates skip it, and a recorded choice (`/etc/veltrix/apps.json`, `{"apps": [...], "failed": [...]}`) skips it too. The prompt (`ask_extra_apps` in `install.sh`) prints the numbered list 1–10 (FreeTube, WhatsApp, Telegram, Spotify, VLC, LibreOffice, VS Code, Discord, GIMP, Vile), parses space-separated numbers or `all`, re-prompts on invalid input, never crashes (EOF = none; a piped final line without a trailing newline is still read as input), and records the choice. Parsing is glob-free (`read -ra`, never `for token in $line`) and rejects tokens longer than 2 chars before `$((10#…))` (no 2⁶⁴ wrap); `all` matches on the whitespace-normalised line, so `a l l` selects nothing. The repo packages are pre-downloaded into the pacman cache in step 1 (`apps_predownload`, `pacman -Sw`, ~700 MB — the step-1 output discloses the size BEFORE it runs, and the README lists it; if step 1 was skipped the prompt says the cache may be cold instead of claiming pre-downloaded; and when a choice is already recorded — an update — the pre-download is skipped entirely, since the question is never re-asked and the picked apps are already installed) so picked ones install in seconds; `install_extra_apps` then installs exactly what was picked, every step guarded — a failed app is warned about and recorded in `failed`, never blocks the install, and the final banner names the failed apps instead of printing a green "complete" over them. Unknown ids are marked failed, never printed as `[ok]`, and ids are JSON-escaped into `apps.json`. The choice file is written symlink-safe (temp file + `mv`, explicit mode 644) and every write is guarded so a failed bookkeeping write warns instead of aborting the install under `set -e`. Installed versions are logged to `/etc/veltrix/apps-versions.log`; removal is documented in the README (including `flatpak remote-delete flathub`). Per-app honesty: WhatsApp is a web-app `.desktop` file (no package; the site needs network to use); Spotify and FreeTube are Flatpak from Flathub and are NOT pre-downloaded (they download when picked), and picking either adds Flathub as a persistent system-wide remote — the prompt and the README say so; FreeTube (v1.2, replacing the YouTube web app) is the privacy-focused YouTube client — no ads, no tracking, no account, no recommendation feed — installed as `io.freetubeapp.FreeTube`; VS Code is the open-source `code` build from extra; Vile (Adnan's own privacy browser, v48) is built from the source vendored in `vile/` (see `vile/VENDORED.md`) when picked — build deps (`cmake sqlite qt6-base qt6-webengine`) installed on demand, never pre-downloaded, binary to `/usr/local/bin/vile` with a `vile.desktop` file and its own icon; nothing Vile is installed unless picked. Nothing reads `apps.json` yet — the `failed` list is a record for a future first-boot retry, not an implemented one. Test seams (test-only, never honoured in a shipped install): `VELTRIX_APPS_NO_SUDO=1`, `VELTRIX_APPS_CHOICE_FILE`, `VELTRIX_APPS_DESKTOP_DIR`, `VELTRIX_APPS_VERSIONS_FILE`; tests extract the functions from `install.sh` itself, never a copy (`scripts/dev/apps-prompt-test.sh`).
+
+### Detection (no questions asked)
+
+`veltrix-setup` detects from the existing Arch install (never asks):
+- keyboard layout (`vconsole` → XKB)
+- timezone
+- locale
+
+### Install targets
+
+The independent session daemon is built in both dev installs and the PKGBUILD:
+`cd session && cargo build --release --locked` (the package first fetches crates in
+`prepare()` and adds `--offline` in `build()`). `rust` is a direct makedependency,
+so the dependency extraction in install.sh includes it without pulling Hyalo's
+extra build dependencies. Binary: `/usr/bin/veltrix-sessiond`; unit:
+`/usr/lib/systemd/user/veltrix-sessiond.service`, beside `veltrix.service`, in
+`package_veltrix()`. No enable step and no public D-Bus activation file.
+Hyalo starts it explicitly; frozen Hyprland uses veltrix-sessiond-legacy.service
+with only --media --power, avoiding duplicate TS/Rust agents. `Type=dbus` and shell ordering
+wait for readiness. The full unit uses org.veltrix.Session after all services register;
+the legacy unit uses notification-ready org.freedesktop.Notifications. systemd
+rejects two units configured with the same BusName even if they conflict.
+Dev UI reloads do not rebuild or restart the daemon.
+After changing Rust, rebuild/install the binary and restart its unit deliberately.
+
+Hyalo's early Rust-only switch (#1017, 2026-11-05) starts
+`veltrix-rust-shell.service` (`veltrix-shell --bar`), never the TS veltrix.service or
+separate dock. sessiond defaults to all services; explicit flags select a subset
+for private harnesses, with --notifications-only for the notification harness.
+The readiness name is acquired after selected services register. IPC defaults to
+Rust; --session=ts is explicit legacy compatibility. The Hyalo package and dev
+install ship the Rust shell/unit. See `toolkit/shell/SESSION.md` for gaps, live
+acceptance and removal of only temporary rust-only.conf files after installation.
+
+
+- `/usr/bin/{veltrix, veltrix-ui, veltrix-greeter, veltrix-lock, veltrix-game-mode, veltrix-setup, veltrix-update, …}`
+- `/usr/share/veltrix/` — configs, bundles, `VERSION`, wallpaper, plus the setup payloads `defaults/` (minus wallpaper) and `config/greetd/` that `veltrix-setup` reads — same layout whether shipped by the package or by install.sh §5
+- **No GTK theme is installed, and that is the point** (commandment 11, 2026-09-20). Our processes call `useNoGtkTheme()` — `GTK_THEME=Empty`, which GTK resolves out of its own gresource — so there is no file to ship and none to go missing. install.sh instead `rm -rf`s two artefacts it used to install: `/usr/share/themes/veltrix` (our old blank theme, pixel-identical to `Empty` but offered by every theme chooser on the system) and the pre-rename `crystal-shell` orphan. ⚠️ Do not "fix" a missing theme by naming one: a `GTK_THEME` that resolves to nothing silently loads GTK's FULL built-in theme, which is how the old arrangement could be broken without any symptom. See `ui/lib/veltrix-kit/platform/gtk-theme.ts`.
+- `/usr/share/wayland-sessions/veltrix.desktop`
+- `/usr/lib/veltrix/<name>` — private native libgjs runners, one per name in
+  `lib/veltrix-host/hosts` (the five bundles and the GJS helpers in `bin/`, whose
+  shebang points here); built by `lib/veltrix-host/build.sh`. The package and dev
+  install ship them all except `veltrix-installer`'s, which ships with that package.
+  Dev UI reloads compile/run the checkout's shell host; no reinstall is needed for a
+  runner-source change in dev. An uninstalled executable bundle can use
+  `VELTRIX_NATIVE_HOST_DIR=<checkout>/lib/veltrix-host/build`. See architecture.md →
+  "Every GJS program has a native executable identity".
+- `/usr/share/applications/`
+- XDG portal config
+
+User config always under `~/.config/veltrix/`.
+
+### ⚠️ Anything the installer creates in the user's HOME must be chowned — ancestors included
+
+The installer runs under `sudo`, so every `mkdir -p` into `$REAL_HOME` creates the
+**missing parents as root**, and a root-owned dir in the user's home breaks whatever the
+user's own session writes there — silently, because the writers swallow the error.
+
+Both known cases are fixed and both live in **`bin/veltrix-setup`**, side by side (one
+implementation, so the package hook and `veltrix-update` repair it too, not just `install.sh`):
+
+- `~/.config` — root-owned meant no `gtk-{3,4}.0` (icon theme + dark never reached GTK apps),
+  no `dconf`, no `user-dirs.dirs` (clean-install bugs 1/2/4, VM 06-22).
+- `~/.cache` + `~/.cache/veltrix` — created by the installer's package build cache
+  (`~/.cache/veltrix/pkgbuild`, three `mkdir` sites in `install.sh`, all now via
+  `ensure_pkg_cache`). Root-owned meant Astal couldn't cache frequents (dock/app-grid
+  ordering never persisted), no album-art cache, and **`veltrix-update` couldn't create its
+  work dir** — an mktemp inside `~/.cache/veltrix` — so the update path was broken on a fresh
+  install (VM sweep 08-10).
+
+The failing condition is a **first** install on a machine where the dir doesn't exist yet,
+and once poisoned a rerun looks fine — so it only ever shows up on a virgin VM base. When
+adding an installer path that writes into the home, chown the dir **and its parents**.
+
+### Asset resolution — `SHELL_ROOT`, never the config dir
+
+Code-shipped assets (icons in `assets/icons/`, `style.css`) resolve ONLY against
+`SHELL_ROOT` (`core/Paths.ts` = `$VELTRIX_SHELL_ROOT`, set by `bin/veltrix-ui`):
+the source tree `repo/ui/shell` in `--dev`, `/usr/share/veltrix/ui/shell` in
+`--system`. `install.sh` ships `ui/shell/assets/` into `/usr/share/...`.
+
+Do NOT resolve assets against `~/.config/veltrix/` — an old secondary
+`${config}/veltrix/ui/shell/...` path existed only because the config dir used
+to be a symlink to the repo (see footgun below); it was removed from
+`Icons.ts`/`app.ts`/`ThemeManager.ts` (2026-06-05). Rule of thumb: **shipped assets →
+`SHELL_ROOT`; user state → `~/.config/veltrix/`.** They are never the same place.
+
+The greeter/lockscreen bundles have no `VELTRIX_SHELL_ROOT` env; when shared code
+in `ui/lib/` needs a shipped shell asset (e.g. `avatar.ts`'s Settings-matching
+`user-round.svg` glyph), it falls back to the literal
+`/usr/share/veltrix/ui/shell` — safe because those two bundles ALWAYS run from
+/usr/share (their bin wrappers) and install.sh ships `ui/shell/assets` there in
+BOTH install modes. Same pattern as the lockscreen loading the greeter's
+compiled `style.css` from its installed path. Always keep a theme-icon last
+resort for the missing-file case.
+
+## Dev loop
+
+```bash
+./install.sh --dev                       # one-time setup
+# edit TSX/SCSS in ui/shell/
+Super+Shift+R                            # reload UI in a graphical session
+tail -f "$XDG_RUNTIME_DIR/veltrix-ui.log"  # logs (per-user; falls back to /tmp)
+killall veltrix-shell                              # nuke stale GJS holding the old UI
+./scripts/gen-types.sh                  # (re)generate @girs/ typings — see below
+cd ui/shell && npm run typecheck        # needs @girs/
+cd ui/shell && npm run build            # SCSS + the kit's modules + scripts/bundle.sh --kit-external (needs the `esbuild` package)
+veltrix-ipc toggleAppGrid                # send an IPC command
+```
+
+### ⚠️ The lockscreen has a dev mode now; the GREETER still has none
+
+`--dev` makes the SHELL run from the source tree (`bin/veltrix-ui` sets
+`VELTRIX_SHELL_ROOT` to `repo/ui/shell`), which is why `Super+Shift+R` is enough for it.
+
+**`bin/veltrix-lock` grew the same branch** (2026-08-19, commit `25681ad6`): it reads
+`~/.config/veltrix/.dev`, and if that path holds a `ui/lockscreen/app.ts` it `cd`s there and
+runs `scripts/run.sh app.ts` instead of the installed bundle. So on a `--dev` install the
+lockscreen you get from `loginctl lock-session` IS your working tree — no install step, and
+the crash-watchdog loop wraps the dev path exactly as it wraps the installed one.
+
+**`bin/veltrix-greeter` still has no such branch.** It hardcodes
+`/usr/share/veltrix/ui/greeter/build/veltrix-greeter` and `exec`s it or dies; the lockscreen
+still reads its CSS from the greeter's *installed* `style.css`, so **a greeter SCSS edit is
+invisible to a dev lockscreen too**. For those, `npm run build` produces a perfectly good
+artifact that the running system never looks at.
+
+### Rendering a shell surface or an installer step under Xvfb (no compositor)
+
+The full shell cannot start in this VM (no `Gtk4LayerShell` typelib), and the full installer cannot start without `base.json` — so a surface or a step is rendered standalone by a dev harness in `scripts/dev/` (`ipad-panel-render.ts` for the iPad home panel, `installer-step-render.ts` for the interface step, `ipad-composition-render.ts` for the bar + panel + dock frame, `prayer-checklist-rollover-test.ts` for the checklist day-rollover regression), bundled with `scripts/bundle.sh --kit-external=ui/lib/veltrix-kit/build/js` and run under Xvfb with `gjs -m`. Two gotchas, both proven Nov 13 2026: (1) import the surface/step DYNAMICALLY inside `activate` and build the window BEFORE the import — a static import constructs singletons that need a display and crashes; (2) this VM's GTK is 4.14.5 and `var()`/custom properties need GTK 4.16, so the harnesses FLATTEN the `--veltrix-*` tokens (parsed from the same `veltrixVars()` call the shell uses, harvested from both sheets, substituted with a paren-counting scanner) before loading the sheets from files — `load_from_data()` with custom properties segfaults this GTK, and the unflattened sheets render dark-on-dark text that is a VM artifact, not a product bug (Arch ships GTK 4.20). Label every screenshot from a harness "standalone render under Xvfb", never "the shell"/"the installer". Three more harness rules from the fix pass (Nov 13): (3) hide the cursor in every harness (`win.set_cursor(Gdk.Cursor.new_from_name(display, "none"))`) — the Xvfb X cursor marred two v1 renders as a stray ×; (4) the installer harness window MUST carry the `veltrix-installer-window` CSS class or the `.is-selected` ring's ancestor selector never matches and the faithful render shows no selection state — verify the ring by pixel-checking the SAVED render; (5) the composition harness's bar/dock strips are simplified stand-ins in the shell's own CSS, while the panel is the real panel — label the render that way, it is not a Dell photo. (6) the composition harness updates the bar's Hijri clock line on a 5s timer, not synchronously after `panel.refresh()` — the panel's `refreshPrayer()` is async (it awaits the prayer-times helper) and the Hijri service only has its date after that completes; the screenshot is taken at ~10s, the harness quits at 15s. (7) the Halal Audio page harness (`scripts/dev/halal-audio-page-render.ts`, Nov 13): a standalone harness must NOT call `registerConfigEntries()` — its import chain spawns `hyprctl`, which does not exist without Hyprland, so the harness registers only the one key its page needs, mirroring `config-entries.ts` verbatim; a stale `gjs` holding the app id makes a second run exit 0 silently (single-instance handoff — kill the stale process first); `Gtk.Widget.add_tick_callback` segfaults this gjs build on an unrealized widget (probe state via timeouts + `get_active()`/`get_style_context().get_state()` instead); start Xvfb with `setsid nohup … & disown` — a plain backgrounded Xvfb dies when its exec session ends; and a switch constructed with an initially-true value paints OFF in the harness until a post-present change (proven VM behaviour — same switch + same CSS paints correctly in a minimal process, so do not "fix" the page for it; the Dell screenshot is the arbiter).
+
+(8) Pure decision logic belongs in a dependency-free module (`ui/shell/core/nmcli-parse.ts`, `installer-launchers.ts`, `surfaces/dock/restore-order.ts` — Nov 15 2026 bug-hunt), so a probe can bundle it with esbuild and run it under plain node, no gjs and no display at all; the probe file itself carries the gjs invocation in its header for the Dell/CI run. `print` is a GJS global, so a dual-run probe shims it (`const print = (globalThis as any).print ?? console.log`). Every such probe carries a CONTROL that fails on the old code (the German nmcli line the old regex missed; the B,B,B oscillation the old dock pick produced) — a probe that passes on the old code is not testing the fix. (9) `/tmp` on this VM is a 512 MB tmpfs: a probe that builds a venv and downloads wheels + a model does NOT fit in it (`wordscan-install-probe.sh` mktemps on the main disk instead — the ENOSPC failure it hit first is a VM artifact, not a product bug).
+
+The failure mode is silent and reads as "my change didn't work": the bundle builds, the SCSS
+compiles, `git status` shows the edit, and the screen is identical (2026-08-09 — cost a round
+trip on the design-system pass). **Whenever you touch `ui/greeter/`, or any `style.scss` the
+lockscreen inherits from it, the change is not testable until it is installed.** The
+three files `install.sh` copies (its lines ~505/506/518) are:
+
+```bash
+cd ui/greeter && npm run build && cd ../lockscreen && npm run build && cd ../..
+sudo cp ui/greeter/style.css            /usr/share/veltrix/ui/greeter/
+sudo cp ui/greeter/build/veltrix-greeter /usr/share/veltrix/ui/greeter/build/
+sudo cp ui/lockscreen/build/veltrix-lock /usr/share/veltrix/ui/lockscreen/build/
+```
+
+Then: **the lockscreen** is seen by locking the session (`loginctl lock-session`) — cheap and
+reversible with your password. ⚠️ **And only with your password — killing the lock client is not
+a way out.** `ext-session-lock` is designed so a client that dies without unlocking leaves the session
+locked — that is the security property, not a crash — so `pkill veltrix-lock` gets you a locked
+screen with nothing drawing on it. In a VM where nobody knows the password (or after a
+`faillock`), the only exit is restarting greetd from another TTY or over SSH; and if that greetd
+already consumed its `initial_session`, `sudo rm -f /run/greetd.run` first or you land on the
+greeter instead of the session. **The greeter** is not cheap either: seeing it means logging out or
+restarting `greetd`, which kills the session you are working in. Don't restart greetd to
+check a style change; look at it on the next login, in the VM, or offscreen with
+`scripts/dev/lock-probe.js` (which needs neither an install nor a session — it reads
+`ui/greeter/style.css` straight from the repo).
+
+**What the greeter says is readable again (#614, 2026-09-21): `journalctl -t veltrix-greeter -b`.**
+`veltrix-greeter-session` used to open with `exec 1>/dev/null 2>&1` — greetd hands the session the
+VT's own descriptors (that is how a text greeter like `agreety` works), so the redirect was there to
+keep the banner off the console behind the splash, and it took the only instrument the greeter has
+with it. Now both streams go through `systemd-cat`, so that one tag holds the compositor, the
+bundle and anything they spawn — Hyprland's children inherit the descriptors.
+⚠️ **Both** streams, because the bundle's `console.log` never writes to fd 1: it goes through
+GLib's `Gjs-Console` domain, which puts it on **stderr**. Redirecting stdout alone captures the
+shell and loses the greeter — which is the line you are looking for.
+
+Note the asymmetry this creates in a review: the greeter and the lockscreen **share one
+stylesheet**, so every greeter-visible change ships whether or not anyone looked at it.
+
+### ⛔ The `assets` branch is a published URL, not stale work — never merge or delete it
+
+`assets` is an ORPHAN branch (no merge base with `main`) holding the README's eight screenshots and
+nothing else. It exists so binaries stay out of `main`'s history, and **its branch name is part of a
+live URL**: `README.md` on `main` links every screenshot as
+`raw.githubusercontent.com/adnqcr7-code/veltrix/assets/screenshots/*.webp`.
+
+⚠️ So it is exactly the shape that a branch sweep destroys — no PR, no shared history, one commit
+from July, a name that reads like a scratch branch. Deleting it, renaming it or merging it into
+`main` breaks all six images on the project's front page, and the break is invisible from a local
+checkout. Leave it alone; to change a screenshot, commit onto `assets` and push it.
+
+### The fourth bundle: the installer builds everywhere and ships only on the ISO
+
+`ui/installer/` (2026-08-25) is a normal bundle — `npm run build` in it produces
+`build/veltrix-installer`.
+
+🔴 **It is RUN in a VM and nowhere else — dry run included. Never on the host.** The rule and the
+reasoning are below, under "The installer runs in a VM, or it does not run"; read it before you
+launch that binary, not after.
+
+What is different is where it GOES. `packaging/veltrix/PKGBUILD` is a split package and emits
+`veltrix-installer` beside `veltrix` and `veltrix-kit`; only nidara-iso's `packages.x86_64`
+names it. So:
+
+- **makepkg builds all three; what you INSTALL is chosen by name.** ⚠️ `makepkg --pkg` no longer
+  exists — pacman 7.0 removed it and makepkg 7.1 answers `invalid option '--pkg'` — and install.sh
+  kept passing it until 2026-09-23, which left its local-package fallback dead. It now builds
+  everything and hands `veltrix` + `veltrix-kit` to ONE `pacman -U` (files moving between
+  the two only change owner cleanly inside a single transaction).
+- A file glob for "the package that was just built" must be **anchored**: `veltrix-*` matches
+  `veltrix-installer-*` too — and since the rename it matches `veltrix-*` as well, so the
+  anchor is now load-bearing twice over. `install.sh` uses `"$dir/$want"-[0-9]*`, which pins the
+  name to the version that follows it.
+
+⚠️ **The desktop package is `veltrix`, renamed from `veltrix` on 2026-08-30.** The bare name
+was the PRODUCT's, and `pacman -Qi veltrix` was answering "what version of Veltrix do you have" with
+this component's number — the last place still doing that once `/etc/os-release` lost its version.
+The new package carries `provides`/`replaces`/`conflicts` on the old name, so existing installs
+migrate on one `pacman -Syu` (verified against a local repo: `removing veltrix... installing
+veltrix...`) and `pacman -S veltrix` still resolves. **Two consequences worth holding:**
+anything that QUERIES by name must ask for both while old installs exist (`pacman -Qq veltrix`
+returns "not installed" on a renamed machine — it does not error, it just quietly says no), and the
+bare `veltrix` is deliberately free for a future metapackage meaning the whole product, which must
+NOT be created while `replaces=(veltrix)` is still in play.
+- `install=`/`backup=` belong inside `package_veltrix()`; at the top level they would apply to
+  both packages.
+
+One thing it does NOT own, and that is deliberate: **what Veltrix installs** is
+`/usr/share/veltrix-installer/base.json`, airootfs content in nidara-iso — the app reads it and
+refuses to continue when it is absent (a development checkout is not an installation medium, and
+saying so is better than an installer that looks ready and fails at the end).
+
+The installer has a "Choose your interface" step (`ui/installer/steps/interface.ts`, Nov 12 2026): macOS pre-selected (Recommended) or iPad Mode, each with a real preview image (`ui/installer/assets/interface-{macos,ipad}.jpg`, downscaled concept renders, labelled previews; a missing file degrades to a text card, never a broken choice). The answer seeds `interface.mode`; the plan (`lib/plan.ts`) applies it only for iPad Mode, as a custom command setting `org.veltrix.interface ipad-mode` for the new user (macOS needs no command — the schema default is false). The full installer cannot run without `base.json`, so the step is verified by a standalone render harness (`scripts/dev/installer-step-render.ts`, bundled to `/tmp/installer-step.js`, Xvfb 1280×800, the step wrapped in the real `VeltrixClamp(widget, 900, true, 560)` — the wizard's own clamp, so the 480px previews are constrained exactly as the installer constrains them).
+
+⚠️ Hyprland **tiles it** unless told otherwise, which is how it was first seen: a full-height
+pane sharing the screen. `config/hypr/hyprland.lua` carries a `float-installer` window rule
+matching the `veltrix-installer` app-id; on an installed system it matches nothing.
+
+#### Nothing floating hangs off the screen — and the hook is `window.update_rules`
+
+A floating window keeps whatever size the CLIENT asks for and Hyprland never shrinks it to fit, so
+any application that remembers a maximized geometry — Chrome does — lands with its title bar off
+the top of the display. `config/hypr/hyprland.lua` clamps it in Lua, because the config language
+cannot express "the monitor minus the bar and the dock" and Lua gets `monitor.reserved` as named
+fields.
+
+🔑 **The clamp hangs off `window.update_rules`, and that is the whole point.** Hyprland
+re-evaluates a window's rules whenever its state changes — floating included — and hands the
+callback the settled geometry. Traced live across a float toggle driven by a raw `hyprctl
+dispatch`, with nothing of ours in the path:
+
+    update_rules addr=0x…df700 floating=true size=2542x1282   still the tile
+    update_rules addr=0x…df700 floating=true size=2560x1440   the settled one
+
+⚠️ **Do not go back to hooking the entry points.** The first version (#299) used `window.open` plus
+a 60 ms one-shot timer on the Super+F keybind, and it missed every other way to float a window —
+the dock's window menu, `veltrix-ipc toggleFloat`, the MCP verb, any keybind a user adds. Chrome came
+up at `[-1,-101] 2560x1440` on a machine whose config already contained that clamp. The timer was
+never the problem: measured, the geometry is final 68 ms after the toggle and never moves again.
+
+⛔ **`max_size` is NOT the global answer, and it looks like it is.** It does everything you want on
+paper — the compositor enforces it continuously, it accepts expressions (`max_size =
+"monitor_w-16 monitor_h-156"` capped a client asking 2560x1440 down to 2544x1284 at `[8,48]`), and
+it needs no events at all. **But a `max_size` rule makes the window FLOAT, unconditionally.**
+Measured in three arms on one throwaway class: with `max_size = "800 600"` the window floats at
+800x600; with the rule's other props and no `max_size` it tiles at 2542x1282; and with a cap the
+tile could never reach (`monitor_w-16 monitor_h-156`) it floats anyway. A blanket `class = ".*"`
+rule would turn a tiling desktop into a floating-only one. There is also no native option for this
+— the whole `HL.ConfigKey` list has nothing about keeping floating windows inside the work area.
+
+Both halves of the clamp are verified, and the second one matters as much: a window that FITS is
+left byte for byte where the compositor put it (same window, same toggle, hook on and hook off →
+`[1566,761] [700,500]` both times).
+
+🔑 **The law it states since #511 is the industry's, and Hyprland states the opposite one.** Clamp
+the SIZE to the usable area, then apply the edges with **top and left LAST so they win**: if a
+window still cannot fit, the excess goes DOWN and RIGHT, never up, because up is where the header
+is. Hyprland's `fitBoxInWorkArea` (`0.56.2`) runs its four operations in the other order — the
+bottom-edge branch overwrites the top-edge one — and **none of the four resizes anything**; there is
+no size ceiling in the compositor at all (`CWindow::maxSize()` is empty by default). KWin
+(`geometry.size().boundedTo(area.size())` + `moveTop` last), mutter
+(`meta_rectangle_clamp_to_fit_into_region` + `constrain_titlebar_visible`) and niri (*"Clamp by top
+and left last so it takes precedence"*, with a unit test) all do it the other way round.
+
+Measured in a nested Hyprland with a layer-shell probe reserving 40 top and 100 bottom on 2560x1440,
+this branch against `main` — and note which row is the discriminator:
+
+| case | before | after |
+|---|---|---|
+| asks 2560x1440, floats | `[-1,-101] 2560x1440` unclamped | `[9,49] 2542x1282` |
+| fits 800x600, moved to `[300,-200]` | **`[300,-200]`** | **`[300,49]`** |
+| fits 800x600, already inside | not moved | not moved |
+| tiled | `[9,49] 2542x1282` | `[9,49] 2542x1282` |
+
+Two guards ride with it. **Fullscreen and maximized windows are skipped** — that geometry belongs to
+the fullscreen handler, and `maximized` already returns the work area. And **the size asked for is
+remembered per address**: a client whose protocol `min_size` exceeds the usable area (tech debt #99)
+legitimately refuses to shrink, and re-asking would chase the `window.update_rules` its own resize
+fires.
+
+🔑 **And for a window that FITS, the top is the only edge we defend — the asymmetry IS the feature.**
+The first version of #511 clamped all four, which reads as correct and is not: a window you cannot
+push off to the side, or let run under the dock, is not floating, it is tiling with extra steps.
+That was the owner's call and it is the right one. The top is different in kind, not in degree:
+everything you need to get a window back — header, close button, the strip you drag — lives up
+there, so off the right it is reachable and off the top it is gone. The same asymmetry the others
+encode: mutter's `constrain_titlebar_visible` lets a window leave every edge and gives the title bar
+`top_amount = 0`; KWin's `keepInArea(partial)` keeps a strip reachable, not the whole frame inside.
+
+| a fitting 800x600 asked to go | four hard edges | only the top |
+|---|---|---|
+| up, to `[300,-200]` | `[300,49]` | `[300,49]` |
+| right, to `[2400,600]` | **`[1752,600]`** | **`[2400,600]`** |
+| left, to `[-300,600]` | **`[8,600]`** | **`[-300,600]`** |
+| down under the dock, to `[400,1300]` | **`[400,732]`** | **`[400,1300]`** |
+
+🔑 **The margin is `gaps_out` PLUS `border_size`, and forgetting the border is worth exactly one
+pixel per side.** `at`/`size` report the CLIENT box; the border is reserved OUTSIDE it
+(`WindowTarget.cpp` applies `CHyprBorderDecoration::reservedArea()`), which is why a window tiled
+alone reports `[9,49] 2542x1282` and not the `[8,48] 2544x1284` of its layout box. A clamp that
+measured against the raw usable area put the client where the BOX belongs, so the floating window
+sat one pixel into the margin on every side and read as 2px wider than its tiled self — the owner
+saw it as "the gaps shrink a little when I float it". Toggling now moves nothing at all:
+
+| Settings alone on an empty workspace | tiled | floating | tiled | floating |
+|---|---|---|---|---|
+| before | `[9,49] 2542x1282` | `[8,48] 2544x1284` | `[9,49] …` | `[8,48] …` |
+| after | `[9,49] 2542x1282` | `[9,49] 2542x1282` | `[9,49] …` | `[9,49] …` |
+
+🔑 **When the clamp shrinks a window, WHERE it leaves it is decided by the anchor, not by the
+event.** If the window's top-left is inside the usable area, somebody put it there: shrink it where
+it stands. If it is not, the position is not a decision anyone made — it is what Hyprland invents
+for an oversized floating window, `[-1,-101]`, the whole monitor — so centre it. The owner found the
+symptom: *"¿por qué al cambiar el tamaño de una flotante, a veces se centra?"* Because it did:
+resize a floating window past the usable area and the next thing that re-evaluated its rules shrank
+it AND teleported it to the middle.
+
+⚠️ **The obvious fix is by WHEN, and it is wrong.** "Only centre at birth (`window.open`)" reads
+perfectly and breaks the tile→float toggle, which arrives as `window.update_rules`: the flag says
+"not a placement" for the one transition where Hyprland has just thrown the geometry away, and the
+window lands at `[-1,49]` instead of on the corner its tiled self occupied. Measured, three
+scenarios that a by-WHEN rule cannot satisfy at once:
+
+| | by WHEN (`placing` flag) | by WHERE (anchor inside?) |
+|---|---|---|
+| tiled → floating | `[-1,49]` ✗ | `[9,49]` ✓ (identical to tiled) |
+| resized past the area, then focused | `[300,300]` ✓ | `[300,300]` ✓ |
+| born asking 2560x1440 | `[0,49]` ✗ (samples a half-applied box) | `[9,49]` ✓ |
+
+The anchor rule also self-heals: our own resize fires another `update_rules`, and by then the window
+is inside and fits, so the second pass is a no-op.
+
+⚠️ **Which is why `GAPS_OUT`, `BORDER_SIZE` and `ROUNDING` are declared once at the top of
+`hyprland.lua` and fed to BOTH `hl.config` and the clamp.** The bug was two copies of the same
+number disagreeing about what it included. Note the cascade step keeps using `GAPS_OUT` and not the
+margin: the border is not part of what the eye reads as a gap.
+
+#### Leaving fullscreen: the compositor announces it BACKWARDS, and the clamp used to eat the restore
+
+A floating window that goes fullscreen — a video in a browser — came back as the whole usable area
+instead of the size and place it had. Without our clamp Hyprland restores it perfectly, so it was
+ours. The trace, from the bench:
+
+    clamp float=true fs=2 at=0,0 size=2560x1440      in fullscreen, skipped
+    clamp float=true fs=0 at=0,0 size=2560x1440      🔴 fs is ALREADY 0, the box is still fullscreen's
+      -> resize 2542x1282 · move 9,49                 we write geometry…
+    EVENTO fullscreen fs=0 at=9,49                    …and the fullscreen event arrives after
+
+🔑 **`window.update_rules` arrives with `fullscreen` already 0 while the geometry is still the
+fullscreen box, and the `window.fullscreen` event only fires afterwards.** Writing geometry on that
+call replaces exactly what the restore was about to put back.
+
+The fix is a two-line state machine in the same callback — no new event, no ordering assumption
+between hooks: remember the fullscreen mode seen per address, and when it goes non-zero → 0, **skip
+that pass entirely**. Whatever the compositor restores is a geometry that already passed through the
+clamp, and if it somehow does not fit, the next `window.update_rules` catches it.
+
+⚠️ **Two instrument traps found while chasing this, and both make a dead probe look alive:**
+
+- **`print()` from a Lua CALLBACK reaches nothing.** A print at config-load time shows up in the
+  instance log as `[Lua] …`; the same print inside an `hl.on` handler appears neither there nor on
+  the compositor's stdout. Trace from callbacks with `io.open(path, "a")` instead. (Corollary worth
+  knowing: the `print("Veltrix: …failed")` in the clamp's `pcall` guard is invisible — a clamp that
+  throws fails silently.)
+- **`string.format("%d", …)` throws in Lua 5.4 on a non-integer**, and window coordinates are
+  floats mid-animation. Inside the guard's `pcall` that error is swallowed, so the instrumented
+  clamp did nothing at all while its measurements looked plausible. Format with `tostring()`.
+
+⚠️ **And in the bench, a GTK probe must not use `Gtk.Application`**: it is single-instance, so once a
+run on the host has taken the app-id, the nested copy never maps and the bench reports "no window".
+Use a plain `Gtk.Window` plus `GLib.MainLoop`.
+
+#### Super+M maximized two different windows, because the box depends on `floating`
+
+`IFullscreenHandler::calculateFullscreenBox` maximizes into `WORKSPACE->m_space->workArea(target->floating())`
+— **the argument is the window's own floating flag**. So the same key gave two windows: a tiled one
+landed inside `gaps_out` at `[9,49] 2542x1282`, and a floating one landed in the FLOATING work area,
+whose gap is `general:float_gaps` and defaults to **0** — `[1,41] 2558x1298`, flush against the bar
+and the dock with only the border between. It was not Hyprland misbehaving: it was honouring a
+setting we had never set.
+
+Setting `float_gaps = GAPS_OUT` collapses them. One geometry now comes out of four different routes,
+which is the invariant worth keeping:
+
+| route | result |
+|---|---|
+| tiled alone on the workspace | `[9,49] 2542x1282` |
+| that window toggled floating | `[9,49] 2542x1282` |
+| a floating window maximized (Super+M) | `[9,49] 2542x1282` |
+| a floating window asking for 2560x1440, clamped | `[9,49] 2542x1282` |
+
+⚠️ **And the guard that remembers what we asked for must remember the SIZE WE SAW too.** Keyed on the
+request alone, it also swallowed the legitimate retry after something other than the client changed
+the geometry: restoring from Super+M handed the window its box back — 2544x1284, 2px past the usable
+area — and the guard then refused to correct it for the rest of that window's life, so every later
+event re-entered the shrink branch and, if the anchor was outside, re-centred the window. That is
+what "it keeps forcing the centre after maximizing" was. "The client ignored us" is only true when
+the size is still exactly the one measured when we asked.
+
+#### A new floating window does not land on top of the last one — and the rule is *cascade IF covering*
+
+Hyprland centres every floating window that asks for no position, so the same terminal opened three
+times is ONE window with two underneath it, pixel for pixel. `config/hypr/hyprland.lua` cascades —
+but only in the case that needs it, which is the whole design.
+
+🔑 **The rule is KWin's `Placement::cascadeIfCovering` (`src/placement.cpp:529`): step a window away
+only when it would COMPLETELY cover another one.** So the first window of an empty workspace is
+still centred, and a small dialog over a big parent never moves — which is the modal exemption for
+free, and just as well, because Hyprland exposes no `modal` to Lua. Out of room, KWin gives up and
+keeps the original placement rather than walking the window off the area; we do the same.
+
+The step is `max(rounding + gaps_out, min(availW, availH) / 48)` — KWin scales its offset with the
+area (`area.width()/48`), mutter uses a flat 50 (`CASCADE_INTERVAL`), and the floor is ours: below
+`rounding` (24) plus `gaps_out` (8 when this was written, 4 since 2026-09-29) the covered window's
+corner stops reading as a corner. On a 2560x1440 monitor with our bar and dock that was 32; it is 28
+now.
+
+⚠️ **One divergence, deliberate**: KWin walks the stacking order and skips a window already buried
+under others. Lua gets no z-order, so every mapped window on the workspace is tested. The cost is a
+rare extra step.
+
+Measured in the bench, four identical 800x600 windows on an empty workspace, this branch against
+`main` — and note that only ONE row moves:
+
+| case | `main` | with the cascade |
+|---|---|---|
+| four 800x600, in turn | `[880,390]` **x4** | `[880,390] [912,422] [944,454] [976,486]` |
+| a 400x300 opened over them | `[1080,540]` centred | `[1080,540]` centred |
+| two 2500x1200 (no room to step) | `[30,90]` both | `[30,90]` both |
+
+The cascade runs on `window.open` ONLY. Placement is decided once, when the window appears; running
+it again on every rule re-evaluation would move a window the user had already put somewhere.
+
+⚠️ **Still not covered, and it is not the clamp's fault**: nothing re-runs when the RESERVED AREA
+itself changes (the algorithm has no `recalculate` and no Lua event fires — measured: 0 px of
+movement across a bar and a dock appearing and disappearing under a live floating window), and a
+bare interactive drag fires no event either. Upstream's `misc:float_force_onscreen` /
+`new_float_force_onscreen` (PR hyprwm/Hyprland#15492, in `main`, **not** in the 0.56.x branch) are
+applied from `setPositionGlobal` and will cover those routes when a release carries them — but they
+only ever MOVE, so the size clamp stays ours. #511 tracks the rest.
+
+#### A monitor that goes away and comes back shifts every floating window by FALLBACK's width
+
+Powering the only monitor off and on left every floating window **1920 px to the left**, most of them
+entirely off-screen (measured on the host: three of six had their right edge at `2551 − 1920`). The
+clamp does not catch it — it defends only the top edge, on purpose.
+
+🔑 **It is Hyprland's own arithmetic** (read in 0.56.2, unchanged in `main` of 2026-09-07): with no
+other monitor, `onDisconnect` moves nothing and the headless `FALLBACK` (1920x1080) takes x = 0. The
+monitor that returns is a NEW `CMonitor` whose position is the unset sentinel `(-1,-1)`; `onConnect`
+moves the returning workspaces onto it before arranging (no old monitor → no translation), `arrange()`
+puts it `auto` right of FALLBACK at 1920 and `moveTo` **skips** translating from the sentinel, then
+FALLBACK is destroyed and the next `arrange()` moves it back to 0 — and **this** `moveTo` translates
+every floating window by −1920. Tiled windows get re-laid-out and never show it.
+
+The fix in `hyprland.lua` is a snapshot, not a clamp, because after the fact nothing knows where the
+window WAS: `monitor.removed` records each floating window still inside the removed monitor's box,
+relative to it, and `monitor.layout_changed` restores them once **no FALLBACK remains** (earlier
+layout changes are intermediate arrangements). With a second monitor alive Hyprland moves the
+workspaces before `removed` fires, those windows are outside the box, and the snapshot stays out of
+it — that multi-head path is unmeasured. ⚠️ Verifying needs a real power cycle (or an output
+removed/re-added in the VM); never a display command on the host.
+
+⚠️ **kitty remembers its window size**, so it is a contaminated instrument for this: a probe run
+left a later "clean" kitty coming up 2544x1284 and looking like a regression the clamp had caused,
+when the hook was off. Pass `-o remember_window_size=no -o initial_window_width=… -o
+initial_window_height=…` for every arm.
+
+#### A window rule matches an IDENTIFIER, and a static rule only ever sees the one the window was BORN with
+
+⚠️ **This section said something subtly different until 2026-08-31, and the difference is the
+whole mechanism.** It said our identifiers "arrive LATE" and that a rule keyed on them is
+"matched too late". They do arrive late; the rule is not matched late. It is **never matched at
+all**. The corrected version is below, and `scripts/ci/hypr-rule-check.mjs` now enforces it, so
+this paragraph is no longer the only thing standing between a rule and the window it means.
+
+The Hyalo side also derives native app-ids from literal `app_id` initializers in
+nk-wayland `Options` in toolkit Rust sources; there is no hand-maintained native
+allowlist. Build/target trees are excluded. A native app-id rename must update its
+factory rule in the same change. This does not change the legacy GTK birth/stamp
+checks below.
+
+**Hyprland splits a rule's effects in two, and they behave nothing alike** (Configuring →
+Window-Rules, quoted):
+
+| | evaluated | matched against |
+|---|---|---|
+| **static** — `float`, `center`, `size`, `move`, `workspace`, `monitor`, `pseudo`, `suppress_event`, `fullscreen`, `pin`, `group`, `content`… | "once when the window is opened and never again" | "it is always the `initialTitle` and `initialClass`", whatever `class` and `title` say later |
+| **dynamic** — `opacity`, `rounding`, `no_blur`, `no_anim`, `opaque`, `border_size`, `idle_inhibit`, `immediate`, `decorate`… | "re-evaluated every time a property changes" | the CURRENT class and title |
+
+**And our windows change class after they open.** The shell, the greeter, the lockscreen and the
+installer all give a window its real identity through `setWindowAppId` (`ui/lib/veltrix-kit/platform/app-id.ts`), which
+lands at **MAP** — after the toplevel already exists carrying the PROCESS app-id GTK put on it at
+creation (`org.veltrix.desktop` for the shell, `org.veltrix.greeter`, `org.veltrix.lock`,
+`org.veltrix.installer`).
+
+⚠️ **`org.veltrix.desktop`, not `org.veltrix.shell`.** Two places in this skill said the latter for a
+day. Nothing declares it; a rule naming it matches nothing, silently. The check derives the list
+from each bundle's `app.ts` for exactly that reason, and prints it in every failure message.
+
+So the two kinds of effect have **opposite** traps:
+
+- a **static** rule naming a stamped class (`veltrix-installer`) never fires — the window is simply
+  left tiled, which on an empty workspace is the whole work area. ⇒ **name the birth class.**
+- a **dynamic** rule naming a birth class stops applying the moment the window stamps its own id.
+  ⇒ **name the stamped class.**
+
+Naming both always satisfies both, which is what `float-installer` does:
+
+    match = { class = "^(org\\.veltrix\\.installer|veltrix-installer)$" }
+
+Measured with a minimal GTK4 window — one variable per arm, same empty 2560x1440 screen, default
+size 960x760, rule `float + center`:
+
+| arm | result |
+|---|---|
+| app-id from birth | 960x760 ✔ |
+| + `set_size_request(960,760)` | 960x760 ✔ |
+| app-id stamped at map, rule on the LATE class | **2544x1284** ✘ the work area |
+| same, on a workspace with one other window | **1272x1284** ✘ half the tile |
+| app-id stamped at map, rule on an EARLY TITLE | 960x760 ✔ |
+| app-id stamped at map, rule on the BIRTH class | 960x760 ✔ |
+
+⚠️ **What those two failing arms were never asked** is whether the window was *floating*. The
+numbers are consistent with both readings — "floated late at the size it had adopted" (what this
+section used to claim) and "never floated, still tiled" (what the documented mechanism says must
+happen). The docs settle it; the measurement does not, because `floating` was not recorded. If
+anyone re-runs those arms, record `hyprctl clients -j | jq .[].floating`; the outcome does not
+change any rule here, but it closes the last gap between what we measured and what we assert.
+
+**When two of our windows share a process, they share a birth class — and then the birth title is
+all that is left.** Settings, About and Settings' modal dialogs are all born `org.veltrix.desktop`.
+A static rule that floats "the shell's windows" floats Settings too, permanently, because a static
+effect is never re-evaluated and so can never be taken back. That is why `float-about` matches
+`^About Veltrix$` and why moving it to `veltrix-about` in 2026-08-31 was explicitly NOT done when
+About finally got an app-id of its own. A birth title is a code literal on the toplevel from
+creation — an identifier in every sense that matters here, not live interface text.
+
+⚠️ **The hazard that remains is i18n, and it is now a CI failure rather than a comment.** Wrap that
+title in `t()` and the literal leaves the source, the rule matches nothing, and it does so in every
+locale including English. `hypr-rule-check.mjs` requires every title a rule matches to be a literal
+some window in `ui/` actually sets — so a window a rule keys on has to keep an untranslated birth
+title, and the day someone translates it, CI says which rule they broke.
+
+⚠️ Two things this explains and one it retires:
+
+- `resizable` is NOT the difference, and neither is `set_size_request` — both were arms above, both
+  fine. Neither is the `maximized` flag on its own: every arm reported `maximized=true`, including
+  the ones that came up correctly. (Related and already known: **Hyprland never clears the `tiled`
+  toplevel state** — see the note in `ui/lib/veltrix-kit/platform/tokens.ts` — so `maximized`/`tiled` are useless as a
+  signal for "someone else is sizing me".)
+- A `size` in the rule also fixes it, by overriding the adopted size after the fact. It works
+  (verified), but it duplicates a number that already lives in the window's own source — and for a
+  window whose height is content-driven (About wraps its values, so its height moves with the
+  locale) there is no correct number to duplicate. Prefer naming the birth class.
+- The old advice "never match a title, full stop" is retired as unimplementable: for two windows of
+  one process there is nothing else at creation. The rule is now the checkable one — a matched
+  title must be a birth title our source sets, and `^$` (this toplevel has no title) is a
+  structural fact rather than text.
+
+⚠️ **kitty remembers its window size**, so it is a contaminated instrument here: a probe run left a
+later "clean" kitty coming up 2544x1284 and looking like a regression, with the clamp switched off.
+Every arm needs `-o remember_window_size=no -o initial_window_width=… -o initial_window_height=…`.
+
+### Who owns the disk — archinstall, in both modes
+
+Between 2026-08-28 and 2026-09-04 this bundle partitioned with its own hands: `steps/run.ts` ran
+`sgdisk --zap-all`, `mkfs.*`, `mount` and the Btrfs subvolume layout, and archinstall was handed a
+`/mnt` already made (`pre_mounted_config`). That was never a decision anybody wrote down — it
+arrived inside PR #281, whose message is about sidebar metrics — and three of the four level-1
+findings of the installer review lived in it. **#310 reversed it**, one mode at a time:
+
+| mode | what `lib/disk-config.ts` emits | since |
+|---|---|---|
+| entire disk | `manual_partitioning`, two partitions with status `create`, `wipe: true` | 2026-09-04 |
+| manual | `manual_partitioning`, the assigned rows as `existing`/`modify`, `wipe: false` | 2026-09-04 |
+
+**`steps/run.ts` no longer touches a disk in either mode**, and `pre_mounted_config` is gone from
+the bundle. What it spawns is one process.
+
+⚠️ **In manual mode the Format tick is the whole difference between two archinstall words**, and
+the one it maps to is not an in-place `mkfs`:
+
+- unticked → `status: "existing"`. Skipped by both `device_handler.partition()` and
+  `_format_partitions()`; only mounted.
+- ticked → `status: "modify"`, which **deletes the partition and re-creates it** at the start and
+  length from our JSON before formatting it (`_setup_partition`, `requires_delete = not wipe`).
+  It is what upstream's own menu sets when you tick format (`partitioning_menu._prompt_formatting`),
+  and it has two consequences: the geometry must be EXACT — `start` and `size` are transcribed from
+  `lsblk` in bytes, never recomputed — and parted re-adds it under `optimalAlignedConstraint`, so a
+  legacy partition that does not sit on a MiB boundary is refused before `disk.commit()` rather than
+  quietly reformatted.
+
+⚠️ `lsblk`'s `START` is in **512-byte sectors always** (it is `/sys/.../start`), whatever `LOG-SEC`
+says. Multiplying by the drive's own sector size puts every partition of a 4Kn disk eight times too
+far along it.
+
+⚠️ **Swap is not a mount point**, and saying it was is the bug this deleted (#423): the row goes out
+with `mountpoint: null` and `fs_type: "linux-swap"`, which is how `_mount_partition` reaches its
+`swapon` branch and `device_handler.format` reaches `mkswap`.
+
+⚠️ **genfstab does NOT write the entry, and the installed machine has swap anyway** — two facts that
+look contradictory and are both true (measured, VM 2026-09-04). archinstall runs
+`genfstab -pU -f /mnt /mnt`, and genfstab's prefix filter (`[[ $device = "$prefixfilter"* ]] ||
+continue`) is written for swap FILES: a `/mnt/swapfile` starts with the prefix, `/dev/vda3` never
+does, so every archinstall install with a swap PARTITION is missing that line. What turns it on at
+boot is `systemd-gpt-auto-generator`, off the GPT partition TYPE — the discoverable swap GUID
+survives archinstall's delete-and-recreate. `lib/swap.ts` writes the entry ourselves, in genfstab's
+own column shape and keyed by UUID, so the machine declares what it has instead of relying on a
+mechanism nobody chose; the UUID check means an upstream fix would not produce a duplicate.
+
+⚠️ **A row made from a GAP (`create`, #447) has `path: ""` in the answer** — the partition does not
+exist until archinstall creates it, and the node it gets is written nowhere. Anything after the
+disk page that names or finds a row by `m.path` is wrong for those rows, silently. Three places
+were, all found on the 2026-09-13 manual-mode VM pass: the summary and the confirmation printed
+`swap  ·    ·  2 GiB` (now `place()` in `steps/summary.ts`, falling back to "Free space");
+`lib/swap.ts` handed `blkid` the empty path, logged a warning and wrote NO fstab line for a
+created swap (now `partitionAtStart()`: the partition on `m.device` whose `START`×512 equals
+`m.start`, probed in `disk-config-probe.ts`); and the disk page restored answers keyed by
+`m.path` while its table keys gaps `free:<disk>@<start>`, so after a language change
+(`invalidate()` rebuilds every page) a swap or root put into free space came back as "None"
+(now `freeRowKey()` on both sides).
+
+⚠️ **A second attempt in the same live session inherits the first one's leftovers**, and archinstall
+dies on them before writing anything. archinstall `swapon`s what it creates and its `__exit__`
+unmounts nothing, so after any run — finished or failed — the swap is on and `/mnt` is mounted; the
+next run's `umount_all_existing` hands lsblk's mountpoint for that swap, the literal `[SWAP]`, to
+`umount -R` (measured 2026-09-13). `lib/release-target.ts` runs before the spawn: on the TARGET disks
+only, swapoff → umount deepest first → `cryptsetup close` deepest first, and the run stops before
+archinstall if something cannot be released. Its order and scope are probed in
+`disk-config-probe.ts`, with a CI control that deletes the disk scope.
+Since #565 the same release also runs at the END of every run, after the log copy, so a finished
+install no longer sits mounted under `/mnt`: anything that inspects the target after "Installation
+complete" (the VM harness does) must mount it itself.
+
+⚠️ **The end of a run has an outcome, and the footer reads it** (`Step.outcome`, #565). After a
+failure only Close shows, as the primary button; "Restart now" appears only after a success. Set the
+outcome BEFORE `setBusy(false)`: that notify is what repaints the footer.
+
+⚠️ **`nmcli networking connectivity` without `check` is NetworkManager's CACHED answer**, refreshed only
+every so often. The run step read "full" seconds after the internet was cut and archinstall then hung
+15 min in `pacman -Sy` (measured 2026-09-14). `connectivity({ fresh: true })` adds `check` and is for
+the one moment that decides to start; the welcome page polls every 3 s and must keep the cached read —
+a forced check is a request to ping.archlinux.org. The welcome page HOLDS Continue without a usable
+network (#566) only while there is no offline install (nidara-iso#20).
+
+⚠️ **NetworkManager writes a user restriction as `permissions=user:<name>:;`** — a trailing reserved
+field. `lib/network-connections.ts` (#564) carries the live session's saved `*.nmconnection` into the
+target (Calamares' `networkcfg`; archinstall's `iso` network type copies iwd/networkd, not NM) and
+rewrites that user to the new account. Its first version matched an invented `user:live;`, the probe
+built on the same invented shape passed, and only the VM install caught it — probe fixtures for
+another program's file format come from a MEASURED file, never from memory.
+
+⚠️ **Which partition is the ESP is `espMount()`, exported from `lib/disk-config.ts`, and there is
+one of it.** Four places need that answer — the page that refuses a non-FAT ESP, the summary that
+names it, the layout that flags it `boot`/`esp` (without the flag `get_efi_partition()` returns
+None and the install stops *after* pacstrap), and the bootloader patching that has to write into
+the partition archinstall installed onto. They disagreed silently before.
+
+⚠️ `manual_partitioning` has no "the rest of the disk": every partition is an absolute start and an
+absolute length, and `parse_arg` refuses four kinds of wrong (first partition below 1 MiB,
+overlaps, a start or length that is not MiB-aligned, a last partition reaching into the backup GPT
+header) — at the worst moment, after every question has been answered. Those four apply **only to
+partitions with status `create`**, so they are entire-disk mode's problem: the sums are copied from
+upstream's own `suggest_single_disk_layout` and the disk's `LOG-SEC` is collected for them.
+`scripts/dev/disk-config-probe.ts` checks both modes against real capacities and real tables without
+going near a disk. ⚠️ Its manual half was blind until a case with a **misaligned** partition was
+added — every layout in it started on a MiB boundary, so a translation that rounded the geometry
+produced identical output and the probe still said ALL INVARIANTS HOLD.
+⚠️ With subvolumes the root partition takes `mountpoint: null` — the mountpoints belong to the
+subvolumes, and giving it one as well mounts the root twice.
+
+⚠️ **A subvolume and a partition can claim the same path, and nothing stops them.** Both modes emit
+our five subvolumes for a btrfs root, so manual mode has to drop the ones a row of the table already
+takes — today that can only be `/home`, because the mount dropdown offers `/`, `/boot`, `/home` and
+swap and nothing else, which is also why `@snapshots` is always emitted and
+"every install has `/.snapshots`" can be assumed. `@` is never dropped: `/` is the root row itself.
+Emitting `@home` beside a partition at `/home` is **accepted** by archinstall — `parse_arg` validates
+geometry and says nothing about mount points being unique — and the failure is silent all the way
+through: the root sorts first (`installer.py` orders by `x.mountpoint or Path('/')`, and a subvolumed
+root carries none), `@home` is mounted, then the partition is mounted ON TOP of it (`mount()` skips
+only when the SAME device is already there), the install writes into the upper layer, `genfstab`
+emits two lines for `/home`, `systemd-fstab-generator` refuses the second, and the machine boots with
+the empty subvolume mounted and the person's files under a shadowed mount. The install SUCCEEDS; it
+fails at the first login. `disk-config-probe.ts` is the only thing that catches it.
+
+### What the disk page REFUSES lives in `lib/manual-problems.ts`, not in the page
+
+`manualProblems(mounts, uefi)` is both the list printed under the partition table and the whole of
+manual mode's `ready()`, so a rule missing from it is a Continue button that lights up on a layout
+that cannot work. It moved out of `steps/disk.ts` on 2026-09-05 for one reason: the page imports
+Gtk, and a rule that can only be evaluated with a display is a rule that can only be checked by
+clicking. `uefi` is a parameter rather than a `/sys/firmware/efi` read for the same reason — the
+BIOS branch is otherwise unreachable on a UEFI runner.
+
+The rules today, each one added after an install had already finished and produced a machine that
+does not boot or does not install: a root must exist and **must be formatted** (#437 — `existing` is
+skipped by both `device_handler.partition()` and `_format_partitions()`, so pacstrap lands on
+another distribution's `/usr` and pacman aborts on the first collision; the same clause covers a
+partition with no filesystem at all, which has nothing to mount), a UEFI machine needs an ESP, that
+ESP must be FAT (#414/#421), a kept swap row must already be swap (#423), and no two rows may claim
+one mount point. ⚠️ Several swap rows are NOT a duplicate — `swapon` takes as many as it is given.
+
+Added 2026-09-22, and the mirror of the ESP rule: **every mount point that is NOT under `/boot` has
+to hold a filesystem Linux can live on** (`LINUX_FILESYSTEMS`: btrfs, ext2/3/4, f2fs, xfs). The
+dropdown offers `vfat` on every row, and nothing said no — a FAT `/` took the repartitioning and
+died on the first symbolic link pacstrap wrote, and a FAT (or kept NTFS) `/home` INSTALLED, handing
+somebody a home directory with no owner and no permissions. The effective filesystem is the chosen
+one when we format and what lsblk reports when we keep, so `""` is its own refusal: a kept partition
+with nothing on it has nothing to mount, and the fix is the Format tick rather than a filesystem.
+`/boot` and anything under it are exempt on purpose — FAT is what an ESP IS, and the two ESP rules
+above own that path.
+
+### The disk the medium is on is not a target, and no VM run can check it
+
+`lib/live-medium.ts` names the disk the session booted from and `listDisks()`/`listPartitions()`
+drop it. Before 2026-09-22 the USB stick was offered like any other disk (labelled "removable",
+which is not a warning), and erasing it repartitions the device the live session is reading from.
+
+⚠️ **The harness boots the ISO as a CD-ROM, which lsblk calls `rom`** — already dropped by the
+`type === "disk"` filter — so the case only exists on real hardware, or in a VM given
+`-device usb-storage`. That boot was made once, and it paid for itself twice:
+
+- **archiso copies the image to RAM and UNMOUNTS the medium** (`/run/archiso/copytoram`, a tmpfs).
+  A mount-based check returns "" on exactly the machine it protects. The second answer is the
+  kernel command line: every entry in the ISO's loader config carries
+  `archisosearchuuid=%ARCHISO_UUID%`, and that value is the iso9660 volume id `blkid` reports on
+  the stick and on its first partition. `archisolabel=` is the same question spelled the other way.
+- **`/dev/loop0` is mounted under `/run/archiso` and lsblk lists it FIRST**, so "the first node
+  carrying an archiso mount" answers the squashfs loop — a path no disk in the list has, so
+  nothing was excluded and the stick stayed on the page with the whole mechanism working. Only a
+  `type: "disk"` node can be the answer.
+
+Detection is deliberately NOT `rm`-based: an internal port can report a stick as fixed, and a
+removable disk is a perfectly good target.
+
+`scripts/dev/disk-config-probe.ts` now has a second half that runs layouts through it and asserts
+the message keys, and since 2026-09-05 it is the `installer-logic` CI job rather than something a
+human remembers to run. ⚠️ **Wiring it up needed a one-line fix first**: it printed `N FAILURE(S)`
+and exited 0. Fine for a tool a person runs and reads; as a CI step it is a gate that can only
+pass. The job's first step therefore deletes a refusal rule with `sed`, requires the patch to have
+matched something (a reworded rule would silently patch nothing), requires the probe to come back
+non-zero, and restores the file — the run that follows means nothing without it. ⚠️ **Valid layouts are cases in that table too, and they must be**: a
+`manualProblems` that returned every message for every layout would pass a table made only of
+expected failures. Shown to fail in both directions — deleting the root rule fails exactly the two
+root cases by name, and widening it from `/` to any assigned row fails all five layouts that are
+supposed to be installable.
+
+### Firmware state and Secure Boot detection live in lib/firmware.ts
+
+Firmware facts (`isUefi`, `secureBootState`) live in `ui/installer/lib/firmware.ts` rather than
+in the disk page, so they can be inspected without a display or a partitioned disk, and multiple
+steps can read them.
+
+⚠️ **Both paragraphs are SAID on the welcome page, and only there** (2026-09-19). They started on
+the disk page, which asks nothing about firmware and is three clicks in; a machine that cannot boot
+what we are about to install should hear it on the first screen. The welcome step's `ready` carries
+`isUefi()`, so the disk page is unreachable on legacy BIOS — its own `isUefi()` guard stays (a
+refusal is cheap and it is the page that emits the layout) but it no longer prints the text. #604
+added the welcome copy without removing the disk copy, and for two days the same wall of text
+appeared twice, which is how a warning stops being read.
+
+Secure Boot enforcement is read from Linux efivarfs (`/sys/firmware/efi/efivars/`):
+- Standard EFI Global Variable GUID `8be4df61-93ca-11d2-aa0d-00e098032b8c`
+- Variable files are 5 bytes: 4 bytes attribute flags + 5th byte value (`readEfiVarByte`)
+- Readable without privileges (`-rw-r--r--`), so the unprivileged `live` user can read it
+- "Enforcing" requires BOTH `SecureBoot == 1` AND `SetupMode == 0` (`secureBootState` = `"enforcing"`).
+  With `SetupMode == 1` the firmware is in setup mode and does not reject anything (`"disabled"`).
+- Absence (legacy BIOS mode, or firmware not exposing the variable) returns `"unknown"`.
+  Absence = do NOT warn. A false warning on the first page is worse than none.
+- ⚠️ Unlike legacy BIOS (`!isUefi()`), which blocks Continue because there is no BIOS boot path,
+  Secure Boot enforcement **warns without blocking Continue** (#493): turning Secure Boot off in
+  firmware settings is a user choice.
+
+### Windows BitLocker detection lives in lib/bitlocker.ts (#448)
+
+BitLocker volume detection (`isBitlocker`, `findBitlockerDevices`, `bitlockerWarnings`) lives in
+`ui/installer/lib/bitlocker.ts` rather than in the disk page, making it unit-testable against
+mock `lsblk` outputs without a display or block devices:
+- libblkid (and thus `lsblk`) reports BitLocker volumes as filesystem type `"BitLocker"`.
+- Volume type is matched **case-insensitively** (`fstype?.toLowerCase() === "bitlocker"`),
+  matching the precedent in `ui/installer/lib/bootloader.ts:233`.
+- In manual partitioning mode (`steps/disk.ts`), detected BitLocker partitions are announced in
+  prose above the table, identifying the partition path and instructing the user to suspend or
+  disable BitLocker from Windows.
+- ⚠️ Like Secure Boot, BitLocker detection **warns without blocking Continue** (#448): it does
+  not make installation unsafe, but explains why an existing Windows partition cannot be shrunk
+  to make room for Veltrix.
+- **Why Fast Startup / NTFS hibernation is NOT probed**: block devices (`/dev/*`) on Linux are
+  permissions `0660 root:disk`. The live medium runs as the unprivileged user `live`, which belongs
+  to `wheel,video,audio,input,storage,network,rfkill,lp` and NOT `disk`. Probing NTFS hibernation
+  or dirty bit via `ntfsprogs` (`ntfsinfo`, `ntfsresize`) or `ntfs-3g.probe` directly against
+  block devices fails with `Permission denied` (exit code 19) without root. Elevating privileges via
+  `pkexec`/`sudo` on the disk page just to inspect a partition is strictly forbidden; therefore only
+  unprivileged BitLocker detection via `lsblk` is shipped.
+
+### The account form's rules are one function too, for the same reason
+
+`accountProblems(fields, touched)` in `lib/account-problems.ts` returns the four per-field messages
+AND a `valid` verdict. ⚠️ **It is one function because `steps/account.ts` had two**: four `if`
+chains filling four error strings, and a separate seven-term `isValid` boolean repeating every one
+of those conditions, with nothing making them agree — the same shape `manualProblems` exists to
+prevent on the disk page.
+
+⚠️ `valid` is **not** "no messages", and the asymmetry is the thing to keep. An untouched empty
+field is deliberately silent (a first paint must not greet anybody with four complaints — the page
+arrives EMPTY, and arrives pre-filled when somebody walks back into it) and still not installable. What must never happen is the reverse — `valid`
+true while any message shows, which is a Continue button lighting up over a visible complaint. The
+probe asserts that direction on every case rather than declaring it once.
+
+⚠️ `touched` is a parameter, not a module flag, for the same reason `uefi` is on `manualProblems`:
+both readings of every empty field have to be reachable from a probe.
+
+### The point of no return is a `confirmNext()` on the step, and the frame shows it
+
+`Step.confirmNext?()` (`lib/flow.ts`) returns the words for a modal — heading, a body that NAMES
+what is about to be destroyed, and the two button labels — or nothing, in which case the footer
+button advances as every other one does. `SummaryStep` is the only step that returns any (#436).
+
+⚠️ The frame shows the dialog, not the step, and the split is deliberate: the frame already owns the
+quit alert and has the window to be transient for, while only the step knows what it is about to
+destroy. The body comes from `eraseSentence()`, exported from `steps/summary.ts` and also printed at
+the top of the page — one function, because a modal that names something other than the page behind
+it leaves the reader deciding which of the two descriptions of an irreversible act to believe.
+
+Our layout is unchanged by the move, which is the whole reason it was affordable: 512 MiB ESP at
+1 MiB, the same five subvolumes including `@snapshots`, `compress=zstd`. Upstream's
+`default_layout` would have cost a 1 GiB ESP and four subvolumes — that is what Omarchy is stuck
+with, and it is a property of that layout, not of archinstall.
+
+`lib/bootloader.ts` still writes the loader entries' titles, the kernel cmdline and the timeout
+afterwards, in both modes: `Installer.__exit__` does not unmount, so the ESP is still mounted when
+archinstall exits. ⚠️ Its paths were hardcoded to `/mnt/boot` until 2026-09-04, and manual mode then
+offered three places to put the ESP: pick `/boot/efi` (the Debian/Ubuntu/Fedora spelling) and all
+three edits landed in a plain `/boot` directory on the root filesystem while the bootloader went to
+the ESP — no error, no missing file, just a machine that boots as stock Arch with a 15-second menu
+(installer study, H-03). `loaderRoot()` derives it from the same `espMount()` as everything else.
+
+🔑 **The ESP has ONE mount point, `/boot`, since #430 (2026-09-08)** — and the reason is worth
+keeping because the fix is a deletion. We install systemd-boot with `uki: false`, so the loader
+entry says `linux /vmlinuz-linux`, a path relative to the partition holding the ENTRY, while pacman
+and mkinitcpio write that file to `/boot` on the ROOT filesystem. They only line up when they are
+the same place, so `/boot/efi` and `/efi` produced installs that completed, reported success and
+stopped at `Error loading /vmlinuz-linux: Not Found`. archinstall validates exactly this for Limine
+and Efistub (`bootloader/utils.py:validate_bootloader_layout`) and has no equivalent check for
+systemd-boot, so nothing upstream refuses it either. `loaderRoot()` and `espMount()` both survive
+the deletion on purpose: hardcoding `/mnt/boot` would be correct today and silently wrong the day a
+second spelling comes back. (It also wrote `plymouthd.conf`, the mkinitcpio hook and the watchdog
+drop-ins until 2026-08-30, when those moved to the `veltrix-system` package — see below.)
+
+🔑 **The mirrors are MEASURED, and archinstall's own "speed sort" is not a measurement.**
+`mirror_config` went out empty until #311, so every install downloaded from whatever mirrorlist the
+medium booted with. It now runs `reflector --sort rate` (`ui/installer/lib/mirrors.ts`) and sends the
+result as **`custom_servers`**, never `mirror_regions`. Two reasons, both read out of archinstall 4.4:
+`regions_config(..., speed_sort=True)` sorts on `mirror.speed`, a number that arrives inside
+`archlinux.org/mirrors/status/json/` — the speed the **Arch project's probes** measured, not this
+machine's (`mirror/mirror_handler.py:82`); and `custom_servers` are **prepended** to the mirrorlist
+with the old content left underneath (`installer.py:600-607`) while `mirror_regions` **replaces** the
+file (`:599`). So the measurement wins and the medium's list stays as the floor. It is applied to the
+live system before `minimal_installation()` pacstraps (`scripts/guided.py:100-103`), which is what
+makes it affect the download rather than only the installed machine's config file.
+
+⚠️ **"Prepended" means into the LIVE file, every run, and nothing takes it back out.** A second
+attempt in the same Live session stacked a second `## Custom Servers` block over the first — three
+after three attempts (VM, 2026-09-17) — and pacstrap copies that file into the installed system.
+`prepareLiveMirrorlist` (`lib/mirrors.ts`) strips the LEADING blocks before each spawn.
+
+⚠️ **The length of that list is a deadline.** pacman tries every server in turn with a 10 s connect
+timeout, so 431 of them is why a stalled download took past 20 minutes to fail. The same function
+caps the fallback at 20 for the duration of the install — taken EVENLY through the file, because the
+medium's order is alphabetical by country and the first twenty are all one side of the world — and
+`restoreTargetMirrorlist` writes the full list (measured servers still on top) into the installed
+system at the end, where the length costs nobody anything. Measured in a VM: 425 → 23 servers
+during, 428 after.
+
+⚠️ **The country only narrows, it does not decide** — the same rule the region page follows.
+Measured 2026-09-08: `--country ES` takes **4.5 s**, worldwide takes **27.6 s**, and a country with
+no mirrors (`--country BO`) exits **1** with an empty stdout and `error: no mirrors found` on stderr.
+Below three servers the worldwide run happens as well and its results go on the end. The whole thing
+has a 45 s budget and the subprocess is **killed** at the deadline — an abandoned reflector races
+pacstrap for the same mirrors on a machine that is about to want all the bandwidth there is.
+
+The `arm` question is load-bearing either way — archinstall gets `--dry-run` when we are not
+armed, so the mode that owns the disk does not change what protects it. There are two RUN modes,
+and **where it runs picks one** — one expression in `steps/run.ts` decides:
+
+```ts
+const isLiveMedium   = GLib.file_test("/run/archiso", GLib.FileTest.EXISTS)
+const isForcedDryRun = GLib.getenv("VELTRIX_INSTALLER_DRY_RUN") === "1"
+const isArm = isLiveMedium && !isForcedDryRun
+```
+
+- **`/run/archiso` exists ⇒ it installs for real**, with nothing to opt in to. The live medium is
+  the one place where erasing the disk is the user's stated intent, so the ISO needs no flag.
+- **Anywhere else ⇒ dry run, and there is no way to change that.** A normal session has no
+  `/run/archiso` and cannot be armed. That is a property of the code, **not a licence to run it
+  there** — see "The installer runs in a VM, or it does not run" below.
+- **`VELTRIX_INSTALLER_DRY_RUN=1`** is the only variable, and it only ever points the safe way: it
+  forces a dry run on the medium, for looking at the run screen without consequences. The worst a
+  typo in it can do is refuse to install.
+
+⚠️ There used to be a third input, `VELTRIX_INSTALLER_ARM=1`, which armed the installer anywhere.
+It was removed on 2026-08-29 and should not come back. Its only purpose was to arm the destructive
+path where the live medium is not — which is the dangerous case by definition, not a testing
+affordance: the real path is exercised by booting the ISO in a VM, which has `/run/archiso` and
+therefore needs no flag. Two switches where one direction is safe and the other is not is a design
+that asks to be typed wrong once.
+
+⚠️ **A dry run must touch nothing, and a gate over the *destructive* commands is not that.** The
+partitioner this lesson comes from is gone — `arm` now reaches only `archinstall --dry-run` and
+`configureInstalledBootloader` — but keep the lesson, because it is about where a guard goes rather
+than about `sgdisk`. Gating `sgdisk`/`mkfs` and nothing else left three commands running under the
+"dry run" label: a `umount -R /mnt`, an else-branch that mounted the chosen disk's real partitions
+"for schema validation", and the entire manual-mode mount loop, which was never inside a guard at
+all. None of it destroys data; all of it mutates the machine of whoever is developing the
+installer, and two of the three sat in a bare `catch {}`, so it did so in silence. The fix was to
+move the gate one level down, into the command runner, where a branch added later cannot escape it
+by forgetting to ask.
+
+`configureInstalledBootloader()` takes `arm` and early-returns; that one was right from the
+start.
+
+### `archinstall` is UNPINNED, and a `--dry-run` that passes does not mean it read you
+
+nidara-iso's `profile/packages.x86_64` names `archinstall` with no version, and the live session
+cannot change it afterwards (squashfs, no `-Syu`). So a medium carries **one fixed pair** — the
+archinstall that was current the day the image was built, and the `base.json` built beside it — and
+the only question worth asking is whether the two halves agree. The exposure grows as the disk layer
+moves back to archinstall (#310): today we hand it five keys, then the whole `disk_config`.
+
+⚠️ **The trap is what a passing `--dry-run` does NOT prove.** archinstall reads its configuration
+with `args_config.get('<key>', default)`, one key at a time (`lib/args.py`, `ArchConfig.from_config`).
+A key it no longer knows is not an error — it is **skipped, in silence, exit 0**. A release that
+renamed `custom_commands` would sail through the dry run and produce a finished machine with no
+Veltrix on it: the five commands that write the repository address, trust its key, install the
+desktop and run `veltrix-setup` would simply never run.
+
+What catches that is reading back what archinstall itself wrote. `--dry-run` saves the configuration
+as it understood it to `/var/log/archinstall/user_configuration.json`; a key we sent that is missing
+from that file is a key this archinstall does not read. Two places ask, and they are deliberately
+not the same question:
+
+| where | asks | when it fires |
+|---|---|---|
+| `nidara-iso/check-base-config.sh` (run by `build.sh`) | dry-run **and** the read-back, inside the built airootfs | the build fails and the image is moved to `out/rejected/` |
+| `ui/installer/lib/archinstall-check.ts` (welcome page) | version + dry-run acceptance | a warning on page 1; `missing`/`rejected` hold Continue shut |
+
+The strict half is at build time because that is where a bad pair can still be stopped from
+shipping — and because the saved file is root-owned 0640, which the installer's own user is not.
+The runtime half is the last line: it covers an image built before the gate existed, and it matters
+because **`steps/run.ts` partitions before archinstall is handed the plan** — a configuration
+archinstall refuses is not a failed install, it is a wiped disk followed by a refusal.
+
+⚠️ `--offline` is mandatory in both. Without it archinstall probes connectivity, fetches the package
+database and checks for a newer release of itself *before* it looks at the file, so a captive-portal
+network reports a perfectly good configuration as broken.
+
+`VELTRIX_INSTALLER_FAKE_ARCHINSTALL=missing|rejected|mismatch` forces one of the three warning states
+so they can be looked at in preview. Like `VELTRIX_INSTALLER_DRY_RUN`, it only ever points the safe
+way: it cannot produce `ok`, cannot clear a real verdict and cannot arm anything.
+
+### Preview mode — the installer CAN be opened on a desktop now, with `VELTRIX_INSTALLER_PREVIEW=1`
+
+```bash
+cp ~/…/nidara-iso/profile/airootfs/usr/share/veltrix-installer/base.json ui/installer/
+cd ui/installer && VELTRIX_INSTALLER_PREVIEW=1 ./build/veltrix-installer
+```
+
+⚠️ Read the section below this one first: **the VM rule still stands for anything armed**, and
+preview does not weaken it. Preview can only ever make things safer — `isArm` does not read the
+variable, so a typo leaves you with an installer that refuses to touch your session, never with one
+that touches your disk.
+
+Why a flag at all, when not arming is already correct? Because the existing safety is **the absence
+of a file** (`/run/archiso`), which is the right shape for arming and the wrong shape for a licence
+to run this on a machine somebody is using. Three things sit outside the `arm` gate, because they are
+not installation steps — they are the installer talking to the session it is running in, which is
+right on the medium and unacceptable on a desktop:
+
+| where | what it does to YOUR machine |
+|---|---|
+| `steps/region.ts` | `hyprctl eval hl.config({input={kb_layout=…}})` — changes the real keyboard, on one click in a list. **Not `keyword`**: the Lua parser rejects it, and the two keyword calls this shipped with in #395 were a silent no-op until the VM pass of 2026-09-08 caught the test box still typing `us` |
+| `widget/InstallerWindow.ts` | "Restart now" → `systemctl reboot` |
+| `steps/run.ts` | writes the plan **and the credentials** to /tmp, then spawns `sudo -n archinstall` |
+
+Preview neutralises exactly those three and stops the run step *before* the credentials file exists —
+not for archinstall's sake (it would get `--dry-run` anyway) but because that file holds the account
+password hash, and 0600-then-deleted is right on a medium about to be powered off and wrong on a
+machine that will not be. What it would have run is printed into the log instead, including the full
+plan, which makes the log the thing worth reading.
+
+⚠️ **It wears a banner, and that is load-bearing**, not decoration: an installer that looks exactly
+like the real one and quietly does nothing is the instrument pretending to be the patient. A
+screenshot of a preview must never be mistakable for a screenshot of an install.
+
+⚠️ `ui/installer/base.json` is git-ignored on purpose. Copy the REAL one from nidara-iso rather than
+inventing a stub — a stub would be a fourth thing that looks like the product and is not.
+
+### The installer runs in a VM, or it does not run
+
+🔴 **`veltrix-installer` is never launched on the development machine. Not armed, not unarmed, not
+"just to look at the window".** The VM harness is the only place it runs, in both modes. This is a
+standing instruction from the project owner (2026-08-29), and it exists because the failure it
+guards against has no small version: the host's `/dev/sda` carries Windows and the Linux install
+being used to do the work, and the disk step lists it by name and model, ready to select.
+
+The three arguments that make running it locally feel safe are all worth naming, because each one
+sounds sufficient on its own:
+
+- **"It is unarmed without `/run/archiso`."** True, and it is the property this file documents two
+  sections up. But it is a property of the code you are about to change — the first version of the
+  dry-run gate leaked three commands, which is why that section exists at all. When the safety of a
+  test rests on the correctness of the thing being tested, there is no test.
+- **"I shimmed `sgdisk`/`mkfs`/`mount` on `PATH`."** A `PATH` shim is a soft barrier. It holds only
+  while nothing resolves a binary by absolute path, nothing runs as root, and the environment is
+  inherited intact — three conditions you are not in a position to guarantee for code you did not
+  finish reading. Isolation is the VM boundary; a shim is a convenience inside it.
+- **"The destructive branch is behind a flag."** It was, and the flag's entire purpose was to arm
+  the installer somewhere the live medium is not — which is to say: exactly the dangerous case.
+  That is why `VELTRIX_INSTALLER_ARM` no longer exists. Nothing outside an ISO can be armed today,
+  and that removes one of these three arguments rather than answering it.
+
+⚠️ And the corollary for the positive control, which is otherwise a good habit
+(`feedback: prove the test can fail`): reproducing a partitioning bug **on purpose** means the
+destructive path has to be genuinely reachable for the control to be worth anything. Where you
+reproduce it is therefore a safety decision, not a convenience one. That one goes in the VM before
+it goes anywhere.
+
+### The installer's battery warning reads UPower, so a VM can show it
+
+The welcome page's "running on battery" warning asks UPower's DisplayDevice — the object the bar's
+battery glyph reads — through `lib/upower.ts`; the rule itself (`lib/power.ts`) is a pure function
+the probe runs with no typelib. It read `/sys/class/power_supply` until 2026-09-17, which a VM
+cannot fake, so the warning had never been seen outside real hardware. To see it now, on the Live
+medium as root: `pacman -S python-dbusmock`, then `scripts/dev/fake-battery.sh start 100 full`
+**before** opening the installer (its UPower client binds to whoever owns the name at that moment),
+then `start 40 discharging` / `start 41 charging` flip the warning live.
+
+⚠️ It is NOT part of the page's network poll, and must not go back in. That poll runs only while
+the network warning is on screen, so on any machine with a connection — every machine that can
+install — plugging the charger in never cleared the battery warning. It updates from UPower's
+`notify` instead.
+
+### The low-RAM advisory reads /proc/meminfo, and its probe is in CI
+
+The welcome page's "less than 3 GB of RAM" warning (`lib/memory.ts`, #604) parses `MemTotal` out of
+`/proc/meminfo` — readable unprivileged, so the `live` user gets it with no helper — and compares it
+against `MIN_RECOMMENDED_RAM_MIB` (2800). It **advises without blocking Continue**, like Secure Boot
+and unlike legacy BIOS: pacstrap on a 2 GB machine usually finishes, and when it does not the OOM
+killer is the one that says so. An unreadable or unparseable `/proc/meminfo` returns `null`, and
+`isLowMemory(null)` is `false` — absence never warns, same rule as the firmware facts.
+
+⚠️ The two halves have a control each in `installer-logic`, because both fail quietly on the
+developer's box: `/proc/meminfo` is in **kB** and the rule is in **MiB**, so a unit mixup warns every
+machine or none, and a deleted threshold warns none. The probe (`scripts/dev/memory-probe.ts`)
+shipped with the feature and nothing ran it for two days — a sonda nobody runs is a file, not a test,
+and the same review found its failure path was dead code (a `GLib.idle_add(… system.exit(1))` in a
+probe with no main loop; the `throw` is what exits non-zero).
+
+### Losing the network mid-install: two failures that look nothing alike
+
+Measured in a VM (2026-09-17, `lib/stall.ts` has the detail):
+
+- **Link gone** (QMP `set_link n0 off`) → pacman fails within about a minute on `Could not resolve
+  host`. The page now says the connection was lost (`failedDownloading`, matched on the CHILD's
+  output) instead of "an error occurred" over a traceback asking to report it to archinstall.
+- ⚠️ **"failed retrieving file" is not always the network** (2026-10-13). With the live medium's
+  RAM overlay full (archiso gives it 256 MiB), pacman printed `failed retrieving file … : Failure
+  writing output to destination` (curl error 23) and `failed to synchronize all databases`, both
+  network words, while the network answered. The page said the connection was lost. `failedWriting`
+  now catches the local failures (that line, `No space left on device`, pacman's own free-space
+  check) and WINS: the page says the installer ran out of space and to restart from the medium.
+  `failedDownloading` returns false for them. `stall-probe.ts` holds the real lines, and CI deletes
+  each rule in turn and requires the probe to catch it.
+- **Link up, nothing arriving** (`iptables -I OUTPUT -p tcp -m multiport --dports 80,443 -j DROP`
+  inside the Live medium — DNS keeps working) → `pacman -Sy` sat on "Synchronizing package
+  databases" for 20 minutes with no output: pacman was walking the medium's 431-server mirrorlist,
+  10 s per server, and archinstall only passes pacstrap's output through when it RETURNS. Restored
+  at 20 min it was already too late — the list ran out four minutes later (`failed to synchronize
+  all databases`). The page says the connection stopped responding and to start again if the install stops. It
+  does not promise a recovery: restored 108 s into a package-download stall, the install still
+  failed (skipped mirrors, then HTTP 416 on the resumed `.part` files) — no stalled run in four
+  recovered. Beside the warning is a **Stop the installation** button (owner's call: the person
+  decides, not a timer). It kills archinstall from the other end — our child is `sudo`, so
+  `force_exit` would kill sudo and leave the pacstrap running as root — then pacstrap and pacman,
+  and the disk is released as on any other failure.
+- **When** it stalls decides how long it lasts: during the PACKAGE download it failed on its own at
+  ~3 min (twice) — each mirror is skipped after a few timeouts and archinstall's pacstrap retries
+  fail on the sync at once; during the DATABASE sync it ran past 20 min. That is why the quiet
+  window is one minute, not two (two put the warning on screen next to the failure).
+
+⚠️ **Silence is not a stall.** archinstall runs the desktop's `pacman -Sy veltrix …` as a
+custom command and prints NOTHING until it returns — about a minute on a fast VM link, many minutes
+for ~1.5 GB on a slow one. The warning therefore needs no child line for 1 min AND under 256 KiB
+added to the target's pacman download directories AND a fresh `nmcli networking connectivity check` saying the connection is unusable. Test
+the no-false-warning half with `tc qdisc add dev enp0s3 root tbf rate 30mbit burst 64kbit latency
+400ms` on the medium, which makes that step long and silent while those directories keep growing. (The first version counted bytes on the interface; the
+harness's own SSH reads crossed the floor and flickered the warning off.)
+
+### The LANGUAGE is asked first, and the country is never the first screen
+
+Researched 2026-09-03 against Calamares, Anaconda, subiquity, GNOME Initial Setup and archinstall
+(`~/Dev/veltrix-handoff/INFORME-LOCALE.md`, 67 citations, four of them re-verified by hand). Four
+things in that ecosystem are unanimous, and Veltrix now matches all four:
+
+| convention | where it is verifiable |
+|---|---|
+| the **language is the first question**; the country is never the first screen | `calamares/settings.conf:115` — `sequence: welcome → locale → keyboard → …`, where `welcome` IS the language chooser; `anaconda …/welcome.py:124` — `_langView` with `_localeView` (the territory) as a secondary column |
+| write **only `LANG`** to /etc/locale.conf; `LC_*` inherit | Anaconda, subiquity, GNOME and archinstall all do; only Calamares writes them all |
+| label by **endonym** | all of them |
+| the console keymap hook goes **before** `encrypt` in the initramfs | all of them that support LUKS |
+
+🔑 **The argument for language-first is not taste**: *in what language do you print the country
+names before the reader has told you their language?* Our region page asked the country first and
+named the countries in the UI locale, which on the live medium is always `en_US`.
+
+So `steps/welcome.ts` is the language question — logo, one heading, one dim line, the list — and
+`steps/region.ts` keeps the country, which still narrows timezone and keyboard. The chosen locale's
+TERRITORY seeds the country as a suggestion (`es_AR` → Argentina), never when it is the medium's own
+`en_US`, which would suggest the United States to everybody who has not answered yet.
+
+⚠️ **Where there is NO convention, and we checked before changing anything:** the hostname.
+Calamares puts it on the account page in exactly our position (`users/page_usersetup.ui`:
+FullName, LoginName, **Hostname**, Password) and subiquity does too; Anaconda puts it under
+"Network & Host Name"; archinstall gives it a top-level entry. Two with the account, one with the
+system, one loose — so it stays where it is, and what was missing was the line saying what it is
+FOR, which subiquity bothers to write and we did not.
+
+⚠️ **What it must NOT be is a constant, and it was one until 2026-09-10.** The page opened with
+`Veltrix User` / `veltrix` / `veltrix` already written into the three name fields — values, not hints,
+which `Gtk.Entry` renders identically to something a person typed — so somebody who typed a password
+and pressed Continue installed `veltrix@veltrix` without ever being asked. That is the same argument
+already written next to the password fill (a suggested NAME is a convenience, a suggested CREDENTIAL
+is a credential); the hostname carries a second one of its own: **a machine name that is the same
+string on every install collides with itself.** Two Veltrix machines on one network fight over
+`veltrix.local`, the router lists two identical leases, and `ssh veltrix` reaches whichever answered
+first.
+
+So the fields open empty behind their placeholders, and `deriveHostname()` in
+`lib/account-problems.ts` suggests `<username>-veltrix` as the username is typed — what Ubuntu and
+macOS do, and why. It stops following the moment somebody edits the hostname themselves, and
+`steps/account.ts` decides on RESTORE which of the two it is looking at (empty, or exactly what the
+username would produce ⇒ still a suggestion), so walking back to fix the username updates it. ⚠️ The
+write emits `changed` exactly like a keystroke, so a flag tells our own write apart from the
+person's — the same trap the initial fill documents two paragraphs above it in that file.
+`deriveHostname` also sanitises (`useradd` allows `_` and a leading underscore, RFC 1123 allows
+neither) and cuts the stem to fit 63 characters, because a suggestion that fails the validation next
+to it is a complaint about a field nobody touched.
+
+⚠️ Also no convention: how curated the language list is (archinstall exposes all 328 of glibc's,
+Calamares and Anaconda only what they translate), keyboard abstraction, and GeoIP.
+
+### A long pick-one list puts the current choice at the TOP, and never scrolls to it
+
+`searchableList()` in `ui/installer/steps/common.ts` — second use in the bundle, and a candidate for
+the kit when a third appears.
+
+⚠️ **It deliberately has no `scrollTo`, and it had one through three failed attempts**: a fraction
+of `adj.upper` (which is still growing while GTK allocates, so the first `changed` lands near the
+top and disconnects, pleased with itself), then a guard requiring `upper ≥ rows × 24`, then a `map`
+handler an idle later. Instrumented, the numbers were right — `upper=24316`, `page=320`, value set
+to 385 — and the list still opened at the top.
+
+The answer is the one Anaconda and GNOME Initial Setup already use: a **suggested block first**. The
+caller orders the items with the current choice at the front, and the question "where is my language
+among 328?" stops needing an answer.
+
+⚠️ And a layout law worth keeping: **a `vexpand` widget inside a page that scrolls gets its MINIMUM,
+not the leftover** — the page can always grow instead. The language list rendered three rows tall
+while asking for 220 until the page above it was cut down to a heading and one line. `height` on
+`searchableList` is explicit for that reason.
+
+### Language, keyboard and timezone are ONE step, and the data comes off the system
+
+`steps/region.ts` replaced `language.ts`, `keyboard.ts` and `timezone.ts`, which were the same widget
+three times over hand-written slices — 12 locales, 16 layouts, 26 zones, no way out of the slice.
+
+⚠️ **The fold is not because the live session knows the answers.** It cannot: the ISO's `locale.gen`
+carries one line (`en_US.UTF-8`), `/etc/localtime` is a symlink to UTC and `hyprland.lua` defaults
+`kb_layout` to `us`. Settings → Language even shows a single row on the live medium, because
+`localectl list-locales` lists only GENERATED locales. So `getLiveDefaults()` spends three
+subprocesses discovering three constants, and the page has to ask.
+
+`lib/region.ts` reads four files that are on every Arch system and maintained by somebody else:
+`zoneinfo/iso3166.tab` (249 countries), `zoneinfo/zone1970.tab` (312 zones, each tied to countries),
+`i18n/SUPPORTED` (328 UTF-8 locales) and `systemd/kbd-model-map` (60 keyboards, and the keymap↔xkb
+bridge above).
+
+🔑 **A country NARROWS the three questions; it does not answer them.** `defaultsFor` fills a field in
+only when the data is unambiguous and returns **null** otherwise, and null is the useful answer —
+a page that shows Brazil's sixteen zones and waits has asked a small question, while one that
+silently picked has answered a different question than the user did. Two traps that were shipped
+once and are the reason `scripts/dev/region-probe.ts` exists:
+
+- **Sorting a country's locales by CODE is not a ranking.** It made Spain default to Aragonese,
+  Brazil to Hunsrik, the United States to Cherokee, the United Kingdom to Welsh — every one a real
+  locale of that country and none of them the answer. `primaryLocaleFor` uses kbd-model-map's BCP-47
+  column instead, which covers 54 of the 249; the rest get null.
+- **`zone1970.tab`'s order is not by population.** Brazil begins at an island of three thousand
+  people and the United States at New York out of twenty-nine.
+
+⚠️ **There is no separate "regional format" question, and that does NOT contradict Settings.** The
+installer writes only LANG, so the seven `LC_*` in `core/RegionConfig.ts` fall back to it — which is
+`regionalLocale: ""`, the value Settings shows as *"Same as language"* and ships as its DEFAULT. An
+installed machine lands in Settings' own default state. Likewise there is no "interface language"
+question: the shell reads LANG to pick its own.
+
+⚠️ Locale rows are labelled by **endonym** through `Intl.DisplayNames` — ICU is in GJS, so
+"español de España" is derived, not transcribed. And use `Gtk.Entry`, not `Gtk.SearchEntry`: the
+installer's sheet styles `entry`, a SearchEntry draws on `entry.search` and arrives unstyled.
+
+### The step FACTORIES all run at once — a default that reads an earlier answer belongs in `onEnter`
+
+`InstallerWindow.ts` builds its eight steps in one array literal, so **every `XxxStep()` runs before
+the window exists**. `build()` is lazy (first arrival), the factory never was, and the factory is
+where each step used to seed its default. That produced two bugs that look unrelated:
+
+- **The keyboard ignored the language** (#390). `KeyboardStep()` read `getAnswers().language` in its
+  constructor and therefore always read the initial value. Choosing Spanish left English (US) ticked.
+- **Half the installer stayed in the previous language** (#389). A page translates itself inside
+  `build()`, which runs once, so 72 strings froze — and because pages are built on arrival, the
+  result was not "it stays in English" but "it is in whichever language you spoke when you happened
+  to walk past each page". Only the frame and the summary were subscribed to `onLocaleChange`.
+
+`lib/flow.ts` grew two things for this. **`Step.onEnter?()`** runs on every entry, *before* `build()`
+on a first visit — put anything that depends on an earlier answer there, never in the factory. And
+**`FlowResult.invalidate()`** throws away every built page (current one rebuilt at once, the rest on
+next entry); the window calls it on a language change.
+
+⚠️ `invalidate()` is only safe because **no step keeps state in its widgets** — every one reads
+`lib/answers.ts` on build and restores what was chosen. That is a contract: a step that starts
+holding state in a widget must put it in `answers.ts` too. The account step is the exception that
+proves it — `answers.account` is null until the form is *complete*, so it keeps its own `draft`.
+
+⚠️ And the rebuild has to be **deferred to an idle**: the only thing that changes the language is
+activating a row on the language page, so the callback fires inside that row's own `row-activated`
+handler and the rebuild would destroy the list still emitting it.
+
+### ONE keyboard catalogue, two scopes — `ui/lib/keyboards.ts`
+
+Both surfaces ask "which keyboard?" and both read this module (#473). Before it, Settings carried
+**28 rows written out by hand** and the installer derived its own 62; they overlapped on 26, so
+installing with any of the other 36 left the Settings row showing a raw code.
+
+🔑 **`kbd-model-map` is a BRIDGE TABLE, not a catalogue** — the measurement that decided the shape.
+Of the **598** keyboards `xkeyboard-config` describes (99 layouts + 499 variants in
+`rules/base.lst`), systemd names a console keymap for **58**. Nine per cent. Unifying on the bridge
+would have made the single list wrong in both directions:
+
+- `us(colemak)` is real in BOTH namespaces — xkb lists the variant, `kbd` ships the `colemak`
+  keymap — and systemd simply never wrote the row. Unifying on the bridge **deletes Colemak**.
+- `ro(cedilla)` and `ro(std_cedilla)` are rows systemd still carries for variants xkb no longer has
+  (`symbols/ro` renamed them `comma`/`std_comma`). The installer was offering two keyboards that
+  would not have applied to the graphical session either.
+
+So the catalogue is **xkb** — the namespace both surfaces actually set — and the console keymap is a
+PROPERTY joined onto it. `bridged` is a field, not a second list:
+
+| | takes | why |
+|---|---|---|
+| Settings | `allKeyboards()` — 597 | writes Hyprland's `input:kb_layout` only, so it can lock nobody out and withholds nothing |
+| installer | `allKeyboards()` — 597 | since #498. It writes the graphical keyboard EXACTLY and lets the console degrade — which is what every installer outside Debian does |
+
+⚠️ **That second row said `bridgedKeyboards()` — 58 until #498, and both halves of the reasoning
+were wrong.** Withholding 91% of the catalogue bought nothing, because the answer was reaching the
+desktop as a console keymap NAME anyway and arriving wrong for 36 of the 55 it did offer — see "The
+xkb pair travels in its own file" below. `bridgedKeyboards()` still exists and still means what it
+meant; its one caller is now `keyboardsFor()` in `ui/installer/lib/region.ts`, because the BCP-47
+column that says which country a keyboard serves comes from the bridge and exists nowhere else. So
+the country still SUGGESTS its own keyboards first and `scoped()` puts the whole catalogue after
+them.
+
+⛔ **Do NOT widen the bridge by matching names across the two namespaces.** It looks like the
+obvious move and it is the same silent substitution #472 was about: measured 2026-09-07, it rescues
+64 pairs and gets them wrong — Arabic (AZERTY) lands on the French `azerty` keymap, Polish (British
+keyboard) on `pl`.
+
+⚠️ **The id is `layout` + `-` + `variant`** (`us`, `us-colemak`, `de-nodeadkeys`), split at the
+FIRST hyphen — safe because **no xkb layout code contains one** (0 of 99), so a variant may keep its
+own (`us-dvorak-alt-intl`). It is what the label shows, what the config stores and what
+`set_config` takes, and it deliberately does **not** reuse the console keymap's spelling: `cz-qwerty`
+as an id is the xkb variant, as a keymap name it is a file `kbd` does not ship.
+
+⚠️ Two consequences that are easy to miss when touching this:
+- **`describeConfig` summarises an enum over 40 values** (`ENUM_INLINE_MAX`), because that response
+  is what an agent reads before every get/set and this one key carries 597 names. Validation still
+  runs against the whole set.
+- **A dropdown over 24 options gets a search box** (`SEARCHABLE_FROM` in `veltrix-kit/rows.ts`) —
+  and it must be `search_match_mode = SUBSTRING`. GtkDropDown's default is **PREFIX**, so entries
+  named "English (Colemak) · us-colemak" answered "colemak" with an empty popup: the box was there,
+  took the text and found nothing. Only opening it and typing catches that.
+- **`custom` is excluded** from the catalogue. It is xkb's escape hatch for a layout the user writes
+  into `~/.config/xkb`, it does nothing unless that file exists, and alphabetically it was the FIRST
+  entry in the list.
+
+### A keyboard layout has TWO names, and archinstall wants the other one
+
+`xkb` layouts (what Hyprland speaks, what `hl.config({input={kb_layout=…}})` takes) and **vconsole
+keymaps** (what `/etc/vconsole.conf` takes) are different namespaces with overlapping names. The
+installer offered xkb names and sent them straight into archinstall's `locale_config.kb_layout`,
+which is the **console** one — and four of them do not exist there at all:
+
+| xkb | console keymap |
+|---|---|
+| `gb` | `uk` |
+| `latam` | `la-latin1` |
+| `pt` | `pt-latin1` |
+| `br` | `br-abnt2` |
+
+Verify with `localectl list-keymaps` (console) against `/usr/share/X11/xkb/rules/base.lst` (xkb).
+`KeyboardLayout` in `ui/lib/keyboards.ts` carries both — `layout` for the live session, `keymap`
+for the plan — and it is no longer transcribed: the mapping IS `kbd-model-map`, read at runtime, so
+the four rows above are a description of that file rather than a copy of it.
+
+⚠️ **This is a lockout waiting for #310.** mkinitcpio's shipped `HOOKS` carry `sd-vconsole`, so the
+LUKS passphrase prompt uses the **console** keymap. A passphrase typed on a Brazilian keyboard and
+then asked for on a US one is a disk its owner cannot open. Disk encryption does not ship until the
+initramfs keymap is verified on a non-US layout.
+
+⛔ **And this is why `kb_layout` must not carry the answer BACK.** Measured 2026-09-08: reading the
+xkb layout out of `KEYMAP` sent **36 of the 55** keyboards the installer offered to the desktop as a
+different string, and 35 of those were not xkb layouts at all — `sv-latin1`, `jp106`, `it2`, `pl2`,
+`cf`, `de-latin1-nodeadkeys`; `xkbcli compile-keymap` refuses every one. Sweden, Japan, Italy,
+Poland and Canada installed with a keyboard the desktop could not apply. **The maintainer's machine
+is one of the 19 that worked** (`KEYMAP=es`, and `es` is also an xkb layout), which is why it stayed
+invisible.
+
+### The xkb pair travels in its own file — `/etc/X11/xorg.conf.d/00-keyboard.conf` (#498)
+
+The console keymap is a DERIVED value, not the record. The record is the xkb pair, and it goes where
+every systemd machine already keeps it:
+
+| writes it | reads it |
+|---|---|
+| `ui/installer/lib/keyboard-config.ts`, after archinstall (`steps/run.ts`, beside `applyRealName`) | `bin/veltrix-setup` → seeds `kb_layout` **and** `kb_variant` into `veltrix-settings.lua` |
+| `systemd-localed` on any `SetX11Keyboard` — so `localectl set-x11-keymap` on an installed machine lands in the same file | `config/greetd/hyprland-greeter.lua` → `readKeyboard()`, layout + variant |
+| Calamares, by hand, with the same two Options | `ui/greeter/widget/LocaleBar.ts` → `systemKbLayout()`, to label the picker |
+
+⚠️ **NOT written with `localectl set-x11-keymap`**, which is the obvious way and does not work:
+`localectl` talks to `systemd-localed` over D-Bus and there is no systemd running inside the target.
+**The file IS the interface**; the tool is one way of writing it.
+
+⚠️ **It is X11's file name on a session with no X11, and that is deliberate.** The name is
+historical; the CONTENT is what every reader looks for. Invent a Veltrix-shaped file instead and the
+standard one is absent — then `localectl status` on the installed machine reports `us` on a machine
+that is not.
+
+🔑 **All three readers apply the same guard: a name with no `/usr/share/X11/xkb/symbols/<name>` is
+not a layout, and `us` is a better answer than a string the compositor cannot load.** (Try
+`/usr/share/xkeyboard-config-2/symbols/` too — `/usr/share/X11/xkb` is a symlink to it since
+xkeyboard-config 2.48.) The Lua half is the one that decides what the login field TYPES, and
+`scripts/ci/hypr-lua-check.mjs` RUNS it against fixture files — including symbols fixtures, without
+which every case would resolve to `us` and the suite would pass vacuously.
+
+#### 🔑 `kbd-model-map` is systemd's file, and it names keymaps `kbd` does not ship
+
+Reading the bridge at runtime removed the transcription, but not the assumption underneath it: that
+a name in column 1 is a file on disk. **Eight of them were not** (#472) — `ara`, `ko`, `khmer`,
+`es-dvorak`, `ro-std`, `ro-cedilla`, `ro-std-cedilla`, `cz-qwerty`. And **nothing downstream
+notices**: archinstall's `set_keyboard_language()` calls `verify_keyboard_layout()`, logs `error`
+and returns **False** (`lib/installer.py:2056`) — and its only caller ignores the return value
+(`installer.py:976`). The install SUCCEEDS, the summary says Spanish (Dvorak), and the console is
+left unset, i.e. `us`.
+
+`resolveKeymap()` in `ui/lib/keyboards.ts` resolves the name before it can be written,
+by two rules that are **derived, not a table of names to keep in sync**:
+
+1. **another row for the same keyboard** — kbd-model-map lists several keymaps per layout, so a
+   later row may exist where the first does not (`cz-qwerty` → `cz-lat2`);
+2. **the same parts, spelled differently** — `kbd` and systemd disagree about order and separator,
+   not content (`es-dvorak` → `dvorak-es`, `ro-std` → `ro_std`). Applied **only when exactly one**
+   keymap carries those parts, so an ambiguous match can never substitute a different keyboard.
+
+⛔ **What is deliberately NOT a rule *here*: falling back to the layout's plain keymap.** `ro` for
+`ro-cedilla` is a silent swap of one keyboard for another — the class of failure the whole thing
+exists to end. `resolveKeymap` answers "can the console say EXACTLY this keyboard?" and must keep
+answering only that.
+
+🔑 **The base fallback exists, in a field of its own** (`fallbackKeymap`, #498). It answers the
+OTHER question — "and if it cannot, what does the console get instead?" — which every installer
+outside Debian answers the same way: the base layout, silently (Calamares `findLegacyKeymap`,
+`SetKeyboardLayoutJob.cpp:186`; Anaconda and GNOME through `systemd-localed`). Two separate fields
+rather than one lenient function is the whole trick: the degradation is a named step the region page
+can SAY out loud, instead of a guess buried inside a resolver. Measured over the catalogue: 55 have
+a console keymap of their own, **286 degrade to their base**, 256 have nothing and keep the medium's
+`us`.
+
+Three of the bridged rows have no console keymap **under any name** (Arabic, Korean, Khmer; it was
+five until the catalogue became xkb's and Romanian's two cedilla variants turned out not to exist
+there either). They keep being offered — the xkb layout is real and the desktop gets it — with
+`keymap: ""`. Dropping them would delete three languages' keyboards to fix a console that never
+could have worked.
+
+The region page states the consequence rather than hiding the keyboard, in two strings:
+`regionKeyboardConsoleFallback` names the base keymap the console will use, and
+`regionKeyboardNoConsole` says it stays on US when there is not even that. Saying it out loud is the
+one place we differ from Calamares/Anaconda/GNOME, which degrade in silence.
+
+⚠️ **Cut the VARIANT column the same way as the layout column.** Both are positional lists: two rows
+carry `,phonetic` (`bg,us`) and `qwerty,` (`cz,us`), and reading them whole produced a keyboard
+labelled *"bg, ,phonetic"* and a second, broken Czech beside the working one. That cut is what takes
+the list from **62 to 60** — the two that go are those duplicates, and each one's correct twin was
+already in the list. Nothing real is lost.
+
+🔑 **How to check it, on the machine that matters** (the answer is machine-dependent, so this is a
+runtime property and not a CI gate). `esbuild --bundle --format=esm --platform=neutral
+--external:'gi://*'` a three-line probe that calls `allKeyboards()`, run it under `gjs -m`, and diff
+every non-empty `keymap` against `localectl list-keymaps`. Run it against `main` first: an instrument
+that cannot report the eight is an instrument that proves nothing.
+
+### The input method — `fcitx5`, and the one variable everybody sets wrong
+
+⚠️ **This section replaces a claim that was false for months.** It read *"the reason Japanese and
+Simplified Chinese are not offered as languages: Veltrix ships no input method"*. They **were**
+offered — `LANGUAGES` in `ui/installer/lib/languages.ts` has carried `zh-CN` and `ja` since #398 and
+`steps/welcome.ts` shows all thirteen with no filter — and the IME was genuinely missing. The decision
+got written down and never applied, which is the worst of the three possible states: an installer
+promising a language its owner could not write in, and a document saying it did not.
+
+**The IME ships now** (#500): `fcitx5 fcitx5-gtk fcitx5-qt fcitx5-configtool fcitx5-anthy` are
+dependencies of `veltrix`, all in Arch's `extra`. The framework earns its keep for everyone
+as the thing that turns `~/.XCompose` sequences into text for Wayland clients; anthy adds ~24 MiB.
+
+🔑 **The Chinese engine is installed with the LANGUAGE, not with the desktop** (#703). This section
+used to say "the engines are 5 MB of the 23" — their own size, not their dependency trees.
+`fcitx5-chinese-addons` pulls in qt6-webengine: **~540 MiB** on top of the rest of the desktop's
+dependency closure (measured with `pactree -s -u` minus that closure, then `pacman -Si`; `fcitx5-rime`
+was measured as the alternative and is still ~150 MiB, so the engine choice does not change the
+mechanism). `bin/veltrix-language` is the ONE map from a language to its engine, and every path that
+can make Chinese the system language goes through it:
+
+| path | how |
+|---|---|
+| the installer | archinstall writes `/etc/locale.conf`; the plan's `custom_commands` run `veltrix-setup` in the target, which runs `veltrix-language ensure-engine` — no installer code of its own |
+| Settings → Region → Language | `pkexec veltrix-language set <LANG>`: the engine FIRST, then `localectl`, under one password prompt. If the engine cannot be installed the language is NOT changed — a desktop in Chinese with no way to type it is #500 by another route. Prompt dismissed = exit 126 = no error shown |
+| `veltrix-update` | ends in `veltrix-setup` → `ensure-engine` marks an engine the system language needs `--asexplicit`, so the orphan left by the dropped dependency is not one `pacman -Rns $(pacman -Qdtq)` would take |
+| a plain `pacman -Syu` from ≤ 0.13.0 | `veltrix.install` only PRINTS (a scriptlet cannot run pacman): the `pacman -Rns` line for a non-Chinese system, `sudo veltrix-language ensure-engine` for a Chinese one. Nothing is removed silently |
+
+⚠️ `ensure-engine` runs `pacman -S` **without `-y`** on purpose: refreshing the databases without
+upgrading is a partial upgrade. A stale database fails with a download error, which Settings shows
+as "Couldn't apply" and `veltrix-setup` as a warning.
+
+⛔ **Do NOT export `GTK_IM_MODULE`.** It is the variable every guide sets and it is wrong here: GTK4
+speaks `zwp_text_input_v3` to the compositor natively, and setting the variable OVERRIDES that
+native path (GTK's own error string is *"IM Context is hardcoded by GTK_IM_MODULE"*). `bin/veltrix`
+exports four and not that one — `INPUT_METHOD`, `QT_IM_MODULE`, `XMODIFIERS`, `SDL_IM_MODULE`.
+`XMODIFIERS` still matters: XWayland clients have no text-input protocol. Verified on the machine —
+`libgtk-4.so` carries the protocol names, and Hyprland answers BOTH halves
+(`zwp_text_input_manager_v3` for apps, `zwp_input_method_manager_v2` for the IME) — and it is what
+the ArchWiki, fcitx's own Wayland page and Omarchy's `environment.d` drop-in all do.
+
+🔑 **No systemd unit, deliberately.** The package's own `/etc/xdg/autostart/org.fcitx.Fcitx5.desktop`
+starts it, and that path is live here — measured with `systemctl --user list-units 'app-*'`, which
+shows XDG autostart entries running inside a uwsm Hyprland session. Omarchy ships a unit and masks
+the autostart entry; their reasons are theirs (a duplicate tray item, XCompose restarts). Ours would
+add a file, a mask, and a restart loop to fight over the same bus name. **And unlike
+`veltrix.service`, an IME leaking into another Hyprland session is not a bug** — that unit's comment
+warns against `WantedBy=graphical-session.target` because the shell would paint a bar in somebody
+else's session; an input method simply being available is the opposite of a problem.
+
+⚠️ **fcitx5 will take the keyboard layout if you let it.** Its X11 addon can push its own layout
+onto X, and its default group is hardcoded `Default Layout=us` — `buildDefaultGroup` in
+`inputmethodmanager.cpp` does **not** read the locale. `defaults/fcitx5/conf/xcb.conf` turns that off
+(`Allow Overriding System XKB Settings=False`), seeded by `veltrix-setup` only when the user has no
+`~/.config/fcitx5` at all. Without it every XWayland app would quietly undo the work in #498.
+
+✅ **The profile does NOT need seeding, and the VM pass of 2026-09-08 is what settled it.** The
+plan here used to be "capture a configured profile from a VM and ship it", on the reading that
+`buildDefaultGroup` ignores the locale. Measured on a real 简体中文 install, that is not what
+happens: with nobody having opened `fcitx5-configtool` and **no `~/.config/fcitx5/profile` on disk
+at all**, `InputMethodGroupInfo` answers
+
+```
+('us', [('keyboard-us', ''), ('pinyin', '')])
+```
+
+and `Ctrl+Space` + `nihao` gives 你好. fcitx5 derives the group from the locale at startup and only
+writes the file once somebody changes something — so a captured profile would have frozen one
+locale's answer over a correct one. Measured for `zh_CN`; `ja_JP` takes the same path and is
+assumed, not measured. **Read a claim about `buildDefaultGroup` against a running fcitx5 before
+acting on it.**
+
+🔴 **What IS missing is #503 — on Hyprland**: the IME does not reach our **layer-shell** surfaces
+under a focus grab. Same session, same keys — 你好 in kitty and in our own GTK4 Settings window
+(xdg toplevels), raw `nihao` in the search overlay. No profile would have fixed that. ✅ On Hyalo it
+works (2026-10-02, `references/hyalo.md` → "Input methods"); Hyprland is frozen, so it stays there.
+
+### The installer's log is not a terminal, and the children writing to it assume one
+
+Everything `steps/run.ts` spawns — archinstall, and pacman under it — writes for a TTY. Captured
+with `script`, one real `pacman -Qi` line is:
+
+```
+ESC[?25l ESC[0;1m Name : ESC[0m bash CR
+```
+
+A `GtkTextView` has no meaning for any of that, so it printed it: the stray `[?25h`, the coloured
+noise and the blocks of half-drawn progress bars in the installer's log were the child's bytes
+arriving **intact**, not corruption. `lib/ansi.ts` (`stripAnsi`) undresses a line before it lands,
+and `appendLog` is the single funnel it sits in — ours and the child's lines go through the same
+call, so a caller added later cannot forget it.
+
+Two things it does, and it should not learn a third:
+
+- **Escapes are deleted.** CSI, OSC, the short forms, and any leftover ESC — including a sequence
+  the child never finished writing, where removing the ESC alone leaves a literal `[` behind.
+- **A carriage return means the line was redrawn**, so only the last take is kept. A progress bar
+  redraws dozens of times inside what arrives as one line (`read_line` splits on LF alone), and a
+  log wants the final state, not the flip-book. ⚠️ The **trailing** CR is not a redraw — every line
+  of a CRLF stream carries one, and cutting at the last CR without dropping it first returns `""`
+  for every line a pty ever touched.
+
+⛔ It is not a terminal emulator and must not grow into one. Cursor movement, `ESC[K`, scroll
+regions: a log does not have a screen for any of them to mean anything on.
+
+The font that renders it is the other half of the same bug — see design-system.md, "A generic font
+alias is a value fontconfig chooses".
+
+**Looking at it without an ISO: `scripts/dev/installer-log-probe.js`.** Both defects were found by
+building an image and booting it, which is the longest loop in the project, and neither of them
+needed a disk or an archinstall to see. The probe builds just that view — the real classes, the
+real compiled sheet — feeds it bytes captured from a real `pacman` through a pty, and writes the
+pair `-raw` / `-fixed`: the same input with and without `stripAnsi`, which is what makes the "before"
+a control rather than a story.
+
+```bash
+gtk4-broadwayd :5 &
+cd ui/installer && npx --yes sass@1.97.3 --no-charset style.scss style.css && cd ../..
+GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 gjs -m scripts/dev/installer-log-probe.js /tmp/ilog
+```
+
+It prints the family Pango **loaded**, not the one the sheet asked for, and stamps that onto the
+PNGs when they differ — a dev box without `ttf-jetbrains-mono` renders a substitute, so the images
+are honest about layout and nothing else. Same 0-sized-children timing trap as the other probes: it
+waits 1500 ms, and at 600 ms the window is already `mapped` while every child still measures 0×0.
+
+### What `custom_commands` print reaches nobody unless we keep it
+
+archinstall 4.4 runs each of base.json's `custom_commands` as
+`SysCommand(f'arch-chroot -S {target} bash {script}')` **without `peek_output`**
+(`run_custom_user_commands` in its `lib/installer.py`). The output is held in memory and dropped
+when the command succeeds: it never reaches archinstall's stdout (so never our run page), nor
+`cmd_output.txt`, nor `install.log`, which keeps only `Executing custom command "…"`. Measured on
+the clean install of 2026-09-22: five commands, the desktop's whole pacman transaction among them,
+and not one line of their output anywhere. A FAILING command is not silent — archinstall raises
+with its last 500 characters.
+
+So `assemblePlan` wraps every command (`lib/command-log.ts`, `wrapCommandForLog`) to append its
+output to `/var/log/veltrix-install-commands.log` inside the target while still passing it through,
+and after archinstall `reportCommandLog` says where that file is and repeats the lines that warn or
+fail (`[WARN]`, `warning:`, `error:`) in our own log, before that log is copied into the target.
+The wrap is in the installer, not in base.json, so a command nidara-iso adds later is covered
+without anybody remembering to.
+
+Two details are load-bearing, and the probe (`account-rules-probe.ts`) checks both:
+`set -o pipefail` outside, or the pipeline answers with `tee`'s status and a failed install reads
+as a success; and `set +o pipefail` INSIDE the braces, because the group inherits it and base.json's
+`curl … | pacman-key --add -` would start answering with curl's status instead of pacman-key's —
+measured 0 → 7 on a refused connection. The wrap must not change what a command means. A CI control
+deletes the wrap and requires the probe to catch it.
+
+⚠️ **Never `grep -q` in a `pipefail` pipeline.** `grep -q` exits the moment it
+matches, closing the pipe while the producer is still writing — under load the
+producer dies with SIGPIPE (141), `pipefail` turns the pipeline's status into
+141, and the caller reads a real match as a miss. This was a real production
+bug, not a style point: `bin/veltrix-migrate` sets `pipefail` and used
+`gsettings list-keys … | grep -qx`, which silently dropped real user settings
+as "retired" (reproduced 2026-11-12: 20/200 false drops under CPU load, 0/200
+without `-q`). The fix is to drop `-q` and read to EOF (`grep -x … >/dev/null`,
+same match, no early exit) — see the comment at `bin/veltrix-migrate:110`. The
+same shape bit `bin/veltrix-language` (`localectl list-locales | grep -qxF`,
+a generated locale misread as missing) and `.github/workflows/triage.yml`
+(`gh api … | grep -qiE`, a Co-Authored-By signal missed); both fixed the same
+way in Phase 1. The rule is about **pipelines under `pipefail`**: `grep -q` with
+a FILE argument, or in a script without `pipefail` (`bin/veltrix-setup` has
+none), is safe — the pipeline's status is grep's either way and there is no
+producer to kill. A herestring (`grep -q … <<< "$var"`) is safe too: the writer
+is the shell itself and a short string is written before grep starts.
+
+### The run page counts what it can, and says nothing it cannot (2026-09-23)
+
+The run page is one card — the phase now, large; a percentage and a bar; the elapsed time — over
+a line of five steps: connection, disk, **base system, desktop**, settings (the owner chose it from
+four rendered mockups). There is no page heading while it works: the window's header already says
+"Installing Veltrix", and the page used to repeat it. The heading comes back at the end, with the
+outcome.
+
+The five are not arbitrary. Until this change there were four, and the third ("base system") hid
+the longest wait of the install: the DESKTOP is a custom command (`pacman -Sy veltrix …`, 477
+packages, 855 MiB measured), whose output never reaches the pipe — so for most of the install the
+only moving line was our own wrapper, `Executing custom command "set -o pipefail; …`. The desktop
+phase starts when the first custom command creates OUR log in the target (every custom command is
+the Veltrix layer), and it ends when archinstall exits.
+
+⚠️ **Not on archinstall's "Executing custom command" line.** The first build did, and sat on "base
+system, 158 of 158" for the whole desktop: Python block-buffers stdout into a pipe, and all five of
+those lines arrived together AFTER the install they announce (measured in the VM, 2026-09-23).
+archinstall is now started under `env PYTHONUNBUFFERED=1` so its lines are live — which the stall
+check needs too, since it reads the time of the last line — but the phase boundary stays on the
+file, which is ours and cannot arrive late.
+
+Where each number comes from — all in `lib/run-progress.ts`, pure, probed by
+`scripts/dev/run-progress-probe.ts` (in `installer-logic`, with a control):
+
+- **base**: archinstall runs pacstrap on a pty, so its stdout carries pacman's `Total (n/N)` and
+  `(n/N) installing`. Only the FIRST transaction's total is tracked — archinstall runs smaller
+  passes right after (zram-generator 1/1, efibootmgr, networkmanager), and following them would
+  drag a finished bar back to the start.
+- **desktop**: downloads are the ` … downloading...` lines after `Packages (N)` in the command log
+  (above). Without a tty pacman prints NO per-package line while installing, so installs are
+  counted where pacman keeps count: directories under the target's `/var/lib/pacman/local`, minus
+  their number when the big transaction was first seen (it always downloads everything first).
+  Polled once a second, armed runs only.
+- **the percentage** is the one estimate: each phase has a FIXED weight (`PHASE_WEIGHTS`) and only
+  the count inside a phase is real. Retune the weights from a real install over a real network, not
+  from a VM on a package cache (that one finishes in about two minutes).
+
+Where there is nothing to count, the line under the bar is the last line the work printed, minus
+our `[TAG] ` prefixes, and never the command wrapper (`isPlumbing`). The step markers are drawn
+(`widget/PhaseMarker.ts`) and take their ink from CSS through `get_color()`: the accent is spent on
+the active step and the bar, nothing else.
+
+### `base.json` is now READ BACK to the person (2026-09-03)
+
+The summary step reads the product config and prints what it decided — kernels, `gfx_driver`,
+`bootloader_config`, `swap`, `mirror_config.mirror_regions`, and `basePackages()` for the package
+list (which had been written, exported and never called). So a product decision taken in
+nidara-iso reaches the last screen before the point of no return **without anybody remembering to
+come back here** — which is the same reason `base.json` is a file on the medium rather than
+constants in this repo.
+
+Two consequences when you change that file:
+
+- a key you rename or move disappears from the page silently. Every read goes through a
+  `pick(config, [...])` that returns `undefined` rather than throwing, and a row whose value is
+  missing is simply not appended — deliberately (a summary that crashes the last page is worse
+  than one that says less), so **look at the page after touching the schema**.
+- the one line NOT from `base.json` is the locked root account. archinstall only touches root when
+  the plan carries `root_enc_password`, and `assemblePlan` omits it on purpose; the summary states
+  that as a decision because it is one, and nothing in the config records it.
+
+### Measuring a page instead of looking at it: `disk-page-probe.ts` (2026-09-03)
+
+`region-page-probe` opens one step to be looked at; `scripts/dev/disk-page-probe.ts` opens one to
+be MEASURED. It mounts `DiskStep` alone (never `InstallerWindow` — the rule that the installer
+only runs in a VM is about the process existing on a machine somebody is using, not about the
+disk code being reached), prints what the partition table asks for, and then stays open.
+
+```bash
+cd ui/installer && npx --yes sass@1.97.3 --no-charset style.scss style.css && cd ../..
+./scripts/bundle.sh scripts/dev/disk-page-probe.ts /tmp/disk-probe
+DISK_PROBE_SEED=ok /tmp/disk-probe                 # opens with / and an ESP already assigned
+DISK_PROBE_SEED=dupe /tmp/disk-probe               # two partitions on one mount point
+for l in en_US es_ES fr_FR de_DE it_IT pt_BR pt_PT pl_PL nl_NL ru_RU zh_CN ja_JP; do
+  LANG=$l.UTF-8 DISK_PROBE_ONCE=1 /tmp/disk-probe 2>&1 | grep 'pane required'
+done
+```
+
+Four things it exists to teach, each of which cost time before it did:
+
+- **The pane follows the table, not the other way round.** `WINDOW_LAYOUT.wizardContent` is set
+  from the widest locale's measurement (#399). The sweep above is how that number is re-derived
+  when a string changes; Russian has been the widest, and it is the column HEADINGS that make it
+  so, not the data.
+- **Natural, not minimum.** Every cell ellipsises, so the table's *minimum* is a few dozen pixels
+  and GTK will happily allocate it. And the PAGE's natural width is useless — the heading and the
+  warning above the table are wrapping labels, whose natural width is the whole paragraph on one
+  line. Measure the table; add the page's own padding, measured with a ruler box wearing
+  `.installer-body` rather than copied out of the stylesheet.
+- **Measure the worst case.** A `Gtk.DropDown` is as wide as its SELECTED item: the same table
+  measured 543 with every row unanswered and 645 once one was answered.
+- ⚠️ **A probe that pokes the page must put it back — and had better not poke at all when
+  somebody is looking.** Selecting the longest option to measure the worst case fires the row's
+  own handlers (the smart format default ticks a checkbox), and restoring the selection does not
+  restore that. Half an hour went into a "bug" where the first row came up mounted at `/boot/efi`
+  and the page correctly complained about a duplicate nobody had asked for. The worst-case pass
+  now runs only under `DISK_PROBE_ONCE=1`, which measures and quits.
+
+⚠️ **Synthetic wheel scroll does not reach GTK4 in these windows.** `veltrix-click scroll-at`
+reports `ok` and nothing moves — measured 2026-09-03 against the installer's page scroller and
+the region page's 249-row country list, which users demonstrably scroll by hand. The page's own
+scroller is fine: tabbing to a control below the fold scrolls it into view. So do not conclude
+"the page does not scroll" from a synthetic scroll that did nothing — check with the keyboard.
+
+### The queue is GitHub issues; the skill keeps the rules (2026-08-31)
+
+Two places, split by kind, and the split is the point:
+
+- **An issue** answers *what is next and in what order*. It dies when the PR merges.
+- **`references/tech-debt.md`** answers *what is true and what not to do*. It outlives the fix —
+  several RESOLVED items still carry a rule that binds — and it ships in the checkout, so a
+  contributor's agent has it without asking GitHub for anything.
+
+Each open debt carries its queue entry in a line under its heading; the debt numbers are NOT
+renumbered to match, because a `#N` in a commit message from July still has to resolve.
+
+**Close from the PR body with `Closes #<n>`.** That is the whole discipline. A tracker nobody
+empties is worse than no tracker, and this repo had 300 PRs against one issue before this.
+
+Milestones are the phases of the standing work order; labels name the area (`installer`,
+`hyprland`, `design-system`, `login-screens`) or the shape of the next step (`needs-vm`,
+`needs-measurement`, `debt`). An issue whose fix lives in **nidara-iso** or **veltrix-repo** is
+filed in that repo and cross-referenced, never duplicated.
+
+⚠️ **Do not start a fourth list.** A report artifact records what a measuring session found, on a
+date, and stops there — the moment one starts carrying status it becomes a second queue with its
+own numbering, which is exactly the collision that produced this section.
+
+### The boot splash left this repo entirely — do not bring any of it back
+
+There is no Plymouth theme here any more, and `packaging/veltrix/PKGBUILD`, `install.sh` and
+`bin/veltrix-setup` say nothing about Plymouth on purpose. It all lives in **`veltrix-system`**, a
+package in `veltrix-repo` — the third of four layers, documented in `nidara-iso/PRODUCT.md` ("Four
+layers, and the third one had no owner").
+
+The three-day round trip is worth keeping, because each step looked right at the time:
+
+1. **It shipped inert for four days.** The PKGBUILD and `install.sh` copied a theme,
+   `veltrix-setup` ran `plymouth-set-default-theme`, and the installer added `splash` plus the
+   `plymouth` mkinitcpio hook. All three were written defensively — test for the binary, skip when
+   absent — and `plymouth` was in **nobody's** dependency list. Nothing failed; nothing happened.
+   Caught by asking an installed machine (`pacman -Qi plymouth` → not found), not by reading code
+   that was individually correct.
+2. **`depends=(plymouth)` fixed the chain and broke the layer.** A boot splash is the PRODUCT's
+   branding. `install.sh` puts this desktop on an Arch somebody already uses, and repainting their
+   boot is precisely what it must not do. GNOME Shell does not depend on Plymouth; Ubuntu ships a
+   Plymouth theme.
+3. **So the whole thing moved**, and with it the watchdog drop-ins and `plymouthd.conf` that
+   `lib/bootloader.ts` used to write into the target.
+
+**The rule, and it decides the next case too: if an Arch user installing only the desktop would not
+want it, it does not go in `veltrix`.** Boot experience, system defaults, anything that repaints
+somebody's machine — the product's, not the desktop's.
+
+### The ESP may not be ours, and every edit is scoped by that
+
+⚠️ **The partition `lib/bootloader.ts` writes into can belong to somebody else.** Reusing an
+existing ESP is exactly what a person does when they want Veltrix and their Windows or Ubuntu in one
+firmware menu, and until 2026-09-06 all three of its edits ran flat over `*.conf` and `loader.conf`:
+a neighbouring Arch got its entry retitled `Veltrix`, any foreign entry without `quiet` got OUR
+kernel command line appended, and a `loader.conf` belonging to whoever installed first was
+destroyed — the one place in the chain where both `bootctl install`
+(`src/bootctl/bootctl-install.c:913`) and archinstall (`installer.py:1310-1326`) are careful and we
+were not (#443, #444).
+
+**The line between ours and theirs is archinstall's own stamp.** Every entry it writes carries
+`# Created by: archinstall` and `# Created on: <init_time>`, one value per run
+(`installer.py:1224-1232`), so `steps/run.ts` records the same instant (`archinstallStamp()`) one
+line before the spawn and `entryIsOurs()` keeps only entries dated at or after it. It reads another
+program's output format on purpose and **fails safe**: an unrecognised header matches nothing, we
+edit nothing, and the cost is an entry still titled `Arch Linux`. Matching too much edits a system
+that is not ours — which way a wrong guess falls is the whole reason it is written this way round.
+
+On a shared ESP we change **one key, `timeout`, and only upwards** (`patchLoaderConf`): a longer
+foreign menu is a preference, a `timeout 0` or a commented-out one is raised because otherwise our
+new entry cannot be reached at all, and `default`, `console-mode` and keys we have never heard of
+survive. And "is another system here?" now counts foreign loader entries and foreign `EFI/<vendor>`
+directories, not just Windows — a Linux neighbour used to answer `false` and get `timeout 0`, i.e.
+a menu that never appears (#445).
+
+The rules are pure functions with a probe and a CI gate (`bootloader-rules-probe.ts`), because none
+of this is reachable from this repo: it needs a machine with another system already installed, and
+the person who finds out otherwise is the one whose Windows has gone from the menu.
+
+### And it has to be big enough to hold a kernel
+
+`ESP_MIN_BYTES` in `lib/manual-problems.ts` is **300 MiB**, and it is a capacity rather than a
+taste: with `uki: false` the ESP is mounted at `/boot`, so pacstrap puts the kernel and BOTH
+initramfs images inside it. Measured 2026-09-06 on a running machine — a 512 MiB ESP carrying two
+kernels plus the loader is **250 MB used, 49%** — so one kernel set is ~125 MB, half again as much
+as package sizes suggest, because the fallback initramfs carries every module. 300 MiB is that,
+plus the boot files already on a shared ESP (a factory Windows one runs 30-50 MB), plus the
+headroom an upgrade needs while the new kernel is written beside the old.
+
+It sits between the two numbers we know: archinstall refuses below **200 MiB**
+(`installer.py:249`) — and refuses INSIDE the install, after our summary said everything was fine,
+so our floor may never be lower than theirs — and **512 MiB** is what entire-disk mode creates.
+
+⚠️ The refusal STATES the number, in thirteen languages, which makes each of those sentences a second
+copy of the constant. `disk-config-probe` asserts the message and `ESP_MIN_BYTES` agree: raise the
+constant alone and the person resizes to the size the message asked for and is refused again.
+
+### What `lib/bootloader.ts` is allowed to keep
+
+It writes the **kernel command line and the loader timeout, and nothing else**. Those are
+archinstall's output, named after this machine's kernels, owned by no package — genuinely
+per-machine, which is the only test that keeps something in the installer.
+
+The four things it used to write left for one reason worth internalising: **written by an
+installer, a setting is applied once and never again.** A machine installed in August would never
+receive an improvement to its own boot. A package arrives by `pacman -Syu` like everything else.
+Any new "let's also configure X on the target" belongs in `veltrix-system` unless it fails that
+per-machine test.
+
+⚠️ `splash` stays on the cmdline and must: the initramfs half comes with the package, a splash
+needs both, and the cmdline half has no owner but us. `nowatchdog` and `modprobe.blacklist=` are
+duplicated by the package's drop-ins deliberately — the cmdline reaches the kernel before anything
+in `/etc` is read.
+
+### Testing the LOGIN itself, without a VM and without logging out
+
+`lock-probe.js` covers how the greeter looks. For what it *does* — the greetd conversation in
+`ui/greeter/lib/greetd.ts`, which the greeter speaks directly (no AstalGreet since 2026-08-17) —
+there is a fake daemon:
+
+```bash
+python3 scripts/dev/fake-greetd.py /tmp/greetd.sock /tmp/req.jsonl &   # add --big-endian for the control
+scripts/bundle.sh scripts/dev/greetd-probe.ts /tmp/greetd-probe
+GREETD_SOCK=/tmp/greetd.sock /tmp/greetd-probe                        # expect: PROBE-RESULT ALL PASS
+```
+
+The probe covers wrong password → `AuthError{isAuthFailure:true}`, right password → resolves, and
+no `GREETD_SOCK` → an error the card must NOT show as "wrong password".
+
+🔑 **Read `/tmp/req.jsonl`, not just the PASS lines.** It records the conversation the daemon saw,
+and that is the only place some of the contract is visible — a failed attempt must be followed by
+`cancel_session`, because greetd refuses the next `create_session` while a failed one is still
+under configuration. A client that skipped it would still print PASS.
+
+⚠️ **`--big-endian` exists so you can watch the probe FAIL before believing a green run** (it
+byte-swaps the reply's length prefix; a correct client reports a framing mismatch). Worth using:
+the bug it models is a real one — AstalGreet writes that prefix native-endian and reads it back
+big-endian, and it never surfaced upstream because `read_bytes_async` returns whatever is
+available instead of filling the count, so the nonsense length was harmless.
+
+### Rebuilding the Wayland shim (`lib/veltrix-wl/`)
+
+TSX changes reload with `Super+Shift+R`; the C shim does not. After editing `veltrix-wl.c/.h` the
+library and typelib have to be rebuilt **and reinstalled system-wide** — the shell resolves
+`gi://VeltrixWl` from the default girepository path, so a fresh build sitting in `lib/veltrix-wl/build/`
+changes nothing until it is installed.
+
+```bash
+lib/veltrix-wl/build.sh                    # → lib/veltrix-wl/build/ (.so + .gir + .typelib)
+sudo install -Dm755 lib/veltrix-wl/build/libveltrix-wl.so.0.0.0 /usr/lib/libveltrix-wl.so.0.0.0
+sudo ln -sf libveltrix-wl.so.0.0.0 /usr/lib/libveltrix-wl.so.0
+sudo ln -sf libveltrix-wl.so.0     /usr/lib/libveltrix-wl.so
+sudo install -Dm644 lib/veltrix-wl/build/VeltrixWl-1.0.typelib /usr/lib/girepository-1.0/
+sudo install -Dm644 lib/veltrix-wl/build/VeltrixWl-1.0.gir     /usr/share/gir-1.0/
+sudo ldconfig
+```
+
+To try it without installing (handy for a throwaway test script):
+
+```bash
+GI_TYPELIB_PATH=lib/veltrix-wl/build LD_LIBRARY_PATH=lib/veltrix-wl/build gjs -m test.js
+```
+
+⚠️ **Two things go stale silently.** The `.gir` in `/usr/share/gir-1.0/` is what `scripts/gen-types.sh`
+reads to generate `@girs/VeltrixWl-1.0` — skip installing it and the local typecheck reports the new
+API as nonexistent. And CI's typecheck uses the **`@girs/` snapshot from the `ci-assets` release**,
+which knows nothing about `VeltrixWl` until a maintainer refreshes it; the first PR that imports the
+shim needs that refresh or typecheck fails on CI while passing locally.
+
+### Adding a widget (auto-registration)
+
+Create ONE file in `ui/shell/widgets/` that default-exports a
+`const w: AtomicWidget = {...}`. **`references/writing-a-widget.md` is the full page** —
+the vocabulary, the optional fields, and the boundary CI enforces; copy `calculator.ts`
+as a minimal template. Then:
+
+```bash
+node scripts/gen-widget-index.mjs        # regenerates widgets/widgets.gen.ts
+# Super+Shift+R — the dev launcher also runs the codegen automatically
+```
+
+Commit `widgets.gen.ts` **together with** the new widget file — the CI job
+`widgets-gen` fails the PR if the committed file is stale. No registry edit is
+needed beyond the widget's required `category` (`"media"`|`"utilities"`|`"system"`,
+which auto-places it in the bar) + optional `barOrder` (intra-category fine-tune);
+`CC_DEFAULT_LAYOUT` in `widgets/index.ts` stays editorial (an unlisted id packs after the
+listed ones). The codegen hard-errors
+on non-widget files in `widgets/` (helpers go in `common/`) and on
+duplicate ids — fix what it says and re-run.
+
+If the widget depends on hardware (battery, radios, backlight…), declare
+`isAvailable()` (+ `watchAvailable(cb)` if presence can change at runtime) —
+without hardware the widget must not exist for the user (see the hardware-gate
+rules in `architecture.md`). On a dev desktop, exercise it with the fake-*
+scripts above.
+
+### Debugging "the change didn't apply"
+
+When a reload seems to do nothing or styles refuse to refresh, the cause is almost always a zombie `gjs` process still drawing the previous UI. Order of escalation:
+
+1. `Super+Shift+R` again.
+2. `killall veltrix-shell` — then `Super+Shift+R` once it's gone.
+3. `tail -f "$XDG_RUNTIME_DIR/veltrix-ui.log"` and re-trigger; look for stack traces.
+
+### Finding CSS that can never reach its widget (`scripts/dev/scope-audit.mjs`)
+
+```bash
+cd ui/shell && npm run build          # style.css must be current
+node ../../scripts/dev/scope-audit.mjs   # exit 1 if anything is unreachable
+```
+
+Every surface sheet is wrapped in its window's selector (commandment 2), which makes the scope a
+fact about the TSX — and the TSX moves. When a surface changes windows, the rules that used to
+reach it stay in the sheet, stop matching, and report **nothing**: no SCSS error, no GTK warning,
+no diff. The symptom arrives months later as "that thing looks like raw GTK now", from a human.
+
+For every class named in `css_classes:` / `add_css_class()` by code that renders into a window,
+this looks for at least one selector in the compiled sheet that is either unscoped (the global
+kit) or scoped to *that* window. No selector at all is fine — the widget is Cairo-painted or the
+class is a marker. Only selectors naming a **different** window is the bug.
+
+It found three on its first run (2026-08-10): the island's whole media panel (`.veltrix-media-*` was
+inside `_control-center.scss`'s `#veltrix-bar` block while `PlayerIsland` shows the same panel —
+broken since July), the "Default" audio badge and the slider readout (both scoped to the CC's
+detail page while Settings wore them too).
+
+**Pass 2 — a window inside a window (added 2026-08-10, needs no list).** Pass 1 is only as complete
+as its hand-kept `WINDOWS`, so it is blind to a window nobody told it about. The
+`VeltrixAlertDialog` was exactly that: its own toplevel, whose rules #97 swept inside
+`window.veltrix-settings-window`. Every class in it comes from `../lib/veltrix-kit`, which pass 1
+attributes to **Settings** — so it found a Settings-scoped selector, called it reachable, and went
+green while the whole dialog rendered as raw GTK.
+
+Pass 2 asks a structural question instead: a window scope root (`window.…`, `window#…`, `#veltrix-…`)
+in a **non-initial** position is impossible by construction, because a `Gtk.Window` is always a
+`GtkRoot` and a transient is a sibling root, never a descendant. Zero false positives across the
+sheet's 1259 selectors. ⚠️ Match `window` as a whole compound, never as a suffix — GTK4's node name
+for a `Gtk.ScrolledWindow` is `scrolledwindow`, and a substring test flags every
+`scrolledwindow.apps-list-scroll > viewport` in the sheet.
+
+⚠️ **What it cannot tell you**: whether a *reachable* rule is the one you meant, or whether
+specificity lets something else win. It answers "can this rule ever apply here", nothing more. A
+clean run is not a substitute for looking at the running shell.
+
+⚠️ **Keep `WINDOWS` in step with the scope table** in `design-system.md` whenever a surface moves
+or is added — and note that its `dirs` follow the MOUNT SITE, not the folder name: `widgets/media.ts`
+is listed under the island because `PlayerIsland` mounts its panel there. The mount site of a
+**transient** is its own root: don't add the alert dialog's classes to Settings just because
+Settings opens it.
+
+⚠️ **Verify the tool against a known bug before trusting a green run.** Reintroducing one into
+`style.css` (which is generated, so it costs a rebuild to undo) is how the first version was caught
+matching only half of it: it anchored `.class` on a preceding space, so every element-qualified rule
+— `label.accent-label`, `button.veltrix-btn`, `spinbutton.time-spin` — was invisible, and a class
+styled *only* that way read as "no CSS at all" and passed.
+
+### Checking the Settings window's geometry law (`scripts/dev/settings-geometry.mjs`)
+
+```bash
+node scripts/dev/settings-geometry.mjs                       # default width sweep
+node scripts/dev/settings-geometry.mjs --widths 1400,1050,802
+```
+
+Drives the LIVE session: for each window width it resizes the Settings window through Hyprland,
+walks all 18 pages via `veltrix-ipc settingsPage`, and reads each page's real `bounds` out of
+`queryUI`. It asserts the three invariants of `WINDOW_LAYOUT` (design-system.md) — same pane width
+across pages, same pane width across window widths, and the window's floor holding — and exits 1
+on a violation.
+
+It exists because this failure is **invisible one page at a time**: the breakpoint used to be
+derived per page, so the sidebar docked on 16 pages and floated on 2 at the same window size, and
+the only way to see that is to sweep. It is also how the numbers in `WINDOW_LAYOUT` were measured.
+
+⚠️ Needs a graphical session (it is not a CI gate), and it resizes/floats the user's Settings
+window, restoring size and tiling state at the end. ⚠️ It resizes with `hl.dsp.window.resize` —
+under this repo's Lua config the classic `hyprctl dispatch resizewindowpixel …` string is a Lua
+syntax error, and the shape of that mistake is that it prints an error and keeps going, so a sweep
+built on it reports differences that are really the window never having moved (that happened while
+writing this one — the first table it produced was noise).
+
+### Driving game mode's session without a game (`scripts/dev/game-session-probe.ts`) — a CI GATE
+
+> **VELTRIX fork (Phase 0): DELETED with Game Mode.** The probe file
+> (`scripts/dev/game-session-probe.ts`), the logic it drove
+> (`ui/shell/core/game-session-logic.ts`) and both CI steps (probe + control) are gone.
+> The rest of this section is history.
+
+```bash
+npx --yes esbuild@0.28.2 scripts/dev/game-session-probe.ts --bundle --platform=node \
+    --format=esm --outfile=/tmp/game-session-probe.mjs && node /tmp/game-session-probe.mjs
+```
+
+What game mode does around a game (`ui/shell/core/game-session-logic.ts`, architecture.md → "Game
+mode") only runs when a game opens, which is not something a test can arrange — so it fakes the
+WORLD instead: a profiles daemon that remembers the profile, an awww that remembers what each output
+shows, a compositor with a focused workspace, timers that fire when told. That is why the logic is a
+file of its own with no `gi://` import: the probe bundles it for node.
+
+What it asserts is that a session is **undone**: the profile after it is the one from before, across
+all three profiles, two windows for one game, a profile changed mid-game, a quit from another
+workspace, the setting off (counted as writes, not read off the final value — a value can be right
+for the wrong reason), no daemon at all; the artwork on the game's output and the wallpaper back; the
+grace that keeps a session across a launcher handing over to its game; silencing on, off mid-game,
+and over; and a shell that restarts mid-session adopting the record instead of capturing
+"performance". CI runs it in the `hypr-config` job with a control that deletes the "still the one
+we set" condition and requires the probe to fail.
+
+It replaced `scripts/dev/hypr-game-mode-test.lua`, which drove the same rules inside `hyprland.lua`
+against a stubbed `hl` while the session lived there.
+
+**End to end, on Hyalo nested** (how #682's game mode was verified, 2026-10-01): `headless-shell.sh`
+with `HYALO_CONFIG=config/hyalo/hyalo.toml` (the default, `/dev/null`, has no `[rules.games]`),
+`GSETTINGS_SCHEMA_DIR` pointing at the repo's schemas compiled into a temp dir (a new key is not in
+the installed schema), a fake `powerprofilesctl` first in `PATH` (the sandbox copies the user's dconf,
+and with the profile setting on the shell would otherwise switch the REAL machine's profile), a
+`HYALO_DRIVER` that starts `SteamAppId=440 gjs -m fakegame.js` and takes `veltrix-hyalo msg
+screenshot`s, and fake artwork at `$VELTRIX_SANDBOX/.steam/steam/appcache/librarycache/440/
+library_hero.jpg`. ⚠️ Keep `VELTRIX_SANDBOX` SHORT (the harness's own `/tmp/veltrix-hyalo-home.*`):
+the sandbox's runtime dir is inside it, and awww refuses a socket path that long ("File name too
+long") — no wallpaper at all, before or during the game.
+
+### Do the shipped locales still FIT? (`scripts/dev/text-budget.js`) — a CI GATE
+
+```bash
+gjs -m scripts/dev/text-budget.js                    # the gate, as CI runs it
+gjs -m scripts/dev/text-budget.js --scales 1.0,1.5   # narrow the sweep
+gjs -m scripts/dev/text-budget.js --verify           # cross-check the budget live
+gjs -m scripts/dev/text-budget.js --font "Noto Sans 11"
+```
+
+The companion to `settings-geometry.mjs` and the opposite kind of instrument: that one drives the
+live session and cannot run in CI; this one touches nothing, builds real GTK labels with the real
+compiled stylesheet, and measures every string of all **12 locales** at text scales 1.0→1.5. It is
+wired into the headless smoke job (the only one with a GDK display *and* `inter-font`).
+
+**Why offline rather than a sweep of the real window**: the locale comes from `$LANG` at shell
+startup (`core/i18n/detectLanguage`), so a live sweep of 12 locales means 12 shell restarts.
+
+**Three slots since 2026-09-07 (#428), and two verdicts.** It measured exactly one column — the
+Settings sidebar — for a month, and the two Control-Centre surfaces it did not measure were both
+already broken in shipped locales: the 2×1 tile title in six languages, the AI status banner in
+seven. *The instrument existed, was good, and was pointed at one place.* When you add a fixed-width
+text box, add it here in the same change.
+
+| slot | box | metric | verdict |
+|---|---|---|---|
+| Settings sidebar label | 250px column → 174px | natural width | truncation FAILS |
+| Control Center tile title | 2×1 tile → **96px** (since 2026-09-30) | wrapped MINIMUM for a title that can lose its subtitle, natural otherwise | overflow FAILS, truncation reported |
+| Control Center status pill | the 364px grid − the pill's ends, dot and gaps − a Stop button whose label is translated | natural width (one line) | truncation FAILS |
+
+⚠️ **The script READS those numbers out of the source with regexes**, so a refactor that only
+renames or restructures a constant breaks it without changing a pixel: it exits 2 ("could not read
+…"), and CI's smoke job goes red. That is how #675 sat red for nine commits on 2026-09-30 —
+`CAPSULE_CHROME` went from literals to `CAPSULE_ICON_SIZE + CAPSULE_ICON_GAP`, and the banner
+became a pill without `BANNER_PADDING`. When you touch `widget-kit/tile.ts`,
+`CCLayoutManager.ts`, `BaseIsland.tsx` or `StatusIndicators.tsx`, run
+`VELTRIX_REPO=$PWD gjs -m scripts/dev/text-budget.js` before pushing.
+
+- **overflow** — the text sets a *minimum* wider than its box. A minimum cannot be squeezed: GTK
+  grows the box and the surface clips it. A layout break, and no ellipsis can save it.
+- **truncation** — the text ellipsises inside its box. Information is lost, the layout holds. It
+  fails for the sidebar, where the label is a page's only name, and is REPORTED for a CC tile, whose
+  icon, subtitle, detail panel and Settings → Widgets row all still say what it is.
+
+`--fail-at` moves the scale line. The degradation ladder is the useful half — it is how you see that
+Japanese goes at 1.25 and English itself at 1.39, i.e. that the column is tight for the job rather
+than one locale being long. (The CC's own text does not move with the slider at all: outside
+Settings the ramp is fixed `$fs-*`, so its three rows are identical at every scale, by design.)
+
+🔑 **The answer to a name that does not fit is a shorter name, or a soft hyphen — not a smaller
+font and not a cut word.** See "A translated string that does not fit" in the i18n section.
+
+⛔ **What this gate CANNOT see, and it cost a released version to learn.** Every slot asks *"does
+this text fit a box of N pixels?"* and takes N from the source. It cannot ask whether the box **is**
+N pixels. v0.12.0 shipped the status banner with its labels correctly wrapped, its card 412px wide
+against a 356px grid, and this script printing PASS — because `set_size_request` is a FLOOR, nothing
+above the card capped it, so it was allocated its NATURAL width, and *a label only wraps when it is
+given less than it asked for*. The owner saw it in one glance after the release.
+
+So: **`--verify` is not optional polish, it is the other half of the instrument.** It now measures
+the two CC boxes live (`veltrix-ipc toggleCC` first; the banner also needs AI control granted) and
+fails if a box is not the size the sweep assumes. Proven able to catch it: with the clamp removed it
+prints `card measures 412px, expected 356px ← WRONG` and exits 1, while the offline sweep above
+still says PASS. Run it before believing a green run about a box you have not looked at — and look
+at the box.
+
+Three traps, each of which produced a green run that measured nothing:
+
+- ⚠️ **A `Gtk.Settings` change needs the main context PUMPED.** Without it the sweep measures every
+  scale at 1.0 and passes — the first version printed four identical numbers for four scales.
+- ⚠️ **The font is PINNED to the shipped default** (read from the line in `core/ThemeManager.ts`
+  that seeds it), not taken from the machine — a budget is a property of the product. And the script
+  **refuses to run if that family is missing**, because fontconfig substitutes SILENTLY: an
+  unavailable font does not error, it just measures a different typeface.
+- ⚠️ **The locale files are parsed, not imported** (they are TypeScript, this is gjs). The parse is
+  asserted — a locale that yields under 50 keys aborts the run rather than passing vacuously.
+- ⚠️ **So are the widgets**, for the CC slot: a tile title is not a list in a manifest, it is the
+  second argument of whichever capsule maker the widget calls. Two things that parse has to get
+  right, and got wrong first: a getter body is SCANNED to its matching brace (a regex terminator cut
+  at the first nested `}` and handed back half a getter — and half a getter has no `""` in it, so a
+  title that wraps was filed as one that never does); and which title can wrap is decided per
+  TERNARY BRANCH, because a widget's title and subtitle are usually the same ternary on the same
+  condition (`recording ? t(a) : t(b)` beside `recording ? elapsed() : ""`). Reading it per widget
+  fails the build over a state that cannot occur. An identifier the parse cannot resolve **exits 2**
+  rather than being read as "no `""` here".
+
+🔑 **`--verify` is what keeps the budget honest**, and it earned that on the day it was written:
+`sidebar.ts` documented the label budget as 176px and the real allocation measured **170px**. The
+comment had missed the capsule's 1px borders and Adwaita's `list > row { padding: 2px }` — the very
+padding `.veltrix-row` exists to clear, which the sidebar's bare `Gtk.ListBoxRow`s never opted out
+of. Six pixels, in the one place already known to be a string over budget. Derive a budget, then
+make the machine check the derivation against a real window.
+
+### Proving a selector matches NOTHING (the sentinel probe — a technique, not a script)
+
+`scope-audit` answers "can this rule reach the window?"; `gtk-probe` answers "how big is this?".
+Neither answers *"is `window.veltrix-dock-window > box` dead?"*, because that is a question about one
+bespoke widget tree. **Ask it instead of deriving it from the source:**
+
+1. Declare the selector with a **sentinel** no other rule uses — `padding: 37px` — at
+   `STYLE_PROVIDER_PRIORITY_APPLICATION`.
+2. Rebuild the exact nesting in question (read it out of the TSX; the dock is
+   `win.set_child(overlay)` → `overlay.set_child(layout)` → `layout.set_child(da)` +
+   `add_overlay(shim)`).
+3. `gtk4-broadwayd :5` + `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 gjs -m probe.js`, wait one frame,
+   walk the tree and print every node whose `get_style_context().get_padding()` carries the sentinel.
+
+~50 lines, and deliberately **not** committed: the tree is different for every question, so a
+permanent tool would only ever be scaffolding. The 2026-08-10 run over `&>box` returned 0.
+
+🔑 **A zero proves nothing until a control has produced a one.** Always run a variant whose direct
+child really IS the node you are asking about — otherwise a typo'd selector, a provider that never
+loaded, or a probe that walks the wrong root all look exactly like "dead". Same lesson as verifying
+`scope-audit` against a reintroduced bug, one paragraph up.
+
+🔑 **Once it is fixed, drop the sentinel and read the REAL sheet.** The sentinel proves reachability;
+it does not prove the dialog now wears its own stylesheet. Same ~50-line probe, but load
+`ui/shell/style.css` and print declared values (`get_padding`, `get_border`, the Pango weight)
+against what the SCSS says. Point it at a `git worktree add … origin/main` build via `SHEET=` and
+before/after come out of one instrument. The 2026-08-10 alert-dialog run read `4 9` padding and
+weight 400 before, `14 16` and 600 after — which also showed the entry had NOT been raw all along:
+it was wearing the global `entry` rule from `_components.scss` (2px border, `6 10`), the only part
+of the dialog with a global fallback to fall back to.
+
+🔑 **Run the counterfactual too, and doubt the caution as hard as the claim.** The third variant here
+was "what if the redundant wrapper were removed?" — because the tech-debt note warned that would make
+the selector start matching. It also returned 0 (`layout` is an overlay as well), so the note had
+been guarding nothing. **A warning derived from a source read is a hypothesis with the same burden of
+proof as the thing it warns about.**
+
+⚠️ **A plain `Gtk.Window` is not a layer-shell surface.** Confirm the shape against the running shell
+before acting: `veltrix-ipc queryUI <selector>` prints each node's `path` as GType ancestry
+(`"GtkWindow.fullscreen > GtkOverlay"`), which settles "what is the window's direct child?" directly.
+
+⚠️ **A widget-tree walk cannot see GTK-internal CSS nodes.** `decoration`, `slider`, `trough`,
+`contents` are nodes without widgets — neither this probe nor `queryUI` will ever report them, and
+their absence is not evidence they are dead. That is why `decoration` survived the deletion that
+removed `&>box` from the same rule.
+
+### Measuring a control's real geometry with no screen (`scripts/dev/gtk-probe.js`)
+
+For any question of the form *"where does this inset actually come from?"* on a widget that
+mixes GTK's own boxes with our CSS — the native `Gtk.DropDown` is the standing example. Reading
+the three stylesheets failed five rounds in a row on that one; this is what ended it.
+
+```bash
+gtk4-broadwayd :5 &                          # offscreen display, once per session
+GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 \
+  gjs -m scripts/dev/gtk-probe.js /tmp/probe
+```
+
+It builds the specimen with `ui/shell/style.css` loaded at the **same provider priority the
+shell uses** (`PRIORITY_USER + 10`, as in `ThemeManager`), and prints the CSS node tree with
+each node's bounds / padding / border / margin / state, the same deltas `queryUI` reports
+(node vs toplevel), and a PNG of the surface — `Gtk.WidgetPaintable` → `Gsk.CairoRenderer` →
+`save_to_png`, so you can count pixels of the actual render. `EXTRA_CSS=` loads above
+style.css and `LOW_CSS=` loads at the *theme's* priority, which turns it from a dump into an
+experiment: "does our declaration really beat the theme's?" is one run, not an argument.
+`ITEMS=N` sets the option count and `SEARCH=1` turns the popup's search box on the way
+`VeltrixDropDownRow` does above 24 options — **a searchable dropdown is a different popup, measure
+it as one**: turning search on puts GTK's default list factory back over ours (bare labels + a
+checkmark, 17 px rows, none of our fill), which is why the kit re-applies its factory afterwards.
+`REAPPLY=1` is that re-application, so the before/after is two runs (caught 2026-09-16).
+
+Why offscreen and not the live shell: it is reproducible, it needs nobody to hold a popover
+open, and it can answer counterfactuals ("what did the PREVIOUS commit's CSS measure?") that a
+live session cannot. That last one is how the dropdown's "13px at the top vs 7 at the sides"
+turned out to be a **stale-stylesheet reading** — the card padding and the list margin both
+live at once, which no committed state ever had.
+
+⚠️ **`:focus-visible` cannot be reproduced offscreen.** GTK grants it on keyboard traversal
+only; `grab_focus()` + `gtk_window_set_focus_visible()` set the FOCUS_VISIBLE *state flag*
+(you can see it in the dump) and the selector still does not match. Use `:focus` or `:selected`
+as the stand-in when the question is about the CASCADE; anything that genuinely depends on the
+focused state is a live check.
+
+⚠️ **Never conclude from one absolute bound.** `compute_bounds` on these nodes is ambiguous
+enough that a single number fits two readings; compare DELTAS between nodes measured in the
+same run — that rule is why the probe prints the pairs itself.
+
+### Reading the glass in PIXELS (`scripts/dev/glass-probe.ts`)
+
+For any question about the tint or the rim: "does this retint move anything?", "is the rim still
+the same ramp?", "did that refactor change a single pixel?". Needs no display and no compositor —
+`drawSquircle` takes a Cairo context, so an offscreen `ImageSurface` is a complete stage for it.
+
+```bash
+scripts/bundle.sh --js scripts/dev/glass-probe.ts /tmp/glass-probe.js
+gjs -m /tmp/glass-probe.js /tmp/before      # → /tmp/before.png + /tmp/before.txt
+# …edit the tint or the ramp, rebundle, run again as /tmp/after…
+diff /tmp/before.txt /tmp/after.txt         # empty = the render did not move by one bit
+```
+
+It bundles the REAL painters (not a copy of their maths — that is how an instrument catches the
+patient's disease) and renders the dock's own capsule call, in both modes, over an opaque mid-grey.
+The `.txt` is the instrument and the PNG is for eyes. Per specimen it dumps **two** traverses, and
+it takes both: the centre COLUMN is the axis the gradient runs along (top key light → bottom ground
+bounce), while the mid-height ROW is the only place the lateral stops land — **the `.08` mid-flank
+dip, which is the entire point of the Fresnel ramp, appears at neither end of the column.**
+
+**Why it had to exist** (2026-08-23, tech-debt #79): `GLASS_TINT.light` had shipped for two months
+saying `#fafafa` in its strings while handing Cairo pure white, and nothing anywhere rendered the
+two halves, so the disagreement was invisible to reading and invisible to looking. Fixing it needed
+a claim in pixels — the fix moved the dark capsule by **0 of 284** sampled pixels and the light one
+by at most **2/255** — and that claim is not something you can get from a screenshot of a desktop.
+
+⚠️ **Prove it can fail before believing a green diff.** Perturb one stop of the ramp (`FLANK_DEPTH`,
+or a white stop) and re-run: only the pixels that stop governs may move. An empty diff from an
+instrument you have never seen react is not evidence.
+
+⚠️ **Two sampling traps, both of which produced a confident wrong reading in one session (2026-08-23):**
+- **A fixed window near an edge only measures the edge where it happens to be.** Sampling a column
+  at a constant x reads the flank at mid-height and the BACKGROUND everywhere else — and background
+  is a perfectly plausible-looking number. Find the edge per row (first pixel that differs from the
+  backdrop) before reading it.
+- **A single pixel on a DIAGONAL edge under-reads the stroke.** A 1px stroke crossing the grid at an
+  angle spreads its coverage over several pixels, so each one is a blend of stroke, body and
+  backdrop: the same rim measures ~97 on a straight run and ~126 on the corner. That is dilution,
+  not a lighter rim. On curves, trust the render (and the eye) over a point sample.
+
+### What the icon theme SAYS vs what it PAINTS (`scripts/dev/icon-theme-probe.js`)
+
+For any "the icons are wrong" report. Run it inside a session, as the session user:
+
+```bash
+gjs -m scripts/dev/icon-theme-probe.js                  # snapshot: names + resolved FILES
+SET=Papirus gjs -m scripts/dev/icon-theme-probe.js      # …then watch a change land
+```
+
+It prints, together, the gsettings value, `Gtk.Settings:gtk-icon-theme-name`,
+`Gtk.IconTheme.get_theme_name()` and — the part that decides it — the absolute FILE
+`lookup_icon()` resolves for each specimen. A name reading "Papirus" over a path under
+`/usr/share/icons/Adwaita` is the whole bug in two lines, and no screenshot can tell those two
+apart.
+
+**Why it had to exist** (2026-08-18): on the first session of a clean install the desktop painted
+Adwaita icons while gsettings said Papirus, and a shell restart fixed it. Three different causes
+produce that same picture — gsettings not seeded yet, GTK reporting a theme it does not paint
+from, or one of our surfaces caching a resolved file. The probe eliminated the middle one in one
+run (GTK follows the change perfectly, name AND file, within the same process), which left the
+two that were real: the gsetting is only written ~2 s into the session (fixed by seeding it in
+`bin/veltrix-setup`), and the dock caches its art (fixed in `DockCore`; see
+`architecture.md` → `AppService.ts`).
+
+🔑 **Reproducing the first boot costs two commands, so never test this by reinstalling:**
+
+```bash
+dconf reset /org/gnome/desktop/interface/icon-theme    # back to the schema default
+systemctl --user restart veltrix                        # the shell starts on it, as on day one
+```
+
+Screenshot at ~1.5 s: that is the window the seeding closes. The same pair is the falsifiable
+test for any future fix here — before the seeding it shows Adwaita, after it shows Papirus.
+
+### Verifying the CURSOR — five instruments lie, and they lie in your favour
+
+Two sessions (2026-08-16/17) went almost entirely into instruments rather than the fix. Read this
+before running a single cursor experiment.
+
+**🔑 The law first, because most "it does not work" readings are really this.** Hyprland redraws the
+pointer **only when it sees a different shape NAME** — `IHyprRenderer::setCursorFromName` opens with
+`if (name == m_lastCursorData.name && !force) return;`. So a crossing between two surfaces that both
+say `default` repaints NOTHING, and neither does re-sending the same shape. Leaving a window "works"
+only because something on the way out changes the name (a resize border → `left_side`, bare desktop →
+`left_ptr`, a text field → `text`). Design every A/B around that, or the control arm will be as dead
+as the test arm — which is how a perfectly good calibration was thrown away here.
+
+The five liars:
+
+- **`grim -c` cannot see the cursor's theme or size**, and it fails in the direction that reads as
+  "your change did nothing". It refreshes its copy on the pointer-focus path only. Calibrated three
+  ways: with the pointer moved but the NAME unchanged it reported an identical 157 px / ink 0.078 for
+  a black theme and a white one; only after a name-changing crossing did it discriminate (Adwaita
+  112 px vs Qogir-Dark 147 px). A capture also once reported a 24-px box while a person looking at
+  that screen saw a cursor four times bigger. **Never conclude from a screenshot.**
+- **The TERMINAL refreshes the cursor for free.** It re-declares its cursor whenever it prints, so any
+  experiment with the pointer over the terminal you are typing in measures the echo of your own
+  commands. An entire session of "works by hand, not from the code" was this.
+- **kitty HIDES its cursor when the pointer is still**, and un-hiding re-declares it. A theme change
+  tested over kitty therefore "works" no matter what your patch does.
+- **`hyprctl dispatch movecursor 469 756` moves nothing** on this Lua config (`')' expected`), and
+  worse: even in the correct form (`hyprctl dispatch "hl.dsp.cursor.move({ x = …, y = … })"`) a warp
+  produces **no crossing event**, and GTK only pushes a cursor for a device it has a recorded pointer
+  focus for. So the standard way to park the pointer **silently disables the mechanism under test**.
+  Park it with real motion — `veltrix-input move X Y 2560 1440` — and assert `hyprctl cursorpos`.
+- **Hyprland's own log stops being written**, three times in one session. `debug:disable_logs` is only
+  re-read on `config.reloaded`, and `hyprctl eval` does NOT emit that event — so trying to turn logs
+  on by eval leaves them OFF with no way back. Put `hl.config({ debug = { disable_logs = false } })`
+  in `hyprland-user.lua` and `hyprctl reload`. Then **bracket every run with a canary** (any `hyprctl`
+  call logs `Hyprctl: new connection from pid N`): if your pid is missing at the end, the log died
+  mid-run and every count in it is void. A whole "the bug is reproduced!" reading came from a log that
+  had frozen seven minutes earlier.
+
+Also true, and each broke a reasonable-looking assumption: **the visible cursor and the setting
+disagree indefinitely** (`gsettings get cursor-theme` reports the new one while the screen shows the
+old); **a cursor change made in Settings fires while the pointer is over the Settings window,
+which is another process, so the shell's refresh finds no surface to bump on** — the Settings
+process has to bump its own window (`bindSettingsCursorRefresh`, Nov 13 2026), and a change that
+fires over a third-party app leaves a pending repaint for the next bar/dock enter; **portal latency measured in a COLD process is not the warm one** (~1.5 s spawning a probe,
+20 ms in the running shell, which inverted an ordering the design rested on); **`veltrix-click` applies
+the change by itself** (its choreography lands real pointer motion seconds after the command returns,
+and it toggles `cursor:invisible`); and **restarting the shell destroys the Settings window**, leaving
+the pointer over the wallpaper with no surface of ours beneath it.
+
+**What actually works: the WIRE.** `WAYLAND_DEBUG=1 gjs -m probe.js 2> log`, with a minimal GTK4
+window that reproduces the case — for the dropdown bug that meant a window containing one
+`Gtk.DropDown`. It shows `wp_cursor_shape_device_v1.set_shape`, `wl_pointer.enter/leave` and
+`xdg_popup.destroy` with timestamps, which is the whole causal chain. Building it FIRST would have
+saved both sessions. ⚠️ Grep it with `#`, not `@` — `WAYLAND_DEBUG` writes `wl_pointer#31.enter`, and
+a pattern with `@` matches nothing and reads as "no events". ⚠️ And assert the ORDER: a `set_shape`
+sitting right after a `wl_pointer.enter` is that enter, not your change.
+
+⚠️ **Control your own variables.** One run here showed pointer focus returning "spontaneously" 800 ms
+after a popover closed, which reversed a conclusion — it was the user's hand on the mouse. Three
+scripted selections with no human input showed it never returns. If a human is at the machine, the
+mouse is an uncontrolled variable.
+
+### Measuring what a layer's blur costs (`scripts/dev/blur-arm.sh`)
+
+The harness behind `references/tech-debt.md` §46. Use it for any claim of the form "this surface's
+blur got cheaper" — the box ratio a surface declares is easy to read off `dumpState`, but it is not
+a GPU number and should never be quoted as one.
+
+One arm = one line. It restarts the shell, parks it on an empty workspace, starts a rectangle that
+damages the screen at the monitor's refresh rate (`blur-damage.js`, a BOTTOM layer painting a GSK
+color node), puts the shell in the state you name via `veltrix-ipc`, samples `gpu_busy_percent` at
+20 Hz for 20 s, and prints mean/min/max plus the damage client's fps.
+
+```bash
+# arm A — the OLD code, checked out from a ref, as the ONLY variable
+REF=origin/main FILES=ui/shell/surfaces/bar/Bar.tsx \
+  scripts/dev/blur-arm.sh "old: full surface" setIsland agent
+# arm B — the working tree, same scenario
+scripts/dev/blur-arm.sh "new: declared rect" setIsland agent
+# the floor: the same shell with nothing open
+scripts/dev/blur-arm.sh "floor"
+scripts/dev/blur-arm.sh --reset          # put back whatever a REF arm swapped in
+```
+
+Anything after the label goes to `veltrix-ipc` verbatim, so any IPC action can be the scenario
+(`toggleCC`, `toggleAppGrid`, `setIsland overview`…). Knobs: `SECS`, `WS`, `SETTLE`, `DX/DY/DW/DH`.
+
+**Reading it:**
+
+- Run the arms **alternated** (A,B,B,A) — the machine drifts across a long sweep.
+- 🔑 **Check `fps=` on every arm.** It must be the monitor's rate. A throttled arm carried a
+  different load than its partner and means nothing; throw it out rather than averaging it in.
+- **Quote the delta AND the floor.** "Opening X now costs nothing" is a claim about the floor;
+  "X is 5 points cheaper" is a claim about the delta. They fail independently.
+- The number is tied to **where the damage sits**: §46's cost is the intersection of that rect with
+  the region a surface declares, so a surface whose region misses it measures as free. Say where it
+  was. (This is why the island's Assistant mode reads as free and its overview does not.)
+
+⚠️ **Three ways to get a confident wrong number**, all of them silent, all of them paid for:
+
+1. **Two arms agreeing.** The likeliest failure, and it looks exactly like "my change does nothing".
+   Every arm must state the tree it measures; the script restores a previous arm's swapped files when
+   an arm names no `REF`, because an arm that inherits the tree re-measures its predecessor
+   (2026-08-10: a pair read 8.9 vs 9.4 whose real numbers were 6.1 vs 1.1).
+2. **A short window.** The same arm read ~9 % at `SECS=4` and 6.1 % at `SECS=20` — a short sample
+   sits on the transient the state change itself causes and inflates each arm differently.
+3. **`pkill -f` matching the caller.** The stray-client kill lives inside the script for a reason:
+   `-f` matches whole command lines, so any shell whose argv merely *mentions* the damage file kills
+   itself. A caller that ran `chmod +x scripts/dev/blur-damage.js && …blur-arm.sh …` died on it
+   (exit 144, no output). Invoke the harness with a command line that does not name that file.
+
+### Testing in a QEMU VM (installer / greeter / lockscreen)
+
+The paths CI cannot cover — `install.sh` on a virgin Arch, the greetd→greeter→login
+chain, the lockscreen — are tested in a QEMU VM. Working invocation (verified 2026-07-03;
+`<disk>` = your Arch qcow2, UEFI via OVMF):
+
+```bash
+qemu-system-x86_64 -enable-kvm -machine q35 -cpu host -m 4096 -smp 4 \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+  -drive if=pflash,format=raw,file=<ovmf-vars-copy>.fd \
+  -drive file=<disk>.qcow2,if=virtio \
+  -vga none -device virtio-vga-gl -display egl-headless \
+  -audiodev none,id=snd0 -device intel-hda -device hda-output,audiodev=snd0 \
+  -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22 \
+  -usb -device usb-tablet
+```
+
+Gotchas that cost real debugging time:
+- **Always emulate a sound card** (the `-audiodev`/`intel-hda` lines): without one, PipeWire
+  has no sink, the bar volume icon shows muted, and audio bugs are invisible — the missing
+  `pipewire-audio`/`pipewire-pulse` packages (audio dead on every clean install) went
+  undetected for weeks because test VMs had no audio device. `-audiodev none` needs no host
+  audio; the guest still gets a working sink.
+- **`-vga none` is mandatory** with `-device virtio-gpu-gl`/`virtio-vga-gl`: without it QEMU
+  adds a default bochs VGA, the guest gets TWO DRM cards, Hyprland picks the 3D-less bochs
+  one and dies instantly ("start-hyprland error" at the greeter, greetd hits start-limit).
+  ⚠️ **It also has a SILENT variant, and it is worse** (seen 2026-08-25 booting the ISO):
+  Hyprland picks the *right* card and runs — `hyprctl` answers, layer surfaces map, the log is
+  clean — while QEMU's window and QMP `screendump` show the OTHER card, which nothing draws on.
+  So the desktop looks dead and the compositor is fine. The tell is that a text console
+  (`ctrl+alt+f2`) IS visible while the desktop is black, and `dmesg` names `simple-framebuffer`
+  beside `virtio-gpu-pci`. Chasing the EGL errors it produces (`createImageFromDmaBufs failed`,
+  then `verifyDestinationDMABUF: FAIL, format is external-only`) is chasing the wrong device:
+  they disappear with the flag, and `AQ_NO_MODIFIERS=1` does not help.
+- `-display egl-headless` renders guest GL offscreen — verify via `grim` over SSH
+  (`hostfwd` → port 2222), no window needed. (`gtk,gl=on` / `sdl,gl=on` may fail to create
+  a GL context depending on the launching environment; egl-headless is the reliable one.)
+- **Offline qcow2 snapshots** (`qemu-img snapshot -c/-a <tag>`, VM OFF) are the iteration
+  workflow — restore a clean state between installer runs. Applying one rolls back
+  EVERYTHING, including the guest's `~/.ssh/authorized_keys` — snapshot AFTER installing
+  your SSH key.
+- **Screenshotting the greeter**: it runs as the `greeter` system user, whose Hyprland does
+  not inherit `WAYLAND_DISPLAY` — find it with `sock=$(sudo ls /run/user/<greeter-uid>/ |
+  grep -x 'wayland-[0-9]')`, then
+  `sudo env XDG_RUNTIME_DIR=/run/user/<greeter-uid> WAYLAND_DISPLAY=$sock grim /tmp/shot.png`.
+- **Getting a seat session without typing a password** (needed for lockscreen tests over
+  SSH): append `[initial_session] command = "/usr/bin/veltrix" user = "<user>"` to
+  `/etc/greetd/config.toml` and restart greetd — but greetd honors it only once per boot,
+  tracked by `/run/greetd.run`, so `sudo rm /run/greetd.run` before the restart. Revert the
+  config byte-exact afterwards so the Veltrix-owned `/etc/greetd` fingerprint keeps matching
+  (`install.sh --update` re-syncs only fingerprint-matching configs).
+- Fast deploy iteration without a full `install.sh --update`: `scp` the rebuilt bundle +
+  compiled `style.css` over the installed copies under `/usr/share/veltrix/` (+ wrappers
+  under `/usr/bin/`) and restart greetd / re-lock.
+
+CI gates **SCSS compile + typecheck + widgets-gen freshness + headless boot smoke + Assistant
+loop** (`agent-loop`, see below).
+
+⚠️ **`ci.yml` triggers on `pull_request` AND `merge_group`, and dropping the second one breaks
+merges silently.** `main` uses a merge queue: the queue builds a temporary `merge_group` ref
+(the PR merged onto the current `main`) and waits for the four REQUIRED checks — styles,
+typecheck, smoke, widgets-gen — to report against it. Without the `merge_group:` trigger those
+checks never start there, so the queue entry waits until it times out and is kicked, while the
+PR still shows a full set of green checks from its own `pull_request` run. Nothing reports an
+error; a merge just never happens. The workflow the queue runs is the one on the BASE branch, so
+this trigger has to be on `main` before any of it works. Adding a new required check means adding
+it to the queue's list too, or the same stall returns.
+
+Note that `pull_request` already checks out `refs/pull/N/merge` — the merge RESULT, not the
+branch — so a green PR check has always been a statement about the merge, not just the diff.
+What the queue adds is that the statement is re-made against the `main` that is actually current
+at merge time.
+
+⚠️ **There is deliberately no `push: branches: [main]`, and it is only safe to leave out BECAUSE
+the queue exists** (removed 2026-08-23). The `merge_group` run tests the exact commit that becomes
+`main`, so a post-merge run re-proves a result that already exists — measured over nine merges,
+nine queue runs and nine push runs, one for one, the push starting *seconds* after the queue's had
+gone green on the same tree. That was a third of all CI. It also cost reliability rather than
+buying it: the smoke installs Arch packages and a mirror 404 there is enough to kick a PR out of
+the queue, so the third run was a third shot at that per change.
+**Put it back if the merge queue is ever turned off** — without the queue nothing tests the merged
+result, only each PR in isolation, and two PRs that are individually green can break `main`
+together. The trigger and the queue move as a pair.
+⚠️ One consequence to know: after a merge there is no longer a `main` run to open. The queue's run
+is the authoritative one, and it is no longer "orphaned" — it is the only one.
+
+**What `main` actually gates, so a contributor's agent does not assume otherwise** (2026-08-16):
+the four checks above, plus linear history, no force pushes, no deletions. It does **not**
+require an approving review — that requirement existed until today and was unsatisfiable (one
+collaborator, and GitHub does not let anyone approve their own PR), so it produced a bypass on
+every merge instead of a review. **CI is the automated gate; the human gate is the maintainer
+reading the PR**, and nothing in this repository enforces the second one. Write access is what
+keeps `main` safe from outside: opening a PR is open to anyone, merging one is not.
+
+The **smoke job** (`scripts/ci/headless-smoke.sh`, `smoke` in ci.yml) is the only gate that
+actually RUNS the shell: the runner loads the kernel's **vkms** module (virtual KMS — needed
+because Hyprland cannot boot with zero DRM devices: aquamarine's GBM allocator wants a node,
+and `HYPRLAND_HEADLESS_ONLY` is set by hyprtester but read by NOTHING, verified on v0.55.2
+and main), then a privileged `archlinux:latest` container installs the dependencies from
+official Arch repos, builds **both in-repo C libraries** (so a broken `build.sh` fails CI
+instead of a user's clean install), bundles the shell with `scripts/bundle.sh`, boots Hyprland with the SHIPPED
+`config/hypr/hyprland.lua` on the vkms display (seatd session + systemd-udevd for device
+enumeration; rendering is kms_swrast/llvmpipe), runs the bundle exactly as production does
+(`VELTRIX_SHELL_ROOT` + cwd = shell root), and FAILS if the process dies, `veltrix-ipc
+listActions`/`dumpState` don't answer with valid JSON, or the boot log contains `JS ERROR`.
+It then grims a desktop + Control Center screenshot into the `smoke-artifacts` artifact for
+HUMAN review — deliberately not a pixel diff (rejected as fragile).
+
+⚠️ **`libveltrix-auth` is built here for a reason that has nothing to do with this boot.** The
+shell never loads it — the LOCKSCREEN does, and the lockscreen is not part of the smoke. Until
+2026-08-23 it was the only C library in the repo that **no job compiled**, and it is the one
+that authenticates: a C error, or a `build.sh` that stopped producing a typelib, reached people
+at `install.sh` time. The job also asserts the **eight signals** the GIR must expose, because
+GJS resolves a signal name at `connect()` time — a renamed or dropped signal is not a compile
+error anywhere, it is an exception thrown the first time someone locks their screen, on a
+surface no automated boot visits. The built dependency
+stack is cached as a tarball keyed on `install.sh`'s hash **+ `headless-smoke.sh`'s** + a month
+stamp (bounds soname drift against the moving `archlinux:latest`); Hyprland refuses root, so the boot phase
+re-runs the script as an unprivileged `ci` user (`run` subcommand). Note the smoke job
+builds the COMMITTED tree (it does not re-run the widget codegen — staleness is the
+`widgets-gen` job's gate).
+
+⚰️ **Historical, kept because the trap generalises.** While the smoke built the Astal stack from
+source, the list of libs lived in TWO files — `install.sh`'s `astal_pkgs` and the smoke's
+`astal_subdirs` — and the dependency-cache key hashed only `install.sh`, which made "we no longer
+need lib X" **unfalsifiable in CI**: drop X from the smoke list alone and the restored tarball
+still contained it, so the shell booted and the removal looked proven. The fix was to hash both
+files. Both the source build and the cache are gone as of 2026-08-18 (nothing is built from source
+in the smoke any more), but the shape of the trap is worth keeping: **when a cache key does not
+cover every input that decides what gets built, a green run can prove the opposite of what you
+think.**
+
+🔑 **A missing Astal lib did not necessarily break the shell, and that cut both ways** — the reason
+"it still boots" was never proof that a lib was unnecessary. astal-gjs's `overrides.ts` imported
+~10 `gi://Astal*` modules through a `suppress()` wrapper that swallowed the failure, so an absent
+lib silently skipped its array-getter patches instead of throwing. Live proof that the path was
+real: **`AstalPowerProfiles` was in that list and was never installed on any Veltrix machine**, and
+the shell always booted. astal-gjs itself is gone now, but the lesson survives it: **you cannot
+conclude "the dependency is needed" from the shell merely *starting*.**
+
+The SCSS job is pure JS. The typecheck job can't run
+`scripts/gen-types.sh` (a runner has no GI stack to read), so it downloads a ~4 MB compressed
+snapshot of `@girs/` from the repo's `ci-assets` release and runs `tsc --noEmit` against it —
+no `node_modules` is
+needed. **If CI typecheck fails on a type that exists locally, the snapshot is stale**: a
+maintainer refreshes it with `scripts/dev/publish-ci-typings.sh` (re-run after any GTK/Astal
+update that changes the typings).
+
+**Getting a native backtrace from a GLib CRITICAL/WARNING** (proven 2026-06-09 — this is how
+the boot-time `g_list_store_remove` CRITICAL was attributed to libastal-tray, which is gone
+as of 2026-08-18 — the technique is not): stop the unit,
+run the shell once with criticals made fatal so it aborts and leaves a coredump, restore, read
+the trace:
+```bash
+systemctl --user stop veltrix
+VELTRIX_SHELL_ROOT="$PWD/ui/shell" G_DEBUG=fatal-criticals timeout 20 \
+  bash -c 'cd ui/shell && ../../scripts/run.sh app.ts' > /tmp/fatal-crit.log 2>&1
+systemctl --user start veltrix      # restore the session UI immediately
+coredumpctl gdb -1 --debugger-arguments="-batch -ex 'bt 30'"
+```
+Even with stripped libs the frames name the guilty LIBRARY, which is usually enough to decide
+ours-vs-upstream. (`G_DEBUG=fatal-warnings` exists for warnings, but it aborts on the first
+harmless warning — see tech-debt #9 — so prefer fatal-criticals.) Astal's Vala sources for
+cross-referencing a frame: `https://raw.githubusercontent.com/Aylur/astal/<ASTAL_REF from
+install.sh>/lib/<lib>/src/…`.
+
+**`veltrix-portal`** (installed to `/usr/bin`, D-Bus-activated as
+`org.freedesktop.impl.portal.desktop.veltrix`) is Veltrix's xdg-desktop-portal **Settings, Wallpaper, DynamicLauncher, Account, and Background
+backend**:
+1. **Settings**: serves the complete `org.freedesktop.appearance` namespace (`accent-color` as `(ddd)` RGB tuple, `color-scheme` as uint32 0=none/1=dark/2=light, `contrast` and `reduced-motion` as uint32) from gsettings, and `org.veltrix.appearance` (the two switches `reduce-transparency` and `window-background`, plus the exact accent hex `accent-hex` — the four opacities are derived from the switches, not served) from GSettings `org.veltrix.appearance` — so GTK4, libadwaita/GNOME apps, Qt apps AND our own installer/lock screen follow the desktop under Hyprland. It is the application half of the appearance contract (architecture.md, "The appearance contract"); test changes with `scripts/dev/appearance-contract-probe.sh`. Other namespaces (font-name, cursor-theme) fall through to the gtk backend (`org.freedesktop.impl.portal.Settings=veltrix;gtk` in `/etc/xdg-desktop-portal/hyprland-portals.conf`). Live updates: the daemon watches gsettings `accent-color` and `color-scheme` and emits `SettingChanged` — and watches `accent-hex` too, because a hex change may not change the GNOME name (many hexes publish one name) and third-party apps reading only `org.freedesktop.appearance` would otherwise keep the old triple. The accent table is the ten presets of `ui/lib/veltrix-kit/platform/accent.ts` `ACCENT_HEX` — keep them in sync — but `accent-color` is served from the exact stored hex, not the table.
+1b. **Access** (routed since 2026-09-13, #535): consent prompts — camera, microphone, location… — forwarded to the shell's `org.veltrix.Shell.Consent`, which draws them (architecture.md, "Consent prompts: the portal asks, the shell draws"). Never grants by default. Probes: `scripts/dev/consent-portal-probe.sh`, `scripts/dev/consent-dialog-probe.sh`.
+2. **Wallpaper**: implements `org.freedesktop.impl.portal.Wallpaper.SetWallpaperURI` — so "Set as Desktop Background" in browsers (Firefox, Chrome, Brave) and image viewers (Loupe, Eye of GNOME) automatically applies and persists the wallpaper via `veltrix-ipc setWallpaper` (with automatic caching of temporary/sandboxed images to `~/.local/share/veltrix/wallpapers/`).
+3. **DynamicLauncher**: implements `org.freedesktop.impl.portal.DynamicLauncher` (`PrepareInstall` and `RequestInstallToken`) — so web browsers (Google Chrome, Chromium, Brave, Edge, Firefox) and sandboxed apps can seamlessly install Progressive Web Apps (PWAs) and desktop shortcuts into `~/.local/share/applications/` and `~/.local/share/icons/`, automatically indexed live by Veltrix's `AppService`.
+4. **Account**: implements `org.freedesktop.impl.portal.Account` (`GetUserInformation`) — serves the user's username, real name, and avatar image URI (`~/.face` / `AccountsService` / `veltrix/avatar.png`) to sandboxed apps and chat clients.
+5. **Background**: implements `org.freedesktop.impl.portal.Background` (`GetAppState`, `NotifyBackground`, `EnableAutostart`) — manages background execution and autostart entries (`~/.config/autostart/`) for sandboxed Flatpaks.
+Testing gotcha: `XDG_DESKTOP_PORTAL_DIR` redirects BOTH `.portal` discovery AND
+`portals.conf` lookup; GJS gotcha: a bare `v` out-arg needs the `*Async` + manual
+`invocation.return_value` pattern (auto-marshalling hangs the reply).
+Stale-daemon gotcha: being D-Bus activated, the portal OUTLIVES a session restart and keeps the
+GSettings schema it started with. `install.sh` restarts it only AFTER `glib-compile-schemas`
+(restarting xdg-desktop-portal re-activates it at once), and `veltrixKeys()` serves a key the
+old schema lacks as its default: one failing key used to fail the whole `ReadAll`, and
+xdg-desktop-portal then answered `{}` for EVERY namespace asked with it (2026-10-19, the
+settings slice died with `portal missing org.freedesktop.appearance.accent-color`). If an app
+says the portal is missing a key that `gsettings` has, `pkill -f veltrix-portal` first.
+
+**`veltrix-doctor`** (installed to `/usr/bin`) prints a Markdown diagnostic report:
+versions, hardware, `hyprctl monitors`, systemd unit state, `veltrix-ipc dumpState`, recent
+log errors. Run it FIRST when debugging a user's install, and attach its output as evidence
+on bug reports and hardware/compat PRs.
+
+**`veltrix-mcp`** (installed to `/usr/bin`; registered for this repo via `.mcp.json`, and for installed users via the installer-managed `~/.config/veltrix/.mcp.json`)
+serves the agent surface — IPC actions, config, state, screenshots (inline images), doctor —
+plus the **computer-use** tools (`query_app`, `do_app_action`, `type_text`, `press_key`,
+`focus_window`) as MCP tools over stdio. Plain GJS, no Node/npm at runtime; mostly a thin adapter
+over `veltrix-ipc` (so it needs no changes when IPC commands are added) — the exceptions are the
+perception/action/keyboard tools, which run the standalone `veltrix-a11y`/`veltrix-act`/`veltrix-type`
+helpers directly because reaching into a foreign app is not shell-self-control (`focus_window` is
+the exception-to-the-exception: it delegates back to the shell's `focusWindow`, which owns the
+Hyprland binding). Details and governance (`org.veltrix.ai` `allow-mcp` / `allow-computer-use` /
+`allowComputerControl`, live-read per call) in
+`references/state-and-ipc.md`.
+
+**Regenerating `@girs/` (and the trap it sets).** `@girs/` is git-ignored, so a fresh clone / a new
+environment has none. Regenerate with `./scripts/gen-types.sh` (offline — reads the system
+`.gir` files; ~208 `.d.ts`; do **not** pass `-u`, which would rewrite the committed `tsconfig`).
+**The trap:** without `@girs/`, `npm run typecheck` doesn't fail loudly — it floods you with ~57
+*false* `Namespace 'Gtk' has no exported member 'Box'`-style errors. Real errors hide in
+that noise, so a regression can sit unnoticed (it did: typecheck silently went 0→32 between work
+sessions). **If you see "has no exported member" on GI types, you're missing `@girs/` — regenerate
+before trusting any typecheck result.**
+
+**i18n: a new string lands in ALL THIRTEEN catalogs, in the same PR.** ⚠️ **This policy changed on
+2026-08-23** — the old one deferred everything but `en`/`es` to a bulk pass at publication, and
+you will still find that phrasing quoted in older notes.
+
+What changed is that the debt is **gone** for the hand-written languages: since #206 the catalogs sat at **698/698, zero
+untranslated, zero stale** — the first time that has ever been true. The key count has since grown to 935: en, es and the
+new ar (2026-11-12, bilingual feature) sit at **935/935, zero untranslated, zero stale**; the other ten sit at 769/935,
+166 untranslated each — the bulk-pass backlog the policy was written to prevent has re-opened for those ten, and it is
+deferred in writing because only Arabic + English are in scope for now. The bulk-pass policy existed
+to manage a backlog, and managing a backlog is a different job from not having one. Letting a
+single key slip re-opens it, and the whole cost of the ledger below was learning that a backlog
+nobody is looking at grows silently (v0.6.0 and v0.7.0 each shipped 82 keys short, and it reached
+84 without anything noting the move). **Keep the zero** for every language you touch. `node scripts/ci/i18n-check.mjs` prints
+the table; a PR that leaves it non-zero is a PR that re-opened the backlog, and should say so out
+loud rather than let the ledger absorb it.
+
+English, Spanish and Arabic are the three **working** languages — written first and by hand, never
+machine-passed. The maintainer runs the shell in Spanish, so an `en`-only key shows stray English
+(runtime fallback is `es → en → key`), and writing es beside en validates the wording immediately.
+The other ten are translated to that finished wording.
+
+Type-wise, `t()` is typed `key: keyof typeof en` (`en` is the canonical key source), so a missing
+entry in any other catalog is **not** a type error — the gate below is what catches it, not the
+compiler. That was originally described as a safety net for the bulk-translated locales, not a
+licence to skip es. (It used to derive from `es`, which broke the typecheck on every new key —
+fixed in `core/i18n/index.ts`.)
+
+#### A translated string that does not fit
+
+`text-budget.js` fails a build when a string overflows a fixed box, and the fix is a **product**
+one, never a typographic one. The order to try, established 2026-09-07 on the CC tiles (#428):
+
+1. **A shorter word.** `cc.focus.title.off` was "Concentración" (94px against 84) in Spanish,
+   "Concentration" in French, "Concentração" in pt-BR. It is now "Enfoque" / "Focus" / "Foco". The
+   owner's rule, in their words: *«buscar otra palabra… en lugar de "ensuciar" la UI con palabras
+   cortadas»*.
+2. **A SOFT HYPHEN (U+00AD)** where the word is a compound and there is no shorter one — German and
+   Dutch mostly: `Zwischen­ablage`, `Bildschirm­aufnahme`, `Scherm­afbeelding`,
+   `Registra­zione schermo`. Pango treats it as a break opportunity, so the wrapped minimum
+   collapses to the longer half, and the character is INVISIBLE unless the break is actually taken.
+   ⚠️ It is also invisible in a diff and to `grep`: search for `Zwischen` and not for the whole
+   word, and the ledger's hash sees it as an edit like any other.
+3. **Never** a smaller font (outside Settings the ramp is fixed `$fs-*` — see design-system.md) and
+   never a mid-word cut.
+
+#### The translation ledger (`scripts/ci/i18n-check.mjs`) — a CI GATE
+
+```bash
+node scripts/ci/i18n-check.mjs                     # report: per locale, untranslated + stale
+node scripts/ci/i18n-check.mjs --check             # the gate, as CI runs it
+node scripts/ci/i18n-check.mjs --sync              # after adding/rewriting ENGLISH strings
+node scripts/ci/i18n-check.mjs --translated de,fr  # after actually TRANSLATING those locales
+```
+
+The ledger was built to make a backlog visible; with the backlog at zero its job is to **defend
+the zero**, and it does that unchanged — it fails when it no longer matches the catalogs, so
+**a PR that adds an untranslated string carries the new count in its own diff** and cannot land
+the debt quietly. That is exactly what was missing when v0.6.0 and v0.7.0 both shipped 82 keys
+short and the number reached 84 with nothing anywhere noting it had moved.
+`ui/shell/core/i18n/translation-state.json` is the record — committed, machine-managed.
+
+It tracks the invisible failure too. A key can be present *and* wrong: translated once, then the
+English rewritten underneath it. That renders a confident sentence that no longer matches the
+product, which is worse than the English fallback a missing key gives you — and nothing could
+detect it, because nothing recorded which English a translation was made from. The ledger stores
+a hash of every English string as of the last reconciliation; when one changes, every locale still
+holding the old wording is listed as `stale`.
+
+⚠️ **`--sync` and `--translated` are not interchangeable.** `--sync` is bookkeeping and never
+claims a translation is current; `--translated <locale>` is the only thing that clears a locale's
+stale list, and it is a statement of fact about work you actually did. Equally, never "start
+clean" by deleting the ledger and re-syncing — with no prior basis, every translation is declared
+current and all outstanding drift disappears silently. It was seeded (2026-08-17) by walking each
+locale's git history for the English in effect the last time each key's translated value changed;
+rebuild it that way or not at all.
+
+Hard failures, independent of the ledger, because these must always be zero: a catalog that does
+not parse or yields < 50 keys, a duplicate key inside a catalog (the later one silently wins), an
+orphan key left behind by a retired English one, an `en` key missing from `es`, and a
+greeter/lockscreen mini-catalog missing a language or a key (those two are duplicated per bundle
+by hand, so their parity is checked rather than assumed).
+
+#### Countable and date-shaped strings go through `Intl`, not through keys
+
+⚠️ **Before adding a key for anything with a number in it, check whether ICU already knows it.**
+GJS's SpiderMonkey ships full ICU, so `Intl.NumberFormat(locale, {style:"unit", unit:"hour",
+unitDisplay:"long"})` and `Intl.ListFormat` render "3 days and 8 hours", "3 días y 8 horas", "3 дня
+и 8 часов", "3 dni i 8 godzin" — correct plural forms in all thirteen locales, verified in `gjs`.
+Hand-written keys for day/hour/minute would have needed plural variants that Russian and Polish
+have three of each, and would have been wrong in exactly the locales nobody here can proofread.
+This is how About's uptime row is built (`core/SystemInfo.ts`); `uptime -p`, which it replaced,
+answers in the PROCESS's locale, so a Spanish page read "3 days, 8 hours, 3 minutes".
+
+⚠️ Reaching for it costs one line of `ui/shell/tsconfig.json`, already there:
+`"lib": ["ES2020", "ES2021.Intl", "DOM"]`. `target` stays ES2020 (it is what keeps
+`useDefineForClassFields` off — see `scripts/bundle.sh`), and the ES2020 lib does not DECLARE
+`Intl.ListFormat`. **Keep `DOM` in that list**: naming `lib` at all replaces the default, and
+dropping DOM takes `TextDecoder` with it. esbuild ignores `lib` — the bundle was verified
+byte-identical (same md5) before and after the line.
+
+### Fonts & CJK variants
+
+The UI font is **Inter** (ThemeManager seeds `Inter 11` into the `font-name` gsetting on first
+boot only — a user's explicit pick is never clobbered; `syncFont()` turns it into
+`* { font-family: "<pick>", "Symbols Nerd Font", sans-serif; }`). CJK and emoji render through
+Pango's **per-glyph fallback** — `noto-fonts-cjk`/`noto-fonts-emoji` are hard deps in both install
+channels — so there is no per-language font switching and none is needed.
+
+Which **regional Han variant** (SC/TC/JP/KR/HK) serves those fallback glyphs is decided by
+`config/fontconfig/65-0-veltrix-noto-cjk.conf` (shipped by the pacman package AND install.sh §5 as
+`/usr/share/fontconfig/conf.avail/…` + symlink in `/etc/fonts/conf.d/`). **The `65-0-` filename is
+load-bearing**: fontconfig's own `65-nonlatin.conf` hardcodes the KR face in its fallback list, and
+among fallback families earlier list position wins — renamed to `70-` the rules load but every CJK
+locale still gets Korean stroke forms (full story in the file's header). The text language comes
+from `LANG` (Settings → Region), so verification is
+`fc-match "sans-serif:lang=ja"` → `Noto Sans CJK JP` (and SC/TC/HK/KR for zh-cn/zh-tw/zh-hk/ko).
+
+The **greeter** runs with an empty greetd env (no `LANG` → "C" locale), which used to leave its
+clock in English and its kanji on the wrong regional face. It now sets its OWN process locale via
+GJS's built-in gettext module (`imports.gettext.setlocale`, reached through the legacy `imports`
+global so the bundler never sees a bare specifier): `initProcessLocale()` in
+`ui/greeter/lib/i18n.ts` maps the UI language (saved pref → `LANG` → `/etc/locale.conf` → en) to
+its glibc locale (`GLIBC_LOCALES`, the exact set veltrix-setup generates). **Call-site is
+load-bearing**: it must run inside `app.start`'s `main()` — GTK's init calls
+`setlocale(LC_ALL, "")`, so a module-level call gets silently reset to "C" before first render.
+The language dropdown re-applies it live and `dateNames.refreshDateFormat()` re-probes the date
+order/separators (greeter-only export; %x reads the process locale, so a live switch must
+re-probe). Strings + dates update instantly; the Han glyph *face* follows on the next greeter
+start (Pango caches the process language). Fail-soft: an ungenerated locale leaves setlocale
+returning null and everything stays as before.
+
+### Testing Wi-Fi without a Wi-Fi adapter
+
+The Network settings page only exercises when a Wi-Fi device exists. On a wired-only box,
+simulate one with the kernel's `mac80211_hwsim` (virtual 802.11 radios that NetworkManager
+treats as real). A dev helper lives at `scripts/dev/fake-wifi.sh` (start/stop a WPA2 AP).
+The recipe:
+
+```bash
+sudo modprobe mac80211_hwsim radios=2     # → wlan0 + wlan1; not persistent across reboot
+sudo pacman -S hostapd                    # broadcaster
+nmcli radio wifi on                       # radios boot "unavailable" until wifi is enabled
+sudo scripts/dev/fake-wifi.sh start       # AP "VeltrixTest" / pass veltrix123
+# Settings → Network → Scan → connect
+sudo scripts/dev/fake-wifi.sh stop
+sudo modprobe -r mac80211_hwsim           # and delete the VeltrixTest profile you just saved
+```
+
+**A wired-only box is not a worse rig for this, it is the BEST one** — `modprobe` /
+`modprobe -r` on a machine with no real wireless is a hot-plug you can do twice a minute,
+which is how tech-debt #22/#71 was finally closed (A→B→A with Settings open and no shell
+reload). Watch the bar icon too, not just the page: network presence reaches three surfaces.
+
+Non-obvious traps this setup exposes, all of which bit real code:
+
+- **The shell watches exactly ONE Wi-Fi device.** `NetworkService.pickDevice()` prefers a
+  device with an active connection, else returns the **first** of that type (`wlan0`) — the
+  rule inherited from AstalNetwork's `get_device()` and kept on purpose. So the *fake AP must
+  run on `wlan1`* and `wlan0` stays the managed client — otherwise the page watches the
+  broadcaster and sees an empty AP list while `nmcli` on the other interface sees everything.
+- **The world regulatory domain `00` sets `NO-IR` on 2.4 GHz**, which silently stops
+  hostapd from ever beaconing — the interface stays `type managed` instead of `type AP`.
+  Pin a real country first (`iw reg set ES`, also `country_code=` in the hostapd conf).
+- **The radio flag lives on the CLIENT, not on the device**: `enabled` is
+  `NM.Client.wireless_enabled`. With no wireless hardware at all NM reports it **false**,
+  which is why `Net.wifiEnabled()` answers `true` when there is no adapter — absent is not
+  off, and the bar must not paint a "radio off" icon on a machine that never had a radio.
+- **A password prompt needs a process INSIDE the session.** The shell's secret agent answers
+  NetworkManager only for requests it is allowed to see, and `nmcli` over SSH is an inactive
+  session to polkit ("Not authorized"). To drive the real flow, click Connect in Settings; to
+  run a probe that registers its own agent or activates a connection, start it from Hyprland:
+  `hyprctl dispatch 'hl.dsp.exec_cmd("gjs -m /tmp/probe.js > /tmp/probe.log 2>&1")'`.
+- **NetworkManager gives an agent 120 s, then drops the request WITHOUT `CancelGetSecrets`.**
+  Measured twice on 2026-09-28 ("No agents were available for this request" exactly 120 s
+  after `need-auth`). Until then a dialog nobody answered stayed `pending` in
+  `core/NetworkAgent.ts` for good, and every later request was refused "another dialog is
+  open" in 4 ms: Connect did nothing until that forgotten dialog was closed by hand. The agent
+  now withdraws its own request at `NM_GET_SECRETS_TIMEOUT_MS` and the dialog closes. Test it
+  without clicking: `nmcli device wifi connect VeltrixTest ifname wlan0` (no password, no
+  `--ask`, so NM asks OUR agent), leave the dialog alone for two minutes, then run it again —
+  the dialog must come back. `nmcli device disconnect wlan0` exercises the normal withdrawal.
+- **An unparented dialog is centred on the MONITOR, not on Settings.** Hyprland places a
+  floating toplevel with no transient parent in the middle of the screen, over whatever app is
+  there; the owner never saw the password form (2026-09-28). `runWifiDialog` parents it to
+  Settings when Settings is the active window (the join came from there).
+- **libnma's GTK 4 form logs a `GtkIconSize` CRITICAL on every build** — upstream (1.10.6's
+  `wifi.ui` still says `icon_size 6`, GTK 3's DIALOG), raised by GtkBuilder inside the
+  constructor, so not preventable from here; in dev it also raises DevLogWatch's notification.
+  The image it left as a broken glyph is replaced with ours after construction.
+- **Changing the AP's passphrase is the router-password-changed test.** Stop the AP, start it
+  again with another `wpa_passphrase`: NM drops the link, autoconnect retries, and the prompt
+  must appear on its own with the "couldn't connect" wording (REQUEST_NEW). Before the agent
+  existed that network was unreachable until its profile was deleted by hand.
+
+### Testing VPN import
+
+Settings → Network → VPN → "Add VPN…" imports the user's own file with
+`nmcli connection import type <wireguard|openvpn> file <path>` (`core/NetworkService.ts`:
+`importVpnProfile` / `vpnImportKindForPath`). WireGuard is built into NetworkManager;
+OpenVPN import needs the `networkmanager-openvpn` plugin or nmcli fails and the page shows
+its first error line. Secrets never pass through our code — nmcli reads the file itself and
+NM stores them — and an imported profile gets `connection.autoconnect no`, so it never
+comes up on its own; the user connects it from the list (`vpnUp`/`vpnDown`). Dell test:
+import a real `.conf` and a real `.ovpn`, connect each, confirm traffic goes through it
+(`curl ifconfig.me` before/after), then disconnect. An `.ovpn` that references external
+cert/credential files instead of inline ones is refused by NM ("invalid secrets") — that is
+NM's rule, not ours; the provider must supply inline credentials.
+- **An enterprise (802.1X) AP runs in the same rig.** hostapd has an internal EAP server:
+  a third `mac80211_hwsim` radio, `wpa_key_mgmt=WPA-EAP` + `ieee8021x=1` + `eap_server=1`, an
+  `eap_user_file` with a PEAP/MSCHAPv2 user and a throwaway openssl CA + server cert, plus its
+  own dnsmasq. Connect with "No CA certificate is required" ticked in libnma's form.
+- **Clicking a row by fixed coordinates lies when rows reorder.** The AP list sorts by
+  strength, and two hwsim APs both report 100 %, so their order flips between rebuilds — a
+  "connect VeltrixTest" click joined the other network. Locate the button (`queryUI`) or keep
+  one AP up.
+- **A GJS object-lifetime bug does not show up in one click.** The libnma over-unref needed
+  several dialogs AND the AP leaving and coming back (libnm finalising the object) before the
+  shell died. The reproducer that proved it: join → AP stop/start → repeat; the negative
+  control crashed 2× in 6 rounds.
+- **A leaked password is caught with a `ps` loop, not by reading the code.** Poll
+  `ps -eo user,args | grep <the key>` every 50 ms from another user during a connect; the
+  positive control is that the same loop DID catch `nmcli … password …` before 2026-09-14.
+- **DHCP lands after the SSID.** `notify::active-access-point` fires well before an address
+  exists, so anything showing an IP must also watch the device's `ip4-config` (that is the
+  difference between `watchWifiNetwork` and the wider `watchWifi`).
+
+### Testing Ethernet: the IP form on the host, the switch only in a VM
+
+**The IP/DNS form writes to real profiles, so test it where a mistake costs nothing.** On a
+dev box the cable is the internet (and the agent's own connection). The form is SHARED with
+every saved Wi-Fi network, so the fake AP of the section above is the bench: its default route
+sits at metric ~20600 behind the cable's 100, and a manual address on it breaks nothing. A
+throwaway wired profile bound to a missing interface (`nmcli connection add type ethernet
+ifname nd-none autoconnect no`) is the bench for the write path alone. The service can be
+driven without the UI — a probe bundled with `scripts/bundle.sh` that imports
+`core/NetworkService` and calls `wifiIpTarget(ap)`/`applyIp` (2026-09-28: manual → reapply →
+auto, the key of the WPA profile intact after both).
+
+**The switch cannot be tested over SSH in a VM, because SSH IS the cable.** QEMU's user
+network forwards the harness port to the guest's DHCP address, so switching the cable off —
+or giving it another address — drops the only channel. What worked (2026-09-28, the daily bed
+booted with `-snapshot`, which also survives a guest REBOOT inside the same QEMU process):
+a script left running in the guest (`setsid nohup`) that switches off from Settings, logs
+`nmcli` + the profiles' `autoconnect`/mark (a `gjs -c` one-liner; `nmcli` cannot show the
+`user` setting), photographs, enables a user unit and reboots; the unit logs the state after
+boot and switches back on. When the guest stays unreachable, QMP is the way in: `screendump`
+to see it, `input-send-event` (abs 0..32767) to click, `send-key` to open a terminal and type
+`nmcli device connect <iface>`. That is how the `filter_connections` crash was found: the path
+only runs with NO active connection, i.e. only ever with the cable off.
+
+⚠️ Driving Settings for it: a `GtkSwitch` exposes the AT-SPI action **`toggle`**, not `click`;
+a `GtkDropDown`'s items take no action — open it with `click` on its toggle button, then
+`veltrix-type key … Down/Up` + `Return`, and read back that the button's name changed before the
+next step. And `veltrix-click at` takes WINDOW coordinates, which are `queryUI`'s bounds, not
+`veltrix-a11y`'s (off by the header, ~40 px, on Settings).
+
+### Testing Bluetooth without a Bluetooth adapter
+
+`AstalBluetooth` talks to **BlueZ over the system D-Bus**, so (unlike Wi-Fi's real
+`mac80211_hwsim` radio) you fake the whole `org.bluez` service with **python-dbusmock**'s
+`bluez5` template — the same approach GNOME uses for its BT panel. Dev helper:
+`scripts/dev/fake-bluetooth.sh` (needs `pacman -S python-dbusmock`; run as root — it
+stops `bluetooth.service` and owns `org.bluez`).
+
+```bash
+sudo scripts/dev/fake-bluetooth.sh start   # adapter + Keyboard/Mouse (paired) + Phone (nearby)
+# Super+Shift+R, then Settings → Bluetooth
+sudo scripts/dev/fake-bluetooth.sh stop    # restores real bluetooth.service
+```
+
+The bluez5 template has **two quirks the script works around**, plus one hard limit:
+
+- **`StartDiscovery` throws `KeyError: 'DiscoveryFilter'`** — the template reads that
+  adapter prop without initialising it. The script seeds it with an empty
+  `Adapter1.SetDiscoveryFilter` after `AddAdapter`, so the Scan button works.
+- **`Device1.Connect`/`Disconnect` (what the UI buttons call) update an internal
+  `device.connected` *attribute* + emit `PropertiesChanged`, but NOT the property store**,
+  while the `Mock.ConnectDevice` *control* method does the opposite. Mixing them desyncs a
+  device (the guard then raises `AlreadyConnected`/`NotConnected` and the click silently
+  no-ops). So the script creates devices **paired-but-disconnected** and never pre-connects.
+  Live connect↔disconnect then works within a session, but **after a UI reload a device
+  reverts to disconnected** (the store was never updated) and reconnecting can stick —
+  `stop && start` the mock to reset.
+- **Pairing is "just works" only** — the template's `Pair` never calls back into a
+  registered `Agent1`, so the passkey/PIN dialogs (the shell's pairing agent in
+  `BluetoothService`) can't be exercised with this mock. Test those by calling the agent
+  directly as root (`sudo busctl` recipe in `architecture.md`) or with real hardware.
+- **`RegisterAgent` errors `AlreadyExists: Another agent is already registered`** after the
+  first shell (re)load — the mock remembers the first registration forever and never cleans
+  up on disconnect (real BlueZ tracks the sender and auto-unregisters). Benign, but it means
+  agent registration can only be observed on the first load after `start`.
+- **The mock outlives dev sessions.** It's a root daemon; nothing stops it when you move on,
+  and every BT (and battery — `fake-battery.sh` mocks UPower the same way) symptom you debug
+  afterwards is the mock's, not the real stack's. When BT/battery behaves oddly, FIRST check
+  who owns the name: `busctl --system status org.bluez` (a `python3 -m dbusmock` PID = mock
+  still up → `sudo scripts/dev/fake-bluetooth.sh stop`).
+
+This setup surfaced a real latent bug, fixed in `BluetoothService.setPowered`:
+`is_powered` is **DERIVED from the adapter**, not a setting of its own — writing it throws
+"not writable" — so the old `bt.is_powered = state` toggle flipped the switch visually but
+never powered the radio. Drive `bt.adapter.powered` instead; `is_powered` re-derives from it
+and still emits `notify::is-powered`. The bug was found on AstalBluetooth and the shape
+**survived the rewrite on purpose**: `core/bluez.ts` (ours since 2026-08-18) keeps the same
+derived/writable split, so the trap is still there to fall into.
+
+### Testing media players (MPRIS) without making a sound
+
+`scripts/dev/fake-mpris.js` registers a minimal `org.mpris.MediaPlayer2.<name>` player on
+the session bus (plain GJS, no deps, no audio). Use it to exercise `core/MediaService`'s
+selection heuristic, the source-selector pin menu, and the cover-art chain:
+
+```bash
+gjs scripts/dev/fake-mpris.js fakeA "Aurora" "Red track" "Artist A" "<data:-URI>" Playing kitty
+gjs scripts/dev/fake-mpris.js fakeB "Boreal" "Blue track" "Artist B" "https://github.com/adnqcr7-code.png" Playing
+playerctl -p fakeB pause      # drive status flips (Playing beats Paused in the heuristic)
+```
+
+Recipes for generating the `data:` art URI are in the script header. Its `Position` advances
+with the clock while Playing, `Seek`/`SetPosition` move it and emit `Seeked`, and
+`FAKE_MPRIS_NO_TRACKID=1` drops `mpris:trackid` — the case where `SetPosition` is a documented
+no-op and a client has to fall back to a relative `Seek`. All art now resolves through
+`core/MediaService`'s own chain into `~/.cache/veltrix/media-art/`; the `player.vala … Failed to
+cache cover art` CRITICALs that used to accompany every `data:`/`https:` track were AstalMpris
+and are gone with it (2026-08-17).
+
+**The layer underneath has its own probe.** `core/mpris.ts` talks to the session bus, so it can
+be exercised without the shell:
+
+```bash
+scripts/bundle.sh scripts/dev/mpris-probe.ts /tmp/mpris-probe
+/tmp/mpris-probe            # from the repo root; spawns its own fakes → PROBE-RESULT ALL PASS
+```
+
+It asserts the roster (appear/leave + the listener MediaService subscribes with), the metadata
+and root-interface reads, both seek paths, and — the one that is a measurement rather than a
+check — that **3 s of playback emit zero `notify`**. Position is extrapolated from an anchor
+instead of polled, so a playing player is silent; if that check ever counts signals again,
+something started polling. ⚠️ `DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent /tmp/mpris-probe`
+is the negative control — it must report FAIL.
+
+### Exercising BlueZ without a Bluetooth adapter
+
+`core/bluez.ts` talks to `org.bluez` on the SYSTEM bus, so it can be driven without
+the shell — and without hardware:
+
+```bash
+scripts/bundle.sh scripts/dev/bluez-probe.ts /tmp/bluez-probe
+/tmp/bluez-probe                                  # roster half only
+sudo scripts/dev/fake-bluetooth.sh start          # python-dbusmock bluez5
+/tmp/bluez-probe                                  # -> PROBE-RESULT ALL PASS (19)
+sudo scripts/dev/fake-bluetooth.sh stop
+```
+
+Two halves. The **roster** half runs anywhere and asserts the contract that holds
+with nothing plugged in: empty lists, false `is_powered`, a null adapter, and
+subscribe/dispose that does not throw. The **device** half needs the fake and
+asserts the paired/nearby split, a per-device `notify` firing exactly once, and
+the power round-trip through `adapter.powered`.
+
+WARNING: the negative control is `DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent
+/tmp/bluez-probe`, and the FIRST version of this probe did not survive it: "no
+adapter" and "no system bus" both produce an empty roster, so all nine roster
+checks passed identically either way. Reaching the bus is now a PRECONDITION that
+fails hard and stops the run. If you add a check here, ask which of those two
+worlds it can tell apart.
+
+**The strongest test is not in the probe.** With the fake up and the shell
+running, flip a property from outside and watch the UI move:
+
+```bash
+python3 -c "import dbus; dbus.SystemBus().get_object('org.bluez',
+  '/org/bluez/hci0/dev_AA_BB_CC_00_00_03').UpdateProperties('org.bluez.Device1',
+  {'Paired': dbus.Boolean(True)}, dbus_interface='org.freedesktop.DBus.Mock')"
+```
+
+Settings -> Bluetooth must move that device from "Detected" to "Paired" on its own.
+
+### Exercising WirePlumber (`core/wireplumber.ts`)
+
+Unlike the BlueZ/MPRIS probes there are no fakes: PipeWire is running on any
+machine with sound, so the probe drives the REAL graph and puts it back.
+
+```bash
+scripts/bundle.sh scripts/dev/wp-probe.ts /tmp/wp-probe
+/tmp/wp-probe                                     # -> ALL PASS (24)
+/tmp/wp-probe --linear                            # negative control #1
+PIPEWIRE_REMOTE=nonexistent /tmp/wp-probe         # negative control #2
+```
+
+It changes the machine's volume and briefly plays silence through `pw-cat`; the
+last check asserts the restore landed. It imports `core/wireplumber` and nothing
+else from the shell — importing `core/AudioService` would pull in `AppService`,
+which needs a display open BEFORE the import (see apps-probe).
+
+🔑 **The check that matters most is the boring one: our volume equals what `wpctl`
+prints.** `mixer-api` starts in LINEAR scale and AstalWp set it to CUBIC — measured
+on the same sink at the same instant, 0.6361 vs 0.8600. A module that forgets
+`scale` is not broken in any visible way; it just reads 64 % where the system says
+86 %. That is why control #1 exists: `--linear` makes the probe compare `wpctl`
+against a linear reading, and that check MUST go red. Control #2 takes the graph
+away, and the precondition must fail hard — an earlier version of the module let it
+pass, because a failed connect and a machine with no sound card both look like an
+empty roster (the same trap bluez-probe caught).
+
+⚠️ **`Wp.init(Wp.InitFlags.ALL)` takes the whole shell's log away, and nothing
+reports it.** `ALL` includes `SET_GLIB_LOG`, which routes ALL GLib logging — every
+`console.log` in the shell, not just WirePlumber's — through WirePlumber's writer,
+which applies its own level filter. With `WIREPLUMBER_DEBUG` unset (the normal
+case) that filter drops MESSAGE level, so from the moment the audio graph comes up
+`tail -f veltrix-ui.log` goes silent: the last line of every session was
+"[ThemeManager] Global Styles READY!", and `[IPC] serving org.veltrix.Shell` — a
+line that had been there for weeks — simply stopped appearing. `print`/`printerr`
+keep working, which is what makes it look like the shell is still logging. The
+module therefore passes `PIPEWIRE | SPA_TYPES | SET_PW_LOG` and leaves
+`SET_GLIB_LOG` out; the flag exists for CLIs like `wpctl` that want one log format
+for their own output. **Symptom to recognise: the log stops mid-startup with no
+error.** Confirm with `WIREPLUMBER_DEBUG=M` — the missing lines come back in
+WirePlumber's format.
+
+⚠️ Two more GJS facts about libwireplumber, both of which cost a debugging round:
+`Wp.init()` installs that writer, so calling it TWICE in one process aborts
+(`g_log_set_writer_func() called multiple times`) — the probe must not re-init what
+the module already did, and that stays true with the narrower flags. And
+`Wp.Core`'s `connect`/`disconnect` are PipeWire's, not
+GObject's: `core.connect("disconnected", cb)` does not throw, does not warn, and
+does not attach the handler. Use `GObject.Object.prototype.connect.call(core, …)`.
+That is the exact case `watchDevices` exists for — `notify::devices` covers only
+add/remove, so an in-place pairing change would otherwise leave the device in the
+wrong list until a full rebuild.
+
+### Exercising the session notification daemon (`session/`)
+
+The daemon and its GJS client are tested together on a **private bus with a
+throwaway cache**. `scripts/ci/sessiond-test.py` creates both with
+`dbus-run-session` / `TemporaryDirectory`; do not launch the new server on your
+normal session bus to test it. Needs cargo, dbus-run-session, notify-send, Python
+GObject (`python-gobject` on Arch; `python3-gi` on Ubuntu), GJS and esbuild.
+
+```bash
+cargo build --manifest-path session/Cargo.toml --locked
+cargo clippy --manifest-path session/Cargo.toml --locked --all-targets -- -D warnings
+cargo test --manifest-path session/Cargo.toml --locked
+scripts/bundle.sh --js scripts/dev/notifd-probe.ts /tmp/notifd-client.js
+python3 scripts/ci/sessiond-test.py session/target/debug/veltrix-sessiond --client /tmp/notifd-client.js
+```
+
+CI's `sessiond` job first **breaks adoption of replaces_id**, rebuilds, and requires
+this same integration to fail specifically at `replaces_id replaces the live entry`.
+It restores the source before the real build/lint/tests. A random startup error
+cannot count as the control catching the rule.
+
+**The daemon does not poll at idle (#1054), so a fake provider must signal.** BlueZ,
+obex, NetworkManager, tray and audio work is woken by the provider's own signals,
+owner changes and request wake-ups; only a slow reconciliation (30 s) and active
+leases/transfers/meters keep a timer. A private-bus fake that changes its state
+without emitting what the real service emits (InterfacesAdded/Removed,
+PropertiesChanged) now times out instead of being rescued by a poll, which is the
+point: the fakes in `sessiond-bluetooth-test.py` and `sessiond-network-test.py` emit
+them. Measure idle cost per thread from `/proc/<pid>/task/*/status`
+(`voluntary_ctxt_switches`); `scripts/dev/audio-wake-check.sh` covers the audio
+request wake, which CI cannot (no PipeWire).
+
+The integration sends a real `notify-send`, checks replacement (including a
+resolved id and the uint32 ceiling), public close/private dismiss signals and
+reasons, presentation-only sender expiry/history retention, resident actions, raw-image decoding,
+deduplication, privacy permissions and the 150-file cap. It seeds an old GJS
+serialize-shaped store and restarts the Rust process to verify history and
+transient exclusion. The GJS probe imports the **actual shell client**: it checks
+one warning/empty NC with no daemon, first connection, live callbacks, daemon
+loss/reconnect, and killing the client while notifications continue. Rehydrated
+history never emits banner callbacks; an already-open NC also refreshes through
+its unchanged roster subscription. Neither NotifService nor a surface is mocked
+or edited. The probe itself is now a stdin-controlled client, not a second server.
+
+On a running installed session, ordinary `notify-send` still reaches the daemon:
+
+```bash
+notify-send -a Discord -u critical "Critical" "kept in the NC"
+notify-send -t 3000 "Expires" "sender timeout, gone in 3 seconds"
+notify-send "Transient" "banner only" --hint=int:transient:1
+systemctl --user status veltrix-sessiond.service
+journalctl --user -u veltrix-sessiond.service
+```
+
+### Exercising the application host (`ui/lib/veltrix-kit/platform/host.ts` + `ui/lib/veltrix-kit/platform/app-id.ts`)
+
+The host is the last piece of AGS that was not scaffolding, and nearly everything
+it does is invisible when it stops happening: an app-id nobody reads back, an
+environment variable that only hurts CHILD processes, a `hold()` whose absence
+looks like a clean exit. `scripts/dev/host-probe.ts` states each of those out loud.
+It needs a **live graphical Hyprland session** — it opens real windows and asks the
+compositor what class it filed them under.
+
+```bash
+scripts/bundle.sh scripts/dev/host-probe.ts /tmp/host-probe --alias:@host=./ui/lib/veltrix-kit/platform/host
+/tmp/host-probe                                                # → 14 checks
+```
+
+(Extra arguments after the outfile go straight to esbuild — note the flag spelling
+changed with the bundler: `--alias:@host=…`, not `--alias "@host=…"`. The wrapper
+sets `LD_PRELOAD` itself.)
+
+The alias is the whole trick: the probe imports `@host`, so the SAME source could be
+pointed at either host.
+
+⚰️ **The AGS control is RETIRED and cannot be re-run** — `ags` is not installed any
+more, so `@host=/usr/share/ags/js/lib/gtk4/app.ts` resolves to nothing. Its result is
+the evidence for the migration and is recorded here so nobody re-derives it: it went
+red on exactly six checks — the `application-id` we asked for (AGS overwrote it with
+`io.Astal.<instance>`), the Hyprland class that follows from it, the per-window
+override's "process id untouched" companion, `prgname`, the application name, and
+`Adw.is_initialized()` — while staying GREEN on `LD_PRELOAD`, `hold()`, CSS
+apply/reset and GTK-initialised-at-import, the behaviours the replacement had to
+KEEP. The control that still runs is the LD_PRELOAD one:
+
+```bash
+env -u LD_PRELOAD gjs -m "$XDG_RUNTIME_DIR"/host-probe-<hash>.js   # → 13 pass, 2 SKIPPED
+```
+
+⚠️ The LD_PRELOAD check **arms itself**: the probe reads its own
+`/proc/self/environ` — the exec-time environment, which `unsetenv` cannot change —
+so "it was set when we started and is not set now" is a real before/after. Started
+without it, the check is SKIPPED with a message rather than scored green, because
+"gone now" proves nothing if nobody ever set it. **And dropping the `LD_PRELOAD=`
+prefix does not disarm it**: the bundler emits a shell wrapper that sets the
+variable itself, so the honest control runs the decoded JS the wrapper leaves in
+`$XDG_RUNTIME_DIR`. That was written as a working control and was not one until it
+was actually run.
+
+⚠️ Two silent traps it exists to catch, both found by running it:
+`gi://GdkWayland?version=4.0` must be imported or GJS sees the surface as
+`unknown_GdkWaylandToplevel` **with no methods** (a `typeof` guard then makes the
+whole per-window app-id a no-op that logs nothing); and the override must be
+applied at `map`, not `realize`, because GTK stamps the process-wide id on the
+`xdg_toplevel` it creates during the first `present()`.
+
+### Exercising bounded native menus (#959 B)
+
+Use `toolkit/settings/check-bounded-menu-headless.sh` with absolute HYALO_BIN,
+NK_WIDGETS_BIN (the built `bounded-menu-probe` example), NK_SETTINGS_DATA exports
+and a fresh NK_WIDGETS_LOG. It runs the existing private Cage/Hyalo harness, not
+the owner's Wayland socket/bus/settings. Check disk first; stop below 10 GiB.
+The two GTK reservation fixtures use Cairo/shm: default GTK GL/dmabuf on this
+software headless path can fail import and crash before the popup is tested.
+
+The diagnostic acknowledges AT-SPI publication tagged with the initiating key
+or request; an unrelated focus/configure publication is not an input barrier.
+Scale 1/1.25, 1000 rows, real wheel/key/AT-SPI, child menus, live parent resize,
+portal changes, live output scale changes, exclusive-zone changes with both
+popup levels open and reposition are checked with applied
+no-clamp/no-reveal controls. Setup failures never count as caught controls.
+Protocol barriers establish request ordering, not frame presentation; popup
+geometry checks also wait for the configured buffer commit.
+Evidence stays under target or the owner's task directory. No new CI step/job
+or installation is involved; Rust bar/Tray1 adaptation and live Orca speech are
+separate acceptance.
+
+### Exercising native Tray1 in isolation (#959 A)
+
+The opt-in `--tray` service uses the real binary with a fake SNI/dbusmenu and
+host on a disposable session bus, never the owner's session bus. Build after
+checking `df -h /` (stop below 10 GiB free), then run:
+
+```bash
+/usr/bin/python3 scripts/ci/sessiond-tray-test.py session/target/debug/veltrix-sessiond
+```
+
+The same fixture runs from `cargo test --test tray` in `session/`. It tests both
+watcher names, conflict rollback/no queued takeover, both SNI interfaces, churn,
+icons, actions, menu revisions, 1000 rows and the 4096-node visible limit. This
+is service evidence, not Rust bar/popup scrolling or AT-SPI acceptance. No
+installed unit is changed and no new CI job or step is added. The full contract,
+limits and subsequent popup/host obligations are in
+`session/daemon/src/tray/README.md`.
+
+### Exercising the system tray (`core/tray.ts` + `core/dbusmenu.ts`)
+
+The shell IS this desktop's StatusNotifierWatcher, so — like the notification
+probe — this one has to BE the watcher, and it brings its own tray app
+(`scripts/dev/fake-sni.js`, a real SNI item with a real dbusmenu).
+
+```bash
+scripts/bundle.sh scripts/dev/tray-probe.ts /tmp/tray-probe
+dbus-run-session -- /tmp/tray-probe            # from the repo root → 35 checks
+```
+
+⚠️ **`dbus-run-session` is load-bearing and the probe refuses without it.** On the
+real session bus the running shell owns `org.kde.StatusNotifierWatcher`, so the
+probe would quietly become a mere host and measure the SHELL instead of itself.
+
+Three controls, each failing on a DIFFERENT line:
+
+```bash
+DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent /tmp/tray-probe
+    # → precondition 1: no session bus at all
+/tmp/tray-probe                                 # no dbus-run-session
+    # → precondition 2: the watcher name is already owned
+dbus-run-session -- /tmp/tray-probe --astal     # the library being replaced
+    # → 6 RED. It is evidence, not just a control (see below).
+```
+
+🔑 **What `--astal` turns red is the changelog of this replacement**: a
+`visible: false` row is DRAWN, a submenu arrives with NO children (and a third
+level never at all — the translator walks `GetLayout` one level at a time,
+asynchronously, so a consumer that flattens the model on render sees an empty
+submenu), `ItemIsMenu` defaults to true, `ItemsPropertiesUpdated` emits no
+`items-changed`, and killing an app that published TWO items from one connection
+leaves the first icon stuck in the bar forever.
+
+The fake is also usable by hand — run it inside a live session and an icon appears
+in the bar:
+
+```bash
+gjs scripts/dev/fake-sni.js --deep      # extra submenu level
+gjs scripts/dev/fake-sni.js --pixmap    # no IconName, only ARGB32 pixels
+gjs scripts/dev/fake-sni.js --two       # one app, two icons
+```
+
+⚠️ **A GVariant already built cannot be a member of a format string.** Writing
+`new GLib.Variant("(ia{sv}av)", [id, propsVariant, kids])` in the fake threw
+INSIDE the D-Bus method handler, so the handler never replied and the module under
+test saw a plain TIMEOUT — indistinguishable from "the host never called". Tuples
+containing built variants go through `GLib.Variant.new_tuple`. That cost a full
+debugging round, which is why every handler in `fake-sni.js` now runs inside a
+`guard()` that turns a throw into a D-Bus error: **a fake that fails silently is
+worse than no fake, because its silence is attributed to the code you are
+testing.**
+
+### Checking app search without opening the launcher
+
+`core/app-search.ts` decides what the app grid and Prism show for a query, and eyeballing a
+launcher proves nothing about the 55 apps that did NOT come back.
+
+```bash
+scripts/bundle.sh scripts/dev/apps-probe.ts /tmp/apps-probe
+/tmp/apps-probe             # from the repo root → PROBE-RESULT ALL PASS
+```
+
+Two halves. The **fixture** half states the ranking rules against a hand-written catalogue, so no
+installed app can quietly satisfy them. The **live** half runs the same questions over this
+machine's real `.desktop` files, including a sweep asserting that every installed app's own name
+ranks it first, and the check the whole replacement is about: **no result may be justified only by
+its `Exec=` ARGUMENTS**.
+
+⚠️ Two negative controls, and this probe is worth nothing without them:
+
+- `/tmp/apps-probe --astal` answers the live half with `gi://AstalApps`, the library we removed.
+  It must FAIL the one-character checks (it returns 56 of 56) and the `Exec=` checks. Keep the
+  mode as long as the lib is still installed anywhere — it is the evidence, not just a control.
+- `XDG_DATA_HOME=/nonexistent XDG_DATA_DIRS=/nonexistent /tmp/apps-probe` takes the desktop
+  files away: the live half must go red while the fixture half stays green. If both stay green,
+  the live half is reading nothing.
+
+Note `scripts/dev/gtk-init.ts`: a probe that imports `core/AppService` needs a GTK display open
+BEFORE the import runs (the service builds an icon theme in its constructor), and `Gtk.init()`
+written inline is too late — ES import declarations all execute first. Import that module first.
+
+### Exercising the compositor state layer WITHOUT restarting the shell
+
+`core/HyprlandState.ts` is the shell's model of Hyprland, and reloading the shell to test it
+means blinking the user's desktop. `scripts/dev/hypr-state-probe.ts` runs the same module in a
+process of its own:
+
+```bash
+scripts/bundle.sh scripts/dev/hypr-state-probe.ts /tmp/hypr-probe
+/tmp/hypr-probe 15      # then drive Hyprland from another terminal
+```
+
+⚠️ **Drive it with `hyprctl dispatch "<lua>"`, not `hyprctl dispatch workspace 2`.** With the
+Lua config the classic syntax dies as `')' expected near '2'` — and the other near-miss is
+silent: `hyprctl eval "hl.dsp.focus({ workspace = 2 })"` prints **ok and does nothing**, because
+`hl.dsp.*` BUILDS a dispatch descriptor and `eval` throws it away. `hyprctl dispatch` wraps the
+argument in `hl.dispatch(…)`, which is what actually performs it — the same call `_dispatch`
+makes. Both wrong forms were mistaken for a broken state layer for a while.
+
+What the probe is for is telling the two signals apart:
+
+- `"changed"` = structural (focus, workspace, open/close, geometry, **FSMODE**),
+- `"title-changed"` = a window renamed itself and nothing else.
+
+Measured live 2026-08-17: a terminal running a spinner produced **14 `title-changed` and 0
+`changed`** in 14 s — a rename must never repaint the bar and dock. And driving
+maximized → fullscreen → none → maximized produced a `changed` for every FSMODE transition,
+including the one where the window already filled the monitor and **did not move a pixel**.
+That case is why `fullscreen` is in the state signature.
+
+🔑 **The negative control is `HYPRLAND_INSTANCE_SIGNATURE=nope`**: the IPC layer must report
+`[HyprIPC] event socket connect failed` rather than quietly showing an empty desktop. Silence
+there is the tech-debt #71 failure mode wearing compositor clothes.
+
+### A nested Hyprland is the bench for anything about WINDOWS (a technique, not a script)
+
+Questions about z-order, focus and window rules need real windows, and the only Hyprland on this
+machine is the one the owner is working in. Driving it means moving their windows around; a VM
+means minutes per iteration. A **nested Hyprland** is neither: it is a Wayland client of the live
+session, so it boots in about a second, has its own config, its own `hyprctl` and its own throwaway
+windows, and touching it cannot disturb the desktop it runs inside.
+
+```bash
+Hyprland -c /path/to/probe.lua &                       # env -u HYPRLAND_INSTANCE_SIGNATURE first
+ls -t "$XDG_RUNTIME_DIR"/hypr/                         # the NEW signature is the newest entry
+export HYPRLAND_INSTANCE_SIGNATURE=<new>  WAYLAND_DISPLAY=wayland-<n>
+hyprctl output create headless PROBE                   # ← see trap 1: do not skip this
+kitty --class probe-a -o background=#ff0000 -o background_opacity=1.0 --hold sh -c 'sleep 3600'
+grim -o PROBE shot.png
+```
+
+⚠️ **Trap 1 — an occluded nested compositor does not render, and the photograph does not say so.**
+Its output is a window on the host, so it only draws while the host sends frame callbacks. Cover
+that window with a terminal and `grim` inside the nested session returns a flat colour with no
+error. The fix is the line above: `hyprctl output create headless PROBE` adds an output that
+renders on its own clock, and the windows go on ITS workspace. The tell that separates the two
+cases: an empty nested output photographs as `#111111` (Hyprland's background), so a capture that
+is uniformly *anything else* is a frame nobody drew.
+
+⚠️ **Trap 1b — under a Lua config, `hyprctl dispatch` parses its argument AS LUA.** The classic
+form fails with a parser error that names your dispatcher (`hyprctl dispatch movewindowpixel "exact
+300 -200,address:0x…"` → ``[string "return hl.dispatch(movewindowpixel exact 300 …"]:1: ')'
+expected near 'exact'``, plus a hint). In a bench, drive the compositor the way the config does:
+`hyprctl dispatch "hl.dsp.window.move({ x = 300, y = -200, window = 'address:0x…' })"`.
+
+⚠️ **Trap 1c — the bench measures the WRONG OUTPUT if you do not assert the setup.** `hyprctl
+keyword` is rejected under the Lua parser exactly like `dispatch` is (`"can't work with non-legacy
+parsers. Use eval."`), so the two lines that create the headless output and disable the host window
+fail — and if their output went to `/dev/null`, the run continues happily on `WAYLAND-1`, whose size
+is however the nested compositor's window happened to be tiled on the host. Two arms then produce
+numbers from two different monitors and neither is wrong-looking. Use
+`hyprctl eval "hl.monitor({ output = 'PROBE', mode = '2560x1440@60', position = '0x0', scale = 1 })"`,
+the same for `{ output = 'WAYLAND-1', disabled = true }`, and then **block until
+`hyprctl -j monitors` is exactly the one monitor with exactly the reserved area you expect** before
+spawning anything. A bench that does not assert its own setup is a bench that reports confidently
+about a screen you never configured.
+
+🔴 **Trap 0 — a nested Hyprland WRITES THE LIVE DESKTOP'S GSETTINGS.** `cursor:sync_gsettings_theme`
+is ON by default (`src/config/values/ConfigValues.cpp:611`), and at startup Hyprland calls
+`g_settings_set_string("cursor-theme", …)` + `cursor-size` (`src/managers/XCursorManager.cpp`). A nested
+instance inherits the session's `DBUS_SESSION_BUS_ADDRESS`, so a bench config with no cursor theme set
+the maintainer's real `cursor-theme` to `'default'` (2026-09-13, encargo DIALOGOS — the rest of that
+bench was correctly isolated; this one boot line was not). Launch every nested compositor with
+`env -u DBUS_SESSION_BUS_ADDRESS` (or inside a verified private bus), AND put
+`cursor { sync_gsettings_theme = false }` in its config (`hl.config({ cursor = { sync_gsettings_theme = false } })`
+under Lua) — two locks, because a bench script is the one place a guard hook cannot see into.
+Check after any bench: `gsettings get org.gnome.desktop.interface cursor-theme` is still the cursor
+you chose. ⚠️ Since #536 that key IS the home — the shell follows it live and nothing puts it back at
+the next login, so a bench that rewrites it changes your desktop for good.
+
+⚠️ **Trap 2 — the terminal you reach for is translucent, so two windows photograph as one.** The
+shipped `kitty.conf` sets a background opacity, so a red window under a blue one reads
+`#440484` — which is exactly `#ff0000` under `#0000ff` at 52%, and looks like a rendering bug
+rather than a working stack. Pass `-o background_opacity=1.0` and the frame becomes a binary
+answer.
+
+🔑 **Sample the DOMINANT colour of the frame, not a pixel.** Both probe windows centred and
+covering the output makes the frame's most common colour name the one in front:
+`magick shot.png -format %c -depth 8 histogram:info:- | sort -rn | head -1`. The first version of
+this read the single pixel at the centre of the screen and twice reported white — kitty's text
+cursor happened to sit there, and neither window is white. A one-pixel instrument has no way to
+tell you it sampled the wrong thing.
+
+⚠️ **`hl.dsp.cursor.move` warps the pointer WITHOUT refocusing, so any experiment whose
+precondition is "the pointer is over that window" is blind by default.** Measured 2026-08-31 under
+`input:follow_mouse = 1`: the warp moves `hyprctl cursorpos` to the target and leaves focus exactly
+where it was. Real motion — `veltrix-input move <x> <y> <w> <h>`, crossing the border between two
+windows so there is an actual motion event — does refocus. Assert that positive control before
+believing either branch of the experiment; without it both branches go green and prove nothing,
+which is the same failure as the `movecursor` incident recorded in `tech-debt.md`.
+
+Worked example, with the numbers: `tech-debt-resolved.md` → **#102** (does focusing a window raise
+it, and does the order of the two dispatchers matter).
+
+### Testing the battery widget on a desktop (no battery)
+
+`core/BatteryService.ts` reads UPower's composite **DisplayDevice** (through
+`UPowerGlib`, direct — AstalBattery was dropped 2026-08-17), so on a
+desktop (`is_present = false`) the battery tiles only render a dim fallback icon and the
+Cairo glyph can't be seen. Fake it with python-dbusmock's `upower` template via
+`scripts/dev/fake-battery.sh` (run as root — it stops `upower.service` and owns
+`org.freedesktop.UPower`):
+
+```bash
+sudo scripts/dev/fake-battery.sh start 72              # 72% discharging (neutral fill)
+sudo scripts/dev/fake-battery.sh start 10 discharging  # low → red fill + "low" warning
+sudo scripts/dev/fake-battery.sh start 45 charging     # green fill
+sudo scripts/dev/fake-battery.sh start 100 full        # fully charged
+sudo scripts/dev/fake-battery.sh stop                  # restores real upower.service
+```
+
+**Policy gotcha (why not `SetupDisplayDevice`):** UPower's D-Bus system policy
+(`/usr/share/dbus-1/system.d/org.freedesktop.UPower.conf`) whitelists `send_interface` to
+Introspectable/Peer/Properties/UPower[.Device] — the dbusmock control interface
+`org.freedesktop.DBus.Mock` is **not** in it, so the template's `SetupDisplayDevice` method
+is **"Access denied"** (bluez5 works only because `org.bluez`'s policy is permissive). The
+script instead seeds the DisplayDevice via `org.freedesktop.DBus.Properties.Set` (whitelisted),
+which dbusmock honours. Re-running `start` with new values **re-seeds live** (the glyph
+updates without a reload — `Set` emits `PropertiesChanged`). Only the **first** `start` flips
+`is_present` false→true, which `buildContent` reads at build time — so reload once
+(Super+Shift+R) after the first start, then change values freely.
+
+**Range gotcha:** UPower's `Percentage` is **0–100**, and every consumer here is written
+against a **0–1 fraction** — `Battery.fraction()` does that division (AstalBattery used to,
+which is why the convention exists). Reading `device.percentage` straight renders a 47%
+battery as a full one; an earlier `Math.round(bat.percentage)` in the detail panel was a
+latent "0%/1%" bug of the same family, hidden only because desktops never showed it.
+
+⚠️ **Prove the notify path, not just the numbers.** A service that reads its device once
+looks perfect in a screenshot and is frozen from boot (tech-debt #71). `gjs
+scripts/dev/battery-probe.js [seconds]` prints the DisplayDevice and then logs every
+`notify::` it receives; re-seed the mock while it watches and expect
+`PROBE-RESULT LIVE — n notify tick(s)`. With no mock and no battery it correctly reports
+`NO TICKS` — nothing is changing — so run it against the mock or the result means nothing.
+
+🔑 **AstalBattery had no `charged` property**, only `charging`, which was true at
+FULLY_CHARGED *as well as* CHARGING. `widgets/battery.ts` read `bat.charged` anyway, so the
+"Charged" branch was dead and a laptop at 100% on AC read "Charging" forever.
+`BatteryService` keeps `charging()` and `charged()` strictly apart; callers that meant "not
+draining" (the critical-battery activity, and the glyph's bolt, which means *on AC*) ask for
+both explicitly.
+
+### Checking the independent Settings application
+
+`bin/veltrix-settings` is the supported entry point: it sets the process role before
+imports and supplies the two resource roots. In dev mode it compiles its own stylesheet
+and its own JS bundle (`~/.cache/veltrix/dev-settings/`, never the running shell's), and
+**only when something changed**: a file under `ui/`, the bundler or `lib/veltrix-host/`
+newer than the stamp (directories too, so deletions count; generated `*.css` do not), or
+another git HEAD. Rebuilding every launch cost ~580 ms of a ~1.5 s open (2026-10-17).
+`VELTRIX_SETTINGS_REBUILD=1` forces it. In a release it runs the packaged fifth executable
+with the shared kit.
+`VELTRIX_SETTINGS_REPO` overrides the dev marker for an isolated source walk;
+`VELTRIX_SETTINGS_EXECUTABLE` selects a prebuilt executable in the smoke containers,
+where the unprivileged desktop cannot compile into the root-owned checkout.
+
+Both compositor smokes invoke `settings-process-check.sh` with the private-session
+arming flag. It checks separate processes, navigation, queryUI, crash isolation and
+reopening. Never run its kill walk against the user's session. The nested shell bench
+pins GTK to Wayland even though Hyalo exports Xwayland's DISPLAY, and isolates the
+greeter mirrors. Its system-bus NetworkManager agent can conflict with the real
+user's existing agent; that known nested-session failure is not clean-smoke evidence.
+The runtime display journal is tested in a nested compositor, never on the user's
+monitor; see architecture.md → "Settings is its own application" for lease recovery.
+
+### Testing the built-in Assistant (`veltrix-agent`) without a key or network
+
+`bin/veltrix-agent` is the assistant's brain (local Ollama LLM tool-use loop over stdio — see
+`state-and-ipc.md`). Exercise it headlessly with `scripts/dev/fake-brain.py`, a scripted
+OpenAI-compatible SSE mock (same spirit as the other `fake-*` helpers) that plays exactly one
+tool-use round-trip:
+
+```bash
+# 1) point an ISOLATED config at the mock. The daemon reads GSettings org.veltrix.ai, so give
+#    it the KEYFILE backend in a scratch dir — overriding XDG_CONFIG_HOME alone does NOT
+#    isolate dconf (see "Persistence"). `veltrix-ipc` still hits the live shell:
+mkdir -p /tmp/tc/glib-2.0/settings
+printf "[org/veltrix/ai]\nbrain-backend='openai'\nbrain-model='mock'\nbrain-endpoint='http://localhost:11435/v1'\n" \
+  > /tmp/tc/glib-2.0/settings/keyfile
+# 2) run the mock (default = a harmless read: get_config appearance.accent):
+python3 scripts/dev/fake-brain.py &
+# 3) feed the daemon a user message, keeping stdin open, and read the event stream:
+{ printf '{"t":"user","text":"what accent am I using?"}\n'; tail -f /dev/null; } \
+  | timeout 15 env XDG_CONFIG_HOME=/tmp/tc GSETTINGS_BACKEND=keyfile gjs -m bin/veltrix-agent
+# expect: state thinking → acting → tool get_config → toolresult {...value:"blue"} →
+#         thinking → delta "Done." → done{usage} → idle
+```
+
+Env on the mock scripts the tool call: `FAKE_BRAIN_TOOL` / `FAKE_BRAIN_ARGS` (JSON) /
+`FAKE_BRAIN_FINAL`. Two gotchas (both proven 2026-07-20):
+- **The write gate is enforced by the SHELL, not the daemon.** The shell checks its OWN
+  `allowConfigWrite` (from the user's REAL settings), so a test config with `allowConfigWrite:false` does
+  NOT stop a `set_config` — the daemon's tool hits the live shell and really writes (a `set_config`
+  mock DID toggle night light for real; revert with `veltrix-ipc setConfig … false`). To prove the
+  daemon **surfaces a rejection** without mutating anything, script an **invalid value** (e.g.
+  `nightlight.enabled=banana`): the shell's validator refuses, the daemon relays the error string,
+  the model reports it, nothing changes.
+- **Don't drive the daemon over a plain `subprocess` pipe with Python `readline`** — gjs's stdout
+  buffered oddly there; the `{ printf …; tail -f /dev/null; } | gjs` shell form is what worked. The
+  `timeout` killing the still-alive daemon (exit 124) is expected — it waits for more stdin.
+
+**Reading what happened.** Both halves log into `veltrix-ui.log` (the daemon over the shell's
+inherited stderr), so one grep replays a whole session:
+
+```bash
+grep -E '\[(veltrix-)?[aA]gent' "$XDG_RUNTIME_DIR/veltrix-ui.log"
+# spawn → turn start (provider/backend/model) → step N POST host → step N ok=… text=…c tools=…
+# → tool <summary> → ok/FAIL → turn end (steps, tokens, ms) → daemon gone (exit N | signal N)
+```
+
+Prompts and replies are deliberately NOT logged (length only), so this is safe to paste into an
+issue. When a report says "it did nothing", this is the first thing to ask for.
+
+**Testing the abnormal ends** (the "a turn must never end in silence" invariant): point the config
+at a dead port for a curl failure; `FAKE_BRAIN_FINAL=""` for an empty completion; a mock that always
+streams a `tool_calls` chunk for the `MAX_STEPS` cap; `pkill -f veltrix-agent` mid-turn for the
+shell-side death path. Each must land a visible line in the island — never an empty bubble.
+**Gotcha that cost real time here:** `pkill -f fake-brain.py` **kills the calling shell too** — the
+tool's own command line contains the pattern. Use a pattern that can't match itself
+(`pkill -f 'python3 .*brain[.]py'`) or kill by PID.
+
+**CI gate (`agent-loop` in ci.yml → `scripts/ci/agent-loop-test.py`).** The manual walk above is
+now also a hermetic regression test — the every-serious-bug-was-a-wire-shape-bug lesson turned into
+a gate. It spawns the real daemon (gjs) against an in-process OpenAI-compatible mock under a temp
+`XDG_CONFIG_HOME` **and a temp `XDG_STATE_HOME`**, with a stub `ags` on `PATH` so a tool call returns
+a value with no live shell (an empty `brainProvider` keeps it off the keyring/D-Bus).
+**Both temp dirs are load-bearing, and the second one was learned the hard way.** The daemon restores
+its session from `XDG_STATE_HOME` at startup, so leaving that one real made "spawn a fresh daemon" a
+lie: the earlier scenarios' history arrived in scenario 3's *first* request, the stub `curl` reads
+"this is round 2" off a `tool_result` appearing **anywhere** in the messages, and the round-trip under
+test silently never happened (`session restored: N entries` in the failure telemetry is the tell). It
+was also reading and overwriting the developer's own conversation on every local run. **Anything you
+teach the daemon to persist needs its directory isolated here in the same change.** It asserts the tool-use loop end to end (tool
+call parsed, split args accumulated, tool dispatched, final text streamed) **and both halves of the
+transient-failure policy**: a scripted **503 is retried** past, a **4xx surfaces without retry**.
+Runs on `ubuntu-latest` with only `gjs` + `gir1.2-secret-1` (no Arch container). When you add a wire
+quirk worth locking in (the next Gemini-shaped surprise), add a scenario to the mock rather than
+trusting a live session to catch the regression.
+
+**Scenario 3 tests the ANTHROPIC lane with a stub `curl`, not a mock server.** `buildAnthropicReq`
+hardcodes `api.anthropic.com` on purpose — an env-settable base URL would be a place to redirect a
+user's API key — so there is nothing to point at a local socket. A stub `curl` on `PATH` (same trick
+as the stub `ags`) reads the body off stdin, **writes it to disk**, replays a canned Anthropic SSE
+stream, and mirrors the `veltrix-http:` marker on stderr. The assertions then run against the captured
+**bytes**: thinking block echoed first and unmodified, signature identical, no `cache_control` on it,
+`tool_use` still present, `tool_result` in the follow-up. That is how a lane with **no key available**
+gets real end-to-end coverage — and it is checkable: remove the echo in `toAnthropicMsg` and the
+scenario fails with `thinking block not echoed first`.
+
+**Transient-failure retry (the daemon, `streamCurl`/`runTurn`).** A 5xx, **429/408/409**, or a
+dropped/refused connection is retried up to `MAX_HTTP_ATTEMPTS`, because it is usually transient and
+tools run only AFTER the stream closes, so nothing was half-applied. **429 was missing until
+2026-07-25** and it is the single most likely transient failure for a user on a new key or a free
+tier — it used to arrive as a hard error mid-conversation. The retryable set matches what the
+providers document (Anthropic: 408/409/429/5xx + connection errors; the OpenAI-compatible endpoints
+use the same codes), so all three lanes share one policy. Guards, all load-bearing: retry only
+**before any delta was streamed** (else the reply double-renders — `deltasEmitted` is the guard);
+never retry any other **4xx** or a **full timeout** (curl exit 28 — re-running a 120 s hang thrice
+just triples the wait); and **honour `retry-after`** when the provider sends it, except past
+`RETRY_AFTER_MAX_MS` (15 s), where sitting silently is worse than showing the provider's own message.
+Status and `retry-after` both come back on curl's **stderr** via
+`-w '%{stderr}veltrix-http:%{http_code} veltrix-retry:%header{retry-after}'` (000 → network-level
+failure; the header's HTTP-date form simply won't match the digit regex and falls back to linear
+backoff), kept off the SSE stdout stream on purpose. Handler is re-created per attempt (a failed leg
+may hold partial state).
+
+### Re-syncing a wire lane against its provider (the defined procedure)
+
+The three lanes in `bin/veltrix-agent` are **our** code speaking someone else's protocol, by choice
+(zero runtime deps). The cost of that choice is exactly one recurring chore: when a provider moves,
+we re-sync. Doing it as a defined pass is the difference between an afternoon and a week — the
+Gemini episode of 2026-07-21 cost three defects in one day because the protocol was inferred from
+error responses instead of read. **Never diagnose a provider by trying things.** The order is:
+
+1. **Read the authoritative source, not the error.** Anthropic → the bundled `claude-api` skill,
+   plus the docs pages with a `.md` suffix for clean markdown (`streaming.md`, `thinking*.md`,
+   `handling-stop-reasons.md`). Gemini → the Interactions **OpenAPI JSON**
+   (`curl -sL https://ai.google.dev/static/api/interactions.openapi.json` + `jq .components.schemas.X`;
+   WebFetch truncates the 331 KB). OpenAI-compat → `openai-python`'s stream accumulation, which is
+   the de-facto spec every compat endpoint is written against.
+2. **Diff six things per lane**, in this order — they are where every bug has been:
+   request shape · stream event/delta **names** · **opaque state the provider demands back verbatim**
+   (thought signatures, thinking blocks — the most expensive class, twice now) · usage field names and
+   whether cached tokens are inside or outside the input count · stop/finish values *and* what the
+   loop keys off · the retryable status set.
+3. **Transcribe, don't adopt.** Port the behaviour into the GJS handler; keep the comment that says
+   which documented rule it implements, so the next reader can re-verify without re-deriving.
+4. **Lock it into `agent-loop`** as a scenario, then prove the scenario earns its place: break the
+   fix on purpose and watch it fail. A test that passes with and without the fix is worse than none.
+5. **Say what is still unknown.** A lane verified against a reference is not a lane verified in
+   production; write that down rather than implying coverage that isn't there.
+
+Symptoms that mean a lane has drifted: follow-up turns come back **empty** (dropped opaque state),
+tool calls **vanish** (keying off a status field instead of presence), a **400 on the second step**
+of a tool turn (rebuilt assistant message), usage that looks too **cheap** (unread sub-buckets).
+
+**CI girs note:** the daemon + `Settings → AI` import `gi://Secret` (libsecret). It's already
+installed (transitive) so `@girs/secret-1.d.ts` exists locally, but if CI typecheck ever complains
+about `gi://Secret`, the `ci-assets` girs snapshot needs a refresh (`scripts/dev/publish-ci-typings.sh`).
+
+### Testing the Assistant's PERCEPTION of a live app (the terminal bench)
+
+`agent-loop` covers the wire; the mock cannot cover whether the model **looks** when it should.
+That failure is invisible in the island — a stale answer and a fresh one render identically — and it
+is what this bench exists to catch. Setup: a coding agent runs in a terminal, the Assistant is asked
+to read that terminal, and the operator at the keyboard is the other side of the conversation. It
+earned its place by finding a real defect (PR #66: with an earlier `query_app` in history the model
+answered a live question from a dead screen, `steps=1 tools=0`), and the procedure below is what made
+that measurable rather than anecdotal.
+
+**Use a terminal that publishes a tree.** `gnome-terminal` (VTE) exposes the visible screen as one
+`role: "terminal"` text node; **kitty publishes nothing at all** — it is absent from the registry, not
+empty. The tree comes from the EMULATOR, never from the program inside it. `--ax-screen-reader` on
+`claude` is **not** needed; the raw TUI reads fine.
+
+**Mint the token inside the test, and put it in the terminal's INPUT LINE.** The check is always "can
+it read something it cannot have known", so the value must not exist before the run. It cannot be
+printed as prose either: a TUI collapses tool calls to one line and flushes prose at the **end** of a
+turn, so the operator's messages are not on screen at the moment the agent reads, and earlier ones have
+scrolled past the cap. The prompt box is the only region that is both visible and stable.
+
+**Verify each hop before the next one, or the run proves nothing:**
+
+```bash
+# 1) the token is where the agent will look — through the SAME path it uses
+veltrix-a11y org.gnome.Terminal | jq -r '.nodes[]|select(.role=="terminal").text' | grep -q "$TOKEN"
+# 2) the question actually landed in the island (see below) — BEFORE pressing Return
+veltrix-ipc queryUI .agent-entry     # its `text` must be your question
+```
+
+**Driving the island needs `wtype` directly.** No keyboard verb points at it: `veltrix-type` demands an
+`<app>` and verifies focus via `hyprctl activewindow`, where a layer surface never appears. In agent
+mode the bar holds a **compositor focus grab** for the island (`barModal` in `Bar.tsx`, via
+`common/FocusGrab.ts` — it takes one for every open mode), so synthetic keys reach it — which is also
+why hop 2 is mandatory: if the grab wasn't there, you just typed your question into the operator's own
+prompt. Clean up with the island **closed first**, then `ctrl+u` — an open island eats the clear.
+
+**Run the whole thing as ONE command.** Every separate tool call that raises a permission prompt
+**closes the island**, which is how the first attempt typed into the wrong window. (Auto-accept mode
+avoids it, but one script is what makes the run repeatable.)
+
+**Read the verdict from the log, never from the bubble** — `grep -E '\[(veltrix-)?[aA]gent'`:
+`steps=2 tools=1` means it re-read; `steps=1 tools=0` means it answered from its context and the text
+in the island is a coincidence. State is `$XDG_STATE_HOME/veltrix/agent/`: `transcript.json` is
+`{version,updated,transcript:[{role,text,tools}]}` (the UI's view — poll it for the answer) and
+`session.json` holds the daemon's `history` (the model's context — check the stale copy is really in
+there). Guard the run by asserting that shape before touching anything.
+
+**To test a fix for a VOLATILE read, the stale copy has to still be in `history`** — same conversation,
+same question, changed screen. Best case: the source the old read described is **gone** (the terminal
+was closed), which leaves the dead copy as the only possible origin of the old answer.
+
+**Every other run needs a NEW conversation** — a carried-over conversation answers from context and
+proves nothing. One verb, no shell restart:
+
+```bash
+veltrix-ipc agentNewConversation      # "conversation ended — N turns dropped"
+```
+
+It refuses while a turn is in flight (`a turn is in flight — nothing was discarded`); poll
+`veltrix-ipc dumpState` → `ai.assistant.busy` and retry. **Deliberately unreachable from the
+Assistant itself** (`HIDDEN_ACTIONS` in the daemon) — see `state-and-ipc.md`; you drive it, it
+cannot drive itself.
+
+**Do not "reset" by deleting the two state files under a live shell — that does nothing.** The shell
+holds the conversation in memory and rewrites both at the next turn end, so the deletion is silently
+undone and the run you thought was fresh is not. (The old stop → delete → start dance worked for that
+reason, not because the shell writes on exit — it does not.) If the shell is already down, deleting
+the files is fine.
+
+**Do NOT judge a fix by the turn's total step count — it is dominated by model strategy variance.**
+Measured 2026-07-31, same model, same question, three runs: removing four forced steps left the
+total at 13, then 16, because the model spent the slack differently (run 1 typed `1847` with
+`type_text`; runs 2 and 3 clicked eight digit keys one at a time, one API round trip each). The
+metric that isolates OUR cost from the model's choices is **how many steps pass before the first
+productive action** — the four wasted steps went to 0 and that number does not move with strategy.
+A structural fix should also be proved OUTSIDE the model, deterministically, by driving the verb
+from a shell (which is what actually settles it); the live turn only shows it holds in situ.
+
+**Write the deterministic table BEFORE the live re-run — it is where the fix's own bugs are.** On
+2026-08-01 the run-3 fix (one tolerant `sameApp` shared by perception and action) was verified first
+against a hand-written table of name pairs, positives *and* negatives, asserted symmetrically. It
+failed 3 of 11 immediately: the new matcher lowercased its inputs before tokenizing, destroying the
+capitals that mark the word breaks in `WidgetFactory` — the exact class of bug it existed to fix. A
+live re-run would have shown "still broken" and cost an API turn to say less. Keep the negatives in
+the table: a name matcher gets loose long before it gets wrong, and the PWA class
+(`chrome-…-Default` vs `google-chrome`) is the cheap canary.
+
+**A subtlety this cost: removing a refusal can remove an affordance.** Before the fix, the focus
+refusal pushed the model through `focus_window`, whose description happens to say it is "the
+precondition for the synthetic keyboard" — so the model learned `type_text` existed and used it.
+With the refusal gone, nothing mentioned the keyboard and both later runs clicked glyph by glyph.
+Suspect this whenever an error path is deleted: check what the error was teaching.
+
+**Bring the app up in a known state, and clean up your own contamination.** Two false findings came
+from the environment, not the product: gnome-text-editor **restores its session** (it reopened two
+of the repo's real files, which a computer-use agent could then type into — disable
+`restore-session`, or pick an app with no user data), and a leftover second window makes every node
+match twice, which reads exactly like a resolver bug. Count the windows before believing an
+"ambiguous" result. `hyprctl dispatch closewindow address:0x…` **fails on this config** — Hyprland's
+config is Lua here, so the dispatch is parsed as Lua and errors with `')' expected near 'address'`;
+use `veltrix-ipc closeWindow` (or `hl.dsp.*` form), and never discard the output of a dispatch you
+depend on, or you will read the unchanged state as the app "ignoring" you.
+
+⚠️ **The same Lua trap invalidated a whole A/B on 2026-08-13**, so it is worth stating as a rule
+rather than an anecdote: `hyprctl dispatch movecursor 469 756` errors with `')' expected near '469'`,
+prints it, and continues. The pointer never moved, the precondition of the experiment ("the cursor is
+over the OTHER window") never held, and **both the broken and the fixed build passed**. The form is
+`hyprctl dispatch "hl.dsp.cursor.move({ x = 469, y = 756 })"` (verified in
+`LuaBindingsDispatchers.cpp` for the exact tag). **When a test depends on a dispatch, assert the
+EFFECT and abort when it is missing** — `hyprctl cursorpos` here — instead of assuming the setup
+took. See `tech-debt.md` #67.
+
+### Arming the island's region trap (intermittent dead chips)
+
+For "the island's icons sometimes stop taking mouse input". It cannot be reproduced on demand (see
+`tech-debt.md` #68 for the paths already ruled out), so the tool is a trap left in the running
+session rather than a sweep:
+
+```bash
+systemctl --user set-environment VELTRIX_ISLAND_REGION_TRACE=1
+systemctl --user restart veltrix.service
+grep -n "island-region" "$XDG_RUNTIME_DIR/veltrix-ui.log"     # every stamp; STALE = the bug, caught
+```
+
+Each stamp logs `rects=` (rectangles actually unioned) and `hitTargets=` (clickable targets the
+stamp could see). A CRITICAL `STALE after #N` means a stamp captured fewer targets than are live
+600 ms later with no stamp in between — the dead-chip state, with the sequence that produced it
+sitting directly above it in the log. Off by default and free when off. Disarm with
+`systemctl --user unset-environment VELTRIX_ISLAND_REGION_TRACE` + a restart.
+
+### Testing a live resolution / scale change
+
+The bed for anything that derives a number from the monitor (regions, layout budgets, the overview's
+card width). **CI cannot do it** — the smoke boots at one resolution and never changes it — and you
+do not do it on your own session either, so it is a VM with a `virtio-gpu-gl` output.
+
+```bash
+# NOT `hyprctl keyword monitor …` — "can't work with non-legacy parsers. Use eval."
+hyprctl eval "hl.monitor({ output = 'Virtual-1', mode = '1280x720@60', position = 'auto', scale = 1 })"
+```
+
+- **Go BOTH ways.** Small → large is the more dangerous direction: a stale *small* clamp cuts a
+  large surface, while a stale large one is intersected away harmlessly.
+- **Read numbers, not only pixels.** `veltrix-ipc dumpState` → `overlays.islandBounds` prices the
+  overview against the screen (8px `WO_EDGE_MARGIN` each side: 1903 on 1920, 1263 on 1280), and the
+  region trap above prints the stamped rect per target, which is the only way to see the INPUT
+  region — a screenshot cannot show you where clicks land.
+- **Expect one `TORN` per change, and read it as healthy.** The geometry notification arrives before
+  GTK has re-allocated, so the immediate stamp is stale by construction and #138's 50 ms verify is
+  what corrects it (`capsule=899` → `TORN` → `capsule=579`).
+- ⚠️ **`install.sh --update-apply` on a VM that has no `.git` installs the PREBUILT release** and
+  your branch never runs (`tech-debt` and the VM harness README both say it; it is still the easiest
+  way to waste an hour). `git init` in the served tree first, then confirm the bundle really moved:
+  the shell binary is base64 inside a shell wrapper, so `sed -n 5p <bundle> | base64 -d | grep -c …`,
+  never a plain `grep` on the file.
+
+## Persistence
+
+⚠️ **Settings are moving to GSettings (`org.veltrix.*`, #573)** — `gsettings list-recursively
+org.veltrix` shows them all (dock incl. pinned apps, bar, notifications, night light, workspaces,
+recording, ai, gaming, appearance, widgets, control-center, region). Architecture → "Where a setting lives" has the rules. For dev work:
+
+- **The schema is read COMPILED.** Editing `config/gsettings/org.veltrix.gschema.xml` changes nothing
+  until `./install.sh --dev` installs and compiles it again — into `/usr/share/glib-2.0/schemas`,
+  the package's path, in BOTH modes. Never into `~/.local/share/glib-2.0/schemas`: measured
+  2026-09-14, a copy there SHADOWS the system one, and it would outlive the checkout that put it
+  there. A store whose schema is missing or stale logs `[defineSettings] …` in the shell log.
+- **The store probe writes settings, so run it through its launcher**:
+  `scripts/dev/define-config-probe.sh` gives it a scratch config dir and the keyfile backend (no
+  bus, nothing of yours). It still imports `config-entries.ts`, which reaches Hyprland and writes
+  under `$HOME`, so on a live desktop run it headless and fenced in as well (a short runtime dir —
+  a Wayland socket path over 108 bytes fails):
+  `env -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS HOME=<scratch> XDG_RUNTIME_DIR=<short scratch> WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 dbus-run-session -- cage -- scripts/dev/define-config-probe.sh <out>`.
+- ⚠️ **Overriding `XDG_CONFIG_HOME` does NOT isolate dconf.** The client reads the database under
+  its own `XDG_CONFIG_HOME`, but writes go through the ALREADY-RUNNING `dconf-service`, which writes
+  to yours — a test that "imported" and then read back nothing, measured 2026-09-14. Isolate with a
+  private bus whose activated dconf inherits the scratch dir, env set BEFORE the bus starts:
+  `env -u DBUS_SESSION_BUS_ADDRESS XDG_CONFIG_HOME=<scratch> XDG_RUNTIME_DIR=<short scratch> dbus-run-session -- <test>`.
+  Or use `GSETTINGS_BACKEND=keyfile`, which is what CI does.
+- 🔴 **A private bus WITHOUT a private `XDG_RUNTIME_DIR` kills the session's accessibility bus —
+  for the rest of the session.** Anything GTK on that bus asks for `org.a11y.Bus`, the private
+  `dbus-daemon` activates a second `at-spi-bus-launcher`, and that one unlinks and recreates
+  `$XDG_RUNTIME_DIR/at-spi/bus_0` — the SAME path the real one listens on. The probe exits, its
+  socket file stays, and every process started afterwards gets `Gtk-CRITICAL: Unable to connect
+  to the accessibility bus … Conexión rehusada` at start: no AT-SPI, so `query_app` and every
+  computer-use helper go blind. The real broker keeps running (on an unlinked inode), so
+  `systemctl --user status at-spi-dbus-bus` says all is well; the tell is `bus_0`'s mtime being
+  newer than the service's start. Measured 2026-09-27: one ad-hoc `dbus-run-session -- env
+  GDK_BACKEND=broadway …` on 09-23 00:42 left the owner's session like that for four days.
+  Reproduced in one line (`dbus-run-session -- gdbus call … org.a11y.Bus.GetAddress` changes
+  `bus_0`'s inode). **Every `scripts/dev/*-probe.sh` already passes a scratch
+  `XDG_RUNTIME_DIR` and is safe** — the rule is for anything written by hand. If a probe cannot
+  move the runtime dir, `env GTK_A11Y=none NO_AT_BRIDGE=1 dbus-run-session -- …` (BEFORE the bus:
+  `xdg-desktop-portal-gtk`, which the bus activates on its own, is GTK3 and asks too — measured,
+  `GTK_A11Y=none` alone still clobbers). Repair: `systemctl --user restart at-spi-dbus-bus`; apps
+  already running stay without a11y until restarted.
+- **The migration only runs from `/usr/share/veltrix/migrations`**, i.e. after `install.sh`; a dev
+  checkout reloaded without it reads defaults until then, and nothing is lost — the JSON files stay
+  until the migration takes them.
+
+What still lives in `~/.config/veltrix/` as a file, and why (every PREFERENCE is in GSettings —
+`gsettings list-schemas | grep org.veltrix`):
+
+| File | Purpose |
+|---|---|
+| `wallpaper` | Current wallpaper path + transition — read by `hyprland.lua` and the lock screen too, which cannot read GSettings (JSON; reserves a `surfaces` block for per-surface wallpapers — schema in `ui/lib/wallpaper.ts`) |
+| `greeter-prefs.json` | Greeter preferences (read by the greeter, another user) |
+| `app-frequency.json` | Launch counts — a cache written on every launch, not a preference |
+| `veltrix-settings.lua`, `veltrix-monitor.lua`, `veltrix-workspaces.lua` | OUTPUTS the shell generates for Hyprland, which cannot read GSettings (`veltrix-gaming.lua` was one until #682; a stale copy left behind is required by nothing) |
+| `*.migrated` | The user's original files, kept after the one-time import (#573) |
+
+### Hyprland config ownership model (settled 2026-06-05 — do NOT re-litigate)
+
+There were multiple conflicting approaches across past sessions. This is the final,
+verified-live model. Two tiers, cleanly split:
+
+**SHARED (one for all users, in `/usr/share`):**
+- `/usr/share/veltrix/config/hypr/hyprland.lua` — the base config. Same for
+  everyone; ships with the shell. In `--dev` it's a **symlink → repo**
+  (`config/hypr/hyprland.lua`); in `--system` it's a real copy. **Never edit the
+  installed copy directly** — edit the repo, it says so in its own header.
+
+**USER (per-user, in `~/.config/veltrix/`):**
+- `hyprland-user.lua` — personal overrides, **never overwritten** by updates.
+  `safe_require`'d LAST so it wins. The `@autostart start/end` marker block inside
+  it is managed by **Settings → Apps → Autostart** (`Autostart.tsx`); everything
+  outside the markers is the user's free space — but anything hand-written *inside*
+  the markers that isn't an `hl.exec_cmd` line is dropped on the next UI write
+  (managed-block semantics).
+  Resolution caveat: `package.path` in `hyprland.lua` lists `~/.config/veltrix/`
+  BEFORE `~/.config/hypr/`, and Lua `require()` loads the FIRST match only. The
+  Settings page mirrors that order (`resolveUserConf`): it edits the veltrix file if
+  present, else a legacy `~/.config/hypr/hyprland-user.lua` (pre-2026-07 installs
+  wrote there), else creates the canonical veltrix one — so the UI always edits the
+  file Lua actually loads. Legacy files are edited in place, never migrated.
+- `veltrix-settings.lua` — UI-generated input/keyboard config (sensitivity,
+  `kb_layout`, repeat, touchpad), written by `core/hyprland-settings.ts` for the Input page.
+- `veltrix-monitor.lua` — UI-generated monitor config (output/mode/scale/vrr),
+  written by `core/hyprland-settings.ts` for the Display page.
+- `hypridle.conf` — idle config, WRITTEN by Settings → Power (user state; seeded by veltrix-setup, suspend listener only on battery hardware).
+
+One seeded config lives OUTSIDE both dirs: `~/.config/kitty/` (from `defaults/kitty/`,
+kitty ships no config of its own). `kitty.conf` sets the padding that keeps text clear
+of Hyprland's 24px rounded corners, names the shipped JetBrains Mono (kitty doesn't
+read the gsettings monospace pref), pins the Nerd Font pictogram ranges to
+`Symbols Nerd Font Mono` with `symbol_map`, enables glass (`background_opacity` +
+`dynamic_background_opacity`), and carries a **dark** palette. Seeded ONLY when the
+user has no `kitty.conf` at all — an existing kitty setup is never touched.
+
+⚠️ **kitty has no title bar to drag on Hyprland, and no kitty.conf value can give
+it one** — checked against kitty's own source (`glfw/wl_window.c`
+`setXdgDecorations`): its client-side bar appears only where the compositor does
+NOT answer server-side (e.g. GNOME); Hyprland answers server-side and draws
+nothing, and `hide_window_decorations yes` / `titlebar-only` both SUPPRESS the
+bar rather than showing it. The tab bar and the window title bar are not a
+substitute either — their drags only reorder kitty's own tabs/windows, and
+dragging a tab DETACHES it. The drag handles are the compositor's: Hyalo draws
+its own draggable title bar over kitty, and on Hyprland the bar's AppTitle pill
+is draggable (`Compositor.moveWindowTo`), as is Super+drag anywhere on the
+window. `defaults/kitty/kitty.conf` says this in a comment so nobody "fixes" it
+with a fake knob.
+
+A second seed lives outside both dirs too: `~/.local/share/nautilus-python/
+extensions/veltrix-delete.py` (from `defaults/nautilus-python/extensions/`), the
+"Move to Trash…" row in Files' right-click menu, with a confirmation dialog.
+Seeded ONLY when the user has no file of that name; it needs the
+`nautilus-python` package (in the PKGBUILD's depends — without it Nautilus
+never loads the extension) and loads when Files starts, so a live session picks
+it up after `nautilus -q`. It moves to the Trash, never a permanent delete.
+
+⚠️ **The terminal is the one surface that deliberately ignores the Appearance
+light/dark toggle**, so don't "fix" it. Veltrix used to seed a
+`{dark,light,no-preference}-theme.auto.conf` trio and follow the scheme live; it was
+dropped 2026-08-24 because the light half broke colored output. The measurement,
+reproducible with `scripts/dev/terminal-contrast.py`: on that light palette SEVEN of
+the fourteen ANSI colors fell below 3:1, bright yellow at 1.2:1 — invisible — while on
+the dark one none do. Plain text was never the issue (8.7:1 measured on screen through
+the glass, past WCAG AAA); the color was, because `ls`, `git` and every TUI choose
+their colors against a dark background. A light palette can come back — it has to pass
+that script first. The `symbol_map` is load-bearing for the same reason of not leaving
+things to chance: Adwaita Mono and Inter also claim U+E0B0, so without it fontconfig's
+ranking decides how a prompt's Powerline separators look.
+
+⚠️ **The font is `ttf-jetbrains-mono` + `ttf-nerd-fonts-symbols-mono`, not
+`ttf-jetbrains-mono-nerd`** (dropped 2026-08-24: 232 MiB against 9.8 MiB for the pair,
+on every install). Naming the patched family anywhere does not error — it silently
+resolves to whatever fontconfig substitutes.
+
+**NOTHING goes in `~/.config/hypr/`.** Mainline Hyprland defaults to
+`~/.config/hypr/hyprland.lua`, but Veltrix deliberately keeps that directory
+empty and loads the shared config explicitly via `-c` (see load mechanism below).
+A stray `~/.config/hypr/hyprland.lua` is a leftover from older approaches — remove it.
+(One tolerated exception: a legacy `~/.config/hypr/hyprland-user.lua` from pre-2026-07
+installs keeps working — `package.path` includes that dir as a fallback and the
+Autostart page edits it in place when it's the only one. New files are always
+created in `~/.config/veltrix/`.)
+
+`veltrix-settings.lua` / `veltrix-monitor.lua` are **live UI-generated config, not
+junk** — deleting them is technically safe (`hyprland.lua` uses `safe_require`/pcall,
+so missing files don't break boot) but you'd lose real settings (e.g. `kb_layout`)
+until the user re-touches that Settings page, which regenerates the file. Don't tell
+users to delete them.
+
+⚠️ **`safe_require` treats ABSENT and BROKEN differently, and it has to.** Some of the
+files it loads are written by the SHELL, which starts *after* Hyprland has read this
+config — measured on a first boot: Hyprland up at 01:24:18, `veltrix-workspaces.lua`
+written at 01:24:20 by `core/WorkspaceModes.ts`. So "not found" is the NORMAL state on
+the first login of every machine and on every boot of the live medium, and until
+2026-09-22 it threw a 22-line black panel (the message plus Lua's whole list of
+attempted paths) at the user for it. Now `package.searchpath` decides: no file → a
+`print()` and nothing on screen; a file that exists and fails → the notification, first
+line only. **A new generated file therefore needs no guard of its own** — the old
+`io.open` check around `veltrix-gaming.lua` (a generated file until #682) was exactly
+that, and it is gone.
+
+### How the shared config actually loads (`-c` through `start-hyprland` — subtle)
+
+Session chain: `veltrix` (launcher) → `uwsm start … hyprland.desktop` →
+`start-hyprland` (stock hyprland pkg watchdog) → `Hyprland`. To make `Hyprland`
+load the `/usr/share` config instead of the `~/.config/hypr` default, the launcher
+passes a **DOUBLE `--`**:
+
+```
+uwsm start -e -D Hyprland hyprland.desktop -- -- -c /usr/share/veltrix/config/hypr/hyprland.lua
+```
+
+Why two: `uwsm` forwards args after *its* `--` onto `start-hyprland`; `start-hyprland`
+only forwards args after *its own* `--` to `Hyprland`. A single `--` yields
+`start-hyprland -c <path>`, which `start-hyprland` swallows → Hyprland silently falls
+back to `~/.config/hypr/hyprland.lua`. Don't "simplify" the double dash away
+(`bin/veltrix`, commit d03c9f1).
+
+Verify which config is live: `cat /proc/$(pidof Hyprland)/cmdline | tr '\0' ' '` →
+must show `-c /usr/share/veltrix/config/hypr/hyprland.lua`. (Hyprland 0.55.2
+logs it as `[cfg] Config is either explicit or special`, NOT the literal phrase
+"lua config <path>".)
+
+### Config dir is a real directory, not a symlink (historical footgun)
+
+`~/.config/veltrix/` must be a **real directory** holding only runtime config
+(the `.json` files + the three `.lua` + `wallpaper` + `.dev`). It is **separate** from
+the repo checkout (e.g. `~/Dev/veltrix`). Historically it was once a manual symlink → the repo,
+which fused the config dir and the git tree and caused a delete incident (an
+"organize the config dir" sweep wiped the live checkout). If you ever find it's a
+symlink, that's the bug — make it a real dir.
+
+### Env vars
+
+- `~/.config/uwsm/env` + `~/.config/uwsm/env-hyprland` — toolkit/NVIDIA env. **This is where env vars live, NOT in the Hyprland config.** A new contributor's first instinct is to drop env vars in `hyprland.lua`; that's wrong.
+- Session-wide env (Wayland backend, `QT_QPA_PLATFORMTHEME=xdgdesktopportal`, GI paths) is exported by the `bin/veltrix` launcher itself.
+- **GOTCHA — sourcing order:** uwsm **sources** `~/.config/uwsm/env` as a shell, and it does so AFTER the launcher's own exports, so the env file WINS on any conflicting var. (A stale `QT_QPA_PLATFORMTHEME=qt6ct` in the env file was silently overriding the launcher's `xdgdesktopportal` — fixed in `defaults/uwsm/env` + an idempotent migration in install.sh.) Because it's sourced, values with shell metachars must be quoted: `export QT_QPA_PLATFORM="wayland;xcb"` (a bare `;` truncates the var and runs `xcb` as a command).
+- **`/usr/share/uwsm/env-hyprland.d/veltrix-browser` (from `config/uwsm/`) unsets a SYSTEM-WIDE `$BROWSER`** (2026-09-13). EndeavourOS ships `BROWSER=firefox` in `/etc/environment`, and programs that read the variable before the freedesktop associations (Python's `webbrowser`, most CLIs, "open your browser" login flows) ignored Settings → Default Apps — every freedesktop resolver said Chrome while Python opened Firefox. 🔑 **An `unset` in `bin/veltrix` does NOT work**: uwsm merges the systemd user manager's environment (which already has pam_env's value) OVER the launcher's, so it comes straight back. A variable that disappears while uwsm sources its env files is one uwsm itself removes from the systemd manager (`unset_varnames` in its `prepare_env`) — that is what reaches D-Bus activation and apps. uwsm's load order is: shell profile → `/usr/share/uwsm` → `/etc/xdg/uwsm` → `~/.config/uwsm` (each `env`, `env.d/`, `env-<desktop>`, `env-<desktop>.d/`), so a user's own `export BROWSER=…` in `~/.config/uwsm/env` still wins, while one in `~/.profile` does not (it runs before). Verified by running uwsm's real `/usr/lib/uwsm/prepare-env.sh` on fake dirs: without the fragment `BROWSER=firefox`, with it unset, with it plus a user env `BROWSER=chromium`. ⚠️ Parse its output with a NUL-safe reader: `$(…)` drops the NUL separators and every case reads "unset" — the control caught that.
+- **NVIDIA autodetect:** `install.sh` detects NVIDIA hardware + active driver (`lspci` + `lsmod`) and uncomments the GPU env vars in `~/.config/uwsm/env` ONLY for the proprietary/open driver (never nouveau — those `nvidia-drm`/GBM vars break a nouveau/mesa session). It warns (never auto-edits boot) if `nvidia_drm modeset` is off. On hybrid graphics (iGPU + NVIDIA) `veltrix-setup` writes `AQ_DRM_DEVICES=<igpu>:<dgpu>` to `~/.config/uwsm/env-hyprland` (resolved by bound driver, iGPU first, idempotent replace-or-append): aquamarine opens only the first DRM device unless told, so without this the HDMI port — usually wired to the NVIDIA card — never appears as a Hyprland monitor at all, and no monitor rule or Settings control can enable what the compositor never sees. The dGPU node alone is never written (it would drop the laptop panel); if the driver package is installed but its module is not loaded yet (fresh install, old kernel still running), the next card number is written and re-resolved on the next re-run. AMD/Intel need nothing.
+
+### The login keyring — why it must be PAM's daemon, not systemd's
+
+**Symptom when this breaks:** the session comes up fine, then the first thing that wants a secret
+(browser, the built-in Assistant, git) prompts for a keyring password the user already typed at
+login. Settings → AI still shows a key saved, because the key IS there — the keyring holding it is
+locked. The fix is NOT to store the key somewhere else.
+
+The unlock is a two-part handshake, and Arch ships a third party that breaks it by default:
+
+1. `pam_gnome_keyring` (wired into `/etc/pam.d/greetd` by `veltrix-setup`) starts
+   `gnome-keyring-daemon --login --daemonize` holding the login password. Per the man page,
+   `--login` "does not complete actual initialization" — the daemon parks, waiting.
+2. `hyprland.lua` runs `gnome-keyring-daemon --start --components=secrets`, the documented
+   completion step. **The unlock happens here, not in step 1.** Treating that line as boilerplate
+   and dropping it leaves a session whose secrets nobody can read.
+3. But before parking, the `--login` daemon probes `$XDG_RUNTIME_DIR/keyring/control` to check
+   whether a daemon is already running — and on Arch that exact path is the `ListenStream` of
+   `gnome-keyring-daemon.socket`, **enabled by preset**. The probe is what starts the rival
+   daemon, so discovery always succeeds: the PAM daemon logs `discover_other_daemon: 1`, prints
+   its environment and exits *before* reaching `gkd_login_unlock()` (that call lives only on the
+   initialize path in upstream `daemon/gkd-main.c`). The socket-activated daemon that survives
+   never saw the password. On first login it is worse than a failed unlock: no `login.keyring` is
+   created at all, so the user gets a *create-a-keyring* dialog whose password is then whatever
+   they typed — and PAM can never open it again.
+
+So `veltrix-setup` **masks** `gnome-keyring-daemon.socket` for the user — **and stops it**, which is
+not the same sentence twice. `mask` only refuses *future* starts; it never touches a unit that is
+already running, and `user@$UID.service` outlives the session whenever lingering is on
+(`loginctl enable-linger`, which plenty of tooling sets). A daemon socket-started before the mask
+therefore survives logout after logout still owning `$XDG_RUNTIME_DIR/keyring/control`, every later
+login repeats `discover_other_daemon: 1`, and the mask reads as inert: the user logs out, logs back
+in and reports "nothing changed" (2026-07-26 — only a reboot cleared it). Stop the **socket** first,
+because the `.service` `Requires=` it and follows it down, whereas stopping the service alone leaves
+the socket listening for the next probe to re-activate. If D-Bus activation re-spawns a daemon
+afterwards, that machine needs a **reboot**, not a logout; `veltrix-setup` checks for exactly that and
+says so instead of reporting success.
+
+**It has to be `mask`, not `disable`** — the trap that eats an afternoon. The socket is routinely
+enabled in *global* scope (`/etc/systemd/user/sockets.target.wants/`), and against that a
+`systemctl --user disable` is a silent no-op: it reports success, `list-unit-files` still says
+`enabled`, and the socket starts anyway. systemd does warn ("enabled in global scope … will still
+be started automatically"), which is easy to scroll past. Mask wins in user scope and also survives
+`systemctl --user preset-all` (the Arch preset for it is `enabled`). Mask the **socket only**: the
+`.service` is only reachable through it, and masking that too would break other desktops sharing
+the account that start it deliberately.
+
+**This cannot leave a session without a Secret Service**, which is the objection to check before
+touching it: `--start` starts a daemon when it finds none (that is exactly what
+`/etc/xdg/autostart/gnome-keyring-secrets.desktop` does), and `org.freedesktop.secrets` stays
+D-Bus activatable underneath. The only thing removed is the racer.
+
+Verifying is a **logout/login** (a **reboot** if a rival daemon was already running), not a reload —
+nothing about this path is reachable from `Super+Shift+R`, and the CI smoke does not cover it (the
+headless boot has no PAM login). Read it back from the journal of the new session:
+
+```bash
+gdbus call --session -d org.freedesktop.secrets -o /org/freedesktop/secrets/collection/login \
+  -m org.freedesktop.DBus.Properties.Get org.freedesktop.Secret.Collection Locked
+# healthy: (<false>,)    broken: UnknownMethod: Object does not exist at path
+pgrep -a -f gnome-keyring-daemon      # healthy: ONE, and it is `--daemonize --login` (PAM's)
+                                      # broken:  `--foreground --components=pkcs11,secrets` (systemd's)
+systemctl --user status gnome-keyring-daemon.service   # must be dead — a running one IS the rival
+journalctl -b --since "-5 min" | grep -iE "keyring|discover_other_daemon"
+ls -l ~/.local/share/keyrings/login.keyring   # must exist, born at the login minute
+```
+
+**`discover_other_daemon: 1` on its own does NOT mean broken** — do not read it as the tell, it
+appears in a perfectly healthy session. It is logged by whichever daemon loses the discovery, and in
+the working flow that is `hyprland.lua`'s `--start` finding PAM's daemon, i.e. the handshake
+succeeding. What distinguishes the two cases is *which daemon survives*, hence `pgrep` above:
+`--daemonize --login` in a `session-N.scope` cgroup is PAM's and correct; `--foreground
+--components=pkcs11,secrets` under `user@$UID.service/app.slice` is systemd's and is the bug. A
+healthy boot reads:
+
+```
+greetd[…]: gkr-pam: gnome-keyring-daemon started properly and unlocked keyring
+systemd[…]: Started gnome-keyring-daemon.          ← the uwsm scope for hyprland.lua's --start
+gnome-keyring-daemon[…]: discover_other_daemon: 1  ← that --start finding PAM's daemon: correct
+```
+
+Ignore anything logged for the **greeter's own uid** (`/run/user/955`, `greetd[…]: gkr-pam:
+couldn't unlock the login keyring` before the user logs in, plus a `Started GNOME Keyring daemon.`
+that stops when the greeter exits). Different user, different runtime dir, unrelated to this.
+
+A `login.keyring` whose birth time is *later* than the session's start was created by a prompt
+dialog, not by PAM — its password is not the login password and PAM will never open it. Move it
+aside and let the next login recreate it.
+
+**Do not verify with the service's `Collections` property.** It lists `/collection/login` — and
+`ReadAlias default` resolves to it — even when that collection was never loaded, which is exactly
+the broken state; ask the collection object itself, as above. `Object does not exist at path` is the
+signature of *listed but not loaded*, and it fails **asymmetrically**, which is why it gets
+misfiled as a UI bug: reads answer instantly ("not found" — there is nothing to search), so
+Settings → AI enables its buttons, while the first write must unlock, spawns `gcr-prompter` and
+hangs forever (`timeout 12 secret-tool store …` exits 124, and the journal shows the prompter dying
+on its own 10-second inactivity timeout). Two causes produce it: a rival daemon (above), or a stale
+`user.keystore` whose password is not the login one — `couldn't initialize slot with master
+password: The password or PIN is incorrect` in `journalctl --user -u gnome-keyring-daemon`. For the
+second, move `user.keystore` and `login.keyring` aside and log in again; PAM recreates both. Only
+PAM can, so restarting the daemon by hand never fixes either.
+
+## Default keybindings (from `hyprland.lua`)
+
+| Keys | Action |
+|---|---|
+| `Super+S` | Settings |
+| `Super+,` | Settings (macOS Cmd+,) |
+| `Super` (tap) | App launcher (grid) |
+| `Super+Space` | Search (Prism) |
+| `Super+W` | Workspace Overview (keyboard-navigable: ←/→ move, Enter switch, Esc close) |
+| `Super+A` | Assistant (the built-in agent island; Esc closes) |
+| `Super+C` | Control Center, focus on its first control (Tab/arrows move, Enter/Space activate, Esc closes; see state-and-ipc.md → "Keyboard INSIDE the bar's panels") |
+| `Super+N` | Notification Center, same keys |
+| `Super+Ctrl+B` | Walk the bar's items (←/→ move, Enter/Space/↓ open, Esc back, Esc again leaves) |
+| `Super+Ctrl+D` | Walk the dock's icons (arrows along it move, Enter/Space open, ↑ or Menu the app menu, Esc leaves) |
+| `Super+T` | Kitty |
+| `Super+E` | Nautilus |
+| `Super+L` | Lock |
+| `Super+B` | Bar overlay (bar above fullscreen) |
+| `Super+Tab` / `Super+Shift+Tab` | Cycle windows (same as Alt+Tab) |
+| `Super+Shift+R` | Reload UI |
+| `Super+Q` | Close window |
+| `Super+H` | Hide window (dock icon restores it) |
+| `Super+F` | Float |
+| `Super+Shift+F` | Fullscreen |
+| `Super+P` | Pseudo |
+| `Super+1–5` | Switch workspace |
+| `Super+Shift+1–5` | Move to workspace |
+| `Super+Scroll` | Cycle workspaces |
+| `Super+arrows` | Focus |
+| `Super+Shift+arrows` | Resize |
+| `Super+Alt+arrows` | Snap window to half of the screen (Hyprland only) |
+| `Super+Alt+C` | Centre window at its current size |
+| `Super+LMB drag` | Move window |
+| `Super+RMB drag` | Resize window |
+| `Print` | Region → clipboard |
+| `Shift+Print` | Region → `~/Pictures/` |
+| `Super+Print` | Full screen → clipboard |
+| `Super+Shift+Print` | Full screen → `~/Pictures/` |
+
+### Adding a new keybind that triggers UI
+
+The pattern is: keybind in `hyprland.lua` → `veltrix-ipc <cmd>` → `requestHandler` in `app.ts` → `ShellActions.<action>()` → `Status.<setter>()`.
+
+Don't shortcut this. Every step is there for a reason (Hyprland reload-safety, IPC visibility from CLI, typed registry, central state).
+
+
+### Settings slice startup diagnostics
+
+The slice smoke check retains stderr for every launch, including exits before
+the first window is mapped.
+An early exit must report its status/log instead of waiting out the listing
+deadline; missing-window failures also include the log. Keep the original
+deadline and semantic/pixel assertions. Diagnostic improvement alone is not
+proof that a failed native startup was corrected.
+
+Native Config1 exports `ui.i18n` and `options[].i18n`, rather than translated
+`title`/`label` strings. The read-only settings slice resolves these against its
+exported settings-data language, falling back to English per key, just like native
+Settings. Keep authoritative preference values untouched and keep the default-value
+negative control: localizing metadata must not substitute preference defaults.
+
+### Restarting the isolated IME harness
+
+The phase-0 fcitx5 restart case must use `nk-real-common.py:start_ime` just like
+its initial launch. That helper supplies the per-case `XDG_CONFIG_HOME` and engine
+profile. Starting the replacement directly with the application environment loads
+the default US-only group: Mozc/Pinyin type Latin text and Hangul never commits.
+A D-Bus owner and keyboard grab alone do not prove that the requested engine loaded.
+
+The phase-0 IME scroll case starts a fresh fcitx5 after the native-keyboard tests;
+it must also use `start_ime`, not a direct `p.start`. Otherwise the group and
+classicui theme are lost again even when the explicit restart case passed.
+When auditing Orca logs, use `orca-report.json`: FAIL inside a deliberately broken
+control is expected when the aggregate marks that control CAUGHT. The 2026-10-25
+#946 run 40232572113 had a passing baseline and all 24 controls CAUGHT.
+
+### Native cursor reload and session test readiness (#1017)
+
+Hyalo persists `set-cursor` in its settings layer. Config1's cursor follower must
+reapply its GSettings home on startup, compositor reconnect and actual preference
+changes, but not on `outputs_changed`: Hyalo emits that notification after ordinary
+config reloads too. Resetting the cursor lane there overwrites the saved cursor
+when an unrelated keyboard preference changes. Output-dependent effects retain
+their hotplug reset.
+
+`org.veltrix.Config` can exist before the selected services have finished starting.
+A test of Media must wait for the `org.veltrix.Session` readiness name before creating
+its cached zbus proxy. An initial failed GetAll remains cached even after the name
+appears; repeatedly polling that proxy cannot recover. Keep the five-second
+readiness deadline and explicit `--config --media` subset.

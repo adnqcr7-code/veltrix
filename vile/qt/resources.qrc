@@ -1,0 +1,11 @@
+<RCC>
+  <qresource prefix="/">
+    <file>blocklists/trackers.txt</file>
+    <file>assets/logo.png</file>
+    <file>assets/logo-256.png</file>
+    <file>assets/logo-alpha.png</file>
+    <file>assets/logo-v.png</file>
+    <file>assets/ntp-art.png</file>
+    <file>assets/check.png</file>
+  </qresource>
+</RCC>

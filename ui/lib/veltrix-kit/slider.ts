@@ -1,0 +1,517 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+import Gtk from "gi://Gtk?version=4.0"
+import GLib from "gi://GLib"
+import Gio from "gi://Gio"
+import Cairo from "gi://cairo"
+
+// Palette tokens are CSS variables and Cairo cannot read them, so the accent and
+// the surface's mode arrive through the kit's appearance seam — the bundle registers
+// its own source (the shell registers ThemeManager). See ./appearance.ts.
+import { kitAppearance } from "./appearance"
+import { bindWhileRealized } from "./lifetime"
+import { safeDisconnect } from "./platform/signals"
+import { hexToFloatRgb } from "./platform/accent"
+import { cairoDraw } from "./platform/cairo-draw"
+import { INK_DARK_CLASS } from "./platform/material"
+
+const TRACK_H  = 6   // px — track thickness
+const THUMB_R  = 9   // px — thumb radius (visual)
+
+// Rounded-rectangle (capsule) path.
+function roundRectPath(cr: any, x: number, y: number, w: number, h: number, r: number) {
+    if (w <= 0 || h <= 0) return
+    r = Math.min(r, w / 2, h / 2)
+    cr.newPath()
+    cr.arc(x + w - r, y + r,     r, -Math.PI / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0,            Math.PI / 2)
+    cr.arc(x + r,     y + h - r, r, Math.PI / 2,  Math.PI)
+    cr.arc(x + r,     y + r,     r, Math.PI,      1.5 * Math.PI)
+    cr.closePath()
+}
+
+// Capsule spanning [m0,m1] along the main axis, centered on the cross axis (cc).
+function capsuleMain(cr: any, m0: number, m1: number, cc: number, t: number, horiz: boolean) {
+    const r = t / 2
+    const len = Math.max(0, m1 - m0)
+    if (horiz) roundRectPath(cr, m0, cc - r, len, t, r)
+    else       roundRectPath(cr, cc - r, m0, t, len, r)
+}
+
+export type SliderOrientation = "horizontal" | "vertical"
+
+export interface SliderOpts {
+    min?: number
+    max?: number
+    value: number
+    step?: number
+    /**
+     * Snap the thumb (and therefore the value and the label) to multiples of `step`
+     * instead of gliding freely — detents.
+     *
+     * Use it when the underlying thing is COARSER than the pixels the thumb can
+     * travel, so a free glide would offer precision the system cannot deliver and
+     * most positions would be indistinguishable from their neighbours. The
+     * accessibility text scale is the case that motivated it: font rendering hints
+     * glyph advances to whole pixels, so measured, only ~half of its 0.01 steps
+     * changed anything on screen while all of them moved the number. Snapping to
+     * 0.05 makes every position the user can stop at do something.
+     */
+    snapToStep?: boolean
+    orientation?: SliderOrientation
+    /** Draw the circular thumb (default true). false = bar/fill only. */
+    thumb?: boolean
+    /** Draw the track background behind the fill (default true). false = fill only,
+     *  letting the host widget's own background show through the unfilled part. */
+    track?: boolean
+    /** Paint the accent fill in this DrawingArea (default true). false = draw
+     *  nothing at all here — purely an interactive hit-region (drag/scroll/click)
+     *  — because a host that owns its own background paints the fill itself (the
+     *  CC gauge tiles: BaseIsland's getFill, one continuous shape/border instead
+     *  of a separate inner fill layer — see makeVerticalFillTile). */
+    paintFill?: boolean
+    /** The fill's colour; the accent when omitted. The CC's sliders fill with
+     *  `ON_WHITE`, as its tiles that are on do (`makeHSliderTile`). */
+    fillColor?: { r: number, g: number, b: number }
+    onChange: (v: number) => void
+    onValueChanged?: (v: number) => void   // every change (for label sync)
+    onExtChange?: (cb: (v: number) => void) => (() => void)
+    debounce?: number
+    /** Commit onChange only when the interaction ends (drag release / scroll). */
+    commitOnRelease?: boolean
+    cssClasses?: string[]
+    /** Main-axis size request (width for horizontal, height for vertical). */
+    length?: number
+    trackH?: number
+    thumbR?: number
+}
+
+/**
+ * makeSlider — the ONE slider, for any Veltrix window (Cairo-drawn, horizontal or
+ * vertical). Input is a custom GestureDrag + scroll (NOT a Gtk.Scale), so:
+ *   • clicking the track jumps to that position,
+ *   • grabbing the thumb never warps it (the old Gtk.Scale bug),
+ *   • scroll adjusts by one step,
+ *   • the thumb goes translucent while pressed.
+ * Fill and thumb are drawn together, so they can never visually separate.
+ */
+export function makeSlider(opts: SliderOpts): Gtk.Widget {
+    const { min = 0, max = 100, value, onChange, onExtChange, debounce = 0, commitOnRelease = false } = opts
+    const horiz = (opts.orientation ?? "horizontal") !== "vertical"
+    const thumb = opts.thumb ?? true
+    const drawTrack = opts.track ?? true
+    const paintFill = opts.paintFill ?? true
+    const trackH = opts.trackH ?? TRACK_H
+    const thumbR = opts.thumbR ?? THUMB_R
+    const step = opts.step ?? (max - min) / 20
+    const range = (max - min) || 1
+    const crossMin = Math.max(thumb ? thumbR * 2 : trackH, 20)   // hit-area thickness
+
+    let frac = Math.max(0, Math.min(1, (value - min) / range))
+    let pressed = false
+    const valueOf = () => min + frac * range
+
+    const da = new Gtk.DrawingArea({
+        can_target: true,
+        focusable: true,
+    })
+    if (horiz) {
+        da.hexpand = true; da.halign = Gtk.Align.FILL; da.valign = Gtk.Align.CENTER
+        da.height_request = crossMin
+        if (opts.length !== undefined) da.width_request = opts.length
+    } else {
+        da.vexpand = true; da.valign = Gtk.Align.FILL; da.halign = Gtk.Align.CENTER
+        da.width_request = crossMin
+        if (opts.length !== undefined) da.height_request = opts.length
+    }
+    if (opts.cssClasses?.length) opts.cssClasses.forEach(c => da.add_css_class(c))
+
+    // ── Geometry helpers (use current allocation) ───────────────────────────────
+    // With a thumb, inset the track by the thumb radius so the thumb stays inside the
+    // widget at the ends. Thumbless (capsule), the bar spans the full
+    // length with rounded caps.
+    const pad = thumb ? thumbR : 0
+    const mainLen = () => horiz ? da.get_width() : da.get_height()
+    const track   = () => Math.max(1, mainLen() - 2 * pad)
+    const fracToMain = (f: number) => horiz ? pad + f * track() : pad + (1 - f) * track()
+    const posToFrac  = (p: number) => {
+        const pf = Math.max(0, Math.min(1, (p - pad) / track()))
+        return horiz ? pf : 1 - pf
+    }
+
+    // ── Draw ────────────────────────────────────────────────────────────────────
+    da.set_draw_func(cairoDraw((_: any, cr: any, w: number, h: number) => {
+        if (w <= 0 || h <= 0) return
+        const L = horiz ? w : h
+        const cc = (horiz ? h : w) / 2
+        const trk = L - 2 * pad
+        if (trk <= 0) return
+        const tMain = fracToMain(frac)
+
+        // Track (skipped when track:false — the host widget's background shows through)
+        if (drawTrack) {
+            // Follow the surface skin, not the global mode: a slider in a light-pinned
+            // CC/system-menu over a dark system needs a dark track, not a white one.
+            const dark = kitAppearance().surfaceIsDark(da)
+            const base = dark ? 1 : 0
+            cr.setSourceRGBA(base, base, base, dark ? 0.18 : 0.14)
+            capsuleMain(cr, pad, L - pad, cc, trackH, horiz); cr.fill()
+        }
+
+        // Fill (accent, or `fillColor`) — skipped when a host paints it instead (paintFill:false;
+        // see makeVerticalFillTile, whose gauge fill now lives in BaseIsland).
+        if (paintFill) {
+            const { r: ar, g: ag, b: ab } = opts.fillColor ?? hexToFloatRgb(kitAppearance().accent())
+            cr.setSourceRGBA(ar, ag, ab, 0.9)
+            if (thumb) {
+                // Capsule whose rounded end meets the thumb.
+                if (horiz) capsuleMain(cr, pad, tMain, cc, trackH, true)
+                else       capsuleMain(cr, tMain, L - pad, cc, trackH, false)
+                cr.fill()
+            } else {
+                // Thumbless capsule: clip to the track shape and fill a rect so the fill's
+                // far end follows the capsule's rounded cap (instead of going flat when short).
+                // Only reachable when paintFill isn't turned off — makeVerticalFillTile, the
+                // sole thumb:false caller, always sets paintFill:false (its gauge fill now
+                // lives in BaseIsland instead, see getFill), so this path — gloss included —
+                // is currently dormant, kept for any future thumbless caller that DOES want
+                // this DrawingArea to own its own fill.
+                cr.save()
+                capsuleMain(cr, pad, L - pad, cc, trackH, horiz)
+                cr.clip()
+                const r = trackH / 2
+                const fx = horiz ? pad          : cc - r
+                const fy = horiz ? cc - r       : tMain
+                const fw = horiz ? tMain - pad  : trackH
+                const fh = horiz ? trackH       : (L - pad) - tMain
+                cr.rectangle(fx, fy, fw, fh)
+                cr.fill()
+
+                // Specular sheen on the fill's own surface — same "glass catches light"
+                // language as drawSquircle's gloss (bright top rim, faint bottom rim), just
+                // as a soft wash over the visible fill rect instead of a stroke along a
+                // curve, since the fill's top edge is the value line, not a fixed curve.
+                const rimTop = new Cairo.LinearGradient(0, fy, 0, fy + fh * 0.5)
+                rimTop.addColorStopRGBA(0, 1, 1, 1, 0.30)
+                rimTop.addColorStopRGBA(1, 1, 1, 1, 0.0)
+                cr.setSource(rimTop)
+                cr.rectangle(fx, fy, fw, fh * 0.5)
+                cr.fill()
+
+                const rimBot = new Cairo.LinearGradient(0, fy + fh, 0, fy + fh * 0.85)
+                rimBot.addColorStopRGBA(0, 1, 1, 1, 0.12)
+                rimBot.addColorStopRGBA(1, 1, 1, 1, 0.0)
+                cr.setSource(rimBot)
+                cr.rectangle(fx, fy + fh * 0.85, fw, fh * 0.15)
+                cr.fill()
+
+                cr.restore()
+            }
+        }
+
+        // Thumb
+        if (thumb) {
+            const tr = thumbR - 1
+            const cx = horiz ? tMain : cc
+            const cy = horiz ? cc : tMain
+            cr.setSourceRGBA(0, 0, 0, 0.25); cr.newPath(); cr.arc(cx, cy + 1, tr, 0, 2 * Math.PI); cr.fill()
+            cr.setSourceRGBA(1, 1, 1, pressed ? 0.55 : 0.95); cr.newPath(); cr.arc(cx, cy, tr, 0, 2 * Math.PI); cr.fill()
+            // Keyboard focus: `veltrix-focus-ring`'s 2px accent on the thumb's own edge.
+            // A DrawingArea gets no ring from CSS (no rule reaches it, and our processes
+            // run on no GTK theme), so without this the focus was THERE and invisible.
+            // On the edge, not outside it: the widget is exactly the thumb's diameter
+            // across, and outside it nothing would be drawn.
+            const flags = da.get_state_flags()
+            if ((flags & Gtk.StateFlags.FOCUSED) && (flags & Gtk.StateFlags.FOCUS_VISIBLE)) {
+                const { r: ar, g: ag, b: ab } = hexToFloatRgb(kitAppearance().accent())
+                cr.setSourceRGBA(ar, ag, ab, 1); cr.setLineWidth(2)
+                cr.newPath(); cr.arc(cx, cy, tr - 1, 0, 2 * Math.PI); cr.stroke()
+            }
+        }
+    }))
+    da.connect("state-flags-changed", () => da.queue_draw())
+
+    // ── Commit machinery ────────────────────────────────────────────────────────
+    let pendingId = 0
+    const triggerChange = () => {
+        if (debounce > 0) {
+            if (pendingId) GLib.source_remove(pendingId)
+            pendingId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, debounce, () => {
+                onChange(valueOf()); pendingId = 0; return GLib.SOURCE_REMOVE
+            })
+        } else {
+            if (!pendingId) {
+                pendingId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                    onChange(valueOf()); pendingId = 0; return GLib.SOURCE_REMOVE
+                })
+            }
+        }
+    }
+    const commit = () => {
+        if (pendingId) { GLib.source_remove(pendingId); pendingId = 0 }
+        onChange(valueOf())
+    }
+    // Apply a fraction from interaction: redraw + label, and (unless release-commit)
+    // push the debounced onChange.
+    const applyFrac = (f: number) => {
+        let nf = Math.max(0, Math.min(1, f))
+        if (opts.snapToStep) {
+            // Quantize the FRACTION, so thumb, label and committed value can never
+            // disagree — they are all derived from it.
+            const q = step / range
+            nf = Math.max(0, Math.min(1, Math.round(nf / q) * q))
+        }
+        if (nf === frac) return
+        frac = nf
+        da.queue_draw()
+        opts.onValueChanged?.(valueOf())
+        if (!commitOnRelease) triggerChange()
+    }
+
+    // ── Pointer input — grab the thumb without warping; click track to jump ──────
+    const drag = new Gtk.GestureDrag()
+    let startMain = 0
+    let grabOffset = 0
+    drag.connect("drag-begin", (_g: any, sx: number, sy: number) => {
+        // Claim the sequence so the press/release doesn't bubble to a parent click
+        // handler (e.g. a CC widget tile that would open its detail on release).
+        _g.set_state(Gtk.EventSequenceState.CLAIMED)
+        startMain = horiz ? sx : sy
+        const tPos = fracToMain(frac)
+        if (thumb && Math.abs(startMain - tPos) <= thumbR + 3) {
+            grabOffset = startMain - tPos          // grabbed the thumb → keep it put
+        } else {
+            grabOffset = 0
+            applyFrac(posToFrac(startMain))        // clicked the track → jump there
+        }
+        pressed = true; da.queue_draw()
+    })
+    drag.connect("drag-update", (_g: any, ox: number, oy: number) => {
+        const off = horiz ? ox : oy
+        applyFrac(posToFrac(startMain + off - grabOffset))
+    })
+    drag.connect("drag-end", () => { pressed = false; commit(); da.queue_draw() })
+    da.add_controller(drag)
+
+    // Scroll to adjust (up = increase, both axes).
+    const scroll = new Gtk.EventControllerScroll({ flags: Gtk.EventControllerScrollFlags.BOTH_AXES })
+    scroll.connect("scroll", (_c: any, dx: number, dy: number) => {
+        const d = dy !== 0 ? dy : dx
+        if (d === 0) return false
+        applyFrac(frac + (d < 0 ? 1 : -1) * (step / range))
+        commit()
+        return true
+    })
+    da.add_controller(scroll)
+
+    // Keyboard. Only the arrows ALONG the slider move it; the two across it are left
+    // to move the focus. Taking all four (as this did) made a slider a trap: in the
+    // CC grid nothing but Tab could leave it, and the owner found Esc — which closes
+    // the whole panel — to be the only way out (2026-09-27).
+    const onKey = (keyval: number): boolean => {
+        let nf = frac
+        const s = step / range
+        const down = horiz ? 0xff51 : 0xff54, up = horiz ? 0xff53 : 0xff52   // Left/Right · Down/Up
+        if (keyval === down) nf = frac - s
+        else if (keyval === up) nf = frac + s
+        else if (keyval === 0xff50) nf = 0                                  // Home
+        else if (keyval === 0xff57) nf = 1                                  // End
+        else return false
+        applyFrac(nf); commit()
+        return true
+    }
+    sliderKeys.set(da, onKey)
+    const keys = new Gtk.EventControllerKey()
+    keys.connect("key-pressed", (_c: any, keyval: number) => onKey(keyval))
+    da.add_controller(keys)
+
+    // Accent / mode change → redraw.
+    const unsubscribeAppearance = kitAppearance().onChange(() => { if (da.get_mapped()) da.queue_draw() })
+    da.connect("unrealize", unsubscribeAppearance)
+
+    // External value updates (ignored while the user is dragging).
+    //
+    // 🔑 `bindWhileRealized`, not a one-shot subscribe + cleanup on "unrealize".
+    // Cleaning up without re-subscribing is a subscription that survives exactly one
+    // hide: a cached Settings page unrealizes when you navigate away, the cleanup
+    // runs, and every later visit shows a slider that no longer tracks anything.
+    // The composed toggle and dropdown rows were moved onto this helper on
+    // 2026-08-16 (`veltrix-kit/rows.ts`); the slider was left behind and is caught up
+    // here. Callers whose `onExtChange` also PRIMES the value (calling `cb` once
+    // before connecting) therefore re-read on every realize, which is the point.
+    if (onExtChange) {
+        bindWhileRealized(da, () => onExtChange((v: number) => {
+            if (pressed) return
+            const f = Math.max(0, Math.min(1, (v - min) / range))
+            if (Math.abs(f - frac) > 0.001) { frac = f; da.queue_draw(); opts.onValueChanged?.(valueOf()) }
+        }))
+    }
+
+    // Prime the label.
+    opts.onValueChanged?.(valueOf())
+
+    return da
+}
+
+/**
+ * makeVerticalFillTile — the 1×2 (TALL) CC slider tile. The gauge fill itself is
+ * painted by the HOST island (BaseIsland's getFill, see the widget's AtomicWidget —
+ * Sliders.tsx/brightness.ts), not by this component: one continuous shape/border for
+ * both the empty (glass) and filled (accent) portions, matching how an "on" toggle
+ * tile's whole capsule fills — instead of a separately-drawn inner fill sitting inside
+ * the island's own border with a visible seam between the two. This function now just
+ * supplies the interactive surface (drag/scroll/click-to-jump, `paintFill:false`) plus
+ * the percentage label overlaid at the top and the icon at the bottom. Shared by
+ * volume + brightness.
+ *
+ * The bottom icon is sized/placed to land exactly where a 1×1 tile's icon would —
+ * same 28px glyph, centred UNIT/2 (40px) above the tile's true bottom edge — so a
+ * TALL tile reads as "a 1×1 icon with a slider grown on top", not a smaller one of
+ * its own. margin_bottom math: 40 (UNIT/2) − 4 (BaseIsland TALL padding, the gap
+ * between this overlay and the tile's real edge) − 14 (half the 28px glyph) = 22.
+ * `icon` accepts a getter + subscribe so a level-dependent icon (volume) stays live.
+ */
+/** The slider's key handling, for a HOST that is the keyboard stop instead of the
+ *  slider: a fill tile draws nothing of its own (its host tile paints the gauge), so
+ *  the ring and the stop belong to the tile, which passes its keys here. Registered
+ *  for every slider and for a fill tile's root; `undefined` for anything else. */
+const sliderKeys = new WeakMap<Gtk.Widget, (keyval: number) => boolean>()
+export const sliderKeyHandler = (w: Gtk.Widget): ((keyval: number) => boolean) | undefined => sliderKeys.get(w)
+
+export function makeVerticalFillTile(
+    icon: Gio.FileIcon | (() => Gio.FileIcon),
+    opts: SliderOpts,
+    iconSubscribe?: (sync: () => void) => (() => void),
+): Gtk.Widget {
+    const getIcon = typeof icon === "function" ? icon : () => icon
+
+    const valueLabel = new Gtk.Label({
+        css_classes: ["slider-fill-value"],
+        halign: Gtk.Align.CENTER, valign: Gtk.Align.START, margin_top: 12,
+    })
+    valueLabel.set_can_target(false)
+
+    const iconImg = new Gtk.Image({
+        gicon: getIcon(), pixel_size: 28, css_classes: ["nd-icon", "slider-fill-icon"],
+        halign: Gtk.Align.CENTER, valign: Gtk.Align.END, margin_bottom: 24,
+    })
+    iconImg.set_can_target(false)
+    if (iconSubscribe) {
+        // 🔑 Same rule as the VALUE a few lines down, and for the same reason: a CC
+        // tile is built ONCE, at shell start, so `getIcon()` above runs at a moment
+        // when the service it reads may still be empty — and a one-shot
+        // `iconSubscribe(...)` + cleanup on "unrealize" is a subscription that
+        // survives exactly one hide.
+        //
+        // This half was missed when the value was fixed (0.7.1's volume tile read
+        // 0 %), and it stayed invisible only because AstalWp handed out a permanent
+        // endpoint object: the subscription was live even when built too early, so
+        // the icon corrected itself on the first change. Against a service that
+        // answers null before its roster arrives — ours does — the same code froze
+        // the volume tile on the MUTED glyph for the whole session, with the gauge
+        // beside it correctly reading 86 %.
+        bindWhileRealized(iconImg, () => {
+            iconImg.gicon = getIcon()
+            return iconSubscribe(() => { iconImg.gicon = getIcon() })
+        })
+    }
+
+    // The fill is WHITE (the host's, `ON_WHITE`), so what it covers turns dark: the icon at
+    // the foot once the fill passes its middle, the value at the head at 100 %: they take
+    // `INK_DARK_CLASS`, which each bundle gives the light skin's ink (as on a pane of glass
+    // over a white backdrop).
+    const overlay = new Gtk.Overlay({ hexpand: true, vexpand: true })
+    let lastValue = opts.value
+    const inkOverFill = (v: number) => {
+        lastValue = v
+        const h = overlay.get_height()
+        if (h <= 0) return
+        const top = h * Math.max(0, Math.min(100, v)) / 100
+        const cover = (w: Gtk.Widget, middleFromFoot: number) => {
+            if (top >= middleFromFoot) w.add_css_class(INK_DARK_CLASS)
+            else w.remove_css_class(INK_DARK_CLASS)
+        }
+        cover(iconImg, iconImg.margin_bottom + iconImg.pixel_size / 2)
+        cover(valueLabel, h - valueLabel.margin_top - valueLabel.get_height() / 2)
+    }
+
+    const slider = makeSlider({
+        ...opts,
+        orientation: "vertical",
+        thumb: false,
+        track: false,            // no dark track — the tile's glass shows through
+        paintFill: false,        // the host BaseIsland paints the gauge fill (getFill) as
+                                  // ONE shape/border with the rest of the tile — see the
+                                  // widget's AtomicWidget.getFill (Sliders.tsx/brightness.ts).
+                                  // This DrawingArea is now purely the interactive hit-region.
+
+        // Inner width of the 1×2 cell: UNIT(80) − 2× BaseIsland's TALL padding(4). Still
+        // sizes the hit-region's width (crossMin/width_request) even with nothing painted,
+        // so drag/click-to-jump spans the visible capsule, not a thin sliver.
+        trackH: opts.trackH ?? 72,
+        onValueChanged: (v) => { valueLabel.label = `${Math.round(v)}%`; inkOverFill(v); opts.onValueChanged?.(v) },
+    })
+    slider.hexpand = true
+    slider.vexpand = true
+    // Not a stop of its own: the fill IS the tile, so the tile is the stop, wears the
+    // ring along its own shape and hands ↑/↓ here (see sliderKeyHandler). Two stops at
+    // one spot — the tile, then an invisible hit-region inside it — was what trapped
+    // the CC's volume tile.
+    slider.focusable = false
+
+    overlay.set_child(slider)
+    overlay.add_overlay(valueLabel)
+    overlay.add_overlay(iconImg)
+    // Its height is only known once it is laid out, and that is the moment to look: the
+    // slider fills the overlay, so its `resize` comes with the overlay's height and BEFORE
+    // the frame is drawn. Later than that is too late on the CC's first showing — its open
+    // animation draws what the first frame had (measured, 2026-10-12: a check on the first
+    // tick after map left the icon white on the white until the CC reopened).
+    ;(slider as Gtk.DrawingArea).connect("resize", () => inkOverFill(lastValue))
+    const keysOf = sliderKeys.get(slider)
+    if (keysOf) sliderKeys.set(overlay, keysOf)
+    return overlay
+}
+
+/** Horizontal convenience wrapper (back-compat: width_request → length). */
+export function makeHSlider(opts: Omit<SliderOpts, "orientation" | "length"> & { width_request?: number }): Gtk.Widget {
+    const { width_request, ...rest } = opts
+    return makeSlider({ ...rest, orientation: "horizontal", length: width_request })
+}
+
+/** Volume slider bound to an audio endpoint/stream (`target` has a 0–1 `volume`).
+ *  Fill + thumb are drawn together (no native Gtk.Scale highlight/slider split) and
+ *  the sync guards stop the WirePlumber feedback from fighting the drag. Used by the
+ *  Audio settings page, the CC volume detail, and the bar volume panel — they all had
+ *  their own near-identical copy of this wrapper. `onExternal` fires on an outside
+ *  volume change (e.g. to refresh a mute icon). */
+export function makeVolumeSlider(target: any, opts: {
+    onValueChanged?: (v: number) => void
+    onExternal?: () => void
+    cssClasses?: string[]
+    width_request?: number
+} = {}): Gtk.Widget {
+    return makeHSlider({
+        min: 0, max: 100,
+        value: Math.round((target?.volume ?? 0) * 100),
+        onChange: (v) => { if (target) target.volume = v / 100 },
+        onValueChanged: (v) => opts.onValueChanged?.(v),
+        onExtChange: (cb) => {
+            if (!target?.connect) return () => {}
+            // PRIMES before connecting. `value` above is read once, when the widget is
+            // built, and this hook runs again on every realize (bindWhileRealized), so
+            // reading here is what makes a re-opened panel show the CURRENT volume
+            // rather than the one it was built with — and what covers an endpoint whose
+            // properties the audio graph had not populated yet at build time. Without it the
+            // widget only ever learns about volume changes that happen while it is on
+            // screen; the Control Center's own tile shipped that way in 0.7.1 and read
+            // 0% from login (see surfaces/control-center/Sliders.tsx).
+            const sync = () => { cb((target.volume ?? 0) * 100); opts.onExternal?.() }
+            sync()
+            const id = target.connect("notify::volume", sync)
+            return () => safeDisconnect(target, id)
+        },
+        debounce: 24,
+        cssClasses: opts.cssClasses,
+        width_request: opts.width_request,
+    })
+}

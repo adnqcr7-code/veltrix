@@ -1,0 +1,584 @@
+import { runSettingsAction } from "./SettingsErrors"
+import Gtk from "gi://Gtk?version=4.0"
+import Gio from "gi://Gio"
+import { VeltrixRow, VeltrixStackedRow, VeltrixList, VeltrixButton,
+         VeltrixToggleRow, VeltrixDropDownRow, VeltrixSliderRow, type VeltrixSliderRowOpts,
+         attachTooltip } from "../../../lib/veltrix-kit"
+import { t } from "../../core/i18n"
+import { enumOf, getConfigEntry } from "../../core/ConfigRegistry"
+import { currentUiIcon } from "../../core/Icons"
+import type { PageDecl, ItemDecl } from "./manifest"
+
+/**
+ * Shared UI helpers for Settings pages.
+ * All pages use the same listGroup / createRow / toggleRow / sliderRow / etc.
+ */
+
+// ── Subpage navigation ──────────────────────────────────────────────────────────
+// Settings is a single-child page swapper (see Settings.tsx). A page component
+// receives a SettingsNav so it can push a detail subpage (e.g. a Wi-Fi network's
+// info) into the same shell. The subpage's title rides in the window header as a
+// breadcrumb (`parentTitle › title`); return is via the breadcrumb parent or the
+// header back/forward capsule. One nav per Settings window (there is a Settings per
+// monitor), so it's passed in, never a module singleton.
+export interface SettingsNav {
+    /**
+     * Build + push a subpage, then navigate to it.
+     * @param id        unique & stable page key
+     * @param title     shown in the header breadcrumb
+     * @param parentId  page to return to (breadcrumb parent); usually the caller
+     * @param build     constructs the page widget (called fresh on each push)
+     */
+    pushSubpage: (opts: { id: string; title: string; parentId?: string; build: () => Gtk.Widget }) => void
+    /** Go back one step in history (same as the nav-capsule back button). */
+    goBack: () => void
+}
+
+// ── Page lifetime ─────────────────────────────────────────────────────────────
+/**
+ * `bindWhileRealized` moved to `veltrix-kit/lifetime.ts` (2026-08-16) because the
+ * kit's composed rows re-arm their external-sync through it. Re-exported here so
+ * Settings pages keep their import path; the explanation — why a cached page needs
+ * re-subscription rather than a one-shot cleanup — went with the implementation.
+ */
+import { bindWhileRealized } from "../../../lib/veltrix-kit"
+export { bindWhileRealized }
+
+// ── Search index ──────────────────────────────────────────────────────────────
+export interface SearchItem {
+    pageId: string
+    pageLabel: string
+    label: string
+    subtitle: string
+    /** "page" = the page itself as a destination; "row" = something on it.
+     *  Fifteen of the eighteen pages could not be found by typing their own name,
+     *  because the index only ever held rows — worst on Settings → Audio, whose
+     *  rows are sound cards and playing apps and are deliberately NOT indexed
+     *  (see `pages/Audio.tsx`: hardware state is not a setting). Indexing the page
+     *  as well is what GNOME does: you get the panel AND the preferences. */
+    kind?: "page" | "row"
+}
+
+let _searchIndex: SearchItem[] = []
+let _pageCtx = { id: "", label: "" }
+let _activePageRefresherId = ""
+/** pageId → live re-reads; see `onPageShown` below. */
+const _refreshers = new Map<string, Array<() => void>>()
+
+export const beginPage = (id: string, label: string) => { _pageCtx = { id, label } }
+export const endPage = () => { _pageCtx = { id: "", label: "" } }
+export const setPageRefresherScope = (id: string) => { _activePageRefresherId = id }
+export const clearPageRefresherScope = () => { _activePageRefresherId = "" }
+
+export const clearSearchIndex = () => {
+    _searchIndex = []
+    _pageCtx = { id: "", label: "" }
+    _activePageRefresherId = ""
+    _refreshers.clear()
+}
+export const getSearchIndex = (): SearchItem[] => [..._searchIndex]
+
+/** Register a page as a search destination in its own right. Called once per
+ *  top-level page from `Settings.tsx`, from the label the manifest declares — so a
+ *  page cannot be missing from search without also being missing from the sidebar. */
+export const indexPage = (id: string, label: string) => {
+    _searchIndex.push({ pageId: id, pageLabel: label, label, subtitle: "", kind: "page" })
+}
+
+/** Derive and register search index entries directly from a declarative preference page manifest. */
+export const indexPreferencePage = (page: PageDecl, pageLabel: string) => {
+    const indexItem = (item: ItemDecl) => {
+        if (typeof item === "string") {
+            const entry = getConfigEntry(item)
+            if (entry?.ui && entry.available?.() !== false) {
+                _searchIndex.push({
+                    pageId: page.id,
+                    pageLabel,
+                    label: t(entry.ui.i18n as any),
+                    subtitle: t(`${entry.ui.i18n}.desc` as any),
+                })
+            }
+        } else if ("custom" in item) {
+            _searchIndex.push({
+                pageId: page.id,
+                pageLabel,
+                label: t(item.i18n as any),
+                subtitle: t(`${item.i18n}.desc` as any),
+            })
+        } else if ("decoration" in item) {
+            // Visual decoration only — not indexed
+        } else if ("disclosure" in item) {
+            _searchIndex.push({
+                pageId: page.id,
+                pageLabel,
+                label: t(item.disclosure as any),
+                subtitle: "",
+            })
+            for (const subItem of item.items) {
+                indexItem(subItem)
+            }
+        } else if ("key" in item) {
+            const entry = getConfigEntry(item.key)
+            if (entry?.ui && entry.available?.() !== false) {
+                _searchIndex.push({
+                    pageId: page.id,
+                    pageLabel,
+                    label: t(entry.ui.i18n as any),
+                    subtitle: t(`${entry.ui.i18n}.desc` as any),
+                })
+            }
+        }
+    }
+
+    for (const group of (page.groups ?? [])) {
+        for (const item of (group.items ?? [])) {
+            indexItem(item)
+        }
+        for (const key of (group.reaches ?? [])) indexItem(key)
+    }
+}
+
+// ── Live re-reads ─────────────────────────────────────────────────────────────
+// Top-level pages are built ONCE (Settings.tsx caches them) and the window HIDES
+// on close, so a page body runs exactly one time per shell lifetime. Anything the
+// page SUBSCRIBED to keeps working; anything it merely ASKED — an `execAsync`, a
+// file read, a one-shot `powerprofilesctl get` — was answered once and then went
+// stale in silence, because a frozen value looks exactly like a correct one.
+//
+// This registers such a read against the page being built (the same `_pageCtx`
+// seam `createRow` indexes through, or `_activePageRefresherId` during preference
+// page construction), runs it immediately, and re-runs it whenever the page
+// becomes visible. Subpages need none of it: they are rebuilt on every push,
+// so neither scope being set is the correct no-op.
+//
+// ⚠️ NOT the same job as `bindWhileRealized`, and it is not covered by it. That
+// one re-arms on REALIZE, which fires when you navigate between pages — but
+// hiding the Settings window does NOT unrealize its pages (measured 2026-08-16:
+// close the window on Power, change the profile from a terminal, reopen → a
+// realize-bound read does not run and the page still shows the old profile).
+// Closing and reopening is the most common way a user returns to a page, so a
+// re-read hung off realize misses precisely the case it exists for. Use
+// `bindWhileRealized` for a SUBSCRIPTION whose lifetime must match the widget's
+// (it has something to dispose); use this for a QUESTION that has to be re-asked
+// (it has nothing to dispose).
+export const onPageShown = (read: () => void) => {
+    const id = _pageCtx.id || _activePageRefresherId
+    if (id) {
+        const list = _refreshers.get(id) ?? []
+        list.push(read)
+        _refreshers.set(id, list)
+    }
+    read()
+}
+
+
+export const runPageRefreshers = (pageId: string) => {
+    for (const read of _refreshers.get(pageId) ?? []) {
+        try { read() } catch (e) { console.error(`[Settings] refresh failed on ${pageId}:`, e) }
+    }
+}
+
+// ── Boxed List Group ──────────────────────────────────────────────────────────
+// Thin wrapper over the universal VeltrixList component. Settings-specific code
+// keeps its own entry point, but the actual list is the shared component.
+/** A settings group. `footer` prints dimmed prose under the card for the scope a
+ *  title cannot carry — e.g. WHICH agents a permission group governs (Settings →
+ *  AI). Per-row explanation belongs in the row subtitle, not here. */
+export const listGroup = (title: string, footer: string = "") => VeltrixList(title, [], footer)
+
+// ── Generic Row ───────────────────────────────────────────────────────────────
+// Universal VeltrixRow + the settings-only side effect (search-index registration).
+//
+// 🔑 This is the whole of what Settings adds to a row, and since 2026-08-16 it is
+// the ONLY thing it adds: the composed rows below build their control in the kit
+// and take this function as their `mkRow`. Registering is Settings'; building is
+// the kit's. Anything that builds rows OUTSIDE Settings (widgets/screenrecord.ts)
+// calls the kit directly and is simply never indexed — before, it went through
+// here and relied on `_pageCtx` happening to be empty.
+export const createRow = (label: string, subtitle: string, widget: Gtk.Widget, titleIcon?: Gtk.Widget, leadingIcon?: Gtk.Widget, footer?: Gtk.Widget) => {
+    if (_pageCtx.id) {
+        _searchIndex.push({ pageId: _pageCtx.id, pageLabel: _pageCtx.label, label, subtitle })
+    }
+    return VeltrixRow(label, subtitle, widget, [], titleIcon, leadingIcon, footer)
+}
+
+/** Same as createRow but with the control on its own full-width line underneath —
+ *  for entries + buttons that the trailing slot would squeeze. */
+export const createStackedRow = (label: string, subtitle: string, widget: Gtk.Widget) => {
+    if (_pageCtx.id) {
+        _searchIndex.push({ pageId: _pageCtx.id, pageLabel: _pageCtx.label, label, subtitle })
+    }
+    return VeltrixStackedRow(label, subtitle, widget)
+}
+
+// ── Composed rows: the kit builds, Settings registers ────────────────────────
+// Each of these is the kit's composed row with `createRow` handed in as its row
+// builder. The control, its callback wiring and the guarded external-sync all live
+// in `veltrix-kit/rows.ts`; what stays here is the one thing the kit must not know
+// about, the search index. Call-site signatures are unchanged.
+export const toggleRow = (
+    label: string,
+    subtitle: string,
+    init: boolean,
+    cb: (v: boolean) => void,
+    onExt?: (apply: (v: boolean) => void) => (() => void),
+) => VeltrixToggleRow(label, subtitle, init, cb, onExt, createRow)
+
+export const dropdownRow = (
+    label: string,
+    subtitle: string,
+    init: string,
+    opts: string[],
+    cb: (v: string, index?: number) => void,
+    onExt?: (apply: (v: string) => void) => (() => void),
+) => VeltrixDropDownRow(label, subtitle, init, opts, cb, onExt, createRow)
+
+export const sliderRow = (
+    label: string,
+    subtitle: string,
+    init: number,
+    min: number,
+    max: number,
+    cb: (v: number) => void,
+    opts: VeltrixSliderRowOpts = {},
+) => VeltrixSliderRow(label, subtitle, init, min, max, cb, opts, createRow)
+
+/**
+ * Declarative setting row: builds the row directly from the registered ConfigEntry.
+ * Replaces hand-rolled toggleRow/dropdownRow/sliderRow calls.
+ */
+export const settingRow = (key: string): Gtk.ListBoxRow => {
+    const entry = getConfigEntry(key)
+    if (!entry) {
+        throw new Error(`[settingRow] Unknown config key: "${key}" — must be registered in config-entries.ts`)
+    }
+    if (!entry.ui) {
+        throw new Error(`[settingRow] Config key "${key}" has no UI declaration (entry.ui is undefined)`)
+    }
+
+    const { ui } = entry
+    const label = t(ui.i18n as any)
+    const subtitle = t((ui.i18n + ".desc") as any)
+    const control = ui.control ?? (entry.type === "boolean" ? "toggle" : entry.type === "enum" ? "dropdown" : entry.type === "number" ? "slider" : undefined)
+
+    if (!control) {
+        throw new Error(`[settingRow] Cannot infer control type for config key "${key}" with type "${entry.type}"`)
+    }
+
+    switch (control) {
+        case "toggle": {
+            const init = Boolean(entry.get())
+            const cb = (v: boolean) => { void runSettingsAction(() => entry.set?.(v)) }
+            const onExt = entry.subscribe
+                ? (apply: (v: boolean) => void) => {
+                    return entry.subscribe!((v) => apply(Boolean(v)))
+                }
+                : undefined
+            return toggleRow(label, subtitle, init, cb, onExt)
+        }
+        case "dropdown": {
+            const values = [...(enumOf(entry) ?? [])]
+            const getOptLabel = (val: string): string => {
+                if (ui.optI18n) return ui.optI18n(val)
+                const optKey = `${ui.i18n}.opt.${val}`
+                const translated = t(optKey as any)
+                if (translated === optKey) {
+                    throw new Error(`[settingRow] Missing translation for option "${val}" with derived key "${optKey}" on config entry "${key}"`)
+                }
+                return translated
+            }
+            const labels = values.map(getOptLabel)
+            const currentVal = String(entry.get())
+            const currentIdx = values.indexOf(currentVal)
+            const initLabel = currentIdx >= 0 ? labels[currentIdx] : (ui.optI18n ? ui.optI18n(currentVal) : currentVal)
+
+            const cb = (_selectedLabel: string, index?: number) => {
+                let idx = index
+                if (idx === undefined || idx < 0 || idx >= values.length) {
+                    idx = labels.indexOf(_selectedLabel)
+                }
+                if (idx >= 0 && idx < values.length) {
+                    void runSettingsAction(() => entry.set?.(values[idx]))
+                }
+            }
+
+            const onExt = entry.subscribe
+                ? (apply: (label: string) => void) => {
+                    return entry.subscribe!((v) => {
+                        const valStr = String(v)
+                        const idx = values.indexOf(valStr)
+                        if (idx >= 0 && idx < labels.length) {
+                            apply(labels[idx])
+                        } else {
+                            apply(ui.optI18n ? ui.optI18n(valStr) : valStr)
+                        }
+                    })
+                }
+                : undefined
+
+            return dropdownRow(label, subtitle, initLabel, labels, cb, onExt)
+        }
+        case "slider": {
+            if (entry.min === undefined || entry.max === undefined) {
+                throw new Error(`[settingRow] Slider setting "${key}" requires both min and max bounds in ConfigEntry`)
+            }
+            const min = entry.min
+            const max = entry.max
+            const init = Number(entry.get())
+            const cb = (v: number) => { void runSettingsAction(() => entry.set?.(v)) }
+            const opts: VeltrixSliderRowOpts = { ...ui.slider }
+            // Stored once at registration — see currentUiIcon.
+            if (opts.icons) opts.icons = [currentUiIcon(opts.icons[0]), currentUiIcon(opts.icons[1])]
+            if (!opts.onExtChange && entry.subscribe) {
+                opts.onExtChange = (apply: (v: number) => void) => {
+                    return entry.subscribe!((v) => apply(Number(v)))
+                }
+            }
+            return sliderRow(label, subtitle, init, min, max, cb, opts)
+        }
+        case "preset": {
+            const presets = ui.presets ?? (enumOf(entry)?.map(Number) ?? [])
+            if (!presets.length) {
+                throw new Error(`[settingRow] Preset setting "${key}" requires ui.presets in ConfigEntry`)
+            }
+            const unit = ui.presetUnit ?? ui.slider?.unit ?? ""
+            const init = Number(entry.get())
+            const cb = (v: number) => { void runSettingsAction(() => entry.set?.(v)) }
+            const onExt = entry.subscribe
+                ? (apply: (v: number) => void) => {
+                    return entry.subscribe!((v) => apply(Number(v)))
+                }
+                : undefined
+            return presetRow(label, subtitle, presets, init, unit, cb, onExt)
+        }
+        case "segmented": {
+            const values = [...(enumOf(entry) ?? [])]
+            const getOptLabel = (val: string): string => {
+                if (ui.optI18n) return ui.optI18n(val)
+                const optKey = `${ui.i18n}.opt.${val}`
+                const translated = t(optKey as any)
+                if (translated === optKey) {
+                    throw new Error(`[settingRow] Missing translation for option "${val}" with derived key "${optKey}" on config entry "${key}"`)
+                }
+                return translated
+            }
+            const options = values.map(val => ({ label: getOptLabel(val), value: val }))
+            const currentVal = String(entry.get())
+            const cb = (v: string) => { void runSettingsAction(() => entry.set?.(v)) }
+            const onExt = entry.subscribe
+                ? (apply: (v: string) => void) => {
+                    return entry.subscribe!((v) => apply(String(v)))
+                }
+                : undefined
+            const seg = segmentedGroup(options, currentVal, cb, onExt)
+            return createRow(label, subtitle, seg)
+        }
+    }
+}
+
+// ── Segmented control ─────────────────────────────────────────────────────────
+/**
+ * The linked row of buttons where exactly ONE is selected — Dock size presets,
+ * for example. One implementation, because there were two and only
+ * one of them was right.
+ *
+ * ⚠️ **A segment is a `Gtk.Button`, never a `Gtk.ToggleButton`.** The deleted
+ * Gaming page built its own group out of ToggleButtons, and a ToggleButton that is already
+ * active turns OFF when clicked: the handler (`if (!btn.active) return`) then bailed
+ * out, leaving the group showing NO selection while a mode was still in force. A
+ * segmented control does not have an empty state — plain buttons plus the
+ * `.veltrix-btn--primary` class cannot express one.
+ *
+ * Re-clicking the current segment is a no-op rather than a second `cb`: picking
+ * what is already picked should not re-apply a wallpaper.
+ */
+export const segmentedGroup = <T,>(
+    options: Array<{ label: string; value: T }>,
+    init: T,
+    cb: (v: T) => void,
+    onExt?: (apply: (v: T) => void) => (() => void),
+): Gtk.Box => {
+    const box = new Gtk.Box({
+        spacing: 0,
+        homogeneous: true,
+        css_classes: ["settings-preset-group", "linked"],
+        valign: Gtk.Align.CENTER,
+    })
+
+    const segments: Array<{ btn: Gtk.Button; value: T }> = []
+    let current = init
+    const paint = () => segments.forEach(({ btn, value }) => {
+        if (value === current) btn.add_css_class("veltrix-btn--primary")
+        else btn.remove_css_class("veltrix-btn--primary")
+    })
+
+    options.forEach(({ label, value }) => {
+        const btn = new Gtk.Button({ label, css_classes: ["settings-preset-btn"] })
+        btn.connect("clicked", () => {
+            if (value === current) return
+            current = value
+            paint()
+            cb(value)
+        })
+        segments.push({ btn, value })
+        box.append(btn)
+    })
+    paint()
+
+    if (onExt) {
+        bindWhileRealized(box, () => onExt((newVal: T) => {
+            current = newVal
+            paint()
+        }))
+    }
+
+    return box
+}
+
+// ── Preset Button Row ─────────────────────────────────────────────────────────
+/** Numeric presets ("48px", "64px"…) as a segmented row. */
+export const presetRow = (
+    label: string,
+    subtitle: string,
+    presets: number[],
+    init: number,
+    unit: string,
+    cb: (v: number) => void,
+    onExt?: (apply: (v: number) => void) => (() => void),
+) => createRow(
+    label, subtitle,
+    segmentedGroup(presets.map(v => ({ label: `${v}${unit}`, value: v })), init, cb, onExt),
+)
+
+// ── Stacked-row field layout ──────────────────────────────────────────────────
+/**
+ * The line of action buttons that sits BENEATH a field in a stacked row,
+ * right-aligned, primary last.
+ *
+ * A field and its buttons side by side is the trailing-slot squeeze one level
+ * down: the entry gets whatever width the buttons leave, so it has to be pinned
+ * to a `width_chars` stub and the three read as one clump. Given a whole card's
+ * width, the field should take it and the actions should sit under it — which
+ * also puts the buttons in the same place on every row, instead of wherever the
+ * field's length happens to leave them.
+ */
+export const actionRow = (...actions: Gtk.Widget[]): Gtk.Box => {
+    const box = new Gtk.Box({ spacing: 8, halign: Gtk.Align.END })
+    for (const a of actions) box.append(a)
+    return box
+}
+
+/** Full-width field with its actions on their own line beneath — the control for
+ *  a `createStackedRow` whose value is an entry the user then acts on. */
+export const fieldWithActions = (field: Gtk.Widget, ...actions: Gtk.Widget[]): Gtk.Box => {
+    field.hexpand = true
+    const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 8 })
+    box.append(field)
+    box.append(actionRow(...actions))
+    return box
+}
+
+// ── Image Picker Row ──────────────────────────────────────────────────────────
+/**
+ * "Pick an image for this" as ONE row: current image leading, text in the middle,
+ * [Choose image…] [reset] trailing.
+ *
+ * The three-zone shape is the point. Both call sites used to hand-roll a
+ * `Gtk.Box` holding preview + both buttons and pass the whole thing as the
+ * TRAILING control, so a 24px thumbnail, a primary button and a secondary button
+ * shared one slot and the row read as one dense clump pushed against the right
+ * edge. `VeltrixRow` already separates leading icon / text / control — the rows
+ * just weren't using it. Nothing here is new layout machinery; it is the row
+ * vocabulary applied.
+ *
+ * It is also the de-duplication: Settings → Top bar (launcher icon) and
+ * Settings → Apps → app detail (per-app icon override) had byte-identical copies
+ * of the preview box, the two buttons and the `Gtk.FileDialog` with its SVG/PNG
+ * filters. Only "what the image IS" and "what picking one does" ever differed,
+ * which is exactly what the callbacks carry.
+ */
+/** The SVG/PNG file dialog every "choose an image" control opens, parented on the
+ *  window `from` lives in. `onPath` runs with the chosen path; cancelling runs nothing. */
+export function pickImageFile(from: Gtk.Widget, onPath: (path: string) => void) {
+    const fd = new Gtk.FileDialog({ title: t("settings.apps.dialog.select-icon"), modal: true })
+    const filter = new Gtk.FileFilter()
+    filter.add_mime_type("image/svg+xml")
+    filter.add_mime_type("image/png")
+    filter.set_name(t("settings.apps.filter.images"))
+    const filters = new Gio.ListStore({ item_type: Gtk.FileFilter.$gtype })
+    filters.append(filter)
+    fd.set_filters(filters)
+    fd.open(from.get_root() as Gtk.Window | null, null, (_: any, res: any) => {
+        try {
+            const path = fd.open_finish(res)?.get_path()
+            if (path) onPath(path)
+        } catch { /* cancelled */ }
+    })
+}
+
+export const imagePickerRow = (
+    label: string,
+    subtitle: string,
+    opts: {
+        /** Paint the current image into the preview. Called now and after every change. */
+        renderPreview: (img: Gtk.Image) => void
+        /** True while a custom image is set — drives the reset button's sensitivity. */
+        isCustom: () => boolean
+        /** Apply a chosen file. Return false to reject it (nothing is refreshed). */
+        onPick: (path: string) => boolean | void
+        /** Restore the built-in/default image. */
+        onReset: () => void
+        /** Label for the reset button ("Default", "Restore original"…). */
+        resetLabel: string
+        resetTooltip?: string
+        /** Leading preview size in px. 32 matches the app-identity leading icons
+         *  in Autostart/Widgets; the detail pages pass more when the image IS the
+         *  subject of the page. */
+        previewSize?: number
+    },
+): Gtk.ListBoxRow => {
+    const { renderPreview, isCustom, onPick, onReset, resetLabel, resetTooltip, previewSize = 32 } = opts
+
+    const preview = new Gtk.Image({ pixel_size: previewSize, valign: Gtk.Align.CENTER })
+    const resetBtn = VeltrixButton({
+        label: resetLabel, variant: "secondary", pill: true,
+        valign: Gtk.Align.CENTER, sensitive: isCustom(),
+    })
+    if (resetTooltip) attachTooltip(resetBtn, resetTooltip, { chrome: false })
+
+    const refresh = () => { renderPreview(preview); resetBtn.sensitive = isCustom() }
+    refresh()
+
+    resetBtn.connect("clicked", () => { onReset(); refresh() })
+
+    const chooseBtn = VeltrixButton({
+        label: t("settings.apps.choose-image"), variant: "primary", pill: true,
+        valign: Gtk.Align.CENTER,
+    })
+    chooseBtn.connect("clicked", () => pickImageFile(chooseBtn, (path) => {
+        if (onPick(path) === false) return
+        refresh()
+    }))
+
+    // Trailing slot holds ONLY the buttons now — the preview leads the row.
+    const buttons = new Gtk.Box({ spacing: 8, valign: Gtk.Align.CENTER, halign: Gtk.Align.END })
+    buttons.append(chooseBtn)
+    buttons.append(resetBtn)
+
+    return createRow(label, subtitle, buttons, undefined, preview)
+}
+
+// ── Static Info Label ─────────────────────────────────────────────────────────
+export const staticLabel = (text: any) => new Gtk.Label({
+    label: String(text ?? "---"),
+    css_classes: ["dimmed"],
+    halign: Gtk.Align.END,
+})
+
+// ── Page Root Box ─────────────────────────────────────────────────────────────
+export const pageBox = (...extraClasses: string[]) =>
+    new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        spacing: 24,
+        css_classes: ["settings-page", ...extraClasses],
+    })

@@ -1,0 +1,258 @@
+# nk-wayland: phase-0 transport
+
+`Window` owns the Wayland connection, synchronized layers, released-slot shm
+buffers, input, text-input-v3 and Veltrix's protocols. Logical coordinates enter
+and leave this API. `Frame.pixel_width/pixel_height` are the physical allocation
+at the current fractional output scale. The app supplies all paint, material and
+motion parameters; this crate has no visual or animation defaults.
+
+## Layers
+
+Check `window.supports_layers()`, then create a layer in `Configure` (or after it):
+
+```rust,ignore
+let a = window.create_layer((80, 60))?;
+window.set_position(a, 20., 40.)?;
+window.paint_layer(a, |frame| render_button(frame))?;
+// The event loop paints the parent and commits its dirty children with it.
+```
+
+Only independently moving content needs a layer. Each `LayerId` names a direct,
+synchronized `wl_subsurface` of this window. IDs are never reused and another
+window's ID is rejected. The 65th live layer is refused before any protocol
+request; destroying one frees its slot. Destroyed IDs are rejected, and events
+already queued for destroyed protocol objects are ignored.
+
+A layer has its own released-slot double buffer, following the parent's buffer
+rules. `paint_layer` invokes the painter only when explicitly called; transforms
+never repaint. It returns `false` without invoking it when both buffers are
+busy. Keep the content dirty and retry from `Application::idle` after dispatching
+releases. `set_layer_size` changes the next paint's logical size; old busy slots
+survive until released. Repaint after `Configure` when the output scale changes.
+A successful paint stages the buffer, viewport and damage for the next commit.
+Repeated paints before that commit reuse the pending slot. It becomes busy only
+when committed: an attachment superseded before its first commit gets no release.
+
+```rust,ignore
+window.set_transition(a, Property::Position, 7, Curve::Bezier {
+    x1: 0., y1: 0., x2: 1., y2: 1., duration_ms: 2000,
+})?;
+window.set_position(a, 300., 40.)?;
+window.commit()?; // sends child commits, ONE parent commit, then flushes
+// The app can now block. Hyalo keeps moving a; no frame callback is needed.
+```
+
+`set_transition` arms only the next change of the specified property. The app
+chooses serials and every spring/Bézier parameter. `set_position`, `set_scale`
+(uniform, about a layer-local anchor) and `set_opacity` set model values; Hyalo
+owns the presented transform, including retargeting and a spring's velocity.
+Invalid/non-finite/unrepresentable fixed values are rejected before requests.
+`set_layer_material` stages app-supplied shapes/material on the same child; its
+own glass is reserved for phase 2 by the contract.
+
+When parent pixels also change, call `redraw()` and let the event loop finish:
+its paint stages all dirty children just before committing the new parent
+buffer. An explicit `commit()` refuses a dirty parent so it cannot accidentally
+publish children with old parent pixels. If only layers changed, the event loop
+commits those without repainting the parent. All child buffers, material and
+transform requests land together with that parent commit.
+
+`Event::Layer { id, event }` carries pointer motion, scrolling, button presses
+and releases, leave, transition completion and cancellation. Pointer/button
+coordinates are **layer local**, already inverse-transformed by Hyalo; the app
+does no animation-aware hit-testing. Parent input keeps the existing `Event`
+variants. `LayerEvent::Done` preserves the serial and full presentation timestamp
+(seconds + nanoseconds). `Cancelled` preserves its serial; the XML gives that
+event no timestamp. No event is synthesized from a client timer.
+
+`control_commit_children_only` is an explicit fault-injection entry point for
+the phase-0 check, deliberately leaving the parent uncommitted. Applications use
+`commit()` or `redraw()`.
+
+See `phase0/README.md` for test 5's blocked-client, retarget and negative controls.
+
+## Text input inside a layer
+
+`set_layer_text_input(id, input)` takes the same `TextInput` payload as the
+root field, with `rect` in that layer's local logical coordinates. Keyboard and
+text-input-v3 focus remain on the root, and surrounding text/password handling
+are unchanged. The local rectangle goes only to the explicit layers-protocol
+association; it is never sent as a root-local standard cursor rectangle.
+
+The association is staged with the next parent commit. Hyalo updates both the
+IME popup position and its `text_input_rectangle` event using the layer's
+presented position and anchored scale every frame, including while the client
+is blocked. `set_text_input` clears it when a root field takes focus. Destroying
+the focused layer clears the association and disables its text input. The
+server also invalidates destroyed/replaced layer objects, restoring the latest
+standard root-local rectangle.
+
+This extends the unpublished v1 draft. Update Hyalo and the client together;
+there is no compatibility claim with a Hyalo built from an older copy of v1.
+
+
+D7 uses `Window::set_layer_blur(Blur, GradedPane[])` for a title whose backdrop is
+blurred without glass tone/rim; the same existing material-v1 requests carry each
+band's gradient. `Application::window_controls()` opts into the existing
+veltrix-window-controls-v1 before configure. Its layout arrives as
+`Event::ControlsLayout`, queried through `window_controls_layout`; the app places
+the box in root coordinates with `place_window_controls`, atomically with its next
+root commit. `window_action` supplies standard xdg fallback actions. No visual
+geometry, text or colour defaults live in the transport.
+
+## The pointer's shape
+
+On every `wl_pointer.enter` the transport asks for the plain arrow
+(`wp_cursor_shape_v1`, `Shape::Default`) when the compositor offers it. A surface
+that sets no cursor shows whatever the last client left there: a drag's "+" stayed
+over the dock after the drop. Without the protocol nothing is set, as before.
+
+## Client title interaction
+
+Root and layer Button events preserve the exact wl_pointer serial and timestamp,
+including when several events are drained before application dispatch.
+`Window::move_from_pointer_press(serial)` sends standard xdg_toplevel.move with
+that press serial and the window's seat; the general last serial is unsuitable
+for an interactive grab. Existing close/minimize/maximize actions are unchanged.
+
+#889's `ControlMaterial` is an explicit capsule transaction: base material/blur,
+ink tone, optional backdrop response, ink endpoints, stable state regions and
+non-overlapping coverage. `set_layer_control_material` validates the entire
+payload before sending requests and stages it with the synchronized parent. It
+sets response/ink tone before adding the pane. No visual defaults are supplied.
+Validation uses the wire's truncating fixed-point conversion for nonempty bounds,
+threshold ordering and coverage overlap; adjacent wire rectangles remain legal.
+The limits are eight washes and sixteen coverage rectangles. Keep zero-alpha
+exit regions with their stable IDs for compositor fading.
+
+
+## Standard popup host
+
+run_popup hosts a standard xdg_popup on the parent's Wayland connection.
+PopupPlacement anchors it in parent window geometry. Pass the initiating physical
+input serial for an explicit grab; Key::serial is None for repeats. Do not replace
+it with a configure serial. Accessibility activation can omit the explicit grab.
+Compositor dismissal is PopupDone; version3 reposition acknowledgement is
+PopupRepositioned(token). Older xdg-shell can open, but reposition returns an error.
+No D7 layer or new toplevel is substituted. Window Drop destroys roles/surfaces
+on callback failure; ordinary close filters queued modal input before parent use.
+
+This cut contains only the primitive and validation tests. The separate transport
+probe/headless harness and their exact-binary evidence follow independently.
+No new native popup role/grab/reposition/cleanup trace or keyboard/Orca, edge,
+fractional, presentation/performance acceptance is implied by compilation.
+
+While this nested loop is open, the parent does not repaint or service its
+configure, scale or appearance changes. Keep it bounded to short menus; a
+long-running child needs parent servicing that this primitive does not provide.
+
+## Popup diagnostic source (#915)
+
+`examples/popup-probe.rs`, `scripts/ci/nk-popup-check.py` and
+`check-popup-headless.sh` reuse the existing private widgets headless host.
+The bounded driver checks physical-key serial, popup role/grab, reposition token,
+outside dismissal and child-callback-error cleanup. Its toplevel substitution
+must complete setup and fail the role assertion; setup timeouts are errors.
+Evidence records source revision and binary hashes. A future run needs fresh
+logs and its exact rebuilt probe; historical fixed binaries prove their source only.
+This extraction was compiled and syntax checked, with no new native execution,
+control catch, protocol trace, focus/Orca or presentation acceptance.
+
+`Window::popup_geometry()` is None for toplevels and unconfigured popups. Once
+xdg_surface.configure is acknowledged it exposes `[x, y, width, height]` from the
+matching compositor popup configure, in parent window-geometry logical coordinates.
+Signed origins survive output constraint adjustments. Geometry/size update together;
+requesting reposition or receiving its token alone never predicts the new origin.
+Use this configured origin, rather than the requested anchor, for modal semantics.
+
+
+The popup probe also logs acknowledged geometry; nk-popup-check.py compares
+these rectangles with incoming popup.configure wire messages and checks None
+for toplevels. This diagnostic extraction is compile/static-only; its checker
+has not been executed on this head. Native baseline/control execution remains
+pending outside this local source split.
+
+
+`run_dialog_with_options(app, parent, options)` opens the same modal xdg toplevel
+as `run_dialog`, with caller title/size and the parent's connection/app-id. Empty
+sizes fail before opening. It shares the existing child teardown and queued-input
+cutoff. `run_dialog` remains the legacy error-dialog wrapper; application choosers
+should supply their translated title and layout constraints instead of inheriting
+its error-dialog defaults. Widget accessibility remains in the caller's provider.
+
+`Window::set_title(&str)` accepts runtime translations on a toplevel (NUL and
+popup/layer roles fail). A modal consumer can set it on Configure before painting
+its first frame; it need not leak a translated String into Options' static title.
+
+Window::portal_parent lazily requests xdg-foreign-v2 export of an actual configured
+xdg_toplevel, reusing this connection and queue. ForeignParent::Unsupported means
+no exporter global (D5 allows empty parent_window); Pending means wait; Ready is
+the compositor's opaque handle prefixed with wayland:. Empty handles are errors,
+popups are refused, and repeated polls retain one export until Window destruction.
+The export is destroyed before the surface role. No blocking roundtrip or own host.
+Format reference: https://flatpak.github.io/xdg-desktop-portal/docs/window-identifiers.html
+Unit tests cover capability/state logic; native export/portal-parenting is untested.
+
+## Activation tokens
+
+Window::activate(String) consumes the initiating client's opaque xdg_activation_v1
+ token on this connection and the existing root surface. Activation::Requested
+means sent, not acknowledged focus. Unsupported means the optional global is
+absent; no repaint or synthetic serial is used. Empty/NUL tokens, popup/destroyed
+targets and supported activation before a configured painted buffer are errors.
+The caller transfers the token and retires launch environment metadata; this
+side never reads the environment. To launch from a click, a layer root asks the
+compositor for one: `request_activation_token(serial, app_id)` returns
+`Result<TokenRequest, TokenFailure>` and later `Event::ActivationToken { request,
+token: ActivationToken }` (opaque; `as_str()` to pass on; Debug hides it) or
+`Event::ActivationTokenFailed` (SHELL-SURFACES.md §4).
+Capabilities.activation names exact optional global support. CPU dispatch/capability
+tests are not a native protocol/focus proof. Settings caller integration is separate.
+
+## Shell surfaces (#959 T1)
+
+The dock and the bar are layer roots: `run_layer(app, options, LayerSpec, wake,
+start)`, with `run` unchanged. `LayerSpec.output` is a single-use `LayerOutput` from
+`OutputWatch::bind_output`; `wake_channel()` lets another thread wake the loop
+(`Event::Wake`); `capture_window` returns `Result<CaptureId, CaptureFailure>` and one
+`Event::Capture` per capture. Contract, limits and evidence: `toolkit/SHELL-SURFACES.md`.
+
+## Bounded action-popup stack (#959 B)
+
+Long menus use `open_menu_popup(MenuPopupPlacement)` on the parent's queue,
+not `run_popup`'s exclusive nested loop. Below/Right positioners request
+flip/slide/resize and v3 reactive constraints. An optional host workarea hint
+caps requested dimensions; compositor configure remains authoritative, including
+when no hint was supplied. IDs/actual geometry/frame/buffer releases are shared
+with the existing nonmodal overlay transport. Only one nonmodal Suggestions
+popup OR a chain of at most sixteen menu popups can exist on a Window.
+
+Each child names the currently active popup as parent. `PopupEvent::Key` routes
+physical keys/repeats to the active menu; pointer events retain the hit level's
+local coordinates. `Repositioned(token)` acknowledges reposition requests.
+`menu_popup_origin(id)` sums acknowledged parent geometry, never requested
+anchors. `close_menu_popup(id)` retires that level and descendants topmost
+first; queued dead-ID events and dismissal input cannot act on the parent.
+Nonmodal Suggestions keeps its original API and keyboard behavior.
+
+`root_pointer_position()` reports the latest dispatched focus on the root as
+root-local logical coordinates, or `None` for a child layer/popup or no focus.
+This state follows raw pointer events even while a modal menu filters events
+delivered to the parent app. Read it **before** closing a popup; retiring its ID
+does not transform its last child-local coordinates into root coordinates.
+
+The app services popup events, paints only confirmed frames, updates its bounds
+hint on layout changes and restores a still-live trigger after close. Parent
+configure/repaint/idle and appearance polling continue. The parent is the
+window's real root: an xdg toplevel (`run`) or a layer root (`run_layer`, whose
+menus attach with `get_popup`; SHELL-SURFACES.md §3), never a hidden or disguised
+toplevel. Read CONTRACT.md and the bounded-menu-probe
+example for the retained action-menu/provider composition and private test.
+
+For an explicit assistive action on a layer root, without a Button/Key serial,
+`request_focused_activation_token` accepts only the root's current compositor
+keyboard-enter serial. The caller requests keyboard focus, waits for Focus(true),
+then requests the token and releases temporary focus. Keyboard leave or capability
+loss clears this proof. A popup's enter cannot become a root grant; synthetic
+serials remain rejected. B3.1 notification actions exercise this handshake on the
+private software compositor, alongside real pointer and keyboard serials.

@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Hyalo forwards one physical press. Never retry an uncertain hardware action.
+exec gdbus call --session --timeout 10 --dest org.veltrix.Session \
+    --object-path /org/veltrix/Power --method org.veltrix.Power1.PowerButtonPressed

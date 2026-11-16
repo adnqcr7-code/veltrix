@@ -1,0 +1,5 @@
+#!/bin/sh
+# Hyalo owns the Rust shell: bar, dock and panels in one process (#1017).
+# No preview key, TS fallback or second dock. systemd starts sessiond first.
+set -eu
+exec systemctl --user start veltrix-rust-shell.service

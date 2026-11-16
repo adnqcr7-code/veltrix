@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Veltrix Settings
+Comment=Configure your Veltrix environment
+Exec=veltrix-settings
+Icon=preferences-system
+Type=Application
+Categories=Settings;DesktopSettings;
+Keywords=settings;config;theme;appearance;
+StartupNotify=false

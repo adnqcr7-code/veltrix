@@ -1,0 +1,988 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-halal-audio — the Audio Filter helper (Settings → Audio Filter).
+# INTEGRATED BUILD (Adnan, Nov 12, 21:37–21:59 EST — see
+# docs/halal-audio-spec.md §12): playback-time, warn-don't-block, the
+# centre-channel vocal filter, and the word scan + whitelist.
+#
+# This file is the ORCHESTRATOR. It implements neither half itself:
+#   - VOCALS: Adnan's VoiceOnly tool (fork/voiceonly/voiceonly.py,
+#     vendored verbatim — see fork/voiceonly/VENDORED.md). Its Fast mode
+#     is the centre-channel trick: pan=mono|c0=0.5*c0+0.5*c1, highpass
+#     80 Hz, lowpass 12000 Hz, light compressor, volume 1.35. Imported
+#     directly (run_fast_filter) — no HTTP server, no duplicated filter
+#     graph. Demucs stays an explicit optional "best quality" mode for
+#     later, never the default, never installed by default.
+#   - WORDS: the parent's wordscan.py (fork/voiceonly/wordscan.py,
+#     vendored verbatim, handed over Nov 12, 21:57 EST — see
+#     fork/voiceonly/VENDORED.md). SHA-256 of the file bytes → whitelist
+#     first → faster-whisper tiny (CPU, int8, on-device) → blacklist.txt
+#     word-boundary matching → clean adds to the whitelist, flagged
+#     warns "This is haram" and is never whitelisted, never blocked.
+#     Invoked through its CLI contract (one JSON object on stdout); this
+#     file only adapts its paths (the veltrix whitelist/blacklist
+#     locations) and maps its verdicts to the helper's exit codes.
+#
+# Unprivileged: it only ever reads a file the user picked. No root, no
+# pkexec, no network at scan/play time, no audio ever leaves the machine.
+# The ONLY network step is `download-models` (explicit, see below).
+#
+#   veltrix-halal-audio check
+#       Print JSON capabilities: ffmpeg, VoiceOnly present?, wordscan
+#       path (or null), faster-whisper installed?, Whisper tiny model
+#       cached?, Demucs + its htdemucs weights cached?, blacklist path
+#       + word count (null + error when wordscan is absent), whitelist
+#       path + count.
+#   veltrix-halal-audio scan INPUT [--model tiny]
+#       Run the word scan through wordscan.py and print its JSON (plus
+#       `clean` and `flagged` for the UI). Exit 0 means the scan RAN —
+#       read `clean` (false = a blacklisted word was found; WARNING
+#       ONLY, nothing is blocked or muted here; the caller decides what
+#       to do). Exit 3 = the scan could not run (wordscan not installed,
+#       faster-whisper missing, model not downloaded, transcription
+#       failed — nothing is whitelisted on this path, ever). Deliberately
+#       NOT exit 4 on a flag: the Settings UI reads the flagged words
+#       from the JSON via execAsync, which discards stdout on a non-zero
+#       exit — a flagged exit code would hide exactly the words the
+#       warning must name. (`play` DOES exit 4 when it refuses to play a
+#       flagged song: the UI never needs stdout from that refusal.)
+#   veltrix-halal-audio play INPUT [--play-anyway] [--dry-run] [--model tiny]
+#       The playback path. (1) Run the word scan (wordscan checks its
+#       whitelist FIRST — a hit skips transcription and playback starts
+#       at once). If a blacklisted word is found, print the warning JSON
+#       ("This is haram") and EXIT 4 WITHOUT PLAYING, unless
+#       --play-anyway was given (the user's choice, their responsibility
+#       — warn, do NOT block). A flagged song is NEVER added to the
+#       whitelist (wordscan owns that rule). (2) Render the file through
+#       VoiceOnly Fast to a temporary MP3 (render-then-play: the filter
+#       graph lives in exactly one place, voiceonly.py), then play the
+#       rendered file with ffplay. The temp file is deleted afterwards,
+#       even on failure. --dry-run streams the rendered file at
+#       real-time speed to null instead of a speaker (no audio device
+#       needed — this is how playback is verified on a headless machine;
+#       real speaker playback is Dell-gated).
+#       FIRST PLAY IS NOT INSTANT: the scan runs before playback, and
+#       tiny Whisper on CPU costs real time (parent measured ~4.6 s for
+#       a short clip including model load; a 3-minute song on Dell-class
+#       CPU is unmeasured — the Dell number is still owed). The
+#       whitelist is what makes repeat plays instant (measured 0.06–
+#       0.075 s for a whitelist hit, no scan). The UI must say so; never
+#       claim instant first-play scanning.
+#   veltrix-halal-audio whitelist
+#       Print the whitelist (audio-hash -> {filename, added} — the
+#       wordscan format; the store is owned by wordscan.py, this verb
+#       only reads it).
+#   veltrix-halal-audio whitelist-clear
+#       Delete the whitelist file entirely.
+#   veltrix-halal-audio hash INPUT
+#       Print the audio hash (SHA-256 of the FILE BYTES — wordscan's
+#       semantics, so this agrees with the whitelist key; a renamed or
+#       moved copy hashes the same, a re-encode does not).
+#   veltrix-halal-audio process INPUT [OUTPUT] [--vocals auto|demucs|voiceonly]
+#       [--no-profanity] [--model tiny] [--blacklist PATH] [--force]
+#       The v1 offline export tool, KEPT as an optional "save a filtered
+#       copy" action — reshaped for the integration: vocal engine is
+#       VoiceOnly Fast by default (`auto` = voiceonly; Demucs only with
+#       an explicit --vocals demucs, and only when installed + weights
+#       cached — optional "best quality" mode for later, slow and heavy,
+#       never the default and never installed by default); the word scan
+#       runs on the ORIGINAL file through wordscan.py and is WARNED, not
+#       muted (the report lists `flagged` words; the output audio is the
+#       vocal-filtered track with nothing silenced). Output defaults to
+#       <stem>.filtered.<ext> next to the input. The input is NEVER
+#       overwritten, modified, or deleted. An existing output is refused
+#       unless --force is given.
+#   veltrix-halal-audio download-models
+#       THE ONLY network step in this feature, and it is explicit:
+#       install faster-whisper into the chosen interpreter first when
+#       it is missing (Nov 14 sweep #5 — on a fresh install it was
+#       installed nowhere, so this step always died on the import),
+#       then download the Whisper tiny model into the user's cache
+#       (small, ~75 MB — this is what the Settings "Install word
+#       scanner" action runs). Demucs weights are NOT fetched here
+#       (best-quality mode, later). `scan`/`play`/`process` never
+#       download anything: if a model is not cached, that stage is
+#       skipped/refused and the report says so.
+#
+# The whitelist (~/.local/share/veltrix/halal-audio/whitelist.json):
+# keyed by the AUDIO HASH — the SHA-256 of the file bytes — so the same
+# song is recognised even if renamed or moved. A re-encode is NOT
+# guaranteed to match (lossy codecs change bytes). Flagged songs are
+# NEVER stored. The store is owned by wordscan.py (plain write, not
+# atomic, no chmod — a known hardening note, see the v3 security
+# review); this helper only reads it and passes its path to wordscan.
+# The blacklist is the shipped blacklist.txt next to wordscan.py, unless
+# the user has placed their own at
+# ~/.local/share/veltrix/halal-audio/blacklist.txt (user-editable copy
+# wins — the shipped one is read-only under /usr/share).
+#
+# Honest limits (also stated in the Settings page, never hidden here):
+#   - The vocal filter is NOT vocal isolation: measured ~6.1 dB of
+#     separation between a centred tone (+2.3 dB out) and a side-only
+#     tone (−3.8 dB out) at equal input level, and drums/bass are
+#     centred too, so they stay. It is "mostly voice", never "only
+#     voice".
+#   - The scan only knows the words on its list (English, 35 words in
+#     the shipped blacklist). It cannot judge lyrics: a track with no
+#     listed words can still have impermissible themes, and a clean scan
+#     does not make a song halal. See spec §9/§12 — the halal critic
+#     rules on that claim, not this file. The user-facing name is "Audio
+#     Filter", not "Halal Audio".
+#   - No live/system-wide/PipeWire filtering, no Spotify filtering, no
+#     library processing: one file, one explicit run, one explicit play.
+#   - First-play scan latency is real (see `play` above); only whitelist
+#     hits are instant.
+#
+# Exit codes: 0 ok / scan ran (read `clean` in the scan JSON); 1 usage;
+# 2 missing input / missing dependency / refused (would overwrite, input
+# == output, bad output extension); 3 a processing step failed or the
+# scan could not run (message on stderr; a partial output, if any, is
+# removed); 4 `play` refused to play a flagged song (a warning, not an
+# error: re-run with --play-anyway if the user chooses to play it).
+# ─────────────────────────────────────────────────────────────────────────────
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+DEFAULT_MODEL = "tiny"
+ALLOWED_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus")
+# Internal _run calls are bounded (code review C3/S2): a hung ffmpeg /
+# demucs / transcription child must not run forever from the CLI.
+RUN_TIMEOUT = 1800
+
+
+# ── Module locations ─────────────────────────────────────────────────────────
+
+def _voiceonly_dir():
+    """Where the vendored VoiceOnly tool lives, in order: explicit env
+    (tests), installed location, repo checkout (dev installs run from
+    the tree). Returns the directory holding voiceonly.py, or None."""
+    env = os.environ.get("VELTRIX_HA_VOICEONLY_DIR")
+    if env and os.path.isfile(os.path.join(env, "voiceonly.py")):
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    for c in ("/usr/share/veltrix/voiceonly",
+              "/usr/local/share/veltrix/voiceonly",
+              os.path.join(here, "..", "voiceonly")):
+        if os.path.isfile(os.path.join(c, "voiceonly.py")):
+            return os.path.normpath(c)
+    return None
+
+
+_VOICEONLY = None
+_VOICEONLY_ERR = None
+
+
+def _load_voiceonly():
+    """Import the vendored voiceonly module (no side effects on import —
+    it only defines functions + a main guard). Returns (module, error).
+    The filter graph lives in exactly one place: voiceonly.py."""
+    global _VOICEONLY, _VOICEONLY_ERR
+    if _VOICEONLY is not None or _VOICEONLY_ERR is not None:
+        return _VOICEONLY, _VOICEONLY_ERR
+    d = _voiceonly_dir()
+    if d is None:
+        _VOICEONLY_ERR = ("VoiceOnly is not installed (expected "
+                          "voiceonly.py under /usr/share/veltrix/voiceonly)")
+        return None, _VOICEONLY_ERR
+    try:
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import voiceonly
+        _VOICEONLY = voiceonly
+    except (ImportError, OSError) as e:
+        _VOICEONLY_ERR = f"cannot import voiceonly from {d}: {e}"
+    return _VOICEONLY, _VOICEONLY_ERR
+
+
+def _find_wordscan():
+    """Where the word-scan module lives, in order: explicit env (tests),
+    installed location, repo checkout. Returns the wordscan.py path, or
+    None. There is NO workspace fallback in shipped code — the module is
+    part of the installed tree, and its absence is a fail-safe (exit 3),
+    never a silent skip."""
+    env = os.environ.get("VELTRIX_HA_WORDSCAN")
+    if env and os.path.isfile(env):
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    for c in ("/usr/share/veltrix/voiceonly/wordscan.py",
+              "/usr/local/share/veltrix/voiceonly/wordscan.py",
+              os.path.join(here, "..", "voiceonly", "wordscan.py")):
+        if os.path.isfile(c):
+            return os.path.normpath(c)
+    return None
+
+
+def _wordscan_python():
+    """Interpreters that may carry faster-whisper, in order: explicit env
+    (tests), the shared Veltrix venv (the install target for
+    faster-whisper), then this interpreter itself. Only `download-models`
+    installs anything (faster-whisper, into the chosen interpreter); this
+    listing only uses what is present."""
+    cands = []
+    env = os.environ.get("VELTRIX_HA_WORDSCAN_PYTHON")
+    if env:
+        cands.append(env)
+    cands.append(os.path.join(os.path.expanduser("~"), ".local", "share",
+                              "veltrix", "venv", "bin", "python"))
+    cands.append(sys.executable)
+    seen, out = set(), []
+    for c in cands:
+        if c and c not in seen and os.path.isfile(c):
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _veltrix_data_dir():
+    env = os.environ.get("VELTRIX_HA_WHITELIST_DIR")
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), ".local", "share",
+                        "veltrix", "halal-audio")
+
+
+def _whitelist_path():
+    env = os.environ.get("VELTRIX_HA_WHITELIST")
+    if env:
+        return env
+    return os.path.join(_veltrix_data_dir(), "whitelist.json")
+
+
+def _blacklist_path(explicit=None):
+    """The blacklist: explicit --blacklist, else the user's own copy in
+    the veltrix data dir if they placed one there, else the shipped one
+    next to wordscan.py. Returns (path, error_or_None)."""
+    if explicit:
+        return explicit, None
+    user = os.path.join(_veltrix_data_dir(), "blacklist.txt")
+    if os.path.isfile(user):
+        return user, None
+    ws = _find_wordscan()
+    if ws is None:
+        return None, "word scan module is not installed"
+    shipped = os.path.join(os.path.dirname(ws), "blacklist.txt")
+    if os.path.isfile(shipped):
+        return shipped, None
+    return None, f"blacklist not found next to wordscan.py ({shipped})"
+
+
+def _blacklist_count(path):
+    """Word/phrase count in a blacklist file (comments + blank lines
+    skipped) — a smoke number for `check`, nothing more."""
+    try:
+        n = 0
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    n += 1
+        return n, None
+    except OSError as e:
+        return 0, f"cannot read blacklist {path}: {e}"
+
+
+def _whitelist_load():
+    """Read-only view of the whitelist (wordscan's format:
+    {audio_hash: {filename, added}}). Returns {} when absent/unreadable
+    — a corrupt file is treated as empty, never as a reason to block
+    playback, but it is reported on stderr so the user knows. The store
+    is OWNED by wordscan.py; this helper never writes it."""
+    path = _whitelist_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print(f"veltrix-halal-audio: whitelist unreadable ({e}); "
+              "treating as empty", file=sys.stderr)
+        return {}
+    return {}
+
+
+# ── Small utilities ──────────────────────────────────────────────────────────
+
+def _run(cmd, timeout=RUN_TIMEOUT):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout, r.stderr
+
+
+def _ffmpeg():
+    return shutil.which(os.environ.get("VELTRIX_HA_FFMPEG", "ffmpeg"))
+
+
+def audio_hash(path):
+    """SHA-256 of the FILE BYTES — wordscan's semantics, so this agrees
+    with the whitelist key. A renamed or moved copy hashes the same; a
+    re-encode does not (lossy codecs change bytes). Returns (hex, error).
+    No ffmpeg needed: hashing bytes is fast even on long songs."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest(), None
+    except OSError as e:
+        return None, f"cannot read {path}: {e}"
+
+
+def _demucs_weights_cached():
+    """True when the htdemucs weights are already on disk, so invoking
+    demucs cannot trigger a download. Demucs 4.x fetches them from the
+    HuggingFace hub (`adefossez/HTDemucs`, `*.safetensors`, ~80 MB) into
+    the content-addressed blob store
+    `~/.cache/huggingface/hub/blobs/…`, reached through symlinks in
+    `models--adefossez--HTDemucs/snapshots/<hash>/` — so the check follows
+    the snapshot symlinks and requires a real file over 10 MB, not just
+    the small yaml. Older layouts (torch-hub checkpoints, ~/.cache/demucs)
+    are checked too."""
+    home = os.path.expanduser("~")
+    hf_repo = os.path.join(home, ".cache", "huggingface", "hub",
+                           "models--adefossez--HTDemucs", "snapshots")
+    if os.path.isdir(hf_repo):
+        for h in os.listdir(hf_repo):
+            snap = os.path.join(hf_repo, h)
+            if not os.path.isdir(snap):
+                continue
+            for f in os.listdir(snap):
+                if f.endswith(".safetensors"):
+                    try:
+                        if os.path.getsize(os.path.join(snap, f)) > 10_000_000:
+                            return True
+                    except OSError:
+                        continue
+    roots = [
+        os.path.join(home, ".cache", "torch", "hub", "checkpoints"),
+        os.path.join(home, ".cache", "demucs"),
+    ]
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for f in filenames:
+                if "htdemucs" in f.lower():
+                    return True
+    return False
+
+
+def _whisper_model_cached(model=DEFAULT_MODEL):
+    """True when the faster-whisper model is already in the HF cache, so
+    constructing it cannot trigger a download. (The cache layout is
+    models--Systran--faster-whisper-<model>/snapshots/<hash>/.)"""
+    home = os.path.expanduser("~")
+    base = os.path.join(home, ".cache", "huggingface", "hub",
+                        f"models--Systran--faster-whisper-{model}")
+    snap = os.path.join(base, "snapshots")
+    if not os.path.isdir(snap):
+        return False
+    for h in os.listdir(snap):
+        if os.path.isfile(os.path.join(snap, h, "model.bin")):
+            return True
+    return False
+
+
+def _faster_whisper_installed():
+    """True when any known interpreter can import faster-whisper."""
+    for py in _wordscan_python():
+        try:
+            r = subprocess.run([py, "-c", "import faster_whisper"],
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0:
+            return True
+    return False
+
+
+# ── The word-scan adapter ────────────────────────────────────────────────────
+
+def run_wordscan(src, model=DEFAULT_MODEL, blacklist=None):
+    """Run the parent's wordscan.py CLI contract on one file:
+    `wordscan.py <audio> [--model tiny] [--blacklist P] [--whitelist P]`
+    prints ONE JSON object on stdout; exit 0 when a verdict was reached
+    (clean or flagged), exit 1 on error. wordscan checks its whitelist
+    FIRST — a hit returns scanned:false with no transcription, so the
+    caller must NOT pre-check the whitelist itself (that would duplicate
+    the rule and could drift from it).
+    Returns (report_dict, error_or_None). On error nothing is
+    whitelisted, ever — wordscan owns that rule and this adapter never
+    touches the store."""
+    ws = _find_wordscan()
+    if ws is None:
+        return None, ("word scan module is not installed "
+                      "(expected wordscan.py under "
+                      "/usr/share/veltrix/voiceonly)")
+    bl_path, bl_err = _blacklist_path(blacklist)
+    if bl_err:
+        return None, bl_err
+    pys = _wordscan_python()
+    if not pys:
+        return None, "no Python interpreter found for the word scan"
+    env = dict(os.environ)
+    env["HF_HUB_OFFLINE"] = "1"
+    # Sandbox proxy quirk (see TOOLS.md): bracketed-IPv6 no_proxy breaks
+    # httpx inside huggingface_hub; sanitise it for the child. (wordscan
+    # sanitises it too — belt and braces, same values.)
+    env["no_proxy"] = "localhost,127.0.0.1,::1"
+    env["NO_PROXY"] = "localhost,127.0.0.1,::1"
+    last_err = None
+    for py in pys:
+        cmd = [py, ws, src, "--model", model,
+               "--blacklist", bl_path, "--whitelist", _whitelist_path()]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=RUN_TIMEOUT, env=env)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            last_err = f"{py}: {e}"
+            continue
+        # wordscan prints ONE multi-line JSON object on stdout (indent=2)
+        # and exits 0 for clean/flagged, 1 for an error verdict — so the
+        # JSON must be parsed whole (taking the last line yields just "}")
+        # and an error verdict's reason lives in stdout, not stderr.
+        # (Caught by the integration test: the first version parsed only
+        # the last line and reported every scan as unparsable.)
+        try:
+            text = r.stdout.strip()
+            report = json.loads(text)
+        except ValueError:
+            try:
+                start = r.stdout.find("{")
+                report, _ = json.JSONDecoder().raw_decode(r.stdout[start:])
+            except (ValueError, IndexError) as e:
+                last_err = f"unparsable word-scan output: {e}"
+                continue
+        if report.get("verdict") == "error":
+            # wordscan's error dict carries the reason under "error",
+            # not "reason" — read both.
+            return None, (report.get("reason") or report.get("error")
+                          or "word scan error")
+        if report.get("verdict") not in ("clean", "flagged"):
+            last_err = f"unknown word-scan verdict: {report.get('verdict')!r}"
+            continue
+        if r.returncode != 0:
+            last_err = (f"word scan exit {r.returncode} with a "
+                        f"{report.get('verdict')} verdict")
+            continue
+        return report, None
+    return None, f"word scan failed: {last_err}"
+
+
+# ── Stage A (vocals) ─────────────────────────────────────────────────────────
+
+def stage_a_voiceonly(src, dst):
+    """The DEFAULT vocal path: Adnan's VoiceOnly Fast filter, imported
+    directly — the centre-channel trick, render-then-play. Returns an
+    error string, or None on success. Raises nothing: VoiceOnly's
+    CalledProcessError is converted here so the caller gets a clean
+    exit 3, not a traceback."""
+    vo, err = _load_voiceonly()
+    if err:
+        return err
+    try:
+        from pathlib import Path
+        vo.run_fast_filter(Path(src), Path(dst))
+    except subprocess.CalledProcessError as e:
+        return ("VoiceOnly vocal filter failed: "
+                + (e.stderr or "").strip()[-300:])
+    except (OSError, RuntimeError) as e:
+        return f"VoiceOnly vocal filter failed: {e}"
+    if not os.path.isfile(dst):
+        return "VoiceOnly finished but the output file is missing"
+    return None
+
+
+def stage_a_demucs(src, workdir):
+    """True separation via Demucs htdemucs, vocals stem only — the
+    OPTIONAL "best quality" mode (explicit --vocals demucs only, never
+    the default). Caller must have checked _demucs_weights_cached()
+    first — this function must never be the thing that downloads a
+    model. Returns (vocals_wav, error)."""
+    demucs = shutil.which("demucs")
+    if not demucs:
+        return None, "demucs is not on PATH"
+    outdir = os.path.join(workdir, "demucs-out")
+    rc, _out, err = _run([demucs, "-n", "htdemucs", "--two-stems=vocals",
+                          "-o", outdir, src])
+    if rc != 0:
+        return None, f"demucs failed: {err.strip()[-500:]}"
+    stem = os.path.splitext(os.path.basename(src))[0]
+    vocals = os.path.join(outdir, "htdemucs", stem, "vocals.wav")
+    if not os.path.isfile(vocals):
+        return None, f"demucs finished but {vocals} is missing"
+    return vocals, None
+
+
+def finalise(src_file, dst):
+    """Write the stage-A file out as `dst`. A source can be copied
+    byte-for-byte only when the destination carries the SAME extension
+    (wav→wav, mp3→mp3); anything else must go through ffmpeg, or the
+    output would be one format wearing the wrong extension."""
+    src_ext = os.path.splitext(src_file)[1].lower()
+    dst_ext = os.path.splitext(dst)[1].lower()
+    if src_ext == dst_ext:
+        try:
+            shutil.copyfile(src_file, dst)
+        except OSError as e:
+            # A failed write is a processing failure, not a crash: the
+            # caller converts this to exit 3 + partial cleanup (C1).
+            return f"cannot write output {dst}: {e}"
+        return None
+    ff = _ffmpeg()
+    rc, _out, err = _run([ff, "-v", "error", "-y", "-i", src_file, dst])
+    if rc != 0:
+        return f"ffmpeg encode to {dst} failed: {err.strip()[-300:]}"
+    return None
+
+
+# ── Verbs ────────────────────────────────────────────────────────────────────
+
+def cmd_check():
+    ws = _find_wordscan()
+    vo_dir = _voiceonly_dir()
+    bl_path, bl_err = _blacklist_path()
+    bl_count, bl_count_err = ((0, bl_err) if bl_err
+                              else _blacklist_count(bl_path))
+    wl = _whitelist_load()
+    print(json.dumps({
+        "ffmpeg": _ffmpeg() is not None,
+        "voiceonly": vo_dir is not None,
+        "voiceonly_path": (os.path.join(vo_dir, "voiceonly.py")
+                           if vo_dir else None),
+        "wordscan": ws,
+        "faster_whisper_installed": _faster_whisper_installed(),
+        "whisper_model_cached": _whisper_model_cached(),
+        "whisper_model": DEFAULT_MODEL,
+        "demucs": shutil.which("demucs") is not None,
+        "demucs_weights_cached": _demucs_weights_cached(),
+        "blacklist": bl_path,
+        "blacklist_words": bl_count,
+        "blacklist_error": bl_count_err,
+        "whitelist": _whitelist_path(),
+        "whitelist_count": len(wl),
+    }, indent=2))
+    return 0
+
+
+def cmd_hash(argv):
+    import argparse
+    p = argparse.ArgumentParser(prog="veltrix-halal-audio hash")
+    p.add_argument("input")
+    a = p.parse_args(argv)
+    src = os.path.abspath(a.input)
+    if not os.path.isfile(src):
+        print(f"veltrix-halal-audio: input not found: {a.input}", file=sys.stderr)
+        return 2
+    h, err = audio_hash(src)
+    if err:
+        print(f"veltrix-halal-audio: {err}", file=sys.stderr)
+        return 3
+    print(json.dumps({"input": src, "audio_hash": h}, indent=2))
+    return 0
+
+
+def cmd_whitelist():
+    print(json.dumps(_whitelist_load(), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_whitelist_clear():
+    path = _whitelist_path()
+    try:
+        os.unlink(path)
+        print(f"whitelist cleared ({path})")
+    except FileNotFoundError:
+        print(f"whitelist already empty ({path})")
+    except OSError as e:
+        print(f"veltrix-halal-audio: cannot clear whitelist: {e}", file=sys.stderr)
+        return 3
+    return 0
+
+
+def cmd_scan(argv):
+    import argparse
+    p = argparse.ArgumentParser(prog="veltrix-halal-audio scan")
+    p.add_argument("input")
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--blacklist")
+    a = p.parse_args(argv)
+    src = os.path.abspath(a.input)
+    if not os.path.isfile(src):
+        print(f"veltrix-halal-audio: input not found: {a.input}", file=sys.stderr)
+        return 2
+    report, err = run_wordscan(src, a.model, a.blacklist)
+    if err:
+        print(f"veltrix-halal-audio: the word scan could not run ({err}); "
+              "no words were checked", file=sys.stderr)
+        return 3
+    # The UI reads `clean` / `flagged` (wordscan's raw verdict + words
+    # are kept alongside, transparently). Exit 0 when the scan ran —
+    # clean or flagged; a flagged scan is NOT an error (see header).
+    out = dict(report)
+    out.update({"input": src, "clean": report["verdict"] == "clean",
+                "flagged": list(report.get("words") or []),
+                "audio_hash": report.get("hash")})
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_play(argv):
+    import argparse
+    p = argparse.ArgumentParser(prog="veltrix-halal-audio play")
+    p.add_argument("input")
+    p.add_argument("--play-anyway", action="store_true",
+                   help="play even if a blacklisted word was found "
+                        "(the user's choice — warn, do not block)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="stream the rendered vocal-only file at "
+                        "real-time speed to null instead of a speaker "
+                        "(verification without an audio device)")
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--blacklist")
+    a = p.parse_args(argv)
+    src = os.path.abspath(a.input)
+    if not os.path.isfile(src):
+        print(f"veltrix-halal-audio: input not found: {a.input}", file=sys.stderr)
+        return 2
+    ff = _ffmpeg()
+    if ff is None:
+        print("veltrix-halal-audio: ffmpeg is not installed", file=sys.stderr)
+        return 2
+
+    # (1) Word scan first (wordscan checks its whitelist first — a hit
+    # skips transcription, so repeat plays start at once). Warn BEFORE
+    # playing: a flagged song is never whitelisted, and without
+    # --play-anyway it is NOT played. A scan that could not run is a
+    # fail-safe refusal (exit 3): an unchecked song is not played.
+    report, err = run_wordscan(src, a.model, a.blacklist)
+    base = {"input": src, "vocal_engine": "voiceonly-fast",
+            "playback": "dry-run" if a.dry_run else "ffplay",
+            "flagged": [], "clean": False, "stage_b_skipped": None,
+            "whitelisted": False, "scanned": False, "played": False}
+    if err:
+        base["stage_b_skipped"] = err
+        print(json.dumps(base, indent=2))
+        print("veltrix-halal-audio: the word scan could not run "
+              f"({err}); not playing an unchecked song", file=sys.stderr)
+        return 3
+    base.update({"audio_hash": report.get("hash"),
+                 "whitelisted": bool(report.get("whitelisted")),
+                 "scanned": bool(report.get("scanned")),
+                 "flagged": list(report.get("words") or []),
+                 "clean": report["verdict"] == "clean"})
+    if report["verdict"] == "flagged" and not a.play_anyway:
+        print(json.dumps(base, indent=2))
+        print("veltrix-halal-audio: WARNING — This is haram: a "
+              "blacklisted word was found "
+              f"({', '.join(base['flagged'])}). Not playing. Re-run with "
+              "--play-anyway if you choose to play it anyway.",
+              file=sys.stderr)
+        return 4
+
+    # (2) Render through VoiceOnly Fast to a temp MP3, then play the
+    # rendered file. The temp file is deleted afterwards, even when
+    # playback fails — nothing is left in /tmp and nothing is written
+    # next to the user's song.
+    import time
+    t0 = time.time()
+    tmpdir = tempfile.mkdtemp(prefix="veltrix-halal-audio-play-")
+    try:
+        rendered = os.path.join(tmpdir, "vocal-only.mp3")
+        err = stage_a_voiceonly(src, rendered)
+        if err:
+            print(f"veltrix-halal-audio: {err}", file=sys.stderr)
+            return 3
+        if a.dry_run:
+            rc, _out, ferr = _run(
+                [ff, "-v", "error", "-re", "-i", rendered,
+                 "-f", "null", "-"], timeout=900)
+            if rc != 0:
+                print("veltrix-halal-audio: playback failed: "
+                      f"{ferr.strip()[-300:]}", file=sys.stderr)
+                return 3
+        else:
+            ffplay = shutil.which("ffplay")
+            if ffplay is None:
+                print("veltrix-halal-audio: ffplay is not installed "
+                      "(it ships with ffmpeg)", file=sys.stderr)
+                return 2
+            try:
+                r = subprocess.run(
+                    [ffplay, "-nodisp", "-autoexit", rendered],
+                    capture_output=True, text=True, timeout=3600)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                print(f"veltrix-halal-audio: playback failed: {e}",
+                      file=sys.stderr)
+                return 3
+            if r.returncode != 0:
+                print("veltrix-halal-audio: playback failed "
+                      f"(ffplay exit {r.returncode}): "
+                      f"{r.stderr.strip()[-300:]}", file=sys.stderr)
+                return 3
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    base["played"] = True
+    base["play_seconds"] = round(time.time() - t0, 2)
+    print(json.dumps(base, indent=2))
+    return 0
+
+
+# faster-whisper, pinned: the word scanner's engine. av is pinned with
+# it — faster-whisper 1.2.1 passes a `metadata_errors` kwarg to av.open()
+# that PyAV removed in 19, so an unpinned av breaks transcription outright
+# (onoma hit the same crash; av==15.1.0 is the newest working pin).
+_WORDSCAN_PACKAGES = ("faster-whisper==1.2.1", "av==15.1.0")
+
+_DOWNLOAD_SCRIPT_WHISPER = (
+    "from faster_whisper import WhisperModel\n"
+    f"WhisperModel('{DEFAULT_MODEL}', device='cpu', compute_type='int8')\n"
+    "print('whisper tiny model downloaded')\n"
+)
+
+
+def _ensure_faster_whisper(py, env):
+    """Make `import faster_whisper` work under `py`, installing it first
+    when it does not. Returns True when the import works afterwards.
+    The ONLY place this helper installs anything, and it only runs inside
+    `download-models` — the explicit, user-triggered network step (Nov 14
+    sweep #5: on a fresh install faster-whisper was installed nowhere, so
+    'Install word scanner' always died on the import)."""
+    try:
+        check = subprocess.run([py, "-c", "import faster_whisper"],
+                               capture_output=True, timeout=120, env=env)
+    except OSError:
+        return False
+    if check.returncode == 0:
+        return True
+    try:
+        r = subprocess.run([py, "-m", "pip", "install", "--quiet",
+                            *_WORDSCAN_PACKAGES],
+                           capture_output=True, text=True, timeout=1200,
+                           env=env)
+    except OSError as e:
+        print(f"veltrix-halal-audio: cannot run pip under {py}: {e}",
+              file=sys.stderr)
+        return False
+    if r.returncode != 0:
+        print(f"veltrix-halal-audio: cannot install faster-whisper "
+              f"under {py}:\n{r.stderr.strip()[-500:]}", file=sys.stderr)
+        return False
+    try:
+        check = subprocess.run([py, "-c", "import faster_whisper"],
+                               capture_output=True, timeout=120, env=env)
+    except OSError:
+        return False
+    return check.returncode == 0
+
+
+def cmd_download_models():
+    """Explicit, user-triggered, the ONLY network step: install
+    faster-whisper into the chosen interpreter first when it is missing
+    (Nov 14 sweep #5), then fetch the Whisper tiny model into the user's
+    cache (small, ~75 MB — this is what the Settings 'Install word
+    scanner' action runs). Demucs weights are NOT fetched here: Demucs
+    is the optional best-quality mode for later, not the default, and
+    its weights are not downloaded by default.
+    Runs under the shared Veltrix venv python when it exists (the install
+    target for faster-whisper), else this interpreter."""
+    venv_py = os.path.join(os.path.expanduser("~"), ".local", "share",
+                           "veltrix", "venv", "bin", "python")
+    for py in [venv_py, sys.executable]:
+        if not os.path.isfile(py):
+            continue
+        env = dict(os.environ)
+        env["no_proxy"] = "localhost,127.0.0.1,::1"
+        env["NO_PROXY"] = "localhost,127.0.0.1,::1"
+        if not _ensure_faster_whisper(py, env):
+            print("veltrix-halal-audio: the word scanner needs "
+                  "faster-whisper, and it could not be installed under "
+                  f"{py} — WordScan stays unavailable (check the network, "
+                  "or install it by hand into "
+                  "~/.local/share/veltrix/venv)", file=sys.stderr)
+            return 3
+        try:
+            r = subprocess.run([py, "-c", _DOWNLOAD_SCRIPT_WHISPER],
+                               capture_output=True, text=True, timeout=1800,
+                               env=env)
+        except OSError as e:
+            print(f"veltrix-halal-audio: cannot run {py}: {e}", file=sys.stderr)
+            continue
+        if r.returncode != 0:
+            print(f"veltrix-halal-audio: model download failed under {py}:\n"
+                  f"{r.stderr.strip()[-500:]}", file=sys.stderr)
+            return 3
+        print(r.stdout.strip())
+        print("demucs weights are not downloaded here "
+              "(best-quality mode, later; the word scanner is ready)")
+        return 0
+    print("veltrix-halal-audio: no Python interpreter found to download "
+          "models with", file=sys.stderr)
+    return 3
+
+
+def cmd_process(argv):
+    import argparse
+    p = argparse.ArgumentParser(prog="veltrix-halal-audio process")
+    p.add_argument("input")
+    p.add_argument("output", nargs="?")
+    p.add_argument("--vocals", choices=["auto", "demucs", "voiceonly"],
+                   default="auto")
+    p.add_argument("--no-profanity", action="store_true")
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--blacklist")
+    p.add_argument("--force", action="store_true")
+    a = p.parse_args(argv)
+
+    src = os.path.abspath(a.input)
+    if not os.path.isfile(src):
+        print(f"veltrix-halal-audio: input not found: {a.input}", file=sys.stderr)
+        return 2
+    if _ffmpeg() is None:
+        print("veltrix-halal-audio: ffmpeg is not installed", file=sys.stderr)
+        return 2
+    if a.output:
+        dst = os.path.abspath(a.output)
+        # C4 (code review): validate the output extension up front
+        # instead of silently coercing to wav.
+        if os.path.splitext(dst)[1].lower() not in ALLOWED_EXTS:
+            print("veltrix-halal-audio: output extension must be one of "
+                  + ", ".join(ALLOWED_EXTS), file=sys.stderr)
+            return 2
+    else:
+        stem, ext = os.path.splitext(os.path.basename(src))
+        if ext.lower() not in ALLOWED_EXTS:
+            ext = ".wav"  # unknown container: emit wav rather than guessing
+        dst = os.path.join(os.path.dirname(src), f"{stem}.filtered{ext}")
+    # S1 (security review): realpath, not abspath — an --output that is a
+    # symlink TO the input must also be refused.
+    if os.path.realpath(dst) == os.path.realpath(src):
+        print("veltrix-halal-audio: output must not be the input file "
+              "(the original is never overwritten)", file=sys.stderr)
+        return 2
+    if os.path.exists(dst) and not a.force:
+        print(f"veltrix-halal-audio: output exists (use --force to replace): {dst}",
+              file=sys.stderr)
+        return 2
+
+    bl_path, bl_err = _blacklist_path(a.blacklist)
+    bl_count, _bl_count_err = ((0, bl_err) if bl_err
+                               else _blacklist_count(bl_path))
+    if bl_err and not a.no_profanity:
+        print(f"veltrix-halal-audio: {bl_err}", file=sys.stderr)
+        return 2
+
+    # C1 (code review, kept from the v1 fix pass): a failed run must not
+    # leave a partial output (the header promises removal). `dst_touched`
+    # marks that this run started writing dst; a pre-existing output this
+    # run never touched (--force + an early failure) is left alone —
+    # deleting it would destroy a file the user still has.
+    dst_existed = os.path.exists(dst)
+    dst_touched = False
+
+    def _discard_partial():
+        if (dst_touched or not dst_existed) and os.path.exists(dst):
+            try:
+                os.unlink(dst)
+            except OSError:
+                pass
+
+    report = {"input": src, "output": dst, "vocal_engine": None,
+              "flagged": [], "stage_b_skipped": None,
+              "blacklist": bl_path,
+              "blacklist_words": bl_count}
+    tmpdir = tempfile.mkdtemp(prefix="veltrix-halal-audio-")
+    try:
+        # ── Stage A ── default is VoiceOnly Fast (the centre-channel
+        # trick). `auto` means voiceonly now; Demucs runs ONLY with an
+        # explicit --vocals demucs (optional best-quality mode for later
+        # — slow, heavy, never the default).
+        vocals_file = None
+        if a.vocals == "demucs":
+            if not (shutil.which("demucs") and _demucs_weights_cached()):
+                print("veltrix-halal-audio: demucs is not installed or its "
+                      "weights are not downloaded — Demucs is the optional "
+                      "best-quality mode for later, not the default; use "
+                      "--vocals voiceonly", file=sys.stderr)
+                return 2
+            vocals_file, err = stage_a_demucs(src, tmpdir)
+            if err is None:
+                report["vocal_engine"] = "demucs"
+            else:
+                print(f"veltrix-halal-audio: {err}", file=sys.stderr)
+                _discard_partial()
+                return 3
+        if vocals_file is None:
+            rendered = os.path.join(tmpdir, "vocal-only.mp3")
+            err = stage_a_voiceonly(src, rendered)
+            if err:
+                print(f"veltrix-halal-audio: {err}", file=sys.stderr)
+                _discard_partial()
+                return 3
+            vocals_file = rendered
+            report["vocal_engine"] = "voiceonly-fast"
+        print(f"veltrix-halal-audio: stage A done "
+              f"(engine: {report['vocal_engine']})", file=sys.stderr)
+
+        # ── Stage B ── WARN, never mute. The scan runs on the ORIGINAL
+        # file (words are the same through the vocal filter; wordscan's
+        # contract is the original). The report lists flagged words; the
+        # output audio is the vocal-filtered track with nothing silenced.
+        dst_touched = True
+        if a.no_profanity:
+            report["stage_b_skipped"] = "disabled with --no-profanity"
+        else:
+            scan, serr = run_wordscan(src, a.model, a.blacklist)
+            if serr:
+                report["stage_b_skipped"] = serr
+            else:
+                report["flagged"] = list(scan.get("words") or [])
+                if scan["verdict"] == "flagged":
+                    print("veltrix-halal-audio: WARNING — This is haram: "
+                          f"{len(report['flagged'])} blacklisted word(s) "
+                          "found (listed in the report; nothing was muted)",
+                          file=sys.stderr)
+        err = finalise(vocals_file, dst)
+        if err:
+            print(f"veltrix-halal-audio: {err}", file=sys.stderr)
+            _discard_partial()
+            return 3
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in ("check", "scan", "play",
+                                        "whitelist", "whitelist-clear",
+                                        "hash", "process",
+                                        "download-models"):
+        print("usage: veltrix-halal-audio {check|scan|play|whitelist|"
+              "whitelist-clear|hash|process|download-models}",
+              file=sys.stderr)
+        return 1
+    if argv[1] == "check":
+        return cmd_check()
+    if argv[1] == "hash":
+        return cmd_hash(argv[2:])
+    if argv[1] == "whitelist":
+        return cmd_whitelist()
+    if argv[1] == "whitelist-clear":
+        return cmd_whitelist_clear()
+    if argv[1] == "scan":
+        return cmd_scan(argv[2:])
+    if argv[1] == "play":
+        return cmd_play(argv[2:])
+    if argv[1] == "download-models":
+        return cmd_download_models()
+    return cmd_process(argv[2:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

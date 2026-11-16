@@ -1,0 +1,721 @@
+#!/usr/lib/veltrix/veltrix-a11y
+// ─────────────────────────────────────────────────────────────────────────────
+// veltrix-a11y — read-only perception of THIRD-PARTY apps for the computer-use
+// layer. Installed to /usr/bin/veltrix-a11y. Prints, as JSON on stdout, the
+// accessibility tree of an application in the SAME flat-node shape as the
+// shell's own `queryUI` (ui/shell/core/UITree.ts) — so an agent perceives a
+// foreign window (Firefox, a file manager, an IDE) exactly the way it perceives
+// the shell, and consumers can't tell the source changed. This is the AT-SPI2
+// backend that UITree.ts always pointed at ("a future AT-SPI2 backend can fill
+// the same shape for third-party apps under the computer-use layer").
+//
+//   veltrix-a11y            → the focused application's window
+//   veltrix-a11y firefox    → windows of apps whose name matches "firefox"
+//
+// READ-ONLY by design (Phase 1). No clicks, no synthetic input, no AT-SPI
+// actions are invoked — available action NAMES are merely listed, as fuel for a
+// later, gated action phase. AT-SPI extents are reported in WINDOW coordinates:
+// a client's SCREEN position is unreliable on Wayland, so global mapping (when
+// it's ever needed) is a compositor-side concern, not ours.
+//
+// Plain GJS on purpose (same as veltrix-portal / veltrix-mcp): gjs +
+// gi://Atspi ship with the shell, no Node runtime, no npm deps on installed
+// systems.
+//
+// Governance: Settings → AI → allowComputerUse (org.veltrix.ai allow-computer-use). This is the ONLY gate
+// that defaults OFF — reading another app's content is privacy-sensitive (≈ the
+// screenshot gate) and reaches outside the shell's own surface. Consent layer,
+// not a security boundary: any local process can already read the a11y bus.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import Atspi from "gi://Atspi"
+import Gio from "gi://Gio"
+import GLib from "gi://GLib"
+
+// The compositor's state — Hyprland's or Hyalo's — in Hyprland's JSON shapes, through ONE
+// CLI (bin/veltrix-wm, #682): PATH first, then a sibling of this script (dev checkout).
+// Never `hyprctl` directly: on Hyalo there is none.
+const WM = (() => {
+    const inPath = GLib.find_program_in_path("veltrix-wm")
+    if (inPath) return inPath
+    try {
+        const sib = `${GLib.path_get_dirname(GLib.filename_from_uri(import.meta.url)[0])}/veltrix-wm`
+        if (GLib.file_test(sib, GLib.FileTest.IS_EXECUTABLE)) return sib
+    } catch {}
+    return "veltrix-wm"
+})()
+
+// The Assistant's gates live in GSettings, `org.veltrix.ai` (#573) — the same keys
+// Settings → AI writes. No schema installed reads as `undefined`, which every gate
+// below treats exactly as it treated a missing ai.json. Each read is a fresh
+// Gio.Settings, so a gate flipped a moment ago is the one that answers.
+// ⚠️ Six copies of this function (veltrix-a11y/act/click/type/mcp/agent);
+// scripts/ci/same-app-check.mjs keeps them identical.
+function aiSetting(key) {
+    try {
+        const schema = Gio.SettingsSchemaSource.get_default()?.lookup("org.veltrix.ai", true)
+        if (!schema) return undefined
+        return new Gio.Settings({ settings_schema: schema }).get_value(key).recursiveUnpack()
+    } catch {
+        return undefined
+    }
+}
+const MAX_NODES = 500       // mirrors UITree.ts
+const MAX_DEPTH = 40        // a11y trees can be deep; guard runaway recursion
+const DEADLINE_MS = 4000    // soft budget: bail out of a slow/huge tree gracefully
+
+// ── gate ─────────────────────────────────────────────────────────────────────
+// Defaults OFF: no schema → disabled, like every other agent gate.
+function computerUseEnabled() {
+    return aiSetting("allow-computer-use") === true
+}
+
+function emit(obj) {
+    print(JSON.stringify(obj, null, 2))
+}
+
+function safe(fn, fallback) {
+    try {
+        const v = fn()
+        return v == null ? fallback : v
+    } catch {
+        return fallback
+    }
+}
+
+// ── state naming ───────────────────────────────────────────────────────────────
+// A curated set of states worth surfacing, checked via StateSet.contains so we
+// never depend on enumerating the full StateType space.
+const STATE_CHECKS = [
+    ["focused", Atspi.StateType.FOCUSED],
+    ["focusable", Atspi.StateType.FOCUSABLE],
+    ["editable", Atspi.StateType.EDITABLE],
+    ["selected", Atspi.StateType.SELECTED],
+    ["checked", Atspi.StateType.CHECKED],
+    ["expanded", Atspi.StateType.EXPANDED],
+    ["active", Atspi.StateType.ACTIVE],
+    ["sensitive", Atspi.StateType.SENSITIVE],
+    ["showing", Atspi.StateType.SHOWING],
+]
+
+function statesOf(acc) {
+    const set = safe(() => acc.get_state_set(), null)
+    if (!set) return []
+    const out = []
+    for (const [name, st] of STATE_CHECKS)
+        if (safe(() => set.contains(st), false)) out.push(name)
+    return out
+}
+
+function isShowing(acc) {
+    const set = safe(() => acc.get_state_set(), null)
+    return !!set && safe(() => set.contains(Atspi.StateType.SHOWING), false)
+}
+
+function isActive(acc) {
+    const set = safe(() => acc.get_state_set(), null)
+    return !!set && safe(() => set.contains(Atspi.StateType.ACTIVE), false)
+}
+
+// ── per-node extraction ────────────────────────────────────────────────────────
+
+// Roles whose mere presence carries signal even without a name (mirrors UITree's
+// INTERACTIVE set, in AT-SPI role-name terms).
+const INTERACTIVE_ROLES = new Set([
+    "push button", "toggle button", "check box", "radio button", "radio menu item",
+    "check menu item", "menu item", "link", "entry", "text", "password text",
+    "combo box", "list item", "slider", "spin button", "page tab", "tab",
+    "table cell", "tree item", "switch",
+])
+
+const MAX_TEXT = 2000       // per node; a full terminal screen is ~2-6 KB
+
+// Roles where the NEWEST content is at the END of the text, so a head-first cut
+// drops exactly what matters. A terminal emulator exposes its visible screen as
+// one text node: the top is scrolled-away history, the bottom is the last output
+// and the prompt. Cutting the tail there hands the agent a stale screen and no
+// way to tell — the same "positional truncation loses the wrong side" failure as
+// the a11y node budget. There is no lever to page it (AT-SPI exposes no
+// scrollback), so the notice states the loss instead of suggesting a retry.
+const TAIL_FIRST_ROLES = new Set(["terminal"])
+
+function textOf(acc, roleName) {
+    // Never leak a secret: AT-SPI exposes masked fields as role "password text".
+    if (roleName === "password text") return "‹redacted›"
+    const iface = safe(() => acc.get_text_iface(), null)
+    if (!iface) return null
+    // AtspiText is the same boxed object as the Accessible, so `iface.get_text`
+    // resolves to Accessible's own 0-arg get_text — call the Text interface
+    // method explicitly to reach the (start, end) overload.
+    const n = safe(() => Atspi.Text.prototype.get_character_count.call(iface), 0)
+    if (!n) return null
+    // ⚠️ character_count OVER-REPORTS on VTE: measured 5535 against a get_text(0,n)
+    // that returned 4925 chars (it counts screen CELLS; the text drops trailing
+    // blanks per line). So it is usable as the upper bound of a range request and
+    // NOTHING else — deriving `n - MAX_TEXT` from it lands past the real end and
+    // AT-SPI answers with an EMPTY STRING, not an error. Take the tail by fetching
+    // the node whole and slicing here; only tail-first roles pay that (a terminal's
+    // visible grid is a few KB, unlike an arbitrary document).
+    // Head-first asks for one char PAST the cap: getting it back is the only
+    // reliable proof there was more (see above — n can't be compared against).
+    const tail = TAIL_FIRST_ROLES.has(roleName)
+    const want = tail ? n : Math.min(n, MAX_TEXT + 1)
+    let t = safe(() => Atspi.Text.prototype.get_text.call(iface, 0, want), null)
+    if (typeof t !== "string" || !t.length) return null
+    // On a character GRID every line comes padded to the full width, and that
+    // padding is cells, never content — measured 1402 of 5432 chars on one screen.
+    // Dropping it buys a quarter of the budget back, losslessly. Only for the grid
+    // roles: in a plain text widget a trailing space can be something someone typed.
+    if (tail) t = t.split("\n").map(l => l.replace(/[ \t]+$/, "")).join("\n")
+    if (t.length <= MAX_TEXT) return t
+    return tail
+        ? `‹… ${t.length - MAX_TEXT} earlier characters on screen omitted›\n${t.slice(-MAX_TEXT)}`
+        : `${t.slice(0, MAX_TEXT)}\n‹… truncated at ${MAX_TEXT} characters›`
+}
+
+function actionsOf(acc) {
+    const iface = safe(() => acc.get_action_iface(), null)
+    if (!iface) return []
+    const n = safe(() => iface.get_n_actions(), 0)
+    const out = []
+    for (let i = 0; i < n; i++) {
+        const name = safe(() => iface.get_action_name(i), null)
+        if (name) out.push(name)
+    }
+    return out
+}
+
+const ACCEL_KEY = /^(F\d+|Enter|Return|Delete|Tab|Escape|Backspace|Space|Insert|Home|End|Page_Up|Page_Down|Up|Down|Left|Right)$/
+
+// Keyboard accelerators of a control's actions (AT-SPI key bindings) — e.g.
+// ["Control+X"]. Often the ONLY semantic handle on a label-less control: GTK4
+// popover-menu items expose no accessible name/text, but DO carry their
+// shortcut, so Ctrl+X ⇒ Cut, F2 ⇒ Rename, Delete ⇒ Move to Trash, etc.
+function shortcutsOf(acc) {
+    const iface = safe(() => acc.get_action_iface(), null)
+    if (!iface) return []
+    const n = safe(() => iface.get_n_actions(), 0)
+    const out = []
+    for (let i = 0; i < n; i++) {
+        // AtspiKeyBinding strings look like "T;;Control+X" (mnemonic;;accelerator).
+        const kb = safe(() => iface.get_key_binding(i), "") || ""
+        const segs = kb.split(";").map(s => s.trim()).filter(Boolean)
+        if (!segs.length) continue
+        // Prefer the real accelerator (has a modifier or is a named key) over the
+        // bare mnemonic letter.
+        const pick = segs.find(s => /(Control|Alt|Shift|Super|Meta)\+/.test(s)) ||
+            segs.find(s => ACCEL_KEY.test(s)) || segs[0]
+        if (pick && !out.includes(pick)) out.push(pick)
+    }
+    return out
+}
+
+function boundsOf(acc) {
+    const iface = safe(() => acc.get_component_iface(), null)
+    if (!iface) return { w: 0, h: 0 }
+    // WINDOW coords: SCREEN extents are unreliable on Wayland (see header).
+    const r = safe(() => iface.get_extents(Atspi.CoordType.WINDOW), null)
+    if (!r) return { w: 0, h: 0 }
+    return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }
+}
+
+// Current/min/max for anything that carries an AT-SPI VALUE — spin buttons,
+// sliders, progress bars. Reported because otherwise a numeric field looks inert:
+// a GTK4 spin button exposes an EMPTY action list, so an agent reading only
+// `actions` concludes it can do nothing but type at it. It cannot type at it
+// reliably either (no focus action), and typing blind is what turned "7 minutes"
+// into 11 h 40 min. With this, the node advertises that `set-value=N` applies.
+// Only emitted when the interface exists, so ordinary nodes stay lean.
+function valueOf(acc) {
+    const iface = safe(() => acc.get_value_iface(), null)
+    if (!iface) return null
+    const cur = safe(() => Atspi.Value.prototype.get_current_value.call(iface), null)
+    if (cur == null) return null
+    return {
+        current: cur,
+        min: safe(() => Atspi.Value.prototype.get_minimum_value.call(iface), null),
+        max: safe(() => Atspi.Value.prototype.get_maximum_value.call(iface), null),
+        settable: true,
+    }
+}
+
+function nodeOf(acc, windowLabel, path) {
+    const roleName = safe(() => acc.get_role_name(), "?")
+    const name = safe(() => acc.get_name(), "") || null
+    // ⚠️ The DESCRIPTION is read, and it is not decoration: a `GtkDropDown`
+    // publishes its SELECTED ITEM as its accessible name and swallows any label
+    // set on it (measured 2026-09-06, `scripts/dev/dropdown-a11y-probe.ts`), so
+    // for that control — the one this tree shows most often in a form — the only
+    // place "which setting is this?" can live is here. Without it, a page of
+    // dropdowns reads as a column of values whose questions are missing, and
+    // whoever is driving cannot tell them apart.
+    const description = safe(() => acc.get_description(), "") || null
+    const actions = actionsOf(acc)
+    const shortcuts = shortcutsOf(acc)
+    const value = valueOf(acc)
+    return {
+        window: windowLabel,
+        type: roleName,            // AT-SPI role name — analogous to UITree's GType
+        id: name,                  // accessible name — analogous to UITree's get_name()
+        role: roleName,
+        // Only when present, like `shortcuts` and `value` below: most nodes carry
+        // none, and a null on every line is noise in a tree that is already long.
+        ...(description ? { description } : {}),
+        text: textOf(acc, roleName),
+        states: statesOf(acc),
+        actions,
+        // Only when present — keeps the common (no-shortcut) node lean.
+        ...(shortcuts.length ? { shortcuts } : {}),
+        ...(value ? { value } : {}),
+        visible: isShowing(acc),
+        bounds: boundsOf(acc),
+        path,
+    }
+}
+
+function isInteresting(n) {
+    return !!(n.id || n.text || n.description || n.actions.length || n.value || INTERACTIVE_ROLES.has(n.type))
+}
+
+// ── a control adopts the value it displays ─────────────────────────────────────
+// A control that SHOWS a value usually does not CARRY it: GTK4 puts the text in a
+// child (a combo box's entry, a spin button's field). Flattened, that leaves the
+// control with `text: null` and the value in a separate node that nothing but
+// geometry ties back to it — and any role filter then keeps the control and drops
+// the child. Measured on the bench 2026-08-01: `match:"combo box"` answered with
+// seven nameless boxes and the value nowhere, the model reported the text was "not
+// available through the accessibility interface" while it sat ONE NODE AWAY, and
+// recovering cost a 23 KB whole-window dump that rode on every later step.
+//
+// So a control with nothing to read adopts the text/value of a descendant that
+// occupies essentially the same box, and that descendant is dropped. Same
+// "containment, not proximity" rule as veltrix-click's collapseContained, applied
+// to perception instead of resolution. Two things make it safe to drop the child:
+// only ANONYMOUS ones are folded (a node with an accessible name is addressable in
+// its own right), and the action helpers walk the live AT-SPI tree themselves —
+// nothing here can make a control unreachable.
+// CONTAINMENT, not equality — the distinction cost a debugging pass. A combo box
+// is 405 px wide and the entry that holds its text is 369: the dropdown arrow
+// takes the rest, so the boxes are nowhere near equal. What identifies the value
+// carrier is that it fills MOST of its host. The area floor is what keeps a list
+// item inside a scroll pane, or one row of a table, from being mistaken for it.
+const BOX_SLACK = 4         // px
+const FILL_RATIO = 0.5      // the carrier occupies at least half its host
+
+function fillsHost(host, cand) {
+    if (!host || !cand) return false
+    const [hx, hy, hw, hh] = [host.x ?? 0, host.y ?? 0, host.w ?? 0, host.h ?? 0]
+    const [cx, cy, cw, ch] = [cand.x ?? 0, cand.y ?? 0, cand.w ?? 0, cand.h ?? 0]
+    if (hw <= 0 || hh <= 0 || cw <= 0 || ch <= 0) return false
+    const inside = cx >= hx - BOX_SLACK && cy >= hy - BOX_SLACK
+        && cx + cw <= hx + hw + BOX_SLACK && cy + ch <= hy + hh + BOX_SLACK
+    return inside && (cw * ch) >= FILL_RATIO * (hw * hh)
+}
+
+function foldValueCarriers(nodes) {
+    const drop = new Set()
+    for (let i = 0; i < nodes.length; i++) {
+        const host = nodes[i]
+        if (drop.has(i) || host.text || host.value) continue
+        if (!INTERACTIVE_ROLES.has(host.type)) continue
+        // A descendant's path is the host's path plus the host's own tag, and the
+        // walk is depth-first, so the subtree is contiguous from here — stop at the
+        // first node outside it rather than scanning the rest of the window.
+        const tag = host.type + (host.id ? `#${host.id}` : "")
+        const prefix = host.path ? `${host.path} > ${tag}` : tag
+        for (let j = i + 1; j < nodes.length; j++) {
+            const cand = nodes[j]
+            if (typeof cand.path !== "string" || !cand.path.startsWith(prefix)) break
+            if (drop.has(j) || cand.id) continue
+            if (!cand.text && !cand.value) continue
+            if (!fillsHost(host.bounds, cand.bounds)) continue
+            if (cand.text) host.text = cand.text
+            if (cand.value && !host.value) host.value = cand.value
+            drop.add(j)
+            break
+        }
+    }
+    return drop.size ? nodes.filter((_, i) => !drop.has(i)) : nodes
+}
+
+// ── tree walk ──────────────────────────────────────────────────────────────────
+
+function walk(acc, windowLabel, path, depth, out, startTime) {
+    if (out.length >= MAX_NODES) return
+    if (depth > MAX_DEPTH) return
+    if (GLib.get_monotonic_time() / 1000 - startTime > DEADLINE_MS) return
+    // Only what's actually on screen — skips collapsed/offscreen subtrees, the
+    // a11y analogue of UITree's get_mapped() guard.
+    if (!isShowing(acc)) return
+
+    const node = nodeOf(acc, windowLabel, path)
+    if (isInteresting(node)) out.push(node)
+
+    const tag = node.type + (node.id ? `#${node.id}` : "")
+    const childPath = path ? `${path} > ${tag}` : tag
+
+    const count = safe(() => acc.get_child_count(), 0)
+    for (let i = 0; i < count; i++) {
+        const child = safe(() => acc.get_child_at_index(i), null)
+        if (child) walk(child, windowLabel, childPath, depth + 1, out, startTime)
+    }
+}
+
+// ── target selection ───────────────────────────────────────────────────────────
+// Returns [{ frame, label }] — the top-level window(s) to walk. With an arg:
+// every window of apps whose name matches the substring. Without: the focused
+// window — resolved by correlating with Hyprland's active window (the reliable
+// signal; AT-SPI's own STATE_ACTIVE is absent for apps that don't participate),
+// falling back to STATE_ACTIVE if veltrix-wm is unavailable.
+
+function children(acc) {
+    const count = safe(() => acc.get_child_count(), 0)
+    const out = []
+    for (let i = 0; i < count; i++) {
+        const c = safe(() => acc.get_child_at_index(i), null)
+        if (c) out.push(c)
+    }
+    return out
+}
+
+// Hyprland's focused window class (lowercased), e.g. "org.gnome.nautilus".
+function hyprActiveWindow() {
+    try {
+        const [ok, out] = GLib.spawn_command_line_sync(`${WM} activewindow`)
+        if (!ok) return null
+        const j = JSON.parse(new TextDecoder().decode(out))
+        return {
+            class: (j.class || "").toLowerCase() || null,
+            pid: j.pid || 0,
+        }
+    } catch {
+        return null
+    }
+}
+
+function getHyprWindows() {
+    try {
+        const [ok, out] = GLib.spawn_command_line_sync(`${WM} clients`)
+        if (!ok) return new Map()
+        const list = JSON.parse(new TextDecoder().decode(out))
+        const map = new Map()
+        for (const w of list) {
+            if (w.pid) {
+                if (!map.has(w.pid)) map.set(w.pid, [])
+                map.get(w.pid).push(w)
+            }
+        }
+        return map
+    } catch {
+        return new Map()
+    }
+}
+
+function appNamesForPid(pid, hyprMap) {
+    const names = new Set()
+    const wins = hyprMap.get(pid) || []
+    for (const hw of wins) {
+        if (hw.class) names.add(hw.class)
+        if (hw.initialClass) names.add(hw.initialClass)
+    }
+    try {
+        const [ok, bytes] = GLib.file_get_contents(`/proc/${pid}/cmdline`)
+        if (ok && bytes.length) {
+            const raw = new TextDecoder().decode(bytes)
+            const argv0 = raw.split("\0")[0]
+            if (argv0) {
+                const base = GLib.path_get_basename(argv0)
+                if (base) names.add(base)
+            }
+        }
+    } catch {}
+    try {
+        const [ok, bytes] = GLib.file_get_contents(`/proc/${pid}/comm`)
+        if (ok && bytes.length) {
+            const comm = new TextDecoder().decode(bytes).trim()
+            if (comm) names.add(comm)
+        }
+    } catch {}
+    return [...names]
+}
+
+function getA11yBusAddress() {
+    let addr = GLib.getenv("AT_SPI_BUS_ADDRESS")
+    if (addr) return addr
+    try {
+        const res = Gio.DBus.session.call_sync(
+            "org.a11y.Bus",
+            "/org/a11y/bus",
+            "org.a11y.Bus",
+            "GetAddress",
+            null,
+            null,
+            Gio.DBusCallFlags.NONE,
+            1000,
+            null
+        )
+        const [busAddr] = res.deepUnpack()
+        return busAddr
+    } catch {
+        return null
+    }
+}
+
+function getA11yBusCandidates() {
+    const addr = getA11yBusAddress()
+    if (!addr) return null
+    try {
+        const conn = Gio.DBusConnection.new_for_address_sync(
+            addr,
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            null,
+            null
+        )
+        const res = conn.call_sync(
+            "org.a11y.atspi.Registry",
+            "/org/a11y/atspi/accessible/root",
+            "org.a11y.atspi.Accessible",
+            "GetChildren",
+            null,
+            null,
+            Gio.DBusCallFlags.NONE,
+            1000,
+            null
+        )
+        const [children] = res.deepUnpack()
+        const hyprMap = getHyprWindows()
+        const candidates = []
+        const apps = []
+
+        for (let i = 0; i < children.length; i++) {
+            const [busName, path] = children[i]
+            let pid = 0
+            try {
+                const pidRes = conn.call_sync(
+                    "org.freedesktop.DBus",
+                    "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus",
+                    "GetConnectionUnixProcessID",
+                    new GLib.Variant("(s)", [busName]),
+                    null,
+                    Gio.DBusCallFlags.NONE,
+                    1000,
+                    null
+                )
+                const [p] = pidRes.deepUnpack()
+                pid = p
+            } catch {}
+
+            const names = pid ? appNamesForPid(pid, hyprMap) : []
+            const wins = hyprMap.get(pid) || []
+            const primaryName = (wins[0]?.class) || names[0] || busName
+            apps.push(primaryName)
+
+            candidates.push({
+                index: i,
+                busName,
+                path,
+                pid,
+                names,
+                primaryName,
+            })
+        }
+        return { candidates, apps }
+    } catch {
+        return null
+    }
+}
+
+// ── one name per app ───────────────────────────────────────────────────────────
+// ONE app wears three different names, and an agent meets all three: Hyprland's
+// class ("org.gtk.WidgetFactory4"), AT-SPI's app name ("gtk4-widget-factory") and
+// the .desktop name ("Widget Factory"). Substring folding cannot bridge them the
+// moment a version digit moves sides — "gtk4widgetfactory" vs "widgetfactory4",
+// neither contains the other — and on 2026-08-01 a live run paid SIX steps for it:
+// query_app accepted only the AT-SPI name, click_at only the Hyprland class, so no
+// single string drove both halves and the model tried four names for one app.
+//
+// So compare TOKEN SETS, not substrings: split on separators, camelCase and
+// letter/digit seams, drop the reverse-DNS prefix, and match when one side's
+// tokens are all present in the other's. Subset (not equality) is what makes a
+// superset query work — "GTK Widget Factory" ⊇ "Widget Factory" — which is how
+// users and window titles actually name things.
+//
+// KEEP IDENTICAL in veltrix-act, veltrix-click and veltrix-type: the four helpers
+// are standalone scripts by design (each is copied to /usr/bin on its own), and
+// the whole point of this function is that all four agree.
+const NAME_NOISE = new Set(["org", "com", "io", "net", "app", "desktop"])
+const nameTokens = (s) => (s || "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")   // camelCase  → "Widget Factory"
+    .replace(/([a-zA-Z])(\d)/g, "$1 $2")   // Factory4   → "Factory 4"
+    .replace(/(\d)([a-zA-Z])/g, "$1 $2")   // gtk4       → "gtk 4"
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(t => t && !NAME_NOISE.has(t))
+
+function sameApp(a, b) {
+    const la = (a || "").toLowerCase(), lb = (b || "").toLowerCase()
+    if (!la || !lb) return false
+    if (la === lb || la.includes(lb) || lb.includes(la)) return true
+    // Tokenize the ORIGINAL strings, never the lowercased ones: the word breaks of
+    // "WidgetFactory" live in its capitals, and lowercasing first is exactly the
+    // bug this function exists to kill (it fused "widgetfactory" into one token).
+    const ta = nameTokens(a), tb = nameTokens(b)
+    if (ta.length && tb.length) {
+        const [small, big] = ta.length <= tb.length ? [ta, tb] : [tb, ta]
+        const set = new Set(big)
+        if (small.every(t => set.has(t))) return true
+    }
+    // Last resort for a side that reaches us already lowercased — Hyprland's class
+    // does — where the camelCase seams are gone for good: drop digits and
+    // separators and compare bare letters. >2 chars so noise cannot match.
+    const bare = (s) => s.toLowerCase().replace(/[^a-z]/g, "")
+    const x = bare(a), y = bare(b)
+    return x.length > 2 && y.length > 2 && (x.includes(y) || y.includes(x))
+}
+
+function selectTargets(filter) {
+    const activeWin = filter ? null : hyprActiveWindow()
+    const activeClass = activeWin?.class || null
+    const activePid = activeWin?.pid || 0
+
+    const busDiscovery = getA11yBusCandidates()
+    if (busDiscovery) {
+        const { candidates, apps } = busDiscovery
+        const matched = []
+        // An agent's vocabulary for "which app" comes from list_windows — i.e. Hyprland
+        // CLASSES — while the filter might use a different spelling ("gnome-terminal" vs
+        // "org.gnome.Terminal": no substring relation, so the plain pass returns zero).
+        // Rescue pass only, after a strict miss, so an exact substring keeps meaning
+        // exactly what it meant.
+        for (const tolerant of [false, true]) {
+            for (const cand of candidates) {
+                const match = filter
+                    ? cand.names.some(n => tolerant ? sameApp(n, filter) : n.toLowerCase().includes(filter))
+                    : (activePid && cand.pid === activePid) || (activeClass && cand.names.some(n => sameApp(n, activeClass)))
+                if (match && !matched.includes(cand)) {
+                    matched.push(cand)
+                }
+            }
+            if (matched.length || !filter) break
+        }
+
+        // If no application matches the filter / active window:
+        // Return immediately WITHOUT touching AT-SPI! Zero fds leaked, zero warnings.
+        if (!matched.length) {
+            return { targets: [], apps, activeClass }
+        }
+
+        // Only resolve the matching application(s) via Atspi.
+        // Index assumption: atspi_accessible_get_child_at_index() sends GetChildAtIndex
+        // to the root accessible object (/org/a11y/atspi/accessible/root) in at-spi2-registryd,
+        // which indexes the exact same registry->apps GPtrArray returned by GetChildren.
+        // Race guard: if an application registers or dies between GetChildren and
+        // get_child_at_index, indices shift and cand.index points to a neighbor.
+        // atspi_accessible_get_process_id() queries GetConnectionUnixProcessID on the
+        // bus daemon (NOT the target app), so checking app.get_process_id() costs 0 fds.
+        // If it does not match cand.pid, we abort the fast path and fall back to classic enumeration.
+        Atspi.init()
+        const desktop = safe(() => Atspi.get_desktop(0), null)
+        if (!desktop) return { targets: [], apps, activeClass }
+
+        const targets = []
+        let raceDetected = false
+        for (const cand of matched) {
+            const app = safe(() => desktop.get_child_at_index(cand.index), null)
+            if (!app) {
+                raceDetected = true
+                break
+            }
+            const resolvedPid = safe(() => app.get_process_id(), 0)
+            if (cand.pid && resolvedPid !== cand.pid) {
+                raceDetected = true
+                break
+            }
+            const appName = safe(() => app.get_name(), "") || cand.primaryName
+            for (const win of children(app)) {
+                const winName = safe(() => win.get_name(), "")
+                const label = winName ? `${appName} — ${winName}` : appName
+                targets.push({ frame: win, label })
+            }
+        }
+        if (!raceDetected) {
+            return { targets, apps, activeClass }
+        }
+    }
+
+    // Fallback: traditional enumeration if D-Bus candidate discovery failed or index race detected
+    Atspi.init()
+    const desktop = safe(() => Atspi.get_desktop(0), null)
+    if (!desktop) return { targets: [], apps: [] }
+
+    const targets = []
+    const apps = []
+    for (const tolerant of [false, true]) {
+        for (const app of children(desktop)) {
+            const appName = safe(() => app.get_name(), "") || "?"
+            if (!tolerant) apps.push(appName)
+            for (const win of children(app)) {
+                const winName = safe(() => win.get_name(), "")
+                const label = winName ? `${appName} — ${winName}` : appName
+                const match = filter
+                    ? tolerant ? sameApp(appName, filter) : appName.toLowerCase().includes(filter)
+                    : activeClass
+                        ? sameApp(appName, activeClass)
+                        : isActive(win)
+                if (match) targets.push({ frame: win, label })
+            }
+        }
+        if (targets.length || !filter) break
+    }
+    return { targets, apps, activeClass }
+}
+
+// ── main ───────────────────────────────────────────────────────────────────────
+
+function main() {
+    if (!computerUseEnabled()) {
+        emit({ error: "computer-use is disabled — enable it in Settings → AI" })
+        return
+    }
+
+    const filter = (ARGV[0] ?? "").trim().toLowerCase() || null
+
+    const { targets, apps, activeClass } = selectTargets(filter)
+    if (!targets.length) {
+        emit({
+            source: "atspi",
+            app: filter,
+            count: 0,
+            nodes: [],
+            hint: filter
+                ? `no window matched "${filter}"`
+                : activeClass
+                    ? `the focused window (${activeClass}) exposes no accessibility tree — pass an app name to target another window (e.g. veltrix-a11y firefox)`
+                    : "could not resolve the focused window — pass an app name (e.g. veltrix-a11y firefox)",
+            apps,
+        })
+        return
+    }
+
+    const walked = []
+    const startTime = GLib.get_monotonic_time() / 1000
+    for (const { frame, label } of targets)
+        walk(frame, label, "", 0, walked, startTime)
+    const out = foldValueCarriers(walked)
+
+    const result = {
+        source: "atspi",
+        app: filter,
+        count: out.length,
+        nodes: out.slice(0, MAX_NODES),
+    }
+    // A near-empty tree on a real window usually means the app didn't expose
+    // accessibility — surface it instead of silently returning nothing.
+    if (out.length === 0)
+        result.hint = "the target window exposed no accessible nodes — its toolkit may need accessibility enabled (e.g. QT_ACCESSIBILITY=1, Electron --force-renderer-accessibility)"
+
+    emit(result)
+}
+
+main()

@@ -1,0 +1,23 @@
+{
+  "$comment": [
+    "Owner #921 geometry, 2026-10-23: matches Hyalo protocols/window_controls.rs; kit header live acceptance remains separate.",
+    "Exported in components.json mode variants; pitch is button + gap; edge is only the outer inset.",
+    "Hyalo keeps an independently usable layout mirror, to be checked against this export by CI."
+  ],
+  "default": {
+    "height": 24,
+    "button": 16,
+    "edge": 4,
+    "gap": 8,
+    "windowInset": 12,
+    "glyph": {
+      "size": 14,
+      "stroke": 1.6,
+      "minimizeHalf": 3.5,
+      "maximizeHalf": 3.7,
+      "maximizeRadius": 1.6,
+      "closeHalf": 3
+    }
+  },
+  "variants": []
+}

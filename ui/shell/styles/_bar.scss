@@ -1,0 +1,548 @@
+@use 'base' as *;
+
+/* ==========================================================================
+   VELTRIX BAR - STITCH FIDELITY (Pills, Dots and Cairo Circles)
+   ==========================================================================
+
+   ONE WINDOW: the bar's. The Activity Island — capsule, chips and modes — and
+   the app grid paint in it too since #708 point 3 (it had a window of its own,
+   `#veltrix-island`, from 2026-07-26). The sections below are by SUBJECT:
+
+     · the capsule row  — `.bar-centerbox`, the left/right flanks, `.bar-center`
+     · the island       — workspace dots, activities
+
+   The scope follows the WINDOW, which is the only thing CSS sees, never the
+   directory a TSX lives in. A panel moved to another window takes its rules out
+   from under them: they stay in the sheet, stop matching and report NOTHING. See
+   design-system.md.
+
+   (`.bar-capsule` deleted 2026-08-10 — DEAD: the name survives only in a comment
+   at surfaces/bar/capsule.ts, no widget has ever carried the class. It was the
+   dead half of the focus-kill rule below.)
+   ========================================================================== */
+
+/* --- Window surfaces themselves --- */
+#veltrix-bar,
+.veltrix-bar-window {
+    background: transparent;
+    padding: 0;
+    margin: 0;
+    /* The shell's font, declared (Phase 1 fix): nothing in the shell/kit SCSS
+       named a family before — Inter rode on fontconfig + hyalo.toml alone, so a
+       Dell without that chain fell back to whatever GTK picked. Inter is the
+       interface font (hyalo.toml `font = "Inter"`); Noto Sans Arabic covers
+       the Hijri tooltip's Arabic month names and Arabic UI text, Noto Naskh
+       Arabic stays as the fallback for Quranic glyphs (tashkeel, superscript
+       alef) — Naskh is the verified Quranic face (docs/bismillah-test.png).
+       Amiri was a dead fallback here with no render proof and no package
+       carrying it; it is NOT a dependency — removed 2026-11-12, bilingual
+       feature. Do not re-add it without a side-by-side render proving it
+       better than Naskh. */
+    font-family: "Inter", "Noto Sans Arabic", "Noto Naskh Arabic", "Noto Sans", sans-serif;
+}
+
+/* The invisible exclusive-zone reservor (see Bar.tsx "Zone reservor"). Transparent
+   via CSS, NOT gtk_widget_set_opacity(0) — toplevel opacity goes through the
+   compositing pipeline and is the suspect for tech-debt #11's frame-clock spin. */
+window#veltrix-bar-zone {
+    background: transparent;
+}
+
+/* ==========================================================================
+   THE STRIP
+   ONE full-width strip of glass (barStrip, capsule.ts), 36px at the very top,
+   edge to edge — the true macOS bar (Adnan, 2026-11-12). The left/right flanks
+   are plain inner boxes inside it. `islandRow` still reuses `.bar-centerbox`
+   below, so the island capsule's 4px top margin and the BAR_H row height come
+   from the same CSS rule as the bar's own row instead of a constant stated
+   twice (Bar.tsx says so at the mount site).
+   ========================================================================== */
+#veltrix-bar,
+.veltrix-bar-window {
+
+    /* --- Centerbox (the island's row only, since the strip) --- */
+    .bar-centerbox {
+        background-color: transparent;
+        border: none;
+        margin-top: 4px;   // ⚠️ island capsule height = BAR_H − this; keep BAR_H/BAR_CAPSULE_H (capsule.ts) in step
+    }
+
+    /* --- Strip --- */
+    .bar-strip {
+        background-color: transparent;
+        border: none;
+    }
+
+    /* The strip's inner row: NO top margin — the glass starts at the screen's
+       top edge (the island's row keeps `.bar-centerbox`'s 4px, so its 32px
+       capsule sits 4 down inside the 36px strip). */
+    .bar-strip-centerbox {
+        background-color: transparent;
+        border: none;
+        margin-top: 0;
+    }
+
+    /* --- Widget labels ---
+       ⚠️ EXPLICIT, and NOT left to the `.bar-left/.bar-center/.bar-right` rule below.
+       That rule colours by ANCESTRY, and a morph ghost has none: `MorphRevealer`
+       paints twins of the capsule's content as its own direct children, precisely so
+       they can travel OUTSIDE the box they belong to. A ghost therefore matches no
+       `.bar-*` ancestor, falls back to the GTK theme's own label colour, and renders
+       WHITE — which is invisible in dark mode (it happens to be right) and obvious in
+       light mode, where the player's title flashed white for the first third of every
+       open and close until a user reported it (2026-08-24).
+       So any label class used inside a capsule must carry its own colour. The Cairo
+       parts of the same ghost were never affected: they read `Theme.chromeIsDark`
+       directly, which is what made the split diagnosable — text wrong, EQ bars right. */
+    .bar-widget-label {
+        color: var(--veltrix-text);
+    }
+
+    /* --- Left/Center/Right flanks (plain inner boxes inside the strip) --- */
+    .bar-left,
+    .bar-center,
+    .bar-right {
+        @include veltrix-reset;
+        padding: 0;
+        margin: 0;
+
+        label,
+        image {
+            color: var(--veltrix-text);
+        }
+    }
+
+    /* (.bar-left / .bar-right side margins are handled in TSX, not CSS.) */
+
+    /* --- Global Bar Button Reset --- */
+    .bar-left button,
+    .bar-center button,
+    .bar-right button,
+    .bar-tray-btn {
+        @include veltrix-reset;
+        padding: 0;
+        margin: 0;
+        min-width: 0;
+        min-height: 0;
+    }
+
+    /* Symbolic icons in the bar take the bar's ink — and their semantic parts keep
+       their MEANING. The palette was `success white, warning white, error white` from
+       the days the bar was always dark, so a symbolic icon's marked part (Telegram's
+       unread dot is `warning`; its own pixmap draws it red) stayed WHITE on the light
+       glass the bar can now wear (#676) — owner-caught 2026-09-29. Warning is orange
+       and error red, as GNOME's (owner, 2026-09-29: a warning in red reads
+       as a failure); success follows the ink — the bar is monochrome, colour is kept
+       for what asks for attention. */
+    .bar-right image,
+    .bar-left image,
+    .bar-center image {
+        -gtk-icon-palette: success var(--veltrix-text), warning var(--veltrix-warning), error var(--veltrix-danger);
+        color: var(--veltrix-text);
+    }
+}
+
+/* ==========================================================================
+   BAR ONLY
+   ========================================================================== */
+#veltrix-bar,
+.veltrix-bar-window {
+
+    /* --- Keyboard ring (Super+Ctrl+B walks the bar) ---
+       GTK's own ring, following the item's HOVER PILL: `.bar-item-veil` is the Cairo
+       layer that paints that pill, and its box IS the pill (capsule.ts), so an outline
+       round it with a pill radius is the pill's shape. Offset 0: the pill sits 4px
+       inside the item top and bottom, which leaves the ring's 2px inside the item; at
+       the sides it spills 2px over the neighbour's edge, which is its padding (nothing drawn there). The item is the stop
+       (a tray icon too — its button is not focusable). This replaced a "focus kill"
+       (outline 0 on the tray buttons), from when nothing in the bar took the keyboard. */
+    .bar-item-veil { border-radius: $veltrix-radius-pill; }
+    .bar-item:focus-visible > .bar-item-veil { @include veltrix-focus-ring(0); }
+
+    /* --- Distro icon: the two-tone V carries fixed colours (2026-11-14), so this color no longer recolours it --- */
+    .bar-distro-icon {
+        color: var(--veltrix-text);
+    }
+
+    /* --- Tray icons: symbolic names used explicitly in code; color applies for recoloring --- */
+    .bar-tray-icon {
+        color: var(--veltrix-text);
+    }
+
+    /* --- Resource ring icon (bar cpu-memory arcs) --- */
+    /* An atomic widget: it renders in the bar AND in the Control Center's grid,
+       which is the same window (the CC is a Gtk.Overlay child of the bar), so one
+       scope covers both. */
+    .resource-icon {
+        font-size: $fs-mini;
+        font-weight: $fw-bold;
+        color: var(--veltrix-text);
+        margin-bottom: 0px;
+    }
+
+    /* Specific styling for the Control Center pill icon */
+    .bar-right image {
+        opacity: 1;
+        /* Full opacity for better contrast */
+    }
+
+    /* The system menu uses the universal .veltrix-menu component (_components.scss).
+       Its inline confirm pair (.veltrix-confirm-*) is universal too and lives there. */
+
+    /* Clock/Date capsule label — tabular numbers prevent jitter as digits tick */
+    .bar-time-label {
+        font-variant-numeric: tabular-nums;
+    }
+
+    /* Weather temperature beside its icon (Phase 1 fix): same size as the
+       clock, tabular numbers — the temperature changes, the width must not. */
+    .bar-weather-temp {
+        font-variant-numeric: tabular-nums;
+    }
+
+    /* Weather temperature in the expanded panel: the big read, bold like an
+       app name (`.bar-app-name` above). */
+    .bar-weather-temp-large {
+        font-size: $fs-title-2;
+        font-weight: $fw-bold;
+        font-variant-numeric: tabular-nums;
+    }
+
+    /* Hijri date beside the clock (Phase 1, I2): the same size, dimmed — the
+       Gregorian clock is the primary read, the Hijri date the second. Its
+       transparency is in the COLOR (rgba token), never the `opacity` property
+       (Hyprland #3126: opacity breaks blur). */
+    .bar-hijri-label {
+        font-variant-numeric: tabular-nums;
+        color: var(--veltrix-text-dim);
+    }
+
+    /* A dimmed bar icon (Wi-Fi with no network, Phase 1 fix): the dim is the
+       icon's COLOR via the dim text token — symbolic icons recolour from CSS
+       `color` — never `opacity`, which breaks blur (Hyprland #3126). */
+    .bar-item image.bar-icon-dim {
+        color: var(--veltrix-text-dim);
+    }
+
+    /* --- App name (AppTitle) --- */
+    // Bold, the weight of a CC tile's title (`.veltrix-atomic-label-bold`; owner, 2026-10-05):
+    // it names the app in front, so it reads as a name and not as one more status beside the
+    // clock. The SIZE stays the bar's, the clock's own, so the two sit on one line. The
+    // menu it opens is all shared `veltrix-menu-*` rows (MenuRow.ts) and has no rules here.
+    .bar-app-name {
+        font-weight: $fw-bold;
+    }
+
+    /* --- Bar inline expansion panel --- */
+    .bar-expansion-panel {
+        /* Vertical gap set from TSX (PANEL_TOP) so it stays in sync with CC/NC. */
+
+        button.suggested-action {
+            @include veltrix-reset;
+            background: var(--veltrix-accent);
+            color: var(--veltrix-accent-fg);
+            border-radius: $veltrix-radius-sm;
+            padding: 6px 14px;
+            font-size: $fs-small;
+            font-weight: $fw-semibold;
+
+            &:hover  { background: rgba(var(--veltrix-accent-rgb), 0.82); }
+            &:active { background: rgba(var(--veltrix-accent-rgb), 0.65); }
+        }
+
+        button.destructive-action {
+            @include veltrix-reset;
+            background: var(--veltrix-danger);
+            color: var(--veltrix-accent-fg);
+            border: none;
+            box-shadow: none;
+            border-radius: $veltrix-radius-sm;
+            padding: 6px 14px;
+            font-size: $fs-small;
+            font-weight: $fw-semibold;
+
+            &:hover  { background: rgba(var(--veltrix-danger-rgb), 0.82); }
+            &:active { background: rgba(var(--veltrix-danger-rgb), 0.65); }
+        }
+
+        button.flat {
+            background: transparent;
+            background-image: none;
+            border: none;
+            box-shadow: none;
+            color: var(--veltrix-text);
+            border-radius: $veltrix-radius-sm;
+            padding: 6px 14px;
+            font-size: $fs-small;
+            font-weight: $fw-medium;
+
+            &:hover  { background: var(--veltrix-accent-10); }
+            &:active { background: rgba(var(--veltrix-accent-rgb), 0.18); }
+        }
+    }
+
+    // Clipboard history + bar overflow lists use the universal .veltrix-menu-row.
+    // The atomic widgets' popover rows (.bar-popover-*) are in _components.scss:
+    // a widget is placed by the user, so it cannot belong to one surface's sheet.
+}
+
+/* ==========================================================================
+   THE ISLAND
+   The workspace dots and the activity forms. `makeWorkspaceDot` is called from
+   ActivityIsland, IslandActivities and WorkspaceOverview — the overview is an
+   island mode — so all three paint in the island.
+   ========================================================================== */
+#veltrix-bar,
+.veltrix-bar-window {
+
+    .workspace-dot {
+        min-width: 6px;
+        min-height: 6px;
+        border-radius: 50%;
+        background-color: var(--veltrix-surface-raised);
+        box-shadow: var(--veltrix-shadow-sm);
+        transition: background-color 0.3s #{$ease}, box-shadow 0.3s #{$ease};
+        margin: 0;
+        padding: 0;
+    }
+
+    // The dots take the island's INK, like its icons — white, or dark where Hyalo
+    // turned the pane's ink (#684). Not the accent: the owner, 2026-10-06 — the
+    // dots are the island's glyphs, and a coloured mark among white icons read as
+    // a second, louder signal than any of them. Active > occupied > empty is
+    // carried by the ink's own tiers (text → text-dim → surface).
+    .workspace-dot.occupied {
+        background-color: var(--veltrix-text-dim);
+    }
+
+    .workspace-dot.active {
+        // A 6px-tall dot stretched to 18 wide: this is a STADIUM, not a corner radius.
+        // The old literal 4 was already past half the height and clamped to the same
+        // shape — it was never a rung of the ladder.
+        min-width: 18px;
+        border-radius: var(--veltrix-radius-pill);
+        background-color: var(--veltrix-text);
+    }
+
+    .workspace-dot.empty {
+        background-color: var(--veltrix-surface-hover);
+    }
+
+    // ── Activity Island: compact activity forms ───────────────────────────────
+    // The capsule's mutated content while an activity is live (media rides the
+    // player compact's own Cairo painters; these are the REC and battery forms).
+    // Steady, not pulsing: a blink re-blurs its surface every frame for as long as
+    // the capture lasts (minutes, not a moment), and the island is the worst place
+    // for one (its own OVERLAY surface, blurred over the bar). What proves the
+    // capture is alive is the clock next to it, which is already ticking.
+    .island-rec-dot {
+        border-radius: var(--veltrix-radius-pill);
+        background: var(--veltrix-danger);
+    }
+
+    // The capture card's hero clock (RecordingIsland). Text colour, not danger —
+    // the red in that card is the 8px dot beside the title, which is the whole of
+    // the shell's red budget for a state that is merely happening.
+    .island-rec-clock {
+        font-size: $fs-title-1;
+        font-weight: $fw-semibold;
+        font-variant-numeric: tabular-nums;
+        color: var(--veltrix-text);
+    }
+
+    .island-rec-time {
+        font-size: $fs-small;
+        font-weight: $fw-semibold;
+        font-variant-numeric: tabular-nums;   // ticking digits must not jitter
+        color: var(--veltrix-text);
+    }
+
+    /* Indicator-chip badge: a turn that finished while the island could not show
+       it. Accent = an answer waiting (accent means "active/selected", and this is
+       the chip that has something for you); danger = the turn failed. No animation:
+       it sits in the bar for as long as it takes the user to look, and a pulsing
+       dot there costs the compositor a blur pass per frame, forever. */
+    .island-chip-badge {
+        border-radius: var(--veltrix-radius-pill);
+        background: $veltrix-accent;
+        /* Reads against the glyph it overlaps, whatever the wallpaper does. */
+        box-shadow: 0 0 0 1.5px var(--veltrix-surface-raised);
+    }
+
+    .island-chip-badge.error {
+        background: var(--veltrix-danger);
+    }
+
+    .island-battery-pct {
+        font-size: $fs-small;
+        font-weight: $fw-bold;
+        font-variant-numeric: tabular-nums;
+        // White on purpose (user call 2026-07-20): the shell has NO red text —
+        // danger lives in fills/dots (the glyph's red sliver carries the alarm).
+        color: var(--veltrix-text);
+    }
+
+    // ── Activity Island: battery-critical expanded surface ────────────────────
+    .island-battery-title {
+        font-size: $fs-small;
+        font-weight: $fw-bold;
+        color: var(--veltrix-text);
+    }
+
+    .island-battery-sub {
+        font-size: $fs-caption;
+        font-weight: $fw-regular;
+        color: var(--veltrix-text-dim);
+    }
+}
+
+// ── Activity Island: the built-in Assistant ──────────────────────────────────
+// Compact "working pill" + the expanded chat panel. Neutral fills throughout —
+// accent is reserved for active/selected state (commandment 10), so bubbles and
+// chips use the surface/text tokens; a tool rejection tints its dot danger.
+#veltrix-bar,
+.veltrix-bar-window {
+    .agent-compact-label {
+        font-size: $fs-small;
+        font-weight: $fw-medium;
+        color: var(--veltrix-text);
+    }
+
+    .agent-header {
+        .agent-title {
+            font-size: $fs-subtitle;
+            font-weight: $fw-semibold;
+            color: var(--veltrix-text);
+        }
+        .agent-status {
+            font-size: $fs-caption;
+            color: var(--veltrix-text-dim);
+            font-variant-numeric: tabular-nums;
+        }
+    }
+
+    .agent-reset, .agent-send {
+        @include veltrix-reset;
+        background: transparent;
+        border: none;
+        box-shadow: none;
+        // 28px is the shell's icon-button box (settings-icon-btn, cc tiles) — this
+        // was the only one at 30.
+        min-width: 28px;
+        min-height: 28px;
+        border-radius: var(--veltrix-radius-pill);
+        &:hover { background: var(--veltrix-surface-hover); }
+    }
+
+    /* Transcript scroll — RESERVED LANE, not a GTK gutter (design-system.md, "Any
+       ScrolledWindow"). The 16px right padding is always there, overflowing or not, so
+       the indicator appearing never resizes or shifts the chat. The lane now holds
+       VeltrixScrolled's .veltrix-scroll-thumb: the view runs vscrollbar_policy EXTERNAL,
+       so there is no `scrollbar` node here to style, and no proximity rule that can
+       fatten it over the bubbles. The old block fought Adwaita for this and lost twice
+       — its `.hovering` rule wins on specificity, AND its base slider rule carries
+       `border: 4px solid transparent` (8px of invisible real width) that only takes
+       over once hovered. Do NOT reintroduce `scrollbar` rules here. */
+    /* Matches LANE in AgentIsland.tsx — keeps the bubbles in the same column as
+       the header/entry while the scroller itself spans into the panel padding. */
+    .agent-transcript { padding-right: 14px; }   // AgentIsland LANE
+
+
+    .agent-bubble {
+        padding: $space-2 $space-3;
+        border-radius: var(--veltrix-radius-lg);
+        .agent-bubble-text {
+            font-size: $fs-small;
+            color: var(--veltrix-text);
+        }
+        // Abnormal end of a turn. The DOT is the semantic mark, the text stays
+        // neutral-dim — red text on glass reads badly (house rule: colour goes in
+        // the mark or the fill, never in the copy).
+        .agent-error-row { margin-top: 2px; }
+        .agent-error-dot {
+            min-width: 6px;                      // size here, NOT a size request
+            min-height: 6px;                     // (the margin below would eat it)
+            margin-top: 5px;                     // optical: aligns to the first text line
+            border-radius: var(--veltrix-radius-pill);
+            background: var(--veltrix-danger);
+        }
+        .agent-error-text {
+            font-size: $fs-small;
+            color: var(--veltrix-text-dim);
+        }
+    }
+    .agent-bubble-user {
+        background: var(--veltrix-surface-raised);
+    }
+    .agent-bubble-assistant {
+        background: var(--veltrix-surface);
+    }
+
+    /* The WORK half of an assistant turn — narration + chips — is deliberately
+       UNBUBBLED: it sits bare on the panel glass so that the answer, which keeps
+       its bubble, is the only thing in the turn wearing a background. That is the
+       whole separation mechanism, and it costs no chrome. See makeBubble. */
+    .agent-interim-text {
+        /* FULL SIZE, dimmed. It was $fs-mini in the first cut and that was the
+           mistake: the opening sentence of a turn is not the caption of whatever
+           chip follows it, and 11px prose labelled it as one. Colour alone
+           carries "this was on the way, not the reply" — the answer's BUBBLE is
+           what carries the hierarchy now. */
+        font-size: $fs-small;
+        color: var(--veltrix-text-dim);
+    }
+    /* `--veltrix-surface`, NOT `surface-back`. Inside the old bubble the chip
+       stacked 0.04 over 0.08 and read at ~0.12; bare on the glass, 0.04 alone
+       was nearly invisible (measured by eye on the live panel, which is the only
+       instrument for this — see the screenshot caveat in tech-debt). It now
+       matches the answer bubble's alpha and the hierarchy is carried by SHAPE
+       instead: a small hugging pill against a wide filled block. */
+    .agent-tool-chip {
+        padding: 3px 8px;
+        border-radius: var(--veltrix-radius-pill);
+        background: var(--veltrix-surface);
+        .agent-tool-dot {
+            /* The SIZE lives here, not in a size request — see makeToolChip. A
+               request plus the margin below would render 6×4. */
+            min-width: 6px;
+            min-height: 6px;
+            border-radius: var(--veltrix-radius-pill);
+            background: var(--veltrix-text-dim);
+            /* Optical nudge DOWNWARD, measured off the rendered pixels rather
+               than reasoned about: geometrically centred, the dot's centre landed
+               2px above the label's ink. The margin joins the CENTRED outer box,
+               so it only moves the dot by half of itself: dot centre = content
+               centre + margin/2. Measured at margin 2 the centre landed on 18.5
+               against ink centring on 19.5, which confirmed the formula and gave
+               the remaining px — at 4 the dot occupies exactly the same rows as
+               the text ink (y17–22 in the sample that settled it).
+
+               The opposite nudge was tried FIRST, on the theory that descender
+               space makes a centred dot look LOW. The pixels said otherwise. Do
+               not re-derive the direction from reasoning; crop and read the rows
+               (see design-system.md). */
+            margin-top: 4px;
+        }
+        .agent-tool-label {
+            font-size: $fs-mini;
+            color: var(--veltrix-text-dim);
+            font-variant-numeric: tabular-nums;
+        }
+        &.agent-tool-fail .agent-tool-dot { background: var(--veltrix-danger); }
+    }
+
+    .agent-entry {
+        @include veltrix-reset;
+        padding: 8px 14px;
+        border-radius: var(--veltrix-radius-pill);
+        background: var(--veltrix-surface);
+        color: var(--veltrix-text);
+        font-size: $fs-small;
+        caret-color: var(--veltrix-accent);   // the caret IS active state → accent
+    }
+
+    .agent-empty-text {
+        font-size: $fs-small;
+        color: var(--veltrix-text-dim);
+    }
+}

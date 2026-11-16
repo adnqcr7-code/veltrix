@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// File helpers — what `ags/file` gave us, minus everything we never called.
+//
+// AGS's module also exported `readFileAsync`, `writeFileAsync` and `monitorFile`
+// (a recursive `Gio.FileMonitor` wrapper that re-arms itself on CREATE). Veltrix
+// imports only `readFile` and `writeFile`; the code that watches files here
+// builds its own monitor because it needs the event kind (ThemeManager,
+// core/*Config). So this is the whole surface.
+//
+// Both are SYNCHRONOUS on purpose: every call site is small JSON under
+// `~/.config/veltrix/` read or written at a user action or at startup, and the
+// async versions were never used once.
+
+import Gio from "gi://Gio"
+import GLib from "gi://GLib"
+
+/**
+ * Read a file as UTF-8 text.
+ *
+ * @throws when the file does not exist or cannot be read — callers that treat a
+ * missing file as "no config yet" must catch, exactly as they did before.
+ */
+export function readFile(file: string | Gio.File): string {
+  const f = typeof file === "string" ? Gio.File.new_for_path(file) : file
+  const [, bytes] = f.load_contents(null)
+  return new TextDecoder().decode(bytes)
+}
+
+/**
+ * Write UTF-8 text, creating the parent directory tree if needed.
+ *
+ * `mode` defaults to 0600: nearly everything here is the user's own config. Pass
+ * 0644 only for a file ANOTHER user must read — the greeter's mirrors in
+ * /var/tmp/veltrix.
+ *
+ * @returns the `Gio.File` written, as the AGS version did
+ */
+export function writeFile(file: string | Gio.File, content: string, mode = 0o600): Gio.File {
+  const gfile = typeof file === "string" ? Gio.File.new_for_path(file) : file
+  const path = typeof file === "string" ? file : gfile.get_path()
+  if (!path) throw Error("path is null")
+
+  const dir = GLib.path_get_dirname(path)
+  if (!GLib.file_test(dir, GLib.FileTest.IS_DIR)) {
+    Gio.File.new_for_path(dir).make_directory_with_parents(null)
+  }
+
+  // DURABLE, not merely atomic. Both of GLib's write paths already rename a
+  // temporary into place, so a reader never sees half a file and a crash of the
+  // shell mid-save cannot truncate one — measured 2026-09-01 by inode: an
+  // in-place write keeps the inode, `replace_contents` and `file_set_contents`
+  // both produce a new one. What neither does by default is fsync, so a POWER
+  // CUT can leave the directory entry pointing at contents that never reached the
+  // disk. That is the failure this flag closes, and it is one call, not thirteen.
+  //
+  // ⚠️ It costs an fsync per write, which is why the write policy above it matters:
+  // a slider that commits thirty times a second would now fsync thirty times a
+  // second. Expensive sinks declare `commitOnRelease` (see config-entries.ts).
+  GLib.file_set_contents_full(
+    path,
+    content,
+    GLib.FileSetContentsFlags.CONSISTENT | GLib.FileSetContentsFlags.DURABLE,
+    mode,
+  )
+  // ⚠️ `mode` only applies to a file being CREATED. Replacing one that exists keeps
+  // its old permissions — measured 2026-09-13: a 0600 file rewritten with 0644 stays
+  // 0600. So a mode is enforced explicitly, or every machine that already got a
+  // 0600 mirror (#488, since 0.11.0) would keep it forever.
+  if (mode !== 0o600) GLib.chmod(path, mode)
+  return gfile
+}

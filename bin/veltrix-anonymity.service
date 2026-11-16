@@ -1,0 +1,18 @@
+[Unit]
+Description=Restore VELTRIX Tor mode at boot
+# The ruleset is the protection, and it does not survive a reboot
+# (nftables rules are not persistent), so re-apply before the network
+# is up: no window at boot where traffic can leave in the clear.
+# Tor itself starts here too — the daemon does not restart itself.
+# When Tor mode is off, veltrix-anonymity apply exits 0 doing nothing.
+After=network-pre.target
+Before=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/veltrix-anonymity apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

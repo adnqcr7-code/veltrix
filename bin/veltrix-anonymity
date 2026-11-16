@@ -1,0 +1,1147 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-anonymity — the system side of Settings → Safety → Anonymity.
+#
+#   veltrix-anonymity on           route ALL traffic through Tor + kill-switch
+#   veltrix-anonymity off          restore normal routing
+#   veltrix-anonymity apply        boot restore: re-apply Tor mode if it was on
+#   veltrix-anonymity status       print JSON state (unprivileged, no root)
+#   veltrix-anonymity leak-check   prove the live path: exit IP + DNS via Tor
+#   veltrix-anonymity install-tor  install the tor package (explicit, pkexec)
+#   veltrix-anonymity rules        print the generated nft ruleset (audit/debug)
+#   veltrix-anonymity verify       re-verify the loaded ruleset (privileged)
+#
+# What Tor mode does (all of it, or it does not claim to):
+#
+#   1. Tor — the tor daemon (Arch `tor` package) with a drop-in that turns
+#      on a transparent proxy (TransPort 9040) and a DNS port (DNSPort 5353).
+#      Tor itself runs as the `tor` system user and reaches the internet
+#      directly; everything else is forced through it.
+#   2. Kill-switch — an nftables table (`inet veltrix-anon`) whose output
+#      chain DEFAULTS TO DROP. Only loopback, Tor's own traffic, traffic
+#      redirected to Tor's ports, and DHCP survive. If Tor stops, nothing
+#      leaves the machine: TCP to the internet hits a closed TransPort
+#      (refused, not leaked) and DNS times out. Enforcement lives in the
+#      firewall, not in per-app proxy settings — a compromised app cannot
+#      bypass it by ignoring a proxy variable, because the packets never
+#      leave the machine except through Tor.
+#   3. DNS — /etc/resolv.conf points at 127.0.0.1 while Tor mode is on, and
+#      every UDP/53 packet is redirected to Tor's DNSPort, so there is no
+#      plaintext-DNS path at all. The previous resolv.conf is backed up
+#      once (never overwritten) and restored on `off` — including the
+#      Content Safety stub symlink, so turning Tor off brings CleanBrowsing
+#      DNS back instead of breaking it.
+#   4. MAC randomisation — NetworkManager is told to use a random MAC for
+#      Wi-Fi scans and for every Wi-Fi/Ethernet connection (new ones via a
+#      conf.d default, existing ones per-connection, previous values
+#      recorded and restored on `off`). This hides the hardware address
+#      from the local network; it does NOT hide the machine from a
+#      network that fingerprints it other ways, and it does nothing at all
+#      once traffic is on the wire past the first hop.
+#
+# Threat model — what this can and cannot do (also in docs/anonymity.md,
+# and the Settings page says the short version, never the absolute one):
+#   - It hides the user's IP address from the sites and services they
+#     contact, and hides the destination from the local network / ISP:
+#     both see only Tor traffic. That is what Tor does, and it is real.
+#   - It does NOT make the user unidentifiable. A site that knows who
+#     the user is (they logged in, they typed their name) still knows.
+#     Browser fingerprinting, cookies, account logins and the user's own
+#     behaviour are outside what an OS-level Tor mode can fix. No OS can
+#     promise "no one will ever know who you are" — anyone who does is
+#     lying, and this module never claims it.
+#   - A malicious Tor exit node sees plaintext traffic to plain-HTTP
+#     sites (not HTTPS). Tor mode is not a substitute for HTTPS.
+#   - The local network still sees that the machine uses Tor (the
+#     traffic pattern is recognisable), and a network that blocks Tor
+#     blocks this mode entirely. Bridges/pluggable transports are a
+#     later step, not this one.
+#   - Turning Tor mode OFF restores normal routing. That direction is
+#     the sensitive one: malware that could silently turn it off could
+#     silently de-anonymise the user. That is why `off` needs the admin
+#     password (polkit auth_admin) while `on` does not — enabling
+#     protection is always safe, disabling it needs the user's consent.
+#     See config/polkit/org.veltrix.anonymity.policy.
+#
+# Safety rules for this helper itself:
+#   - `on`/`off`/`apply`/`install-tor`/`verify` refuse to run as
+#     non-root (exit 1). `status`/`leak-check`/`rules` need no root.
+#   - No credential anywhere: no sudo password is saved, in any file,
+#     keyring or environment variable, not even briefly. The helper runs
+#     as root because polkit authorises the action, not because it knows
+#     a secret — the same design as the background updater. Login
+#     passwords are never this helper's business: they live as one-way
+#     hashes in /etc/shadow, root-only, and this module never creates a
+#     password file of its own.
+#   - Idempotent: `on` twice is the same as `on` once; `off` twice is a
+#     no-op. `on` fails closed: on any step failing after mutation
+#     started, it rolls back (flush nft, stop Tor if it started it,
+#     restore resolv.conf, restore MACs) and exits 1.
+#   - The helper takes no URL, path or version from its caller. The
+#     torrc template is a fixed file shipped by the package; the nft
+#     ruleset is generated from constants in this file.
+#   - `install-tor` is the only step that installs a package, and it is
+#     never silent: it runs `pacman -Sy --noconfirm tor` under its own
+#     polkit action, after the user explicitly taps "Install Tor".
+#
+# Interaction with Content Safety: Tor mode supersedes the CleanBrowsing
+# DNS layer while it is on (DNS goes to Tor, not to CleanBrowsing), and
+# the hosts layer keeps applying. Turning Tor off restores the previous
+# resolv.conf, so Content Safety's DNS layer comes back. The two modules
+# never edit each other's state files.
+#
+# Testing (no Tor, no nftables, no NetworkManager here): every path below
+# honours a VELTRIX_ANON_* environment override, so the whole apply can
+# run against a scratch tree with stub binaries — see
+# scripts/dev/anonymity-probe.sh. Overrides are honoured only when NOT
+# under pkexec (PKEXEC_UID unset): the real path never lets its caller
+# choose what it trusts. VELTRIX_ANON_TEST_MODE=1 bypasses the systemd
+# guard (same convention as the update helper's test overrides).
+# ─────────────────────────────────────────────────────────────────────────────
+import json
+import os
+import pwd
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
+
+TOR_TRANSPORT_PORT = 9040
+TOR_DNS_PORT = 5353
+TOR_SOCKS_PORT = 9050
+TOR_SOCKS_HOST = "127.0.0.1"
+NFT_TABLE = "veltrix-anon"
+STATE_NAME = "state.json"
+STATE_VERSION = 1
+TORRC_NAME = "veltrix-anonymity.conf"
+NM_CONF_NAME = "90-veltrix-anonymity.conf"
+CHECK_URL = "https://check.torproject.org/api/ip"
+DNS_TEST_HOST = "example.com"
+
+# Exit codes: 0 ok, 1 failed, 2 Tor is not installed (for `on` — the UI
+# offers "Install Tor" on this code), 3 nothing to do (already in the
+# requested state / nothing to restore).
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_NO_TOR = 2
+EXIT_NOTHING = 3
+
+
+def _env(name, default):
+    return os.environ.get(name, default)
+
+
+def _test_mode():
+    """True only in the probe harness: test overrides are honoured only
+    when NOT under pkexec — the real path never lets its caller choose
+    what it trusts (same rule as veltrix-update-helper)."""
+    if os.environ.get("PKEXEC_UID") is not None:
+        return False
+    return os.environ.get("VELTRIX_ANON_TEST_MODE") == "1"
+
+
+def paths():
+    """All filesystem locations, overridable for the test harness."""
+    helper_dir = os.path.dirname(os.path.abspath(__file__))
+    return {
+        "state_dir": _env("VELTRIX_ANON_STATE_DIR", "/etc/veltrix/anonymity"),
+        "resolv_conf": _env("VELTRIX_ANON_RESOLV_CONF", "/etc/resolv.conf"),
+        "resolv_backup": _env("VELTRIX_ANON_RESOLV_BACKUP",
+                              "/etc/resolv.conf.veltrix-anonymity-backup"),
+        "torrc_dir": _env("VELTRIX_ANON_TORRC_DIR", "/etc/tor/torrc.d"),
+        "torrc_template": _env("VELTRIX_ANON_TORRC_TEMPLATE",
+                               _find_torrc_template(helper_dir)),
+        "nm_conf_dir": _env("VELTRIX_ANON_NM_CONF_DIR",
+                            "/etc/NetworkManager/conf.d"),
+        "nft": _env("VELTRIX_ANON_NFT", "nft"),
+        "systemctl": _env("VELTRIX_ANON_SYSTEMCTL", "systemctl"),
+        "nmcli": _env("VELTRIX_ANON_NMCLI", "nmcli"),
+        "tor_bin": _env("VELTRIX_ANON_TOR_BIN", "tor"),
+        "curl": _env("VELTRIX_ANON_CURL", "curl"),
+        "dig": _env("VELTRIX_ANON_DIG", "dig"),
+        "pacman": _env("VELTRIX_ANON_PACMAN", "pacman"),
+        "check_url": _env("VELTRIX_ANON_CHECK_URL", CHECK_URL),
+        "dns_test_host": _env("VELTRIX_ANON_DNS_TEST_HOST", DNS_TEST_HOST),
+    }
+
+
+def _find_torrc_template(helper_dir):
+    candidates = [
+        "/usr/share/veltrix/anonymity/torrc-veltrix.conf",
+        "/usr/local/share/veltrix/anonymity/torrc-veltrix.conf",
+        os.path.join(helper_dir, "..", "defaults", "anonymity",
+                     "torrc-veltrix.conf"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return candidates[0]
+
+
+def tor_uid():
+    """The UID Tor runs as (the `tor` system user on Arch). The test
+    harness sets VELTRIX_ANON_TOR_UID; the real path never does."""
+    override = os.environ.get("VELTRIX_ANON_TOR_UID")
+    if override is not None and _test_mode():
+        try:
+            return int(override)
+        except ValueError:
+            pass
+    try:
+        return pwd.getpwnam("tor").pw_uid
+    except KeyError:
+        return None
+
+
+def no_systemd():
+    return os.environ.get("VELTRIX_ANON_NO_SYSTEMD") == "1"
+
+
+def systemd_is_running():
+    """True when THIS root was actually booted with systemd as PID 1.
+    (Same check as veltrix-content-safety: /run/systemd/system only
+    exists where systemd itself booted, so it is absent in a chroot and
+    in a container — /proc/1/comm would lie there.)"""
+    return os.path.isdir("/run/systemd/system")
+
+
+# ── The nftables ruleset ──────────────────────────────────────────────────
+
+def generate_ruleset(uid):
+    """The whole kill-switch, as text. `uid` is Tor's UID: Tor's own
+    traffic is the only traffic allowed out in the clear, and it is
+    allowed by UID, not by port — no other process can borrow it.
+
+    Read it as three chains:
+      output (filter, default DROP — the kill-switch itself): loopback,
+        established traffic, Tor's own UID, traffic already redirected
+        to Tor's ports, and DHCP. IPv6 is dropped outright (Tor does not
+        transport it by default, and an IPv6 path would be a leak).
+      nat-output: everything else is redirected — TCP to TransPort,
+        UDP/53 to DNSPort — except Tor's own traffic and loopback.
+      input (filter, default DROP): loopback, established, and the DHCP
+        reply (UDP sport 67 → dport 68) so a lease can renew while the
+        mode is on. Everything else inbound is dropped: the machine is
+        not reachable from the LAN while anonymous.
+    What is deliberately NOT allowed: NTP (UDP 123 — the clock stops
+    syncing while Tor is on; Tor's own consensus keeps Tor working),
+    mDNS (UDP 5353 multicast — a local-network leak vector), and any
+    LAN service (printing, file shares): Tor mode is whole-device, and
+    a LAN path is a path out that is not Tor."""
+    return """table inet %(table)s {
+    chain output {
+        type filter hook output priority 0; policy drop;
+        ct state established,related accept
+        oifname "lo" accept
+        meta nfproto ipv6 drop
+        meta skuid %(uid)d accept
+        tcp dport %(transport)d accept
+        udp dport %(dns)d ip daddr 127.0.0.1 accept
+        udp dport 67 ip daddr 255.255.255.255 accept
+    }
+    chain nat-output {
+        type nat hook output priority -100; policy accept;
+        meta skuid %(uid)d return
+        oifname "lo" return
+        ip daddr 127.0.0.0/8 return
+        meta nfproto ipv6 return
+        tcp dport != %(transport)d redirect to :%(transport)d
+        udp dport 53 redirect to :%(dns)d
+    }
+    chain input {
+        type filter hook input priority 0; policy drop;
+        ct state established,related accept
+        iifname "lo" accept
+        udp sport 67 udp dport 68 accept
+    }
+}
+""" % {"table": NFT_TABLE, "uid": uid,
+       "transport": TOR_TRANSPORT_PORT, "dns": TOR_DNS_PORT}
+
+
+# Lines the ruleset MUST contain (the kill-switch is not a kill-switch
+# without them) and patterns it must NEVER contain (a clearnet allow).
+REQUIRED_RULES = [
+    "redirect to :9040",               # TCP forced to TransPort
+    "redirect to :5353",               # UDP/53 forced to DNSPort
+    "meta skuid ",                     # Tor's own traffic, by UID
+    "ct state established,related accept",
+    "meta nfproto ipv6 drop",          # no IPv6 egress at all
+]
+# Chain policies, checked per chain (not as plain substrings — the
+# string "policy drop;" appears in two chains, so a tampered output
+# chain would pass a substring check while the kill-switch was gone).
+REQUIRED_CHAIN_POLICIES = [
+    ("output", "drop"),      # the kill-switch itself
+    ("input", "drop"),       # not reachable from the LAN while anonymous
+    ("nat-output", "accept"),
+]
+FORBIDDEN_RULES = [
+    "policy accept;",                  # an accept-by-default chain
+    "accept",                          # (checked below, line by line)
+]
+
+
+def validate_ruleset(text):
+    """Structural check of a generated ruleset. Returns a list of
+    problems (empty = valid). This runs everywhere, including the test
+    harness — `nft -c` needs a kernel that will take netlink, which the
+    build VM does not have, so the Dell must run `nft -c` too (see
+    `verify`, and docs/anonymity.md). The check here catches the
+    failures that matter most: a missing drop, a missing redirect, a
+    stray clearnet allow, unbalanced braces."""
+    problems = []
+    if text.count("{") != text.count("}"):
+        problems.append("unbalanced braces")
+    if "table inet %s" % NFT_TABLE not in text:
+        problems.append("missing table inet %s" % NFT_TABLE)
+    for chain, policy in REQUIRED_CHAIN_POLICIES:
+        # Chains hold rules only (no nested braces), so [^}]* spans one.
+        if not re.search(r"chain %s\s*\{[^}]*policy %s;"
+                         % (re.escape(chain), policy), text):
+            problems.append("chain %s must have policy %s"
+                            % (chain, policy))
+    for req in REQUIRED_RULES:
+        if req not in text:
+            problems.append("missing required rule: %s" % req)
+    # A clearnet allow is any accept that is not one of the known-safe
+    # ones (loopback, established, Tor's UID, Tor's ports, DHCP).
+    safe_accepts = re.compile(
+        r"(oifname \"lo\"|iifname \"lo\"|ct state established,related"
+        r"|meta skuid \d+|tcp dport 9040|udp dport 5353 ip daddr 127\.0\.0\.1"
+        r"|udp dport 67 ip daddr 255\.255\.255\.255"
+        r"|udp sport 67 udp dport 68)\s+accept")
+    for line in text.splitlines():
+        line = line.strip()
+        if line.endswith("accept") and not safe_accepts.search(line):
+            problems.append("unexpected accept (possible clearnet hole): %s" % line)
+    return problems
+
+# ── Small process helpers ───────────────────────────────────────────────
+
+def _run(argv, timeout=30):
+    """Run a command, return (returncode, stdout, stderr). Missing
+    binaries raise FileNotFoundError — callers turn that into an honest
+    'not installed' instead of crashing."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return (124, "", "timed out after %ss: %s" % (timeout, " ".join(argv)))
+    return (proc.returncode, proc.stdout, proc.stderr)
+
+
+def _systemctl(*args, timeout=30):
+    return _run([paths()["systemctl"]] + list(args), timeout=timeout)
+
+
+def _nmcli(*args, timeout=15):
+    return _run([paths()["nmcli"]] + list(args), timeout=timeout)
+
+
+def tor_installed():
+    return shutil.which(paths()["tor_bin"]) is not None
+
+
+def tor_active():
+    """True when the tor service is active. `systemctl is-active`
+    exits 0 only when active; anything else (inactive, failed, or
+    systemd not running here) is False, not an error."""
+    if no_systemd() and not _test_mode():
+        return False
+    try:
+        rc, out, _ = _systemctl("is-active", "tor.service", timeout=10)
+    except FileNotFoundError:
+        return False
+    return rc == 0 and out.strip() == "active"
+
+
+def socks_reachable(timeout=3):
+    """True when something answers on Tor's SOCKS port. A TCP connect
+    only — it proves the listener is up, not that a circuit is built
+    (that is what leak-check is for)."""
+    try:
+        with socket.create_connection((TOR_SOCKS_HOST, TOR_SOCKS_PORT),
+                                      timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+# ── State ───────────────────────────────────────────────────────────────
+
+def _state_path(p):
+    return os.path.join(p["state_dir"], STATE_NAME)
+
+
+def _load_state(p):
+    """The recorded pre-first-`on` system state, or None. An empty,
+    non-dict or unparseable file is corruption, not a state — treating
+    it as one would strand `off` (same rule as veltrix-content-safety)."""
+    try:
+        with open(_state_path(p), encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or not state:
+        return None
+    return state
+
+
+def _save_state(p, state):
+    """Atomic: write temp, fsync, rename. A half-written state file
+    must never be read as the pre-`on` record."""
+    os.makedirs(p["state_dir"], exist_ok=True)
+    tmp = _state_path(p) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, _state_path(p))
+
+
+def _drop_state(p):
+    try:
+        os.unlink(_state_path(p))
+    except OSError:
+        pass
+
+
+# ── Tor configuration ───────────────────────────────────────────────────
+
+def _read_torrc_template(p):
+    try:
+        with open(p["torrc_template"], encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        return None
+
+
+def _write_torrc(p):
+    """Install the Tor drop-in. Returns an error string, or None."""
+    body = _read_torrc_template(p)
+    if body is None:
+        return "torrc template not found: %s" % p["torrc_template"]
+    try:
+        os.makedirs(p["torrc_dir"], exist_ok=True)
+        target = os.path.join(p["torrc_dir"], TORRC_NAME)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(body)
+        return None
+    except OSError as e:
+        return "cannot write %s: %s" % (TORRC_NAME, e)
+
+
+def _remove_torrc(p):
+    try:
+        os.unlink(os.path.join(p["torrc_dir"], TORRC_NAME))
+    except OSError:
+        pass
+
+
+# ── nftables ────────────────────────────────────────────────────────────
+
+def _nft(args, input_text=None, timeout=30):
+    argv = [paths()["nft"]] + list(args)
+    if input_text is None:
+        return _run(argv, timeout=timeout)
+    return _run_stdin(argv, input_text, timeout)
+
+
+def _run_stdin(argv, text, timeout=30):
+    try:
+        proc = subprocess.run(argv, input=text, capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return (124, "", "timed out")
+    return (proc.returncode, proc.stdout, proc.stderr)
+
+
+def _apply_nft(ruleset):
+    """Replace the table with the generated ruleset. Returns an error
+    string, or None. The old table (if any) is deleted first so a
+    half-applied earlier run can never stack two rulesets."""
+    rc, _, err = _nft(["delete", "table", "inet", NFT_TABLE])
+    # delete fails when there is no table yet — that is the normal case.
+    rc, _, err = _nft(["-f", "-"], input_text=ruleset)
+    if rc != 0:
+        return "nft apply failed: %s" % (err.strip() or "exit %d" % rc)
+    return None
+
+
+def _flush_nft():
+    _nft(["delete", "table", "inet", NFT_TABLE])
+
+
+def _rules_loaded():
+    """True when the table exists and contains the kill-switch drop.
+    Privileged: `nft list` needs CAP_NET_ADMIN, so this is only called
+    from privileged verbs — `status` (unprivileged) reports the state
+    file's claim instead, and says so."""
+    try:
+        rc, out, _ = _nft(["list", "table", "inet", NFT_TABLE])
+    except FileNotFoundError:
+        return False
+    if rc != 0:
+        return False
+    return "policy drop;" in out and "redirect to :9040" in out
+
+
+# ── resolv.conf ─────────────────────────────────────────────────────────
+
+def _resolv_kind(p):
+    """What /etc/resolv.conf is now: ('symlink', target), ('file', None)
+    or ('missing', None)."""
+    try:
+        if os.path.islink(p["resolv_conf"]):
+            return ("symlink", os.readlink(p["resolv_conf"]))
+        if os.path.isfile(p["resolv_conf"]):
+            return ("file", None)
+    except OSError:
+        pass
+    return ("missing", None)
+
+
+def _resolv_points_at_tor(p):
+    """True when resolv.conf currently sends DNS to Tor (127.0.0.1)."""
+    try:
+        if os.path.islink(p["resolv_conf"]):
+            return False
+        with open(p["resolv_conf"], encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("nameserver"):
+                    return line.split()[1] == "127.0.0.1"
+    except (OSError, IndexError):
+        pass
+    return False
+
+
+def _set_resolv_tor(p):
+    """Point resolv.conf at Tor. Backs the previous file up ONCE (never
+    overwritten, and never from a file that already points at Tor —
+    backing up our own state would make `off` restore a broken file).
+    Returns an error string, or None."""
+    kind, target = _resolv_kind(p)
+    if _resolv_points_at_tor(p):
+        return None
+    try:
+        if not os.path.exists(p["resolv_backup"]):
+            if kind == "symlink":
+                # The symlink target is what must come back; the backup
+                # is the target path itself, recorded in the state file.
+                pass
+            elif kind == "file":
+                shutil.copy2(p["resolv_conf"], p["resolv_backup"])
+            # 'missing': nothing to back up.
+        if os.path.islink(p["resolv_conf"]) or os.path.exists(p["resolv_conf"]):
+            os.unlink(p["resolv_conf"])
+        with open(p["resolv_conf"], "w", encoding="utf-8") as f:
+            f.write("# VELTRIX anonymity (Tor mode): DNS goes to Tor only.\n")
+            f.write("nameserver 127.0.0.1\n")
+        return None
+    except OSError as e:
+        return "cannot set resolv.conf: %s" % e
+
+
+def _restore_resolv(p, state):
+    """Restore the pre-`on` resolv.conf from the state record + backup.
+    Returns an error string, or None. When there is no record at all
+    (state deleted by hand), the fallback is the distro default — the
+    resolved stub symlink — with a clear note on stderr, so the machine
+    is never left with a resolv.conf that points at a Tor that is off."""
+    prior = (state or {}).get("resolv", {}) if state else {}
+    try:
+        if os.path.islink(p["resolv_conf"]) or os.path.exists(p["resolv_conf"]):
+            os.unlink(p["resolv_conf"])
+        if prior.get("kind") == "symlink" and prior.get("target"):
+            os.symlink(prior["target"], p["resolv_conf"])
+        elif os.path.exists(p["resolv_backup"]):
+            shutil.copy2(p["resolv_backup"], p["resolv_conf"])
+            os.unlink(p["resolv_backup"])
+        else:
+            # No record, no backup: restore the distro default stub.
+            os.symlink("/run/systemd/resolve/stub-resolv.conf",
+                       p["resolv_conf"])
+            print("veltrix-anonymity: no resolv.conf record; restored the "
+                  "systemd-resolved stub (distro default)", file=sys.stderr)
+        return None
+    except OSError as e:
+        return "cannot restore resolv.conf: %s" % e
+
+
+# ── MAC randomisation ───────────────────────────────────────────────────
+
+def _nm_connections():
+    """All NetworkManager connections as (name, type) pairs. Missing
+    nmcli (or no NetworkManager) is an empty list, not an error — the
+    machine may be offline or NM-less, and Tor mode must not fail for
+    it; the conf.d default still covers new connections."""
+    try:
+        rc, out, _ = _nmcli("-t", "-f", "NAME,TYPE", "connection", "show")
+    except FileNotFoundError:
+        return []
+    if rc != 0:
+        return []
+    conns = []
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        name, ctype = line.split(":", 1)
+        conns.append((name, ctype))
+    return conns
+
+
+def _nm_active_names():
+    try:
+        rc, out, _ = _nmcli("-t", "-f", "NAME", "connection", "show",
+                            "--active")
+    except FileNotFoundError:
+        return set()
+    if rc != 0:
+        return set()
+    return {line.strip() for line in out.splitlines() if line.strip()}
+
+
+def _nm_get_cloned_mac(name, ctype):
+    key = "wifi.cloned-mac-address" if ctype == "802-11-wireless" \
+        else "ethernet.cloned-mac-address"
+    try:
+        rc, out, _ = _nmcli("-t", "-f", key, "connection", "show", name)
+    except FileNotFoundError:
+        return None
+    if rc != 0:
+        return None
+    out = out.strip()
+    if not out or ":" not in out:
+        return None
+    return out.split(":", 1)[1].strip()
+
+
+def _mac_randomize(p):
+    """Randomise the MAC for Wi-Fi scans, new connections (conf.d
+    default) and every existing Wi-Fi/Ethernet connection. Returns
+    (record, error): the record maps connection name → previous value
+    (None = the connection had no explicit value), for `off` to
+    restore. Active connections are bounced (down + up) so the new MAC
+    takes effect now, not at the next connect — the link drops for a
+    moment, and the UI says so."""
+    record = {}
+    try:
+        os.makedirs(p["nm_conf_dir"], exist_ok=True)
+        with open(os.path.join(p["nm_conf_dir"], NM_CONF_NAME),
+                  "w", encoding="utf-8") as f:
+            f.write("# VELTRIX anonymity (Tor mode): randomise the MAC.\n"
+                    "# New connections and Wi-Fi scans use a random address;\n"
+                    "# existing connections are set per-connection by the\n"
+                    "# helper, with the previous value recorded in the\n"
+                    "# state file so `off` can restore it exactly.\n"
+                    "[device]\n"
+                    "wifi.scan-rand-mac-address=yes\n"
+                    "[connection]\n"
+                    "wifi.cloned-mac-address=random\n"
+                    "ethernet.cloned-mac-address=random\n")
+    except OSError as e:
+        return (record, "cannot write NM conf.d: %s" % e)
+    active = _nm_active_names()
+    for name, ctype in _nm_connections():
+        if ctype == "802-11-wireless":
+            key = "wifi.cloned-mac-address"
+        elif ctype == "802-3-ethernet":
+            key = "ethernet.cloned-mac-address"
+        else:
+            continue
+        prev = _nm_get_cloned_mac(name, ctype)
+        record[name] = {"type": ctype, "prev": prev}
+        rc, _, err = _nmcli("connection", "modify", name, key, "random")
+        if rc != 0:
+            # The conf.d default is already written: remove it again, so
+            # a failed `on` leaves no MAC change behind at all (the
+            # caller rolls back the rest; this half is ours to clean).
+            try:
+                os.unlink(os.path.join(p["nm_conf_dir"], NM_CONF_NAME))
+            except OSError:
+                pass
+            return (record, "nmcli modify %s failed: %s"
+                    % (name, err.strip()))
+    try:
+        _nmcli("connection", "reload")
+    except FileNotFoundError:
+        pass
+    for name in sorted(active):
+        _nmcli("connection", "down", name)
+        _nmcli("connection", "up", name)
+    return (record, None)
+
+
+def _mac_restore(p, record):
+    """Undo _mac_randomize: remove the conf.d default, restore every
+    recorded per-connection value (or clear it when there was none),
+    reload, bounce the active ones back."""
+    try:
+        os.unlink(os.path.join(p["nm_conf_dir"], NM_CONF_NAME))
+    except OSError:
+        pass
+    active = _nm_active_names()
+    for name, info in (record or {}).items():
+        ctype = info.get("type")
+        prev = info.get("prev")
+        key = "wifi.cloned-mac-address" if ctype == "802-11-wireless" \
+            else "ethernet.cloned-mac-address"
+        if prev is None:
+            _nmcli("connection", "modify", name, key, "")
+        else:
+            _nmcli("connection", "modify", name, key, prev)
+    try:
+        _nmcli("connection", "reload")
+    except FileNotFoundError:
+        pass
+    for name in sorted(active):
+        _nmcli("connection", "down", name)
+        _nmcli("connection", "up", name)
+
+
+def _mac_is_randomized(p):
+    """True when our NM conf.d default is in place."""
+    return os.path.isfile(os.path.join(p["nm_conf_dir"], NM_CONF_NAME))
+
+# ── Verbs ───────────────────────────────────────────────────────────────
+
+def _require_root(verb):
+    if os.geteuid() != 0:
+        print("veltrix-anonymity: '%s' changes the system and must run "
+              "as root (via pkexec)" % verb, file=sys.stderr)
+        return False
+    return True
+
+
+def _require_systemd(verb):
+    if systemd_is_running() or no_systemd() or _test_mode():
+        return True
+    print("veltrix-anonymity: systemd is not running here, so '%s' "
+          "cannot start Tor or apply firewall rules" % verb,
+          file=sys.stderr)
+    return False
+
+
+def _tor_uid_or_fail():
+    uid = tor_uid()
+    if uid is None:
+        print("veltrix-anonymity: no 'tor' system user — is the tor "
+              "package installed?", file=sys.stderr)
+        return None
+    return uid
+
+
+def _start_tor(timeout_s=20):
+    """Start Tor and wait until the service is active. Returns an error
+    string, or None. Tor takes a few seconds to bootstrap circuits;
+    the kill-switch protects the machine meanwhile, so 'active' is
+    enough here — leak-check proves the circuit."""
+    rc, _, err = _systemctl("start", "tor.service")
+    if rc != 0:
+        return "systemctl start tor failed: %s" % err.strip()
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if tor_active():
+            return None
+        time.sleep(1)
+    return "tor did not become active within %ss" % timeout_s
+
+
+def _stop_tor():
+    _systemctl("stop", "tor.service")
+
+
+def _reload_tor():
+    _systemctl("reload", "tor.service")
+
+
+def cmd_on():
+    """Turn Tor mode on. Fail-closed with rollback."""
+    if not _require_root("on") or not _require_systemd("on"):
+        return EXIT_FAIL
+    p = paths()
+    if not tor_installed():
+        print("veltrix-anonymity: Tor is not installed. Run "
+              "'veltrix-anonymity install-tor' (or install the 'tor' "
+              "package) first.", file=sys.stderr)
+        return EXIT_NO_TOR
+    uid = _tor_uid_or_fail()
+    if uid is None:
+        return EXIT_FAIL
+    existing = _load_state(p)
+    if existing and existing.get("mode") == "tor":
+        print("veltrix-anonymity: Tor mode is already on")
+        return EXIT_NOTHING
+    ruleset = generate_ruleset(uid)
+    problems = validate_ruleset(ruleset)
+    if problems:
+        print("veltrix-anonymity: refusing to apply an invalid ruleset:",
+              file=sys.stderr)
+        for problem in problems:
+            print("  - %s" % problem, file=sys.stderr)
+        return EXIT_FAIL
+
+    # Record the pre-`on` system FIRST, before any mutation.
+    was_active = tor_active()
+    kind, target = _resolv_kind(p)
+    state = {
+        "version": STATE_VERSION,
+        "mode": "tor",
+        "tor_was_active": was_active,
+        "resolv": {"kind": kind, "target": target},
+        "mac": {},
+        "rules_applied": False,
+    }
+    # `on` rolls back, in reverse order, anything it managed to do.
+    # Each step records what it did in `done` so the rollback only
+    # undoes real changes.
+    done = {"torrc": False, "tor_started": False, "nft": False,
+            "resolv": False, "mac": False}
+    err = None
+    err = _write_torrc(p)
+    if err is None:
+        done["torrc"] = True
+        if not was_active:
+            err = _start_tor()
+            if err is None:
+                done["tor_started"] = True
+        if err is None:
+            err = _apply_nft(ruleset)
+            if err is None:
+                done["nft"] = True
+                if not _rules_loaded():
+                    err = "nft table applied but verification failed " \
+                          "(table not listed back)"
+        if err is None:
+            err = _set_resolv_tor(p)
+            if err is None:
+                done["resolv"] = True
+        if err is None:
+            record, merr = _mac_randomize(p)
+            state["mac"] = record
+            if merr is None:
+                done["mac"] = True
+            else:
+                err = merr
+    if err is not None:
+        print("veltrix-anonymity: %s — rolling back" % err, file=sys.stderr)
+        if done["mac"]:
+            _mac_restore(p, state.get("mac", {}))
+        if done["resolv"]:
+            _restore_resolv(p, state)
+        if done["nft"]:
+            _flush_nft()
+        if done["tor_started"]:
+            _stop_tor()
+        if done["torrc"]:
+            _remove_torrc(p)
+        return EXIT_FAIL
+    state["rules_applied"] = True
+    _save_state(p, state)
+    print("veltrix-anonymity: Tor mode is on — all traffic goes through "
+          "Tor; if Tor stops, nothing leaves the machine.")
+    return EXIT_OK
+
+
+def cmd_off():
+    """Turn Tor mode off: restore normal routing. Idempotent, and a
+    recovery path even without a state file: it still flushes our nft
+    table and removes our torrc, so a half-applied `on` can never
+    strand the machine behind a kill-switch."""
+    if not _require_root("off"):
+        return EXIT_FAIL
+    p = paths()
+    state = _load_state(p)
+    if not state or state.get("mode") != "tor":
+        # No record of Tor mode: defensive cleanup only.
+        _flush_nft()
+        _remove_torrc(p)
+        if _mac_is_randomized(p):
+            _mac_restore(p, {})
+        print("veltrix-anonymity: Tor mode was not on")
+        return EXIT_NOTHING
+    _flush_nft()
+    err = _restore_resolv(p, state)
+    if err is not None:
+        print("veltrix-anonymity: %s" % err, file=sys.stderr)
+        return EXIT_FAIL
+    _mac_restore(p, state.get("mac", {}))
+    _remove_torrc(p)
+    if state.get("tor_was_active"):
+        # Tor was already running before us: leave it running, but make
+        # it drop our TransPort/DNSPort.
+        _reload_tor()
+    else:
+        _stop_tor()
+    _drop_state(p)
+    print("veltrix-anonymity: Tor mode is off — normal routing restored.")
+    return EXIT_OK
+
+
+def cmd_apply():
+    """Boot restore (systemd unit): if the state says Tor mode was on,
+    re-apply it — Tor's config, the daemon, the firewall rules, the
+    DNS pointer and the MAC default. resolv.conf and the per-connection
+    MAC values are files, so they survive a reboot on their own; the
+    nft table does not, and Tor does not restart itself. Exit 0 when
+    there is nothing to apply."""
+    if not _require_root("apply"):
+        return EXIT_FAIL
+    p = paths()
+    state = _load_state(p)
+    if not state or state.get("mode") != "tor":
+        return EXIT_OK
+    uid = _tor_uid_or_fail()
+    if uid is None:
+        print("veltrix-anonymity: cannot restore Tor mode — no 'tor' "
+              "user", file=sys.stderr)
+        return EXIT_FAIL
+    ruleset = generate_ruleset(uid)
+    problems = validate_ruleset(ruleset)
+    if problems:
+        print("veltrix-anonymity: refusing to apply an invalid ruleset",
+              file=sys.stderr)
+        return EXIT_FAIL
+    err = _write_torrc(p)
+    if err is None and not tor_active():
+        err = _start_tor()
+    if err is None:
+        err = _apply_nft(ruleset)
+    if err is None and not _resolv_points_at_tor(p):
+        err = _set_resolv_tor(p)
+    if err is None and not _mac_is_randomized(p):
+        _, err = _mac_randomize(p)
+    if err is not None:
+        print("veltrix-anonymity: boot restore failed: %s" % err,
+              file=sys.stderr)
+        return EXIT_FAIL
+    state["rules_applied"] = True
+    _save_state(p, state)
+    print("veltrix-anonymity: Tor mode restored at boot.")
+    return EXIT_OK
+
+
+def _active_vpn():
+    """The active VPN connection's name, or None. Unprivileged read;
+    nmcli missing (or no VPN) is None, not an error."""
+    try:
+        rc, out, _ = _nmcli("-t", "-f", "NAME,TYPE", "connection",
+                            "show", "--active")
+    except FileNotFoundError:
+        return None
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        name, ctype = line.split(":", 1)
+        if ctype.strip() in ("vpn", "wireguard"):
+            return name.strip()
+    return None
+
+
+def cmd_status():
+    """JSON state. Unprivileged — and honest about what it cannot
+    verify without root: `rules_applied` is the state file's claim
+    (verified at apply time by the privileged verb); the live proof
+    is `leak-check`."""
+    p = paths()
+    state = _load_state(p)
+    mode = state.get("mode") if state else "off"
+    if mode not in ("tor", "off"):
+        mode = "off"
+    installed = tor_installed()
+    active = tor_active() if installed else False
+    socks = socks_reachable() if active else False
+    warnings = []
+    if mode == "tor" and not active:
+        warnings.append("Tor mode is on but the Tor service is not "
+                        "active — traffic is blocked (kill-switch) until "
+                        "Tor restarts; run 'veltrix-anonymity on' again.")
+    if mode == "tor" and not _resolv_points_at_tor(p):
+        warnings.append("resolv.conf does not point at Tor — DNS may "
+                        "not be going through Tor.")
+    print(json.dumps({
+        "mode": mode,
+        "tor_installed": installed,
+        "tor_active": active,
+        "socks_reachable": socks,
+        "rules_applied": bool(state and state.get("rules_applied")),
+        "rules_verified": "at apply time (privileged); use 'verify' or "
+                          "'leak-check' for live proof",
+        "resolv_points_at_tor": _resolv_points_at_tor(p),
+        "mac_randomized": _mac_is_randomized(p),
+        "vpn_active": _active_vpn(),
+        "kill_switch": "armed" if mode == "tor" else "off",
+        "warnings": warnings,
+    }, indent=2, sort_keys=True))
+    return EXIT_OK
+
+
+def cmd_leak_check():
+    """Prove the live path. Unprivileged: exit IP + IsTor through Tor's
+    SOCKS port, and DNS resolution through Tor's DNSPort. When Tor mode
+    is off there is nothing to prove — it says so instead of failing.
+    The endpoints are overridable (VELTRIX_ANON_CHECK_URL /
+    VELTRIX_ANON_DNS_TEST_HOST) so the probe can point them at stubs;
+    the real path never sets them."""
+    p = paths()
+    state = _load_state(p)
+    mode = state.get("mode") if state else "off"
+    if mode != "tor":
+        print(json.dumps({"checked": False, "mode": "off",
+                          "reason": "Tor mode is off — turn it on first"},
+                         indent=2, sort_keys=True))
+        return EXIT_OK
+    result = {"checked": True, "mode": "tor", "tor": False,
+              "exit_ip": None, "dns_via_tor": False, "details": []}
+    # 1. What the internet sees, through Tor's SOCKS port.
+    try:
+        rc, out, err = _run([p["curl"], "--silent", "--show-error",
+                             "--max-time", "20", "--socks5-hostname",
+                             "%s:%d" % (TOR_SOCKS_HOST, TOR_SOCKS_PORT),
+                             p["check_url"]], timeout=30)
+    except FileNotFoundError:
+        rc, out, err = (1, "", "curl not found")
+    if rc != 0:
+        result["details"].append("exit-IP check failed: %s" % err.strip())
+    else:
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = {}
+        result["tor"] = bool(data.get("IsTor"))
+        result["exit_ip"] = data.get("IP")
+        if not result["tor"]:
+            result["details"].append(
+                "check.torproject.org says this IP is NOT a Tor exit — "
+                "traffic is not going through Tor")
+    # 2. DNS through Tor's DNSPort (and only there).
+    try:
+        rc, out, err = _run([p["dig"], "@127.0.0.1", "-p",
+                             str(TOR_DNS_PORT), p["dns_test_host"],
+                             "+short", "+time=5"], timeout=15)
+    except FileNotFoundError:
+        rc, out, err = (1, "", "dig not found")
+    if rc == 0 and out.strip():
+        result["dns_via_tor"] = True
+    else:
+        result["details"].append("DNS through Tor's DNSPort failed: %s"
+                                 % err.strip())
+    if result["tor"] and result["dns_via_tor"]:
+        result["details"].append("Traffic exits through Tor and DNS "
+                                 "resolves through Tor only.")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return EXIT_OK
+
+
+def cmd_install_tor():
+    """Install the tor package. Explicit and never silent: the user
+    taps 'Install Tor' in Settings, polkit asks for the admin password
+    (auth_admin — installing a package is not a no-prompt action), and
+    this runs `pacman -Sy --noconfirm tor`. The db sync (-Sy) alone
+    upgrades nothing; only the tor package is installed."""
+    if not _require_root("install-tor"):
+        return EXIT_FAIL
+    p = paths()
+    if tor_installed():
+        print("veltrix-anonymity: tor is already installed")
+        return EXIT_NOTHING
+    if shutil.which(p["pacman"]) is None:
+        print("veltrix-anonymity: pacman not found — install the 'tor' "
+              "package with your distribution's package manager",
+              file=sys.stderr)
+        return EXIT_FAIL
+    rc, _, err = _run([p["pacman"], "-Sy", "--noconfirm", "tor"],
+                      timeout=600)
+    if rc != 0:
+        print("veltrix-anonymity: pacman failed: %s" % err.strip(),
+              file=sys.stderr)
+        return EXIT_FAIL
+    if not tor_installed():
+        print("veltrix-anonymity: pacman reported success but tor is "
+              "still not installed", file=sys.stderr)
+        return EXIT_FAIL
+    print("veltrix-anonymity: tor installed.")
+    return EXIT_OK
+
+
+def cmd_rules():
+    """Print the generated ruleset, for audit and debugging. The UID
+    is Tor's real one when resolvable; otherwise 0 with a warning on
+    stderr (the shape is what is audited, not the number)."""
+    uid = tor_uid()
+    if uid is None:
+        print("veltrix-anonymity: no 'tor' user; printing with UID 0 "
+              "(audit shape only)", file=sys.stderr)
+        uid = 0
+    sys.stdout.write(generate_ruleset(uid))
+    return EXIT_OK
+
+
+def cmd_verify():
+    """Privileged re-verification of the loaded ruleset: regenerate,
+    syntax-check with `nft -c`, and confirm the live table contains
+    the kill-switch drop and the TransPort redirect. Exit 0 only when
+    all three hold."""
+    if not _require_root("verify"):
+        return EXIT_FAIL
+    p = paths()
+    uid = _tor_uid_or_fail()
+    if uid is None:
+        return EXIT_FAIL
+    ruleset = generate_ruleset(uid)
+    problems = validate_ruleset(ruleset)
+    if problems:
+        for problem in problems:
+            print("FAIL: %s" % problem, file=sys.stderr)
+        return EXIT_FAIL
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".nft",
+                                     delete=False) as f:
+        f.write(ruleset)
+        tmp = f.name
+    try:
+        rc, _, err = _nft(["-c", "-f", tmp])
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if rc != 0:
+        print("FAIL: nft -c rejected the ruleset: %s" % err.strip(),
+              file=sys.stderr)
+        return EXIT_FAIL
+    if not _rules_loaded():
+        print("FAIL: table inet %s is not loaded (or lacks the "
+              "kill-switch)" % NFT_TABLE, file=sys.stderr)
+        return EXIT_FAIL
+    print("OK: ruleset valid, table inet %s loaded with the kill-switch"
+          % NFT_TABLE)
+    return EXIT_OK
+
+
+def main(argv):
+    verbs = {
+        "on": cmd_on, "off": cmd_off, "apply": cmd_apply,
+        "status": cmd_status, "leak-check": cmd_leak_check,
+        "install-tor": cmd_install_tor, "rules": cmd_rules,
+        "verify": cmd_verify,
+    }
+    if len(argv) != 2 or argv[1] not in verbs:
+        print("usage: veltrix-anonymity "
+              "<on|off|apply|status|leak-check|install-tor|rules|verify>",
+              file=sys.stderr)
+        return EXIT_FAIL
+    return verbs[argv[1]]()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

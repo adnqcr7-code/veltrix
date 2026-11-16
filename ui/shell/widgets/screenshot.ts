@@ -1,0 +1,155 @@
+import Gtk from "gi://Gtk?version=4.0"
+import { BAR_ICON_SIZE, BAR_ITEM_PAD, AtomicWidget, ContentBudget, PANEL_W, WidgetSize, makeCapsuleTile } from "../common/widget-kit"
+import { VeltrixButton } from "../../lib/veltrix-kit/button"
+import GLib from "gi://GLib"
+import { execAsync } from "../../lib/process"
+
+import { t } from "../core/i18n"
+import { uiIcon } from "../core/Icons"
+import compositor from "../core/CompositorState"
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+type CaptureMode   = "area" | "screen" | "window"
+type CaptureAction = "copy" | "save"
+
+// ── grim commands ─────────────────────────────────────────────────────────────
+
+const SAVE_DIR = GLib.build_filenamev([GLib.get_home_dir(), "Pictures"])
+
+function saveFilename(): string {
+    const now = new Date()
+    const pad = (n: number) => String(n).padStart(2, "0")
+    const ts = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`
+    return `${SAVE_DIR}/Screenshot_${ts}.png`
+}
+
+function buildCommand(mode: CaptureMode, action: CaptureAction): string {
+    // Window geometry comes from HyprlandState at this point — capture() calls
+    // this AFTER the close-delay, so the focused client is current (this used to
+    // be a `hyprctl | jq` pipeline evaluated inside bash; same moment, no jq).
+    const focused = compositor.focusedClient
+    const geometry = mode === "area"
+        ? '$(slurp -d)'
+        : mode === "window" && focused
+            ? `${focused.x},${focused.y} ${focused.width}x${focused.height}`
+            : null
+
+    const grimFlag = geometry ? `-g "${geometry}"` : ""
+
+    if (action === "copy") {
+        // The type, not wl-copy's guess: it guesses through xdg-mime, and without it a PNG is
+        // offered as text/plain and pastes as nothing (measured 2026-10-02).
+        return `grim ${grimFlag} - | wl-copy --type image/png`.trim()
+    } else {
+        const file = saveFilename()
+        return `grim ${grimFlag} "${file}" && notify-send "${t("widget.screenshot.saved")}" "${file}"`.trim()
+    }
+}
+
+async function capture(mode: CaptureMode, action: CaptureAction, onClose: () => void) {
+    onClose()
+    await new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 600, () => {
+        resolve(null)
+        return GLib.SOURCE_REMOVE
+    }))
+    try {
+        await execAsync(["bash", "-c", buildCommand(mode, action)])
+    } catch (e) {
+        console.error("[Screenshot] capture failed:", e)
+    }
+}
+
+// ── Shared control builder (used by bar expansion + CC popover) ───────────────
+
+function buildControls(onClose: () => void): Gtk.Widget {
+    let selectedMode: CaptureMode = "area"
+
+    const modes: { id: CaptureMode; label: string }[] = [
+        { id: "area",   label: t("widget.screenshot.mode.area") },
+        { id: "screen", label: t("widget.screenshot.mode.screen") },
+        { id: "window", label: t("widget.screenshot.mode.window") },
+    ]
+
+    const modeRow = new Gtk.Box({ spacing: 4, homogeneous: true })
+    const modeBtns: Gtk.Button[] = []
+    for (const mode of modes) {
+        const btn = new Gtk.Button({ label: mode.label, css_classes: ["veltrix-seg-btn"] })
+        btn.connect("clicked", () => {
+            selectedMode = mode.id
+            modeBtns.forEach((b, i) => {
+                if (modes[i].id === selectedMode) b.add_css_class("suggested-action")
+                else b.remove_css_class("suggested-action")
+            })
+        })
+        modeRow.append(btn)
+        modeBtns.push(btn)
+    }
+    modeBtns[0].add_css_class("suggested-action")
+
+    // Two real actions side by side: Save is the affirmative CTA, Copy is its
+    // neutral sibling. Both were Adwaita classes (`suggested-action` / `flat`),
+    // which only looked native because this panel renders inside the two scopes
+    // that restyle them — outside those, raw GTK. `ghost` would have been the
+    // literal translation of `flat`, but ghost reads as text-with-a-hover and is
+    // for subtle nav affordances, not for an action (design-system.md).
+    const makeActionBtn = (action: CaptureAction, label: string, variant: "primary" | "secondary") => {
+        const btn = VeltrixButton({ label, variant, pill: true })
+        btn.hexpand = true
+        btn.connect("clicked", () => capture(selectedMode, action, onClose))
+        return btn
+    }
+
+    const actionRow = new Gtk.Box({ spacing: 8, homogeneous: true })
+    actionRow.append(makeActionBtn("copy", t("widget.screenshot.action.copy"), "secondary"))
+    actionRow.append(makeActionBtn("save", t("widget.screenshot.action.save"), "primary"))
+
+    const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 12, width_request: PANEL_W.lg })
+    box.append(modeRow)
+    box.append(new Gtk.Separator())
+    box.append(actionRow)
+    return box
+}
+
+// ── Bar icon ──────────────────────────────────────────────────────────────────
+
+function buildBarContent(): Gtk.Widget {
+    return new Gtk.Image({ gicon: uiIcon("nd-screenshot"), pixel_size: BAR_ICON_SIZE, margin_start: BAR_ITEM_PAD, margin_end: BAR_ITEM_PAD, css_classes: ["nd-icon"] })
+}
+
+function buildBarExpanded(onClose: () => void): Gtk.Widget {
+    return buildControls(onClose)
+}
+
+// ── CC content ────────────────────────────────────────────────────────────────
+
+function buildContent(size: WidgetSize, budget: ContentBudget): Gtk.Widget {
+    if (size === WidgetSize.SINGLE) {
+        const box = new Gtk.Box({ hexpand: true, vexpand: true })
+        box.append(new Gtk.Image({ gicon: uiIcon("nd-screenshot"), pixel_size: 28, halign: Gtk.Align.CENTER, valign: Gtk.Align.CENTER, hexpand: true, vexpand: true, css_classes: ["nd-icon"] }))
+        return box
+    }
+
+    // Action tile (no on/off state) → no status subtitle; just the name.
+    return makeCapsuleTile(() => uiIcon("nd-screenshot"), () => t("widget.screenshot.name"), () => "", undefined, budget)
+}
+
+// ── Widget registration ───────────────────────────────────────────────────────
+
+const screenshotWidget: AtomicWidget = {
+    id: "screenshot",
+    category: "utilities",
+    barOrder: 50,
+    name: t("widget.screenshot.name"),
+    icon: uiIcon("nd-screenshot"),
+    locations: ["bar", "cc"],
+    defaultSize: WidgetSize.WIDE,
+    supportedSizes: [WidgetSize.SINGLE, WidgetSize.WIDE, WidgetSize.SQUARE],
+    buildContent,
+    buildBarContent,
+    buildBarExpanded,
+    buildCCDetail: buildBarExpanded,
+    ccDetailRows: 2,
+}
+
+export default screenshotWidget

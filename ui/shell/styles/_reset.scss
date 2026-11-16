@@ -1,0 +1,78 @@
+@use 'base' as *;
+
+/* ==========================================================================
+   VELTRIX DESIGN SYSTEM - SHELL WINDOW BASE (was: the neutralization layer)
+   ========================================================================== */
+
+/* Our interface glyphs (core/Icons.ts) are SYMBOLIC files, so GTK paints them
+   with the CSS `color` of their node — the `image` rule below already binds that
+   to --veltrix-text, and a pinned shell skin only has to move the token.
+   This class used to be `-gtk-icon-filter: invert(1)`, because the drawings were
+   non-symbolic and rendered black. That inversion could not tell OUR black
+   drawing from a THEME's already-white symbolic icon, so the moment #587 let a
+   user choose an interface icon theme, every icon it supplied came out black.
+   It is kept as a marker — "this image is one of our monochrome UI glyphs, never
+   an app's artwork" — and to carry the colour on surfaces whose own sheet does
+   not have the `image` rule. */
+.nd-icon { color: var(--veltrix-text); }
+
+
+/* The shell's own layer-shell windows. What used to be here was a NEUTRALIZATION
+   layer — borders, shadows, outlines, GTK's internal nodes (ripple, highlight,
+   focus-ring, decoration), the drop-target highlight, the scale's internals —
+   all of it declared against a GTK theme the shell no longer loads (tech-debt
+   #107 step 6). With no theme those nodes paint nothing, and the base layer
+   (`ui/lib/veltrix-kit/styles/_base-layer.scss`) is what shows under a node no class of ours
+   reaches. What stays is what is ours to say. */
+#veltrix-dock,
+#veltrix-bar,
+.veltrix-dock-window,
+.veltrix-bar-window {
+    /* Deterministic type base: 14px body. The whole ramp ($fs-*)
+       is anchored to this so em-less elements default to body, independent of
+       the GNOME font size (which only governs family via ThemeManager). */
+    font-size: $fs-body;
+
+    /* Ensure symbolic icons inherit the correct foreground color */
+    image { color: var(--veltrix-text); }
+}
+
+/* ── Native GTK scrollbar fallback — scoped to shell components only ─────────
+   Veltrix's own scroll views are VeltrixScrolled (lib/veltrix-kit/scrolled.ts), which
+   runs vscrollbar_policy EXTERNAL and paints .veltrix-scroll-lane/.veltrix-scroll-thumb
+   instead — none of this applies to them. What is left here catches native scrollbars
+   inside widgets we do not construct (a GTK internal, a third-party child), so the odd
+   one out still looks like the rest. Prefer VeltrixScrolled over adding rules here. */
+#veltrix-dock,
+#veltrix-bar,
+.veltrix-dock-window,
+.veltrix-bar-window,
+.veltrix-settings-window {
+    & scrollbar {
+        background: transparent;
+        border: none;
+
+        trough { background: transparent; border: none; }
+
+        slider {
+            background: var(--veltrix-surface-raised);
+            border-radius: var(--veltrix-radius-pill);
+            min-width: 4px;
+            min-height: 20px;
+            margin: 2px;
+            transition: background 0.2s ease;
+
+            &:hover { background: var(--veltrix-text-dim); }
+        }
+
+        button { opacity: 0; min-width: 0; min-height: 0; padding: 0; }
+    }
+}
+
+/* Veltrix Settings window (Gtk.Window, decorated: false). Transparent because the
+   base layer's `window` rule gives GTK's own toplevels a floating-surface fill,
+   and this window's glass lives on .veltrix-window-glass (Hyprland handles border,
+   rounding and shadows). */
+window.veltrix-settings-window {
+    background: transparent;
+}

@@ -1,0 +1,578 @@
+import Gtk from "gi://Gtk?version=4.0"
+import Gdk from "gi://Gdk?version=4.0"
+import app from "../../../lib/veltrix-kit/platform/host"
+import {
+    VeltrixClamp, VeltrixScrolled, VeltrixSidebar, VeltrixWindow, VeltrixRow,
+    VELTRIX_WINDOW_RADIUS as WINDOW_RADIUS,
+} from "../../../lib/veltrix-kit"
+import { WINDOW_LAYOUT } from "../../../lib/veltrix-kit/platform/tokens"
+
+// Page Imports
+import DisplayPage from "./pages/Display"
+import AudioPage from "./pages/Audio"
+import NetworkPage from "./pages/Network"
+import WidgetsPage from "./pages/Widgets"
+import AboutPage from "./pages/About"
+import AppsPage from "./pages/Apps"
+import BluetoothPage from "./pages/Bluetooth"
+import UsersPage from "./pages/Users"
+import { manifest, type PageDecl } from "./manifest"
+import { buildPreferencePage } from "./PreferencePage"
+import { beginPage, endPage, clearSearchIndex, getSearchIndex, indexPage, indexPreferencePage, pageBox, runPageRefreshers, type SettingsNav } from "./SettingsHelpers"
+import { t } from "../../core/i18n"
+import { SUBPAGE_BUILDERS, subpagesOf } from "./subpages"
+import { uiIcon, currentUiIcon } from "../../core/Icons"
+import IconButton from "../../common/IconButton"
+import { attachTooltip } from "../../../lib/veltrix-kit"
+
+// ── Non-declarative page components registry (P3 #341) ───────────────────────
+// Builders for browser and info pages. Compile-time verified via `satisfies`:
+// every builder declared in manifest must exist here, and no unused builders.
+// ⚠️ TOP-LEVEL pages only. A subpage declares a `builder` too, but its builder
+// lives in `subpages.ts` — the two registries are disjoint sets, and saying so in
+// the type is what keeps each `satisfies` honest: without the `parent` exclusion,
+// adding a subpage to the manifest demands its builder HERE, where nothing can
+// push it.
+type Manifest = typeof manifest
+type ExtractBuilders<P> = P extends { builder: infer B extends string } ? B : never
+type TopLevelPage = Extract<Manifest[number], { icon: string }>
+type ManifestBuilder = ExtractBuilders<TopLevelPage>
+
+type PageComponent = ((nav: SettingsNav) => Gtk.Widget) | (() => Gtk.Widget)
+
+const PAGE_COMPONENTS = {
+    network: NetworkPage,
+    bluetooth: BluetoothPage,
+    display: DisplayPage,
+    audio: AudioPage,
+    widgets: WidgetsPage,
+    apps: AppsPage,
+    users: UsersPage,
+    about: AboutPage,
+} satisfies Record<ManifestBuilder, PageComponent>
+
+type ExtraBuilders = Exclude<keyof typeof PAGE_COMPONENTS, ManifestBuilder>
+const _checkNoExtraBuilders: [ExtraBuilders] extends [never] ? true : { error: "Extra builder in PAGE_COMPONENTS"; extra: ExtraBuilders } = true
+
+/**
+ * Settings - System Configuration Panel
+ * Pure GTK4 — no Adwaita dependency.
+ */
+
+export default function Settings(monitor?: Gdk.Monitor) {
+    clearSearchIndex()
+
+    // The content pane's width — one number for all 18 pages, the search results
+    // included. It is the kit's, not Settings': the window derives its minimum size
+    // and the sidebar's breakpoint from the same value.
+    const PANE_W = WINDOW_LAYOUT.content
+
+    // ── Navigation controls ───────────────────────────────────────────────────
+    const backBtn = new Gtk.Button({
+        child: new Gtk.Image({ gicon: uiIcon("nd-pan-start"), pixel_size: 14, css_classes: ["nd-icon"] }),
+        css_classes: ["veltrix-icon-btn", "nav-btn"],
+        sensitive: false,
+        valign: Gtk.Align.CENTER,
+        halign: Gtk.Align.CENTER,
+    })
+    const forwardBtn = new Gtk.Button({
+        child: new Gtk.Image({ gicon: uiIcon("nd-pan-end"), pixel_size: 14, css_classes: ["nd-icon"] }),
+        css_classes: ["veltrix-icon-btn", "nav-btn"],
+        sensitive: false,
+        valign: Gtk.Align.CENTER,
+        halign: Gtk.Align.CENTER,
+    })
+    // Glass tooltips, app-mode skin (chrome:false → follow the system mode).
+    attachTooltip(backBtn, t("settings.nav.back"), { chrome: false })
+    attachTooltip(forwardBtn, t("settings.nav.forward"), { chrome: false })
+
+    // Navigation capsule (pill shape via CSS): two circles 4 apart, no rule between them
+    // (_settings.scss → "Navigation capsule").
+    const navCapsule = new Gtk.Box({
+        css_classes: ["navigation-capsule"],
+        spacing: 4,
+        valign: Gtk.Align.CENTER,
+        halign: Gtk.Align.CENTER,
+    })
+    navCapsule.append(backBtn)
+    navCapsule.append(forwardBtn)
+
+    // The glass window itself is assembled by VeltrixWindow at the end (so its
+    // header/toolbar can wire to the sidebar, search and nav built below).
+
+    // ── Sidebar ───────────────────────────────────────────────────────────────
+    // The navigation list itself is the universal VeltrixSidebar component; it's
+    // created after the pages are built (below) so its onSelect can call navigateTo.
+    // Order = thematic clusters with title-less dividers (groupStart):
+    // 1) connectivity · 2) the bulk (look/shell/behaviour/apps) · 3) system & devices.
+    // Derived from manifest.ts (P3 #341) — all top-level pages, in order.
+    const categories = (manifest as readonly PageDecl[])
+        .filter(p => !p.parent)
+        .map(p => ({
+            id: p.id,
+            label: t(p.label as any),
+            icon: p.icon ? uiIcon(p.icon) : undefined,
+            groupStart: p.groupStart,
+            pageDecl: p,
+        }))
+
+
+    // ── Page container — single-child swap model ──────────────────────────────
+    // We intentionally avoid Gtk.Stack here. With hhomogeneous/vhomogeneous:false,
+    // Gtk.Stack gives all hidden pages a 0×0 allocation. During CSS reloads
+    // (e.g. dark-mode toggle) GTK snapshots the full widget tree and calls
+    // pixman_region32_init_rect with those 0×0 rects, producing the
+    // "Invalid rectangle" BUG warning. Keeping only the active page in the
+    // widget tree at all times eliminates the problem entirely.
+    const pageCache = new Map<string, Gtk.Widget>()
+    const contentArea = new Gtk.Box({
+        hexpand: true,
+        vexpand: true,
+        css_classes: ["settings-stack"],
+    })
+    let activePageId = ""
+
+    // Page id → breadcrumb metadata. Seeded from categories; subpages add their own.
+    const pageTitles = new Map<string, { title: string; parentId?: string }>()
+    categories.forEach(c => pageTitles.set(c.id, { title: c.label }))
+
+    const showPage = (id: string) => {
+        if (id === activePageId) return
+        const next = pageCache.get(id)
+        if (!next) return
+        const current = pageCache.get(activePageId)
+        if (current) contentArea.remove(current)
+        contentArea.append(next)
+        activePageId = id
+        // Cached page, so its body does not run again: re-ask whatever it had to
+        // GO AND ASK for. See `onPageShown` in SettingsHelpers.
+        runPageRefreshers(id)
+    }
+
+    // Every page (and dynamically-pushed subpage) is a clamped, scrollable box — and
+    // gets the PAGE FRAME (`pageBox`: `.settings-page`'s padding) from HERE when it did
+    // not bring its own. The frame is the host's, not the content's: a widget's
+    // Configure page is built by the widget (screen recording's is a plain box, since a
+    // widget may not import Settings' helpers), and before this it came out with no
+    // side padding — a different width from every other page — and its first card
+    // pressed against the header (owner-caught 2026-09-27).
+    const wrapPage = (content: Gtk.Widget): Gtk.Widget => {
+        let widget = content
+        if (!content.has_css_class("settings-page")) {
+            const frame = pageBox()
+            frame.append(content)
+            widget = frame
+        }
+        // VeltrixScrolled everywhere, windows included — one scroll behaviour for the
+        // whole DE. The clamp already centres the content inside a much wider
+        // viewport, so there is nothing at the right edge to reserve a lane against.
+        const { widget: scroll, scrolled } = VeltrixScrolled({
+            // The pane is a CONSTANT width on every page (WINDOW_LAYOUT); the floor
+            // is the distress width a tiling compositor can force us to, where
+            // yielding beats hiding a row's trailing control off the window's edge.
+            child: VeltrixClamp(widget, PANE_W, true, WINDOW_LAYOUT.contentFloor),
+            reserveLane: false,
+            // The window's own minimum keeps the pane whole, so this only matters when
+            // a compositor forces the window narrower anyway: then the page SCROLLS
+            // sideways instead of losing its right-hand controls to a clip. EXTERNAL,
+            // not AUTOMATIC — GTK's own horizontal scrollbar is exactly the widget the
+            // rest of the DE replaced.
+            hscrollPolicy: Gtk.PolicyType.EXTERNAL,
+            // The page runs flush into the window's bottom-right corner, and the
+            // window is glass(floating) = --veltrix-radius-lg. At 24px that arc clips
+            // ~11px of the pill; the 4px a card needs is not enough here.
+            cornerRadius: WINDOW_RADIUS,
+            cssClasses: ["settings-page-scroll"],
+        })
+        scrolled.hexpand = true; scrolled.vexpand = true
+        scroll.hexpand = true; scroll.vexpand = true
+        return scroll
+    }
+
+    // ── Header breadcrumb (title, with a clickable parent for subpages) ─────────
+    const breadcrumb = new Gtk.Box({ spacing: 8, valign: Gtk.Align.CENTER, css_classes: ["veltrix-window-breadcrumb"] })
+    const updateBreadcrumb = (pageId: string) => {
+        let c = breadcrumb.get_first_child()
+        while (c) { breadcrumb.remove(c); c = breadcrumb.get_first_child() }
+        const meta = pageTitles.get(pageId)
+        if (!meta) return   // e.g. the search-results page — no title
+
+        // Walk the WHOLE chain of ancestors, not just one. Apps → Installed apps →
+        // <app> is three levels deep, and rendering a single parent dropped the root:
+        // the header read "Installed apps › Firefox", which names the page you came
+        // from but not where you are. A trail is only a trail if it reaches the start.
+        //
+        // `seen` is a cycle guard, not defensiveness for its own sake: page ids and
+        // their parents are registered by whoever calls `pushSubpage`, so a page that
+        // names itself (or a pair that name each other) is a plausible typo, and the
+        // symptom would be the Settings window hanging on navigation.
+        const chain: { id: string; title: string }[] = []
+        const seen = new Set<string>([pageId])
+        for (let id = meta.parentId; id && !seen.has(id); id = pageTitles.get(id)?.parentId) {
+            seen.add(id)
+            const m = pageTitles.get(id)
+            if (!m) break
+            chain.unshift({ id, title: m.title })
+        }
+
+        for (const crumb of chain) {
+            const link = new Gtk.Button({
+                label: crumb.title,
+                css_classes: ["veltrix-breadcrumb-link"],
+                valign: Gtk.Align.CENTER,
+            })
+            link.connect("clicked", () => navigateTo(crumb.id))
+            breadcrumb.append(link)
+            breadcrumb.append(new Gtk.Label({ label: "›", css_classes: ["veltrix-breadcrumb-sep"] }))
+        }
+        breadcrumb.append(new Gtk.Label({ label: meta.title, css_classes: ["veltrix-window-title"], halign: Gtk.Align.START }))
+    }
+
+    // Navigation handle handed to each page so it can push detail subpages. Its
+    // methods reference navigateTo/history defined below; they only run on user
+    // interaction, by which point those are initialised.
+    const nav: SettingsNav = {
+        pushSubpage: ({ id, title, parentId, build }) => {
+            pageTitles.set(id, { title, parentId })
+            let w: Gtk.Widget
+            try { w = build() }
+            catch (e) {
+                console.error(`[Settings] Failed to build subpage ${id}:`, e)
+                w = new Gtk.Label({ label: t("settings.page.load-error") })
+            }
+            pageCache.set(id, wrapPage(w))   // rebuild on each push → fresh content
+            navigateTo(id)
+        },
+        goBack: () => { if (historyIdx > 0) navigateTo(history[--historyIdx], false) },
+    }
+
+    // Every page is a search destination in its own right, registered from the same
+    // label the sidebar shows. Without this the index held only ROWS, and a page
+    // whose rows are objects rather than settings — Audio's sound cards, Network's
+    // interfaces — could not be found by typing its own name. Measured before the
+    // change: 15 of 18 pages were unreachable that way.
+    categories.forEach(cat => indexPage(cat.id, cat.label))
+
+    categories.forEach(cat => {
+        // Build page widget
+        let pageWidget: Gtk.Widget
+        try {
+            if (cat.pageDecl.kind === "preference") {
+                indexPreferencePage(cat.pageDecl, cat.label)
+                pageWidget = buildPreferencePage(cat.id, nav)
+            } else {
+                beginPage(cat.id, cat.label)
+                const component = PAGE_COMPONENTS[cat.pageDecl.builder as keyof typeof PAGE_COMPONENTS]
+                pageWidget = (component as (n: SettingsNav) => Gtk.Widget)(nav)
+                endPage()
+            }
+        } catch (e) {
+            endPage()
+            console.error(`[Settings] Failed to load page ${cat.id}:`, e)
+            pageWidget = new Gtk.Label({ label: `${t("settings.page.load-error")}: ${cat.label}` })
+        }
+
+        pageCache.set(cat.id, wrapPage(pageWidget))
+    })
+
+
+    // navigateTo is defined further down; the onSelect closure only runs on a
+    // user click, by which point it's assigned.
+    const sidebar = VeltrixSidebar(
+        categories.map(c => ({ id: c.id, label: c.label, icon: c.icon, groupStart: c.groupStart })),
+        (id) => navigateTo(id),
+    )
+    sidebar.widget.set_name("veltrix-settings-sidebar-list")
+
+    // ── Search results page ───────────────────────────────────────────────────
+    const searchResultsList = new Gtk.ListBox({
+        css_classes: ["veltrix-list", "search-results-list"],
+        selection_mode: Gtk.SelectionMode.NONE,
+        activate_on_single_click: true,
+    })
+
+    const searchResultsEmpty = new Gtk.Label({
+        label: t("settings.search.no-results"),
+        css_classes: ["settings-placeholder"],
+        margin_top: 40,
+        visible: false,
+    })
+
+    const searchResultsPage = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        spacing: 8,
+        css_classes: ["settings-page"],
+        margin_start: 12,
+        margin_end: 12,
+        margin_top: 32,
+        margin_bottom: 32,
+    })
+    searchResultsPage.append(searchResultsList)
+    searchResultsPage.append(searchResultsEmpty)
+
+    const srClamp = VeltrixClamp(searchResultsPage, PANE_W, true, WINDOW_LAYOUT.contentFloor)
+    const { widget: srScroll, scrolled: srScrolled } = VeltrixScrolled({
+        child: srClamp,
+        reserveLane: false,
+        hscrollPolicy: Gtk.PolicyType.EXTERNAL,
+        cornerRadius: WINDOW_RADIUS,
+        cssClasses: ["settings-page-scroll"],
+    })
+    srScrolled.hexpand = true; srScrolled.vexpand = true
+    srScroll.hexpand = true; srScroll.vexpand = true
+    pageCache.set("search-results", srScroll)
+
+    const populateResults = (query: string) => {
+        let child = searchResultsList.get_first_child()
+        while (child) { searchResultsList.remove(child); child = searchResultsList.get_first_child() }
+
+        const q = query.toLowerCase().trim()
+        const matches = getSearchIndex().filter(item =>
+            item.label.toLowerCase().includes(q) ||
+            item.subtitle.toLowerCase().includes(q)
+        )
+        // Pages first: typing a page's name is a coarser, more certain intent than
+        // matching a row that happens to contain the same word.
+        matches.sort((a, b) => (a.kind === "page" ? 0 : 1) - (b.kind === "page" ? 0 : 1))
+
+        matches.forEach(item => {
+            const cat = categories.find(c => c.id === item.pageId)
+            const isPage = item.kind === "page"
+
+            const trailing = new Gtk.Box({ spacing: 12, valign: Gtk.Align.CENTER })
+            // No chip on a page result: it would repeat the label verbatim.
+            if (!isPage) trailing.append(new Gtk.Label({ label: item.pageLabel, css_classes: ["search-result-chip"] }))
+            trailing.append(new Gtk.Image({ gicon: uiIcon("nd-pan-end"), pixel_size: 14, opacity: 0.4, css_classes: ["nd-icon"] }))
+
+            // A result row shows a row that exists elsewhere, so it is built by the
+            // same component those rows are — including the subtitle's wrap. The
+            // hand-rolled copy ellipsised at `max_width_chars: 50`, the same character
+            // stub that was removed from Settings → Audio for cutting strings the row
+            // had room for: a description was clipped at 50 chars inside an 800px pane.
+            const lbr = VeltrixRow(item.label, item.subtitle, trailing,
+                // `.search-result-page` carries no style: what distinguishes a page
+                // result is the absent chip and the full-opacity icon. It is here so
+                // `queryUI` can tell the two kinds apart — the same role the class on
+                // Power's Cairo checkmark plays, and what makes "did the page result
+                // come first" answerable without a screenshot.
+                isPage ? ["search-result-row", "search-result-page"] : ["search-result-row"], undefined,
+                new Gtk.Image({
+                    gicon: currentUiIcon(cat?.icon) ?? uiIcon("nd-preferences-desktop"),
+                    pixel_size: 18,
+                    css_classes: ["search-result-page-icon", "nd-icon"],
+                    opacity: isPage ? 1 : 0.6,
+                }))
+            ;(lbr as any)._targetPageId = item.pageId
+            searchResultsList.append(lbr)
+        })
+
+        searchResultsList.visible = matches.length > 0
+        searchResultsEmpty.visible = matches.length === 0
+    }
+
+    searchResultsList.connect("row-activated", (_: any, row: any) => {
+        const pageId = (row as any)._targetPageId
+        if (pageId) {
+            searchInput.text = ""
+            navigateTo(pageId)
+        }
+    })
+
+    // ── Navigation history ────────────────────────────────────────────────────
+    const history: string[] = []
+    let historyIdx = -1
+    let isProgrammaticNav = false
+
+    const syncSidebarSelection = (pageId: string) => {
+        isProgrammaticNav = true
+        sidebar.select(pageId)
+        isProgrammaticNav = false
+    }
+
+    const updateNavButtons = () => {
+        backBtn.sensitive = historyIdx > 0
+        forwardBtn.sensitive = historyIdx < history.length - 1
+    }
+
+    const navigateTo = (pageId: string, addToHistory = true) => {
+        if (addToHistory) {
+            history.splice(historyIdx + 1)
+            history.push(pageId)
+            historyIdx = history.length - 1
+        }
+        showPage(pageId)
+        syncSidebarSelection(pageId)
+        updateBreadcrumb(pageId)
+        updateNavButtons()
+    }
+
+    // Row activation (user click) is handled by VeltrixSidebar's onSelect →
+    // navigateTo. row-selected stays here for the defensive re-sync (e.g. GTK
+    // clearing selection when the search page steals focus).
+    sidebar.widget.connect("row-selected", () => {
+        if (isProgrammaticNav) return
+        if (activePageId && activePageId !== "search-results")
+            syncSidebarSelection(activePageId)
+    })
+
+    backBtn.connect("clicked", () => {
+        if (historyIdx > 0) navigateTo(history[--historyIdx], false)
+    })
+    forwardBtn.connect("clicked", () => {
+        if (historyIdx < history.length - 1) navigateTo(history[++historyIdx], false)
+    })
+
+    // ── Search ────────────────────────────────────────────────────────────────
+    // Custom search box: our own nd-icon magnifier + Gtk.Text. Gtk.SearchEntry
+    // would force the icon theme's magnifier glyph; this matches the rest of the
+    // shell (same pattern as Prism's search field).
+    const searchInput = new Gtk.Text({
+        placeholder_text: t("settings.search.placeholder"),
+        css_classes: ["settings-search-text"],
+        hexpand: true,
+        valign: Gtk.Align.CENTER,
+    })
+    const searchEntry = new Gtk.Box({
+        css_classes: ["settings-search"],
+        spacing: 8,
+        hexpand: true,
+        halign: Gtk.Align.FILL,
+        valign: Gtk.Align.CENTER,
+    })
+    searchEntry.append(new Gtk.Image({
+        gicon: uiIcon("nd-system-search"),
+        pixel_size: 15,
+        css_classes: ["nd-icon", "settings-search-icon"],
+        valign: Gtk.Align.CENTER,
+    }))
+    searchEntry.append(searchInput)
+
+    let pageBeforeSearch = ""
+
+    searchInput.connect("changed", () => {
+        const query = searchInput.text.trim()
+        if (query) {
+            if (activePageId !== "search-results")
+                pageBeforeSearch = activePageId || categories[0]?.id || ""
+            populateResults(query)
+            showPage("search-results")
+            isProgrammaticNav = true
+            sidebar.unselectAll()
+            isProgrammaticNav = false
+        } else {
+            const target = pageBeforeSearch || categories[0]?.id || ""
+            navigateTo(target, false)
+            pageBeforeSearch = ""
+        }
+    })
+
+    // Escape clears the search (Gtk.Text has no built-in stop-search signal).
+    const searchKeys = new Gtk.EventControllerKey()
+    searchKeys.connect("key-pressed", (_: any, keyval: number) => {
+        if (keyval === Gdk.KEY_Escape) { searchInput.text = ""; return true }
+        return false
+    })
+    searchInput.add_controller(searchKeys)
+
+    // ── Window shell ──────────────────────────────────────────────────────────
+    // The universal VeltrixWindow assembles the glass window + split view + header.
+    // Settings supplies the sidebar, the content, the search box (sidebar top), the
+    // nav capsule + breadcrumb title (header start) and the close button (header end).
+    const closeBtn = IconButton({
+        icon: uiIcon("nd-window-close"),
+        iconSize: 14,
+        variant: "danger",
+        tooltip: t("settings.window.close"),
+        tooltipChrome: false,   // app-mode window: tooltip follows the system mode
+        // The window's own close path, not a `set_visible` of its own: with
+        // `closeMode: "hide"` the two are the same today, and the point of having
+        // one path is that they stay the same if this window ever grows an
+        // `onClose` (an unsaved-changes guard, say).
+        onClick: () => cw.close(),
+    })
+
+    const cw = VeltrixWindow({
+        app,
+        title: "Veltrix Settings",
+        name: "veltrix-settings-window",
+        // What Hyprland files this window under. It matches `veltrix-settings.desktop`,
+        // so the dock, the app grid and the workspace overview all resolve it
+        // through the plain registry lookup — no remap. See ui/lib/veltrix-kit/platform/app-id.ts.
+        appId: "veltrix-settings",
+        cssClasses: ["nd-ignore", "veltrix-settings-window"],
+        content: contentArea,
+        // The sidebar and everything that only means anything with one. Passing it
+        // is what turns this into the two-pane layout — same component either way.
+        sidebar: {
+            widget: sidebar.widget,
+            toggleIcon: uiIcon("nd-sidebar-show"),
+            toggleLabel: t("settings.window.sidebar-toggle"),
+            top: searchEntry,
+            width: WINDOW_LAYOUT.sidebar,
+            contentWidth: PANE_W,
+        },
+        // `start` is a ROW: the nav capsule then the breadcrumb, both in the same
+        // spacing-8 box the toggle leads. The window prepends the toggle itself.
+        header: { start: [navCapsule, breadcrumb], end: closeBtn },
+        // Pages are cached while this application is open. Its host observes
+        // the kit's close path and exits, releasing the process on close.
+        closeMode: "hide",
+        defaultHeight: 760,
+    })
+    const win = cw.window
+    // Glass tooltip instead of the kit's native toggleTooltip (veltrix-kit can't
+    // import shell common/, so the caller attaches it to the exposed handle).
+    attachTooltip(cw.sidebarToggle, t("settings.nav.menu"), { chrome: false })
+
+    // (dumpState's `overlays.settings` is NOT reported from here any more: the shell
+    // reads it off Hyprland's client list — `isSettingsClient` in app.ts — because a
+    // Settings window in its own process cannot write the shell's Status, #571.)
+    win.connect("notify::visible", () => {
+        // Reopening on the page you left does not go through showPage, and hiding
+        // the window does not unrealize the page either — so without this, the one
+        // page a user returns to most often is the one that never refreshes.
+        if (win.get_visible() && activePageId) runPageRefreshers(activePageId)
+    })
+
+    cw.splitView.connectCollapsedChanged(() => {
+        if (!sidebar.getSelectedId() && activePageId)
+            syncSidebarSelection(activePageId)
+    })
+
+    ;(win as any).toggle = cw.toggle
+
+    // Drive navigation from outside (`veltrix-ipc settingsPage <id>`) — lets
+    // scripts and agents open a specific page without synthesizing clicks.
+    // Case-insensitive because the ids are lowercase while the NAMES are not: an
+    // agent asked for the AI page and sent `AI`, which cost it a step for nothing
+    // (measured 2026-07-30). `pageIds` is published so the caller can say which
+    // ids exist instead of only that this one didn't.
+    ;(win as any).pageIds = categories.map(c => c.id)
+    ;(win as any).navigateToPage = (id: string): boolean => {
+        const key = String(id ?? "").trim().toLowerCase()
+        if (!pageCache.has(key)) return false
+        navigateTo(key)
+        return true
+    }
+    // One app's own page (Apps › Installed apps › <app>), by desktop id — the window
+    // menu's "App Settings…". Walked the way a person clicks it, so the breadcrumb
+    // holds the whole trail and the list's row stays in step with the page.
+    ;(win as any).navigateToApp = (appId: string): boolean => {
+        const decl = subpagesOf("apps").find(p => p.builder === "appIcons")
+        if (!decl || !pageCache.has("apps")) return false
+        navigateTo("apps")
+        let list: Gtk.Widget | null = null
+        nav.pushSubpage({
+            id: decl.id, title: t(decl.label as any), parentId: "apps",
+            build: () => (list = SUBPAGE_BUILDERS.appIcons(nav)),
+        })
+        return (list as any)?.openApp?.(appId) ?? false
+    }
+
+    // Default page — seeds history. Appearance is the chosen landing (not the
+    // sidebar's first item), falling back to the first category if it's ever gone.
+    const defaultPage = categories.find(c => c.id === "appearance")?.id ?? categories[0]?.id
+    if (defaultPage) navigateTo(defaultPage)
+
+    return win
+}

@@ -1,0 +1,104 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-greeter-session — Clean greeter compositor launcher
+# Installed to /usr/bin/veltrix-greeter-session
+# Launched by greetd to run Hyprland silently without TTY text leaks.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Where this session's output goes (#614) ─────────────────────────────────
+#
+# greetd hands the session the VT's own stdin/stdout/stderr — that is how a TEXT
+# greeter like `agreety` works at all — so anything written here lands on the
+# console behind the splash. That is what this line was for; it used to be
+# `exec 1>/dev/null 2>&1`, and the cure cost more than the leak.
+#
+# The greeter is the ONE surface with no dev mode: its own system user, its own
+# compositor, before any session exists. The log is the only instrument it has,
+# and everything it said went nowhere — including the line `ui/greeter/app.ts`
+# tells you to read when somebody reports the login screen looking wrong. Chasing
+# exactly that (#612) meant patching this file by hand on the target and
+# restarting greetd.
+#
+# journald takes the output instead: the TTY stays clean and
+# `journalctl -t veltrix-greeter -b` holds the whole session — the compositor, the
+# greeter bundle, and anything they spawn, because Hyprland's children inherit
+# these descriptors. veltrix-system makes the journal persistent, so it also
+# survives the reboot that follows a failed login.
+#
+# ⚠️ BOTH streams go through it, and the GJS half is why: the bundle's
+# `console.log` never writes to fd 1 — it goes through GLib's `Gjs-Console` log
+# domain, and that writer puts it on **stderr**. Redirecting stdout alone would
+# have captured the shell and lost the greeter, which is the line anybody is
+# actually looking for. Measured before writing this, all six shapes arrive:
+# shell stdout, shell stderr, `console.log`, `console.warn`, `print`,
+# `printerr` — and `console.log` arrives on the stderr side.
+#
+# `exec` inside each substitution keeps it to one process, and its own stderr is
+# discarded so that a journald that is somehow not there cannot put systemd-cat's
+# complaint on the VT this line exists to protect.
+exec 1> >(exec systemd-cat -t veltrix-greeter -p info 2>/dev/null) \
+     2> >(exec systemd-cat -t veltrix-greeter -p warning 2>/dev/null)
+
+# ── Wait for a real GPU before starting the compositor (#477) ────────────────
+#
+# greetd is ordered after `systemd-user-sessions` and `plymouth-quit-wait`, and
+# after NOTHING that has to do with the graphics card. On a machine whose GPU
+# takes a moment to probe, greetd therefore starts the greeter while the driver
+# is still coming up, Hyprland's backend cannot start, and it aborts:
+#
+#   CRIT : m_pAqBackend couldn't start! This usually means aquamarine could not
+#          find a GPU or encountered some issues.
+#   throw: std::runtime_error("CBackend::create() failed!")   ← uncaught, SIGABRT
+#
+# Measured on a Navi 10 box, six boots out of six, always by less than a second:
+# greetd started at 07:15:04, Hyprland aborted at 07:15:05, and the kernel logged
+# `[drm] Initialized amdgpu … on minor 1` in that same second — the device became
+# usable just after the compositor gave up. greetd's restart put the login screen
+# up two seconds later, so the only symptom was a black screen nobody could name.
+#
+# ⚠️ "A DRM card exists" is NOT the condition. `simpledrm` had already claimed
+# /dev/dri/card0 from the EFI framebuffer at that point, and amdgpu evicts it when
+# it takes over — so waiting for *a* card returns instantly and changes nothing.
+# What we wait for is a card belonging to a real driver, with connectors and a
+# device node.
+#
+# The wait is BOUNDED and then proceeds regardless: a login screen that never
+# comes is worse than one that starts on a half-ready GPU, and greetd's restart
+# is still there as the last rung. It also runs BEFORE plymouth is deactivated,
+# so the splash covers the wait instead of a bare TTY.
+_gpu_is_ready() {
+    local card drv
+    for card in /sys/class/drm/card[0-9]*; do
+        [ -e "$card/device/driver" ] || continue
+        [ -e "/dev/dri/${card##*/}" ] || continue
+        drv=$(basename "$(readlink -f "$card/device/driver")")
+        # Firmware-framebuffer shims, not GPUs: they are what is already there
+        # while the real driver is still probing.
+        case "$drv" in simple-framebuffer|ofdrm|efi-framebuffer|vesa-framebuffer) continue ;; esac
+        # A card with no connectors is a render node's sibling, not a display.
+        for conn in "$card"-*; do
+            [ -e "$conn/status" ] && return 0
+        done
+    done
+    return 1
+}
+
+_i=0
+while ! _gpu_is_ready && [ "$_i" -lt 100 ]; do   # 100 × 50 ms = 5 s ceiling
+    sleep 0.05
+    _i=$((_i + 1))
+done
+if [ "$_i" -ge 100 ]; then
+    # Plain stderr: it reaches the journal under the same tag as everything else
+    # this session says, which is the point of the redirection above. It used to
+    # need `logger` precisely because it did not.
+    echo "no DRM card with a real driver after 5s — starting anyway" >&2
+fi
+
+# Freeze Plymouth splash to avoid intermediate TTY flashes before compositor paints
+if command -v plymouth >/dev/null 2>&1; then
+    plymouth --ping 2>/dev/null && plymouth deactivate 2>/dev/null || true
+fi
+
+export HYPRLAND_CONFIG=/etc/greetd/hyprland-greeter.lua
+exec start-hyprland

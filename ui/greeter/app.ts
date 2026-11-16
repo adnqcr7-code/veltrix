@@ -1,0 +1,73 @@
+import app from "../lib/veltrix-kit/platform/host"
+import Gdk from "gi://Gdk?version=4.0"
+import GLib from "gi://GLib"
+import Greeter from "./widget/Greeter"
+import { getPreferredUser } from "./lib/greeter-prefs"
+import { initProcessLocale, getLocale } from "./lib/i18n"
+import { applyLocaleDirection } from "../lib/rtl"
+import { initAppearance } from "../lib/veltrix-kit/platform/appearance-css"
+import { withKitSheet } from "../lib/veltrix-kit/platform/kit-css"
+import { applyCrispFontRendering } from "../lib/veltrix-kit/platform/font-rendering"
+import { useNoGtkTheme } from "../lib/veltrix-kit/platform/gtk-theme"
+
+// No GTK theme at all — this sheet is the only CSS there is (commandment 11).
+useNoGtkTheme()
+
+const cssPath = GLib.file_test("./style.css", GLib.FileTest.EXISTS)
+  ? "./style.css"
+  : "/usr/share/veltrix/ui/greeter/style.css"
+
+app.start({
+  applicationId: "org.veltrix.greeter",
+  applicationName: "Veltrix Greeter",
+  processName: "veltrix-greeter",
+  logDomain: "veltrix-greeter",
+  css: withKitSheet(cssPath),
+
+  main() {
+    // First thing after GTK init (which resets the locale to "C" — empty
+    // greetd env): align the process locale with the greeter's language, so
+    // the clock's date names AND Pango's CJK face selection are right from
+    // the first frame. See lib/i18n.ts initProcessLocale().
+    initProcessLocale()
+
+    // The process-wide text direction, from the locale just resolved. The
+    // greeter live-switches language (LocaleBar → setLocale), which
+    // re-applies the direction there; this call covers the first frame.
+    // See ui/lib/rtl.ts.
+    applyLocaleDirection(getLocale())
+
+    // Before any window exists: put glyph baselines on the pixel grid. The greeter
+    // has no ThemeManager, so without this it renders text the shell would not.
+    applyCrispFontRendering()
+
+    const display = Gdk.Display.get_default()
+    if (!display) { console.error("[Greeter] No display"); return }
+
+    // The token ramp, the kit's Cairo seam and the glass rim. The greeter is the ONE
+    // surface outside any user session — the `greeter` system user, its own
+    // compositor, no portal — so it reads the mirror the shell exports for it
+    // (/var/tmp/veltrix/appearance.json) instead. See the contract in ui/lib/veltrix-kit/platform/appearance.ts.
+    // `fixedDarkInk`: this screen's palette is NOT a fallback the session may
+    // override. Everything behind it is a wallpaper, so it is permanently dark
+    // glass with light ink — the desktop being in light mode says nothing about
+    // what is legible here. Without it the ramp emitted from `isDark: false`
+    // outranks this bundle's own sheet (it is installed at USER + 20) and paints
+    // every label black over the login wallpaper. See #612.
+    initAppearance({ channel: "mirror", fixedDarkInk: true })
+
+    // Login UI on the primary monitor only. The other outputs already show the
+    // generic wallpaper painted by awww in the compositor (it covers all
+    // outputs), so a per-monitor greeter window would only duplicate the
+    // password field and race for keyboard focus.
+    const monitors: any = display.get_monitors()
+    if (monitors.get_n_items() === 0) { console.error("[Greeter] No monitors"); return }
+    try {
+      const monitor = monitors.get_item(0) as Gdk.Monitor
+      const win = Greeter(monitor)
+
+    } catch (e) {
+      console.error("[Greeter] Failed on primary monitor:", e)
+    }
+  },
+})

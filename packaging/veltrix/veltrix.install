@@ -1,0 +1,93 @@
+# pacman install hooks for the veltrix package.
+# Keep these messages short: most installs go through install.sh (or the future
+# Calamares installer), which runs the first-time setup itself.
+
+post_install() {
+  cat <<'EOF'
+  Veltrix is installed, but a login session needs one-time setup
+  (greeter, services, per-user config). Run, as your normal user:
+
+      veltrix-setup
+
+  veltrix-setup also creates the per-user Python venv (Hijri date + prayer
+  times data) — without it the prayer lock never fires. Then pick "Veltrix"
+  at the login screen.
+EOF
+  # Content Safety, default ON (Adnan, 2026-11-12): apply the system layers
+  # NOW, at install time, so a fresh install is actually protected instead
+  # of showing the toggle ON while nothing is blocked (M2, fix pass).
+  # Best-effort and never fatal: this runs inside pacman's transaction,
+  # and a failed apply must not fail the install — the shell's startup
+  # reconcile offers one-tap "Apply protection" at first login instead.
+  # The helper is in this same package, so it exists by now; the blocklist
+  # it reads is too. (On an upgrade, nothing is applied here: the scriptlet
+  # runs as root and cannot read the installing user's per-user bit, so it
+  # cannot tell a user who turned protection off from a fresh default-ON —
+  # the reconcile covers upgrades.)
+  # (S1, fix pass #2) Do NOT apply where systemd is not running: in the
+  # archinstall chroot (pacstrap runs scriptlets in-target) and in CI
+  # containers, /run/systemd/system is absent — systemd never booted this
+  # root, so `on` would rewrite /etc/resolv.conf to a stub resolved never
+  # serves. The check is the directory, not /proc/1/comm: across a chroot
+  # /proc still shows the host's init, so the PID-1 name lies. Skip there;
+  # the reconcile offers it at first login. (The helper refuses the same
+  # way on its own, so a direct `on` in a chroot fails honestly too.)
+  # (N5) Also skip on a reinstall: a state file or a hosts backup means a
+  # previous on/off cycle already happened, and re-applying would silently
+  # re-enable protection a user deliberately turned off — the same reason
+  # post_upgrade never applies.
+  if [ -x /usr/bin/veltrix-content-safety ]; then
+    if [ -d /run/systemd/system ] && [ ! -e /etc/veltrix/content-safety/state.json ] \
+        && [ ! -e /etc/hosts.veltrix-backup ]; then
+      if /usr/bin/veltrix-content-safety on >/dev/null 2>&1; then
+        echo "  Content Safety is on by default — CleanBrowsing DNS + hosts block; turn it off in Settings → Safety."
+      else
+        echo "  Content Safety could not be applied at install time — it will be offered at first login."
+      fi
+    elif [ ! -d /run/systemd/system ]; then
+      echo "  Content Safety could not be applied at install time (systemd is not running here) — it will be offered at first login."
+    fi
+    # (Reinstall skip: silent by design. A state file or a hosts backup
+    # means a previous cycle already happened, and saying anything here
+    # would only be noise next to a choice the user already made.)
+  fi
+}
+
+post_upgrade() {
+  cat <<'EOF'
+  Veltrix upgraded. If a Veltrix session is running, reload the shell
+  with Super+Shift+R and run `hyprctl reload` to clear the compositor's
+  config banner (veltrix-update does both for you; greeter and lockscreen
+  update on next use).
+  If this upgrade is from before the per-user Python venv existed, re-run
+  `veltrix-setup` (or `veltrix-update`) once — it creates the venv (Hijri
+  date + prayer times data) the prayer lock needs to fire.
+EOF
+  chinese_engine_note "$2"
+}
+
+# Up to 0.13.0 veltrix depended on fcitx5-chinese-addons for everybody
+# (#703). From the next release pacman keeps it as an orphan, and an orphan is
+# what `pacman -Rns $(pacman -Qdtq)` removes. Nothing here removes it: a
+# scriptlet runs inside pacman's transaction, so it cannot run pacman, and a
+# Chinese user must keep it anyway. Say which of the two this machine is.
+# (`veltrix-update` does the keeping by itself, through veltrix-setup.)
+chinese_engine_note() {
+  [ "$(vercmp "$1" 0.13.0)" -le 0 ] || return 0
+  [ -n "$(ls -d /var/lib/pacman/local/fcitx5-chinese-addons-[0-9]* 2>/dev/null)" ] || return 0
+  case "$(sed -n 's/^LANG=//p' /etc/locale.conf 2>/dev/null | tr -d '"')" in
+    zh*)
+      cat <<'EOF'
+  The Chinese input engine is no longer installed for everybody. Your system
+  language is Chinese, so keep it:  sudo veltrix-language ensure-engine
+EOF
+      ;;
+    *)
+      cat <<'EOF'
+  The Chinese input engine (fcitx5-chinese-addons, ~540 MiB with what it
+  pulls in) is no longer installed for everybody. If you do not type Chinese:
+      sudo pacman -Rns fcitx5-chinese-addons
+EOF
+      ;;
+  esac
+}

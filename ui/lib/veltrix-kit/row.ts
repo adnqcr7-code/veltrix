@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+import Gtk from "gi://Gtk?version=4.0"
+import Pango from "gi://Pango"
+
+export interface VeltrixRowResult {
+    row: Gtk.ListBoxRow
+    /** The horizontal content box, in case a caller needs to tweak it. */
+    box: Gtk.Box
+}
+
+
+/**
+ * VeltrixRow — the ONE place a list/menu row is built.
+ *
+ * A Gtk.ListBoxRow (class `veltrix-row`) with a title, optional subtitle, and an
+ * optional trailing control (switch, dropdown, button…). Hover/press/select come
+ * from `.veltrix-row` in _components.scss (single source, mode-aware). Used by
+ * Settings, Control Center and any future surface — never reinvent a per-surface
+ * row class. See feedback_universal_components.
+ *
+ * @example
+ *   const r = VeltrixRow("Wi-Fi", "Connected", toggle)
+ *   listBox.append(r)
+ */
+/**
+ * The row's DECLARED height, as a class (`--single` 48px / `--double` 72px, both in
+ * `_components.scss`).
+ *
+ * The height is a token; the 14px vertical margin below is the leftover breathing
+ * room, not the thing that defines the box. Before this the height was whatever
+ * `14 + text + 14` happened to sum to, so the SAME one-line row measured **43px on
+ * Settings → Network and 47px on Appearance** (`veltrix-ipc queryUI .veltrix-row`,
+ * 2026-08-03) — not a bug anyone could point at, just lists that breathe differently
+ * from page to page, which is what the user reported.
+ *
+ * ⚠️ It lives on the KIT COMPONENT, not on the `.veltrix-row` class, and that is
+ * deliberate: ~20 places build a bare `Gtk.ListBoxRow` wearing `.veltrix-row` for the
+ * chrome only, and five of them are dense bar/CC panel rows (`widgets/volume.ts`,
+ * `bluetooth.ts`, `vpn.ts`) that bring their own tighter `10/14` padding. A blanket
+ * `.veltrix-row { min-height: 48px }` would have added ~11px to every one of them. A
+ * hand-rolled row is opting out of the component and owns its own metrics.
+ *
+ * ⚠️ `min-height` in CSS, never `height_request`: `.veltrix-row` carries `margin: 1px 0`,
+ * and a GTK4 CSS margin is drawn INSIDE the allocation a size request sets — the two
+ * fight and the margin wins (see design-system.md).
+ */
+export const ROW_H_SINGLE = "veltrix-row--single"
+export const ROW_H_DOUBLE = "veltrix-row--double"
+
+const rowHeightClass = (subtitle: string) =>
+    subtitle ? ROW_H_DOUBLE : ROW_H_SINGLE
+
+/** Title + optional subtitle, the text column shared by both row shapes. */
+function textColumn(label: string, subtitle: string, titleIcon?: Gtk.Widget): Gtk.Box {
+    const text = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL, spacing: 2,
+        hexpand: true, valign: Gtk.Align.CENTER,
+    })
+    const titleLabel = new Gtk.Label({
+        label, css_classes: ["veltrix-row-title"],
+        // ⚠️ ONE LINE, ellipsised — a title does not wrap. Two reasons, and neither
+        // is taste:
+        //
+        // 1. A wrapping label's MINIMUM width is its longest word, so a title made
+        //    the row squeezable down to that: with the pane free to shrink, the text
+        //    column collapsed and descriptions came out one word per line (measured
+        //    2026-08-11, a 47px subtitle column). The pane is a constant now, but a
+        //    row that can only be laid out one way cannot regress into that again.
+        // 2. `veltrix-row--single/--double` DECLARE the row's height (48/72). A title
+        //    that can take two lines makes that declaration a lie for some rows and
+        //    not others — the exact "lists breathe differently from page to page"
+        //    the height tokens were introduced to end.
+        //
+        // Ellipsising is also simply the right answer for what actually overflows
+        // here: not setting names, which fit at 800px in every shipped locale, but
+        // hardware strings — Settings → Audio renders "Starship/Matisse HD Audio
+        // Controller Analog Stereo" as a device title, and it took three lines.
+        //
+        // No `wrap`, so the natural width is the full string: at halign START the
+        // label keeps that (an icon after it stays adjacent) and only gives way when
+        // the row cannot hold it. The subtitle below is the opposite case — prose,
+        // which does wrap — and it is FILL for the reason spelled out there.
+        halign: Gtk.Align.START, xalign: 0,
+        wrap: false, ellipsize: Pango.EllipsizeMode.END,
+    })
+    if (titleIcon) {
+        const titleLine = new Gtk.Box({ spacing: 8, halign: Gtk.Align.START })
+        titleLine.append(titleLabel)
+        titleLine.append(titleIcon)
+        text.append(titleLine)
+    } else {
+        text.append(titleLabel)
+    }
+    if (subtitle) {
+        text.append(new Gtk.Label({
+            label: subtitle, css_classes: ["veltrix-row-subtitle"],
+            // FILL + hexpand, NOT halign START. A halign-START label is allocated its
+            // NATURAL width, and a wrapping GtkLabel's natural width is a line-balancing
+            // heuristic — so every description picked its own break column and the page
+            // read as random: measured live 2026-07-27 with `veltrix-ipc queryUI`, these
+            // same subtitles came out 310, 332, 369, 372, 442, 456, 480, 486, 493, 501,
+            // 540, 556, 567 and 589 px wide, one line here, two there, at no consistent
+            // edge. Filling the column makes the width identical for every row, so a
+            // break happens only where the card actually ends. `xalign: 0` keeps the
+            // text left-aligned inside that full-width box.
+            halign: Gtk.Align.FILL, hexpand: true, xalign: 0, wrap: true,
+            // WORD_CHAR, not WORD: a subtitle can carry a token with no break
+            // opportunity in it — a path, a URL, a German compound — and plain WORD
+            // lets that token overrun the column instead of breaking it. The column
+            // is the fixed side of this layout now; the text yields.
+            wrap_mode: Pango.WrapMode.WORD_CHAR,
+        }))
+    }
+    return text
+}
+
+/**
+ * VeltrixEmptyRow — the "there is nothing here" row inside a list card.
+ *
+ * A list that can be empty needs SOMETHING in its card, or the group reads as a
+ * bare header over a 6px sliver. Five places built that row by hand and they had
+ * already drifted three ways (measured 2026-08-11): Network and Users used a
+ * dimmed `veltrix-row-subtitle` indented to the rows' own 16px text edge; Autostart
+ * and Bluetooth used a CENTERED `.settings-placeholder`, a class with no CSS rule
+ * anywhere in the repo since `0307adf2` renamed it in the stylesheet only — so
+ * those two rendered at full body size, undimmed; and Bluetooth's carried no
+ * height class at all, making it shorter than the device rows it replaces.
+ *
+ * The text is dimmed and sits at the same left edge as every real row's title, so
+ * an empty list looks like the list it replaces rather than like a banner. Page
+ * level "no hardware at all" messages are NOT this — they are `.settings-placeholder`
+ * outside the card (Settings → Sound's banner), which is a different statement.
+ *
+ * ⚠️ Not selectable and not activatable: it is a message, and a message that takes
+ * the row hover state claims to be a control. Every hand-rolled copy was a plain
+ * row and lit up under the pointer.
+ */
+export function VeltrixEmptyRow(text: string): Gtk.ListBoxRow {
+    const label = new Gtk.Label({
+        label: text,
+        css_classes: ["veltrix-row-subtitle"],
+        // ⚠️ FILL, not START — the rule in design-system.md, and this row broke it
+        // silently for as long as its message fit on one line. A `halign: START`
+        // wrapping label is allocated its NATURAL width, and Pango's line balancing
+        // is free to make that tiny: the installer's "no matches" message came out
+        // 21px wide inside a 592px row, one syllable per line (measured 2026-09-03).
+        halign: Gtk.Align.FILL, hexpand: true, xalign: 0,
+        wrap: true, wrap_mode: Pango.WrapMode.WORD_CHAR,
+        // The row's own content metrics, same as VeltrixRow's outermost box, so the
+        // message lines up with the titles of the rows it stands in for.
+        margin_start: 16, margin_end: 16, margin_top: 12, margin_bottom: 12,
+    })
+    const row = new Gtk.ListBoxRow({
+        css_classes: ["veltrix-row", ROW_H_SINGLE],
+        selectable: false, activatable: false,
+    })
+    row.set_child(label)
+    return row
+}
+
+/**
+ * VeltrixStackedRow — same row, control on its OWN LINE underneath, full width.
+ *
+ * Use when the control needs room to breathe: a text entry with buttons, a long
+ * path, a search field. In the horizontal `VeltrixRow` the text column takes
+ * `hexpand`, so a wide control gets squeezed into whatever is left — an API-key
+ * entry ends up comically narrow (user-caught 2026-07-21). This is a layout
+ * choice, not a new component: same `.veltrix-row` chrome, same title/subtitle.
+ */
+export function VeltrixStackedRow(
+    label: string,
+    subtitle: string = "",
+    control?: Gtk.Widget,
+    extraClasses: string[] = [],
+): Gtk.ListBoxRow {
+    const box = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL, spacing: 12,
+        margin_start: 16, margin_end: 16, margin_top: 12, margin_bottom: 12,
+    })
+    box.append(textColumn(label, subtitle))
+    if (control) {
+        control.hexpand = true
+        box.append(control)
+    }
+    // ⚠️ `focusable` and `can-focus` are NOT the same property, and the difference
+    // is the whole reason this row exists. `focusable: false` says the ROW itself
+    // never takes the focus — which is what we want, it is a container with no
+    // behaviour of its own. `can_focus: false` says the row AND EVERY DESCENDANT
+    // are unfocusable, which in a row whose entire point is to hold a text entry
+    // means the entry can never be typed into: it hovers, it takes clicks, it
+    // shows no caret and swallows every keystroke. Adding it here (#281, as
+    // collateral in a chrome-metrics change) broke the installer's account step —
+    // no password, so the installer could not be completed at all — and Settings →
+    // AI's model, endpoint and API-key fields, which is every way a user has of
+    // configuring the Assistant. `VeltrixRow` never carried it; this row now
+    // matches. Do not "restore symmetry" by adding it back.
+    const row = new Gtk.ListBoxRow({
+        activatable: false,
+        selectable: false,
+        focusable: false,
+        css_classes: ["veltrix-row", "veltrix-row--stacked", ...extraClasses],
+    })
+    row.set_child(box)
+    return row
+}
+
+export type VeltrixValidationState = "none" | "warning" | "error"
+
+export interface VeltrixFieldRowResult {
+    row: Gtk.ListBoxRow
+    setError(message: string): void
+    setValidationState(state: VeltrixValidationState): void
+}
+
+/**
+ * VeltrixFieldRow — a stacked row with its own error line underneath the control.
+ *
+ * A form puts each fault inside the row it belongs to, under that field's own
+ * entry, and shows every fault at once (design-system.md:44, #400, #466).
+ *
+ * The control the row is handed is the entry AND its error line, so the row
+ * keeps its own metrics and the message moves with the field it belongs to.
+ *
+ * ⚠️ Not red. The message uses full-strength ink at weight 500 (.veltrix-field-error):
+ * the DE reserves red for recording and for failure. What makes this line read
+ * as a correction is that it is the only full-strength text on a card of dim
+ * subtitles, and that it is attached to the control it is about.
+ */
+export function VeltrixFieldRow(
+    label: string,
+    subtitle: string = "",
+    control?: Gtk.Widget,
+    extraClasses: string[] = [],
+): VeltrixFieldRowResult {
+    const error = new Gtk.Label({
+        label: "",
+        css_classes: ["veltrix-field-error"],
+        halign: Gtk.Align.FILL,
+        hexpand: true,
+        xalign: 0,
+        wrap: true,
+        wrap_mode: Pango.WrapMode.WORD_CHAR,
+        visible: false,
+    })
+
+    const stack = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6, hexpand: true })
+    if (control) {
+        control.hexpand = true
+        stack.append(control)
+    }
+    stack.append(error)
+
+    const row = VeltrixStackedRow(label, subtitle, stack, extraClasses)
+
+    const setValidationState = (state: VeltrixValidationState) => {
+        row.remove_css_class("veltrix-row--warning")
+        row.remove_css_class("veltrix-row--error")
+        if (state === "warning") {
+            row.add_css_class("veltrix-row--warning")
+        } else if (state === "error") {
+            row.add_css_class("veltrix-row--error")
+        }
+    }
+
+    const setError = (message: string) => {
+        error.label = message
+        error.visible = message !== ""
+        setValidationState(message ? "error" : "none")
+    }
+
+    const r = row as any
+    r.setError = setError
+    r.setValidationState = setValidationState
+
+    return { row, setError, setValidationState }
+}
+
+export function VeltrixRow(
+    label: string,
+    subtitle: string = "",
+    control?: Gtk.Widget,
+    extraClasses: string[] = [],
+    /** Small icon shown right after the title (e.g. a lock on a secured Wi-Fi row). */
+    titleIcon?: Gtk.Widget,
+    /** Icon shown BEFORE the title, leading the row (e.g. a widget/app identity icon). */
+    leadingIcon?: Gtk.Widget,
+    /**
+     * A SECOND line INSIDE the row, under the text column — for a secondary
+     * control that belongs to this item but must not compete with `control` for
+     * the trailing slot (Settings → Widgets puts "Configure" here).
+     *
+     * Not the same thing as `VeltrixStackedRow`, which replaces the horizontal
+     * shape entirely: here line 1 keeps its title + trailing control exactly as
+     * it is, so a column of trailing controls stays aligned even though only
+     * some rows carry a footer. That is the whole reason this exists — the
+     * alternative, a sibling row underneath, reads as another ITEM in the list
+     * rather than as part of this one (user-caught 2026-08-02).
+     *
+     * The caller owns the footer's `halign` and its `margin_start` (the indent
+     * that lines it up with the title — leading-icon width + 16px spacing;
+     * VeltrixRow cannot know the icon's size). Keep it visually lighter than the
+     * title: ghost + compact is the house style for a control in this slot.
+     */
+    footer?: Gtk.Widget,
+): Gtk.ListBoxRow {
+    const line = new Gtk.Box({ spacing: 16 })
+
+    if (leadingIcon) line.append(leadingIcon)
+
+    // textColumn, not a copy of it. This function used to inline its own — byte for
+    // byte the same widgets — which is why a fix applied to `textColumn` changed the
+    // stacked rows and left every ordinary row untouched (caught live 2026-07-27,
+    // after the fix "did nothing"). The helper's docstring already claimed both
+    // shapes shared it; now they do.
+    line.append(textColumn(label, subtitle, titleIcon))
+    if (control) line.append(control)
+
+    // The row's padding always sits on the OUTERMOST box, so a footer row has the
+    // same outer metrics as a plain one and only adds its own line — without a
+    // footer this is `line` itself, byte-identical to the original layout.
+    let content: Gtk.Box = line
+    if (footer) {
+        content = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 12 })
+        content.append(line)
+        content.append(footer)
+    }
+    content.margin_start = 16; content.margin_end = 16
+    content.margin_top = 12; content.margin_bottom = 12
+
+    const row = new Gtk.ListBoxRow({ css_classes: ["veltrix-row", rowHeightClass(subtitle), ...extraClasses] })
+    row.set_child(content)
+    return row
+}

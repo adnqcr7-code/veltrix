@@ -1,0 +1,462 @@
+import { runSettingsAction } from "../SettingsErrors"
+import { isSettingsProcess } from "../../../core/SettingsProcess"
+import Gtk from "gi://Gtk?version=4.0"
+import { listGroup, createRow, pageBox, staticLabel, bindWhileRealized, onPageShown } from "../SettingsHelpers"
+import { showVeltrixAlert, VeltrixDropDown } from "../../../../lib/veltrix-kit"
+import { settings } from "../../../core/CompositorState"
+import displays from "../../../core/Displays"
+import { t } from "../../../core/i18n"
+import { uiIcon } from "../../../core/Icons"
+import monitorConfig from "../../../core/MonitorConfig"
+import { safeDisconnect } from "../../../core/signals"
+
+function monitorLabel(name: string): string {
+    if (name.startsWith("eDP")) return `${name} (${t("settings.display.label.builtin")})`
+    return name
+}
+
+function currentMode(mon: any): string {
+    const w = mon.width ?? 0
+    const h = mon.height ?? 0
+    const hz = Math.round(mon.refresh_rate ?? mon.refreshRate ?? 0)
+    if (!w || !h) return t("settings.display.label.unknown")
+    return `${w}×${h} @ ${hz}Hz`
+}
+
+const SCALE_PRESETS = ["1.0", "1.25", "1.5", "1.75", "2.0"]
+
+// Hyprland requires a fractional scale to divide the native resolution into a whole
+// number of logical pixels; otherwise it rejects it and snaps to a valid one. Offer
+// only exact-valid scales for this monitor's resolution (same as GNOME).
+function isScaleValid(w: number, h: number, s: number): boolean {
+    if (!w || !h) return true
+    return Math.abs(Math.round(w / s) - w / s) < 0.001
+        && Math.abs(Math.round(h / s) - h / s) < 0.001
+}
+
+function buildMonitorSection(mon: any, availableModes: string[]): Gtk.Widget {
+    const name: string  = mon.name ?? t("settings.display.label.monitor")
+    const model: string = mon.model ?? mon.description ?? ""
+    const make: string  = mon.make ?? ""
+    const description   = [make, model].filter(Boolean).join(" ") || name
+
+    const { box, listBox } = listGroup(monitorLabel(name))
+
+    // ── Scale dropdown (rebuilt when the resolution changes) ────────────────────
+    // Only exact-valid presets for the current resolution (1.0 always valid).
+    const buildScaleStrings = (w: number, h: number): string[] => {
+        const vs = SCALE_PRESETS.filter(s => {
+            const sv = parseFloat(s)
+            return sv === 1 || isScaleValid(w, h, sv)
+        })
+        const cur = parseFloat(String(monitorConfig.getScale(name)))
+        if (!vs.some(s => Math.abs(parseFloat(s) - cur) < 0.001)) {
+            vs.push(String(cur)); vs.sort((a, b) => parseFloat(a) - parseFloat(b))
+        }
+        return vs
+    }
+    let scaleVals = buildScaleStrings(mon.width ?? 0, mon.height ?? 0)
+    const scaleDrp = VeltrixDropDown({ model: new Gtk.StringList({ strings: scaleVals.map(s => `${s}×`) }), valign: Gtk.Align.CENTER })
+    let scaleApplying = false
+    const syncScaleSel = () => {
+        const cur = parseFloat(String(monitorConfig.getScale(name)))
+        const i = scaleVals.findIndex(s => Math.abs(parseFloat(s) - cur) < 0.001)
+        scaleDrp.selected = i >= 0 ? i : 0
+    }
+    syncScaleSel()
+    scaleDrp.connect("notify::selected", () => {
+        if (scaleApplying) return
+        const v = scaleVals[scaleDrp.selected]
+        if (v != null) void runSettingsAction(() => monitorConfig.setScale(name, parseFloat(v)))
+    })
+    const rebuildScaleOptions = (w: number, h: number) => {
+        scaleApplying = true
+        scaleVals = buildScaleStrings(w, h)
+        scaleDrp.set_model(new Gtk.StringList({ strings: scaleVals.map(s => `${s}×`) }))
+        syncScaleSel()
+        scaleApplying = false
+    }
+
+    // ── Resolution + refresh (two dependent dropdowns, with revert safety) ───────
+    type DMode = { w: number; h: number; hz: number }
+    // AstalHyprland's Monitor.available_modes is always null, so the list is read
+    // from `hyprctl monitors -j` by the page and passed in here.
+    const rawModes: string[] = availableModes ?? []
+    const modes: DMode[] = []
+    for (const s of rawModes) {
+        const m = String(s).match(/^(\d+)x(\d+)@([\d.]+)/)
+        if (m) modes.push({ w: +m[1], h: +m[2], hz: Math.round(parseFloat(m[3])) })
+    }
+    const resKey = (w: number, h: number) => `${w}x${h}`
+    const resList: { w: number; h: number }[] = []
+    const hzByRes = new Map<string, number[]>()
+    for (const md of modes) {
+        const k = resKey(md.w, md.h)
+        if (!hzByRes.has(k)) { hzByRes.set(k, []); resList.push({ w: md.w, h: md.h }) }
+        const hzs = hzByRes.get(k)!
+        if (!hzs.includes(md.hz)) hzs.push(md.hz)
+    }
+    resList.sort((a, b) => b.w * b.h - a.w * a.h)
+    for (const hzs of hzByRes.values()) hzs.sort((a, b) => b - a)
+    const hzForRes = (i: number) => hzByRes.get(resKey(resList[i].w, resList[i].h)) ?? []
+
+    const curW = mon.width ?? (resList[0]?.w ?? 0)
+    const curH = mon.height ?? (resList[0]?.h ?? 0)
+    const curHz = Math.round(mon.refresh_rate ?? mon.refreshRate ?? 0)
+
+    if (resList.length === 0) {
+        // No mode list available — keep the static read-out.
+        listBox.append(createRow(
+            t("settings.display.resolution"), t("settings.display.resolution.desc"),
+            staticLabel(currentMode(mon)),
+        ))
+    } else {
+        let modeApplying = false
+        let prevMode = `${curW}x${curH}@${curHz}`
+
+        const resDrp = VeltrixDropDown({ model: new Gtk.StringList({ strings: resList.map(r => `${r.w} × ${r.h}`) }), valign: Gtk.Align.CENTER })
+        resDrp.selected = Math.max(0, resList.findIndex(r => r.w === curW && r.h === curH))
+
+        const hzDrp = VeltrixDropDown({ model: new Gtk.StringList({ strings: hzForRes(resDrp.selected).map(hz => `${hz} Hz`) }), valign: Gtk.Align.CENTER })
+        const hzInit = hzForRes(resDrp.selected).findIndex(hz => hz === curHz)
+        hzDrp.selected = hzInit >= 0 ? hzInit : 0
+
+        const repopulateHz = (resIdx: number, preferHz?: number) => {
+            const hzs = hzForRes(resIdx)
+            hzDrp.set_model(new Gtk.StringList({ strings: hzs.map(hz => `${hz} Hz`) }))
+            let idx = preferHz != null ? hzs.findIndex(h => h === preferHz) : 0
+            hzDrp.selected = idx >= 0 ? idx : 0
+        }
+
+        const applyMode = async () => {
+            if (modeApplying) return
+            const r = resList[resDrp.selected]
+            const hzs = hzForRes(resDrp.selected)
+            const hz = hzs[hzDrp.selected] ?? hzs[0]
+            const newMode = `${r.w}x${r.h}@${hz}`
+            if (newMode === prevMode) return
+            if (!await runSettingsAction(() => monitorConfig.applyMode(name, newMode))) return
+            showVeltrixAlert({
+                parent: box.get_root() as Gtk.Window,
+                heading: t("settings.display.confirm.title"),
+                countdown: {
+                    seconds: 12, respondId: "revert",
+                    format: (s) => t("settings.display.confirm.body").replace("%d", String(s)),
+                },
+                responses: [
+                    { id: "revert", label: t("settings.display.confirm.revert") },
+                    { id: "keep", label: t("settings.display.confirm.keep"), suggested: true },
+                ],
+                onResponse: (id) => { void runSettingsAction(async () => {
+                    if (id === "keep") {
+                        // The new resolution may invalidate the current scale.
+                        await monitorConfig.commit(name)
+                        prevMode = newMode
+                        if (!isScaleValid(r.w, r.h, monitorConfig.getScale(name))) await monitorConfig.setScale(name, 1.0)
+                        rebuildScaleOptions(r.w, r.h)
+                    } else {
+                        if (isSettingsProcess) await monitorConfig.revert(name)
+                        else await monitorConfig.applyMode(name, prevMode)
+                        const pm = prevMode.match(/^(\d+)x(\d+)@(\d+)/)
+                        if (pm) {
+                            modeApplying = true
+                            const pi = resList.findIndex(rr => rr.w === +pm[1] && rr.h === +pm[2])
+                            if (pi >= 0) { resDrp.selected = pi; repopulateHz(pi, +pm[3]) }
+                            modeApplying = false
+                        }
+                    }
+                }) },
+            })
+        }
+
+        resDrp.connect("notify::selected", () => {
+            if (modeApplying) return
+            modeApplying = true; repopulateHz(resDrp.selected); modeApplying = false
+            applyMode()
+        })
+        hzDrp.connect("notify::selected", () => applyMode())
+
+        const resBox = new Gtk.Box({ spacing: 8, valign: Gtk.Align.CENTER })
+        resBox.append(resDrp); resBox.append(hzDrp)
+        listBox.append(createRow(
+            t("settings.display.resolution"), t("settings.display.resolution.desc"), resBox,
+        ))
+    }
+
+    listBox.append(createRow(
+        t("settings.display.scale"),
+        t("settings.display.scale.desc"),
+        scaleDrp
+    ))
+
+    // Make/model info
+    if (description) {
+        listBox.append(createRow(
+            t("settings.display.model"),
+            t("settings.display.model.desc"),
+            staticLabel(description)
+        ))
+    }
+
+    // Rotation
+    const ROT_NORMAL = t("settings.display.rotation.normal")
+    const ROTATIONS = [ROT_NORMAL, "90°", "180°", "270°"]
+    const TRANSFORM_MAP: Record<string, number> = {
+        [ROT_NORMAL]: 0, "90°": 1, "180°": 2, "270°": 3,
+    }
+
+    const rotModel = new Gtk.StringList({ strings: ROTATIONS })
+    const rotDrp = VeltrixDropDown({ model: rotModel, valign: Gtk.Align.CENTER })
+    const currentTransform = monitorConfig.getTransform(name)
+    rotDrp.selected = currentTransform < ROTATIONS.length ? currentTransform : 0
+
+    // Rotation can leave the screen disorienting/hard to navigate, so it gets the
+    // same revert-safety dialog as the resolution change.
+    let rotApplying = false
+    let prevTransform = currentTransform
+    rotDrp.connect("notify::selected", async () => {
+        if (rotApplying) return
+        const newT = TRANSFORM_MAP[ROTATIONS[rotDrp.selected]] ?? 0
+        if (newT === prevTransform) return
+        if (!await runSettingsAction(() => monitorConfig.applyTransform(name, newT))) return
+        showVeltrixAlert({
+            parent: box.get_root() as Gtk.Window,
+            heading: t("settings.display.confirm.title"),
+            countdown: {
+                seconds: 12, respondId: "revert",
+                format: (s) => t("settings.display.confirm.body").replace("%d", String(s)),
+            },
+            responses: [
+                { id: "revert", label: t("settings.display.confirm.revert") },
+                { id: "keep", label: t("settings.display.confirm.keep"), suggested: true },
+            ],
+            onResponse: (id) => { void runSettingsAction(async () => {
+                if (id === "keep") {
+                    await monitorConfig.commit(name)
+                    prevTransform = newT
+                } else {
+                    if (isSettingsProcess) await monitorConfig.revert(name)
+                    else await monitorConfig.applyTransform(name, prevTransform)
+                    rotApplying = true
+                    rotDrp.selected = prevTransform < ROTATIONS.length ? prevTransform : 0
+                    rotApplying = false
+                }
+            }) },
+        })
+    })
+
+    listBox.append(createRow(
+        t("settings.display.rotation"),
+        t("settings.display.rotation.desc"),
+        rotDrp
+    ))
+
+    return box
+}
+
+// ── Arrangement: extend vs mirror (two or more displays, Hyprland only) ───────
+// Hyprland has no primary-monitor concept and the bar/dock are drawn on every
+// monitor, so there is no primary picker: mirroring shows the source's content
+// on the other displays. Hyalo has no mirror field (`caps.mirror` false), so the
+// section is hidden there rather than offering a choice that does nothing.
+function buildArrangementSection(monitors: Array<{ name: string }>): Gtk.Widget | null {
+    if (!settings.caps.mirror || monitors.length < 2) return null
+    const { box, listBox } = listGroup(t("settings.display.arrangement"))
+    const names = monitors.map(m => m.name)
+    const defaultSource = names.find(n => n.startsWith("eDP")) ?? names[0]
+
+    // The current choice: the source every mirrored output points at, or extend.
+    const currentSource = (): string | null => {
+        for (const n of names) {
+            const m = monitorConfig.getMirror(n)
+            if (m) return m
+        }
+        return null
+    }
+    let source = currentSource() ?? defaultSource
+
+    const applyArrangement = async (mirror: boolean, src: string) => {
+        // Clear the source first: it must extend while the others mirror it.
+        if (mirror) await monitorConfig.setMirror(src, null)
+        for (const n of names) {
+            if (mirror && n === src) continue
+            await monitorConfig.setMirror(n, mirror ? src : null)
+        }
+    }
+
+    const MODE_OPTS = [t("settings.display.arrangement.extend"), t("settings.display.arrangement.mirror")]
+    const modeDrp = VeltrixDropDown({ model: new Gtk.StringList({ strings: MODE_OPTS }), valign: Gtk.Align.CENTER })
+    const sourceDrp = VeltrixDropDown({ model: new Gtk.StringList({ strings: names.map(monitorLabel) }), valign: Gtk.Align.CENTER })
+
+    const modeRow = createRow(
+        t("settings.display.arrangement.mode"),
+        t("settings.display.arrangement.mode.desc"),
+        modeDrp,
+    )
+    const sourceRow = createRow(
+        t("settings.display.arrangement.source"),
+        t("settings.display.arrangement.source.desc"),
+        sourceDrp,
+    )
+    listBox.append(modeRow)
+    listBox.append(sourceRow)
+
+    // ⚠️ Assigning `selected` emits notify::selected, so a re-read that merely SHOWS
+    // the current value would also WRITE it (eval + a rewrite of veltrix-monitor.lua)
+    // on every visit. Guarded, and a failed action re-syncs the dropdowns.
+    let syncing = false
+    const syncFromConfig = () => {
+        const cur = currentSource()
+        syncing = true
+        modeDrp.selected = cur ? 1 : 0
+        sourceDrp.selected = Math.max(0, names.indexOf(cur ?? source))
+        sourceRow.visible = !!cur
+        syncing = false
+    }
+    syncFromConfig()
+
+    modeDrp.connect("notify::selected", () => {
+        if (syncing) return
+        const mirror = modeDrp.selected === 1
+        void runSettingsAction(async () => {
+            try { await applyArrangement(mirror, source) }
+            catch (e) { syncFromConfig(); throw e }
+            syncing = true
+            sourceRow.visible = mirror
+            syncing = false
+        })
+    })
+    sourceDrp.connect("notify::selected", () => {
+        if (syncing) return
+        const src = names[sourceDrp.selected] ?? defaultSource
+        void runSettingsAction(async () => {
+            try { await applyArrangement(true, src); source = src }
+            catch (e) { syncFromConfig(); throw e }
+        })
+    })
+
+    return box
+}
+
+// ── Settings that are NOT per monitor ─────────────────────────────────────────
+/**
+ * VRR is one choice for every monitor: 0=off, 1=always, 2=on demand (any fullscreen
+ * window) — on Hyprland `misc:vrr` (a single GLOBAL int; 2 = any fullscreen window),
+ * on Hyalo each output's `vrr` (`"fullscreen"`). VELTRIX fork (Phase 0 fix): the
+ * old Hyalo meaning of 2 — a game in fullscreen — is deleted with Game Mode.
+ *
+ * It used to be built inside `buildMonitorSection`, i.e. once per monitor. On a
+ * two-monitor desk that put the SAME setting under two different monitor headings
+ * — each promising a scope it doesn't have — with no sync between them, so
+ * changing one left the other showing the old value while both wrote the same key.
+ * Same family as the keyboard layout living in two pages (see
+ * `references/design-system.md`); here the group title carries the honest scope.
+ */
+function buildGlobalSection(): Gtk.Widget {
+    const { box, listBox } = listGroup(t("settings.display.group.all"))
+
+    // Index == value applied: 0=off, 1=always, 2=on demand (any fullscreen window).
+    const VRR_OPTS = [
+        t("settings.display.vrr.off"),
+        t("settings.display.vrr.always"),
+        t("settings.display.vrr.fullscreen"),
+    ]
+    const vrrDrp = VeltrixDropDown({
+        model: new Gtk.StringList({ strings: VRR_OPTS }), valign: Gtk.Align.CENTER,
+    })
+
+    // ⚠️ Assigning `selected` emits notify::selected, so a re-read that merely SHOWS
+    // the current value would also WRITE it (eval + a rewrite of veltrix-monitor.lua)
+    // on every visit. Guarded, and skipped when nothing moved.
+    let syncing = false
+    const syncFromConfig = () => {
+        const cur = monitorConfig.vrr < VRR_OPTS.length ? monitorConfig.vrr : 0
+        if (vrrDrp.selected === cur) return
+        syncing = true
+        vrrDrp.selected = cur
+        syncing = false
+    }
+    vrrDrp.connect("notify::selected", () => {
+        if (syncing) return
+        void runSettingsAction(() => monitorConfig.setVrr(vrrDrp.selected))
+    })
+    // The page is cached and the window hides rather than closes, so this is a
+    // question to re-ask on every visit: MonitorConfig re-reads the effective
+    // `misc:vrr` whenever Hyprland reloads its config (a hand-edited
+    // hyprland-user.lua), and the dropdown has to follow it.
+    onPageShown(syncFromConfig)
+
+    listBox.append(createRow(
+        t("settings.display.vrr"),
+        t("settings.display.vrr.desc"),
+        vrrDrp,
+    ))
+
+    return box
+}
+
+export default function DisplayPage() {
+    const page = pageBox("display-page")
+
+    const placeholder = (label: string) =>
+        page.append(new Gtk.Label({ label, css_classes: ["settings-placeholder"], margin_top: 40 }))
+
+    const clearPage = () => {
+        let child = page.get_first_child()
+        while (child) {
+            const next = child.get_next_sibling()
+            page.remove(child)
+            child = next
+        }
+    }
+
+    // Built ONCE and re-appended by every render: the per-monitor sections are
+    // rebuilt from scratch on a topology change, but this one is not per monitor
+    // and its `onPageShown` re-read must be registered exactly once (a later
+    // render runs outside the page's build context, where registering is a no-op).
+    const globalBox = buildGlobalSection()
+
+    const render = () => {
+        clearPage()
+        // Monitors come from the Displays facade — HyprlandState's cache on Hyprland,
+        // Hyalo's IPC on Hyalo. Empty also covers the compositor being unreachable.
+        const monitors = displays.monitors
+        if (monitors.length === 0) { placeholder(t("settings.display.error.no-monitors")); return }
+
+        monitorConfig.init(monitors)
+        const arrangementBox = buildArrangementSection(monitors)
+        if (arrangementBox) page.append(arrangementBox)
+        // Mode lists come with the monitors, from either compositor — no per-render
+        // re-read.
+        monitors.forEach(mon => {
+            page.append(buildMonitorSection(mon, mon.availableModes))
+        })
+        page.append(globalBox)
+    }
+
+    // The Settings page is built once and cached for the window's lifetime (it hides,
+    // not destroys), so a monitor hot-plugged later would never appear. Rebuild the
+    // sections when the monitor TOPOLOGY changes (the set of connected outputs).
+    // Deliberately keyed on names only — not geometry/scale — because "changed" fires
+    // on every window/workspace event on Hyprland, and a resolution/rotation change is
+    // user-driven through these very dropdowns: rebuilding mid-interaction would
+    // clobber the in-flight revert dialog's closure state.
+    const topology = (): string =>
+        displays.monitors.map(m => m.name).sort().join("|")
+
+    let lastTopology = topology()
+    // Re-rendered and re-watched per visit: monitors can be plugged, unplugged or
+    // rearranged while the user is on another page, and this page is cached.
+    bindWhileRealized(page, () => {
+        render()
+        const sigId = displays.connect("changed", () => {
+            const next = topology()
+            if (next === lastTopology) return
+            lastTopology = next
+            render()
+        })
+        return () => safeDisconnect(displays, sigId)
+    })
+
+    return page
+}

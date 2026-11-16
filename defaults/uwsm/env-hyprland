@@ -1,0 +1,14 @@
+# Veltrix — uwsm environment variables (Hyprland-specific)
+# Only loaded when the Hyprland session starts.
+# Use this for HYPR* and AQ_* variables.
+# Reference: https://wiki.hyprland.org/Configuring/Environment-variables/
+
+# ── GPU selection (hybrid laptops: set automatically by veltrix-setup) ─────────
+# Aquamarine opens only the first DRM card unless told otherwise, so on a
+# hybrid laptop (Intel/AMD + NVIDIA) the outputs wired to the NVIDIA card —
+# usually the HDMI port — never appear. List BOTH cards, iGPU first
+# (the dGPU node alone would drop the iGPU and with it the laptop panel):
+# export AQ_DRM_DEVICES=/dev/dri/card0:/dev/dri/card1
+
+# ── NVIDIA cursor fix (uncomment if needed) ───────────────────────────────────
+# export HYPR_NO_HARDWARE_CURSORS=1

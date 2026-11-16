@@ -1,0 +1,785 @@
+# Maintainer: Veltrix Project <https://github.com/adnqcr7-code>
+#
+# Veltrix's own pacman package. This PKGBUILD travels INSIDE the release tag it
+# builds (packaging/veltrix/PKGBUILD), so the file layout below can never drift
+# from the tree it packages — veltrix-repo's CI fetches the tag's tarball and
+# builds with the PKGBUILD found in it; install.sh uses the same recipe as its
+# local fallback when the published repo lags a release.
+#
+# pkgver MUST equal the repo's VERSION file (bumped together in the release
+# commit; CI enforces the match). The build mirrors install.sh §4 (npm + sass +
+# scripts/bundle.sh × 3) and the veltrix-input compile from §5; package() mirrors
+# §5's file layout. First-time system/user setup (greetd, services, per-user
+# config seeding) is NOT packaging's job — see install.sh / veltrix-setup.
+# TWO packages out of one build (2026-08-25). `veltrix` is the desktop; the second
+# is the graphical installer, and it is separate because an installed system must
+# never carry code that partitions disks — only nidara-iso's package list names
+# `veltrix-installer`, so that is enforced by packaging rather than promised in a
+# comment. One build serves both: the installer is a fourth bundle in this tree
+# (ui/installer/) and everything that makes it look like Veltrix — the kit, the
+# bundler, the SCSS pipeline — is reachable only from inside it.
+#
+# A THIRD since 2026-09-23: `veltrix-kit`, the platform library (tech-debt #108) —
+# the desktop depends on it, and so can an app that is not in this repo.
+#
+# A FOURTH since 2026-10-01: `veltrix-hyalo`, the compositor of our own (hyalo/, #680). A
+# preview session next to the Hyprland one until it reaches parity; nothing depends on it
+# and install.sh does not install it.
+#
+# ⚠️ Anything that picks "the package makepkg just built" must now say WHICH:
+# install.sh installs `veltrix` + `veltrix-kit` by name (it installs the
+# desktop on an Arch somebody already runs, and must never hand them an installer),
+# and veltrix-repo copies every produced package rather than the newest one.
+#
+# ⚠️ RENAMED `veltrix` → `veltrix` (2026-08-30). The bare name was the
+# PRODUCT's and this is one of its four layers, so `pacman -Qi veltrix` answered
+# "what version of Veltrix do you have" with the DESKTOP's number — the exact
+# confusion nidara-iso/PRODUCT.md exists to remove, and the last place still
+# making it now that /etc/os-release carries no version. Every package in this
+# project is `veltrix-<thing>` from here: veltrix, veltrix-installer,
+# veltrix-apps, veltrix-system, veltrix-release. It is also what everybody else does
+# — `ubuntu-desktop` is a metapackage, `gnome-shell` is the component; nobody
+# names the desktop after the distribution.
+#
+# The bare `veltrix` is deliberately left FREE. If it ever comes back it should be
+# a metapackage meaning the product (desktop + apps + system + release), the way
+# `gnome` is in Arch. ⚠️ Do NOT create it while the `replaces=(veltrix)` below is
+# still doing its job: a package named `veltrix` and a package replacing `veltrix`
+# in the same repository is a resolution somebody's `-Syu` has to guess at.
+pkgname=(veltrix veltrix-kit veltrix-installer veltrix-hyalo)
+pkgver=1.0
+pkgrel=1
+# The kit's API version (tech-debt #108) — NOT the release's. It must equal
+# ui/lib/veltrix-kit/package.json's "version": package_veltrix-kit() refuses to
+# build otherwise, and CI's pkgbuild job checks it. A literal, not read from the
+# file, because makepkg reads `provides` BEFORE build() runs (--printsrcinfo,
+# the repo db) and a value computed inside package() is empty there — measured:
+# `ERROR: pkgver in provides cannot be empty`.
+_kitapi=0.1.0
+pkgdesc="VELTRIX — a fluid, glassmorphic desktop environment (Hyprland + GTK4/GJS)"
+arch=(x86_64)
+url="https://github.com/adnqcr7-code/veltrix"
+license=(GPL-3.0-or-later LGPL-3.0-or-later)
+# `install=` and `backup=` are set inside package_veltrix(): at the top level they
+# would apply to BOTH packages, and veltrix.install's greetd/setup work has nothing
+# to do with the installer.
+
+# Runtime deps: PACMAN_DEPS from install.sh minus the build toolchain. Since
+# 0.8.0 nothing here comes from [veltrix] but the `veltrix` package itself — the
+# last pinned Astal package (libastal-auth) went with the native PAM library —
+# so every runtime dep a bare `pacman -S veltrix` needs must be listed HERE.
+depends=(
+  # compositor + session plumbing
+  # 'hyprland>=0.56': config/hypr/hyprland.lua's `glow` block is 0.56-only (added
+  # with the Assistant's focused-window glow). An older Hyprland parses the
+  # session config and rejects the unknown option, so this is a hard floor, not
+  # a preference — the README states the same number.
+  # QUOTED, and it must stay that way: unquoted, bash reads `>` as a redirection,
+  # the depends=() array never closes and the whole PKGBUILD stops sourcing.
+  'hyprland>=0.56' hypridle hyprsunset uwsm greetd power-profiles-daemon polkit-gnome
+  # keyring: the Secret Service (org.freedesktop.secrets) the shell's NetworkAgent
+  # uses for Wi-Fi passwords; libsecret provides the Secret-1 typelib it imports
+  # (gi://Secret). (VELTRIX fork, Phase 0: the Assistant no longer stores any
+  # API key — see the Assistant section of the README — so the keyring is here
+  # for Wi-Fi only.)
+  gnome-keyring libsecret
+  # GTK/GJS runtime
+  gjs gtk3 gtk4 gtk-layer-shell gtk4-layer-shell libpeas-2 wayland
+  # Native projection selector: keyboard mapping, required font discovery and
+  # the native image decoder linked by the Settings crate.
+  libxkbcommon fontconfig dav1d
+  # (no libastal-* packages — all services, runtime, and PAM auth are native C/TS)
+  # services the shell talks to. networkmanager is load-bearing TWICE over: the
+  # daemon, and `libnm` (its dep) for the NM-1.0 typelib core/NetworkService.ts
+  # imports — that typelib used to arrive via libastal-network. `upower` is now
+  # load-bearing the same way: it owns UPowerGlib-1.0.typelib, which
+  # core/BatteryService.ts imports. `libnma-gtk4` owns NMA4-1.0.typelib: the Wi-Fi
+  # dialogs (password, enterprise, hidden network) surfaces/network/WifiSecretsDialog.ts
+  # builds — without it the shell's NetworkManager secret agent has nothing to show.
+  networkmanager libnma-gtk4 bluez bluez-libs bluez-utils bluez-obex upower accountsservice
+  # (no `cups`: nothing in the desktop talks to it — printing is system policy
+  # and lives in veltrix-system, which also enables cups.socket)
+  # `libwireplumber` is the same shape as `upower` above: it owns
+  # Wp-0.5.typelib, which core/wireplumber.ts imports. It arrives as a
+  # dependency of `wireplumber`, and that is exactly the accident this array
+  # exists to stop relying on (#379).
+  pipewire pipewire-audio pipewire-alsa pipewire-pulse wireplumber libwireplumber libpulse sound-theme-freedesktop
+  # `rtkit` is only an OPTIONAL dependency of pipewire, so nothing pulled it in:
+  # a clean install ran pipewire and wireplumber at normal priority, with
+  # "RTKit error: ServiceUnknown" in the journal (VM, 2026-09-13), and audio
+  # that crackles as soon as the machine is busy. It is also what
+  # xdg-desktop-portal's Realtime interface asks for.
+  rtkit
+  xdg-desktop-portal-gtk xdg-desktop-portal-hyprland
+  # The screen shared in a call, in the Veltrix session (Hyalo): config/portal/veltrix-portals.conf.
+  xdg-desktop-portal-wlr
+  # tools the shell/keybinds shell out to
+  brightnessctl ddcutil pamixer playerctl jq curl slurp grim wf-recorder
+  # VAAPI drivers for wf-recorder's hardware path: RecordingConfig defaults to
+  # h264_vaapi whenever /dev/dri/renderD128 exists, and without a libva driver
+  # the encoder fails to initialise — every recording then fails with no file.
+  # Intel needs intel-media-driver, AMD and most others libva-mesa-driver; the
+  # render node alone does not mean VAAPI works.
+  intel-media-driver libva-mesa-driver
+  wl-clipboard cliphist wtype at-spi2-core python-gobject libnotify
+  xdg-utils gsettings-desktop-schemas lz4 mesa pam
+  # `awww` (animated-wallpaper daemon, swww fork) is AUR-only, NOT in Arch
+  # extra: the session's wallpaper engine — hyprland.lua, hyprland-greeter.lua,
+  # WallpaperManager.ts and veltrix-portal all shell out to `awww`/`awww-daemon`
+  # — so a bare `pacman -S veltrix` cannot resolve it from the official repos.
+  # The [veltrix] repo must ship it (or the user builds it from the AUR) or
+  # the install fails on this dep. The other names in this array were NOT
+  # individually verified against archlinux.org (carried over from upstream,
+  # Phase 0); only awww is called out, because the code review flagged it.
+  awww
+  # `dconf` — the BINARY, not the library. veltrix-setup reads through it and the
+  # pacman hook below execs /usr/bin/dconf; it had been arriving as a transitive
+  # dependency of the GTK stack, which is the same shape of latent bug as the
+  # python-gobject one: present on every dev box, absent from nobody's until it
+  # is. Declared because we call it by path.
+  dconf
+  # `git` — called by name, twice, and by neither the shell nor a keybind:
+  # `veltrix-update` clones a release into a temp dir on the stable path, and
+  # `veltrix-agent`'s file layer commits every write it makes to a repository it
+  # creates in ~/.config/veltrix. A machine without it loses the agent's undo
+  # history silently, on the first write (#379).
+  git
+  # default apps wired into the UI (Super+T, Files item…)
+  # (no `pavucontrol`: nothing opens it — Settings → Sound is the mixer)
+  kitty nautilus
+  # `nautilus-python` — the Python bindings for Nautilus extensions. Files'
+  # "Move to Trash…" row (defaults/nautilus-python/extensions/veltrix-delete.py,
+  # seeded per user by veltrix-setup) is inert without it: Nautilus simply never
+  # loads the extension. Declared because the desktop ships the extension file,
+  # not because anything imports it by name.
+  nautilus-python
+  # fonts + icon fallbacks the design system assumes; CJK because the shell,
+  # greeter and lockscreen ship zh-CN/ja catalogs AND every user sees the
+  # 简体中文/日本語 endonyms in the language pickers — without it they render
+  # as tofu boxes (VM sweep 2026-07-13)
+  # The typeface, plus the Nerd Font pictograms as a SEPARATE font that
+  # fontconfig falls back to. `ttf-jetbrains-mono-nerd` is the same typeface
+  # with those pictograms patched into every weight and style, and it costs
+  # 232 MiB against 9.8 MiB for these two — on every install, for glyphs a
+  # terminal reaches through fallback anyway. Verified on screen, not
+  # reasoned about: the Powerline separators (the ones that must tile with
+  # the cell) come out pixel-identical, and the pictograms render about one
+  # pixel heavier because the standalone font carries its own metrics
+  # instead of being rescaled to the typeface's cell.
+  ttf-jetbrains-mono ttf-nerd-fonts-symbols-mono
+  inter-font noto-fonts noto-fonts-emoji noto-fonts-cjk
+  # Arabic: there is NO `noto-fonts-arabic` in the Arch repos (verified
+  # 2026-11-12 — no archlinux.org page, and the ArchWiki Fonts Arabic section
+  # lists only AUR fonts). The Arabic faces (Noto Sans Arabic, Noto Kufi
+  # Arabic, Noto Naskh Arabic) ship in the noto-fonts split package
+  # `noto-fonts-extra` (Extra, "additional variants" — every non-CJK,
+  # non-emoji script). Without it the Bismillah, prayer times and Hijri dates
+  # render as tofu. Do NOT "fix" this to the nonexistent -arabic name: an
+  # unresolvable dep breaks `pacman -S veltrix` outright.
+  # Provenance of the render proof, docs/bismillah-test.png (1600x260,
+  # 2026-11-12): Noto Naskh Arabic Regular at 96 px, PIL + raqm/HarfBuzz,
+  # cyan #00E5FF on #0A0A12 — reproduced pixel-identically on the build VM
+  # (mean channel difference 0.00). That proves the font and renderer here,
+  # not the Arch package: the Dell `fc-list :lang=ar` check is still the
+  # live proof on hardware.
+  noto-fonts-extra
+  # Input method. The installer offers 简体中文 and 日本語 as system languages, and
+  # a CJK language is not typable without one: fonts render it, an IME WRITES it.
+  # Without these the offer was a promise we could not keep — the desktop came up
+  # in Chinese and its owner could not enter a single character (#500).
+  #
+  # The FRAMEWORK is for everyone — it is also what turns ~/.XCompose sequences
+  # into text for Wayland clients. The Chinese ENGINE is not (#703): this comment
+  # used to call the engines "5 MB of the 23", which counted their own size and
+  # not their dependency trees. `fcitx5-chinese-addons` pulls in qt6-webengine and
+  # adds ~540 MiB on top of everything else listed here. It is installed when
+  # Chinese is the system language — at install time and from Settings → Region —
+  # by bin/veltrix-language, and listed in optdepends below. Japanese stays: anthy
+  # adds ~24 MiB.
+  #
+  # ⚠️ `fcitx5-gtk` is for GTK3 and XWayland apps only. GTK4 speaks
+  # `zwp_text_input_v3` to the compositor natively and needs no module — which is
+  # why GTK_IM_MODULE is deliberately NOT exported; see bin/veltrix.
+  fcitx5 fcitx5-gtk fcitx5-qt fcitx5-configtool
+  fcitx5-anthy
+  # adwaita-cursors = the default cursorTheme in defaults/appearance.json; listed
+  # explicitly instead of relying on adwaita-icon-theme happening to depend on it
+  # WhiteSur is deliberately NOT here: it is not in the Arch repos and no AUR
+  # package name for it could be verified against a live source (2026-11-12),
+  # so naming one would be a guess that breaks `pacman -S veltrix`. It is
+  # installed from upstream, pinned to one commit, by bin/veltrix-setup (see
+  # its WhiteSur step) and verified there — papirus + adwaita below are only
+  # the fallbacks for apps that ask for an icon WhiteSur does not carry.
+  papirus-icon-theme adwaita-icon-theme adwaita-cursors
+  # ⚠️ NO `plymouth` here, and it is a decision rather than an omission (2026-08-30).
+  # It was added on 08-29, correctly reasoning that a package shipping a Plymouth theme
+  # and running `plymouth-set-default-theme` must depend on Plymouth — and wrongly, one
+  # day later, because the theme should never have been in THIS package. The boot splash
+  # is the PRODUCT's branding, not the desktop's: `install.sh` puts this on an Arch
+  # somebody already uses, and repainting their boot is exactly what it must not do.
+  # GNOME Shell does not depend on Plymouth; Ubuntu ships a Plymouth theme. It moves to
+  # `veltrix-system` in nidara-iso — see nidara-iso/PRODUCT.md, "Four layers".
+)
+# wayland-protocols + hyprland-protocols supply the XML that wayland-scanner turns
+# into libveltrix-wl's glue; gobject-introspection supplies g-ir-scanner, without
+# which the shell's `gi://VeltrixWl` import has nothing to resolve.
+#
+# This list is LOAD-BEARING, not documentation: veltrix-repo's CI derives its whole
+# build toolchain from the makedepends of the PKGBUILDs it builds — this one
+# included, read straight out of the release tag — and installs nothing else
+# (build-repo.sh runs makepkg --nodeps by design). Anything build() reaches for
+# and this array does not name is absent in that container, which is how v0.7.0
+# died on a missing hyprland-focus-grab-v1.xml. `wayland` (wayland-scanner +
+# wayland-client) and `gtk4` (lib/veltrix-wl/build.sh compiles and g-ir-scans
+# against it) were in exactly that position: never declared, present only because
+# the astal packages built before veltrix happened to pull them in.
+# `esbuild` is in exactly the position this comment warns about: scripts/bundle.sh
+# is the bundler now, and it is the ONE thing build() reaches for that no runtime
+# dep would drag in.
+# Closes on its own line, like depends=() above: install.sh derives both arrays
+# with `sed -n '/^NAME=(/,/^)/p'` (the idiom the pkgbuild CI job already uses),
+# and a `)` anywhere but column 1 makes that range end in the wrong place.
+#
+# Hyalo's (Rust) build deps are their own array, spliced in at the end. makepkg and
+# veltrix-repo's build-deps.sh source the whole file and see them; install.sh sources the
+# makedepends block ALONE, where the splice expands to nothing — deliberately: a dev install
+# runs the shell on Hyprland and never compiles Hyalo (hyalo/README.md builds it by hand).
+_hyalo_makedepends=(
+  libinput seatd libdisplay-info libxkbcommon mesa systemd-libs pango cairo
+)
+# `clang`, not just `clang-libs`: libspa-sys's bindgen finds the compiler's builtin headers
+# (stdbool.h) by asking the clang BINARY; with only libclang it fails in sessiond's build.
+# The Hyalo smoke job installs clang itself, which is why CI never saw it.
+makedepends=(
+  nodejs npm esbuild wlr-protocols wayland-protocols hyprland-protocols
+  wayland gtk4 gobject-introspection pkgconf rust clang
+  "${_hyalo_makedepends[@]}"
+)
+# etc/pam.d/veltrix-lock is tracked so a local customization survives an upgrade —
+# this is where someone adds fprintd or a hardware key to the unlock stack.
+options=(!debug)
+
+source=("veltrix-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# The tarball is fetched over TLS from the release tag and the RESULTING package
+# + repo db are GPG-signed by veltrix-repo's CI — same trust model as the other
+# [veltrix] packages (their git sources also pin by ref with SKIP sums).
+# SKIP is genuine here, not laziness: this PKGBUILD travels INSIDE the tag tarball
+# it would checksum, so a real sum is self-referential — tagging, computing the
+# sum, and editing the PKGBUILD to record it changes the tarball and invalidates
+# the sum. The integrity that matters is the tag (TLS fetch) + the CI signature
+# on the built package and repo db.
+# Phase 11 (publish) item, recorded as a blocker in BUILD_LOG.md: no published
+# tag exists yet — https://github.com/adnqcr7-code/masjid-os returned 404 as of
+# 2026-11-12 (repo renamed to veltrix 2026-11-14) — so no real checksum CAN be
+# computed now, and none is invented
+# here. Switching source= to git+https with a pinned commit was considered and
+# rejected for the same reason: the fork repo does not exist yet, so there is
+# nothing to pin. When the first tag publishes, the release process must compute
+# the tag tarball's real sha256 and record it here (moving the PKGBUILD out of
+# the tarball it checksums, or the sum stays self-referential). Until then SKIP
+# is the honest value.
+sha256sums=('SKIP')
+
+# Hyalo's crates are fetched here, against the committed Cargo.lock, so build() needs no
+# network (Arch's Rust packaging guidelines). Smithay is a git dependency pinned by
+# revision in hyalo/Cargo.toml; `--locked` refuses a lock file that disagrees with it.
+prepare() {
+  cd "$srcdir/veltrix-$pkgver/hyalo"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+  cd "$srcdir/veltrix-$pkgver/session"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+  cd "$srcdir/veltrix-$pkgver/toolkit"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/veltrix-$pkgver"
+
+  lib/veltrix-host/build.sh "$PWD/build/veltrix-host"
+
+  # Shell: SCSS → CSS, TSX → GJS bundle (mirrors install.sh §4).
+  # `npm install`, not `npm ci`: the lockfile is deliberately NOT committed (see
+  # the repo's .gitignore). Only sass + lucide-static resolve from the registry,
+  # both build-time-only — the bundler itself is the system `esbuild`.
+  cd ui/shell
+  npm install
+  # The kit's sheet, loaded at runtime by the shell, greeter and lock in the same
+  # provider as their own (tech-debt #108 phase 2). The installer still compiles
+  # its own copy in until the ISO is published.
+  npx sass --no-charset ../lib/veltrix-kit/styles/kit.scss ../lib/veltrix-kit/kit.css
+  sed -i '/@charset/d' ../lib/veltrix-kit/kit.css
+  npx sass --no-charset style.scss style.css
+  sed -i '/@charset/d' style.css
+  # The kit's modules (#108 phase 3): shell, greeter and lock import them at
+  # runtime from /usr/share/veltrix-kit/js. The installer does NOT (below).
+  node ../../scripts/bundle.mjs kit ../lib/veltrix-kit/build/js
+  mkdir -p build
+  ../../scripts/bundle.sh app.ts build/veltrix --native-host=veltrix-shell --kit-external=/usr/share/veltrix-kit/js
+
+  # Settings is a separate application, sharing the kit at runtime.
+  npx sass --no-charset ../settings/style.scss ../settings/style.css
+  sed -i '/@charset/d' ../settings/style.css
+  ( cd ../settings; mkdir -p build; ../../scripts/bundle.sh app.ts build/veltrix-settings --native-host=veltrix-settings --kit-external=/usr/share/veltrix-kit/js )
+  # What the native Settings reads besides Config1 (toolkit/PHASE1.md D4): its pages, strings
+  # and tokens, exported from the same sources, with their format version. The tokens
+  # compile with the sass `npm install` just put here (no download inside build()).
+  node --experimental-strip-types ../../scripts/export-settings-data.mjs ../../build/settings-data
+  SASS="$PWD/node_modules/.bin/sass" \
+    node --experimental-strip-types ../../scripts/export-tokens.mjs ../../build/settings-data
+
+  # Greeter (reuses the shell's sass install; no npm tree of its own)
+  npx sass --no-charset ../greeter/style.scss ../greeter/style.css
+  sed -i '/@charset/d' ../greeter/style.css
+
+  # Installer — same arrangement, its own sheet. Built on every build: makepkg
+  # runs every package_*() (pacman 7 has no `--pkg`), and install.sh picks the
+  # packages it installs by name; it costs one sass call and one esbuild.
+  npx sass --no-charset ../installer/style.scss ../installer/style.css
+  sed -i '/@charset/d' ../installer/style.css
+  cd ../greeter
+  mkdir -p build
+  ../../scripts/bundle.sh app.ts build/veltrix-greeter --native-host=veltrix-greeter --kit-external=/usr/share/veltrix-kit/js
+
+  # Lockscreen (shares the greeter's style.css)
+  cd ../lockscreen
+  mkdir -p build
+  ../../scripts/bundle.sh app.ts build/veltrix-lock --native-host=veltrix-lock --kit-external=/usr/share/veltrix-kit/js
+
+  # Installer (ISO-only package — see package_veltrix-installer)
+  cd ../installer
+  mkdir -p build
+  ../../scripts/bundle.sh app.ts build/veltrix-installer --native-host=veltrix-installer
+
+  # veltrix-input: zwlr_virtual_pointer_v1 client for the computer-use pointer
+  # (mirrors install.sh §5 — wayland-scanner generates the protocol glue)
+  cd "$srcdir/veltrix-$pkgver"
+  local xml=/usr/share/wlr-protocols/unstable/wlr-virtual-pointer-unstable-v1.xml
+  mkdir -p build
+  wayland-scanner client-header "$xml" build/wlr-virtual-pointer-unstable-v1-client-protocol.h
+  wayland-scanner private-code  "$xml" build/wlr-virtual-pointer-unstable-v1-protocol.c
+  cc -O2 bin/veltrix-input.c build/wlr-virtual-pointer-unstable-v1-protocol.c \
+     -Ibuild $(pkg-config --cflags --libs wayland-client) -o build/veltrix-input
+
+  # veltrix-ipc is built in the session workspace below (native, no interpreter).
+
+  # libveltrix-wl: window capture + hyprland-surface visible region, reachable
+  # from GJS via introspection (mirrors install.sh §5)
+  lib/veltrix-wl/build.sh "$srcdir/veltrix-$pkgver/build/veltrix-wl"
+
+  # libveltrix-auth: PAM authentication for the lockscreen, reachable
+  # from GJS via introspection (mirrors install.sh §5)
+  lib/veltrix-auth/build.sh "$srcdir/veltrix-$pkgver/build/veltrix-auth"
+
+  # Session daemon (package veltrix). prepare() fetched its locked crates.
+  cd "$srcdir/veltrix-$pkgver/session"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --release --locked --offline --workspace --features audio-native
+  install -m755 target/release/veltrix-ipc ../build/veltrix-ipc
+
+  # Standalone Super+P client only; native Settings is not installed by this cut.
+  cd "$srcdir/veltrix-$pkgver/toolkit"
+  cargo build --release --locked --offline -p nk-settings --bin veltrix-display-selector
+
+  # The Hyalo session owns the Rust bar/dock/panels (#1017).
+  cargo build --release --locked --offline -p veltrix-shell --bin veltrix-shell
+
+  # Hyalo (package veltrix-hyalo). Offline: prepare() fetched everything.
+  cd "$srcdir/veltrix-$pkgver/hyalo"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+package_veltrix() {
+  install=veltrix.install
+  # The Veltrix icon theme ships inside assets/ (ui/shell/assets/icons/veltrix, the
+  # only copy of the interface drawings) and is linked into /usr/share/icons below.
+  # Its drawings are Lucide's — ISC, with MIT for the part inherited from Feather —
+  # and its LICENSE travels inside the theme directory.
+  license=(GPL-3.0-or-later LGPL-3.0-or-later ISC MIT)
+  backup=(etc/xdg-desktop-portal/hyprland-portals.conf
+          etc/xdg-desktop-portal/veltrix-portals.conf
+          etc/xdg/xdg-desktop-portal-wlr/Veltrix
+          etc/pam.d/veltrix-lock)
+  # Installed by bin/veltrix-language when the system language needs it (#703),
+  # not by pacman for everybody — see the input-method note in depends.
+  optdepends=('fcitx5-chinese-addons: typing Chinese (installed with Chinese as the system language)')
+  # The rename dance, and all three are load-bearing:
+  #   replaces  — an existing install migrates on the next `pacman -Syu`, with no
+  #               instruction to anybody. This is the only one that touches
+  #               machines that are already out there.
+  #   conflicts — the two names are the same files; pacman must refuse to have both.
+  #   provides  — `pacman -S veltrix` keeps resolving, so every script, note and
+  #               README line written before today still works. That is also why
+  #               the ISO and base.json can be updated at leisure instead of in
+  #               lockstep with this.
+  # Drop them only when no reachable install can still carry the old name — which
+  # is not a date, it is a decision somebody makes after the first public image.
+  # VELTRIX fork (Phase 0): the same three arrays also carry `nidara-desktop`,
+  # the upstream name this fork renames. A machine that installed stock Nidara
+  # migrates to veltrix on the next `pacman -Syu` once the [veltrix] repo is
+  # added, and pacman refuses to hold both names at once.
+  provides=(veltrix nidara-desktop)
+  replaces=(veltrix nidara-desktop)
+  conflicts=(veltrix nidara-desktop)
+  # The shell, greeter and lock import the kit from /usr/share/veltrix-kit at
+  # runtime (tech-debt #108), so without it none of them starts. Pinned to THIS
+  # build: the three bundles were compiled against these module names and
+  # exports, and both packages come out of the same build() anyway.
+  depends+=("veltrix-kit=$pkgver-$pkgrel")
+
+  cd "$srcdir/veltrix-$pkgver"
+
+  # PAM configuration for lockscreen
+  install -Dm644 config/pam/veltrix-lock "$pkgdir/etc/pam.d/veltrix-lock"
+
+  # Polkit action for Content Safety (Settings → Safety): without it pkexec
+  # falls back to the generic "run as super user" prompt for
+  # veltrix-content-safety. The .policy file's exec.path annotation names
+  # this helper, so the prompt says what is happening.
+  install -Dm644 config/polkit/org.veltrix.content-safety.policy \
+    "$pkgdir/usr/share/polkit-1/actions/org.veltrix.content-safety.policy"
+  # Polkit action for the background updater: the privileged apply half
+  # (bin/veltrix-update-helper) runs as root through pkexec, authorised
+  # without a password for the active local session (allow_active=yes).
+  # No password is saved anywhere, so there is no prompt to show — the
+  # policy is the whole authorisation surface for that action.
+  install -Dm644 config/polkit/org.veltrix.update.policy \
+    "$pkgdir/usr/share/polkit-1/actions/org.veltrix.update.policy"
+  # Polkit actions for Anonymity (Settings → Safety → Anonymity): three
+  # verbs, deliberately NOT one authorisation level — turning Tor mode ON
+  # needs no password for the active session, turning it OFF and installing
+  # the tor package need the admin password. See the policy file's header.
+  install -Dm644 config/polkit/org.veltrix.anonymity.policy \
+    "$pkgdir/usr/share/polkit-1/actions/org.veltrix.anonymity.policy"
+
+  # /usr/bin — session launchers, helpers, agent toolkit (install.sh §5 list)
+  local b
+  for b in veltrix veltrix-ui veltrix-settings veltrix-greeter veltrix-greeter-session veltrix-lock veltrix-before-sleep \
+           veltrix-after-sleep veltrix-display-brightness veltrix-power-key veltrix-kbd-light veltrix-media-key veltrix-doctor veltrix-bug-report veltrix-portal veltrix-share-chooser \
+           veltrix-mcp veltrix-agent veltrix-a11y veltrix-act veltrix-type veltrix-click veltrix-wm \
+           veltrix-hook veltrix-update veltrix-update-download veltrix-update-helper veltrix-setup veltrix-migrate veltrix-language veltrix-hijri-date veltrix-prayer-times veltrix-prayer-lock veltrix-weather veltrix-content-safety veltrix-anonymity veltrix-halal-audio; do
+    install -Dm755 "bin/$b" "$pkgdir/usr/bin/$b"
+  done
+  install -Dm755 build/veltrix-input "$pkgdir/usr/bin/veltrix-input"
+  install -Dm755 build/veltrix-ipc "$pkgdir/usr/bin/veltrix-ipc"
+  # One private GJS runner per program (lib/veltrix-host/hosts); the installer's
+  # ships with veltrix-installer.
+  for host in build/veltrix-host/veltrix-*; do
+    [ "${host##*/}" = veltrix-installer ] && continue
+    install -Dm755 "$host" "$pkgdir/usr/lib/veltrix/${host##*/}"
+  done
+
+  # libveltrix-wl + its typelib. The typelib MUST land on the default
+  # girepository path: the three bundles import gi://VeltrixWl with no
+  # GI_TYPELIB_PATH of their own, so a private location would resolve in a --dev
+  # checkout and fail for every packaged install.
+  install -Dm755 build/veltrix-wl/libveltrix-wl.so.0.0.0 \
+    "$pkgdir/usr/lib/libveltrix-wl.so.0.0.0"
+  ln -sf libveltrix-wl.so.0.0.0 "$pkgdir/usr/lib/libveltrix-wl.so.0"
+  ln -sf libveltrix-wl.so.0     "$pkgdir/usr/lib/libveltrix-wl.so"
+  install -Dm644 build/veltrix-wl/VeltrixWl-1.0.typelib \
+    "$pkgdir/usr/lib/girepository-1.0/VeltrixWl-1.0.typelib"
+  install -Dm644 build/veltrix-wl/VeltrixWl-1.0.gir \
+    "$pkgdir/usr/share/gir-1.0/VeltrixWl-1.0.gir"
+
+  # libveltrix-auth + its typelib (PAM authentication for the lockscreen)
+  install -Dm755 build/veltrix-auth/libveltrix-auth.so.0.0.0 \
+    "$pkgdir/usr/lib/libveltrix-auth.so.0.0.0"
+  ln -sf libveltrix-auth.so.0.0.0 "$pkgdir/usr/lib/libveltrix-auth.so.0"
+  ln -sf libveltrix-auth.so.0     "$pkgdir/usr/lib/libveltrix-auth.so"
+  install -Dm644 build/veltrix-auth/VeltrixAuth-1.0.typelib \
+    "$pkgdir/usr/lib/girepository-1.0/VeltrixAuth-1.0.typelib"
+  install -Dm644 build/veltrix-auth/VeltrixAuth-1.0.gir \
+    "$pkgdir/usr/share/gir-1.0/VeltrixAuth-1.0.gir"
+
+  # /usr/share/veltrix — bundles, styles, assets, shared config
+  # The migration units. Sourced by veltrix-migrate, never executed on their own,
+  # hence 644: an execute bit here would suggest a contract this does not have.
+  mkdir -p "$pkgdir/usr/share/veltrix/migrations"
+  install -m644 migrations/*.sh "$pkgdir/usr/share/veltrix/migrations/"
+  install -Dm644 VERSION "$pkgdir/usr/share/veltrix/VERSION"
+  # Content Safety's blocklist of adult domains (StevenBlack porn-only,
+  # MIT). The helper reads it from here at runtime (pkexec'd, root).
+  install -Dm644 defaults/content-safety/blocklist.txt "$pkgdir/usr/share/veltrix/content-safety/blocklist.txt"
+  # Anonymity's Tor drop-in. The helper copies it to /etc/tor/torrc.d/
+  # when Tor mode is turned on and removes it again when it is turned off;
+  # the main torrc is never edited. Tor mode itself is OFF by default.
+  install -Dm644 defaults/anonymity/torrc-veltrix.conf "$pkgdir/usr/share/veltrix/anonymity/torrc-veltrix.conf"
+  # VoiceOnly (Adnan's vocal-only tool) + the word-scan module (parent's),
+  # vendored verbatim in fork/voiceonly/ — see fork/voiceonly/VENDORED.md.
+  # The helper (bin/veltrix-halal-audio) imports voiceonly.py and invokes
+  # wordscan.py from here at runtime; the web UI (static/) ships for the
+  # standalone tool — the desktop integration does not serve it.
+  install -Dm644 voiceonly/voiceonly.py "$pkgdir/usr/share/veltrix/voiceonly/voiceonly.py"
+  install -Dm644 voiceonly/wordscan.py "$pkgdir/usr/share/veltrix/voiceonly/wordscan.py"
+  install -Dm644 voiceonly/blacklist.txt "$pkgdir/usr/share/veltrix/voiceonly/blacklist.txt"
+  install -Dm755 voiceonly/run.sh "$pkgdir/usr/share/veltrix/voiceonly/run.sh"
+  mkdir -p "$pkgdir/usr/share/veltrix/voiceonly/static"
+  install -m644 voiceonly/static/* "$pkgdir/usr/share/veltrix/voiceonly/static/"
+  # Hash-pinned Python requirements for the per-user venv (hijridate +
+  # al-falak); read by bin/veltrix-setup at first-boot setup.
+  install -Dm644 defaults/python-venv-requirements.txt "$pkgdir/usr/share/veltrix/defaults/python-venv-requirements.txt"
+  install -Dm644 defaults/wallpaper/wallpaper.jpg "$pkgdir/usr/share/veltrix/wallpaper.jpg"
+  if [ -f defaults/wallpaper/wallpaper-greeter.jpg ]; then
+    install -Dm644 defaults/wallpaper/wallpaper-greeter.jpg "$pkgdir/usr/share/veltrix/wallpaper-greeter.jpg"
+  fi
+  mkdir -p "$pkgdir/usr/share/veltrix/wallpapers"
+  install -m644 defaults/wallpaper/*.jpg "$pkgdir/usr/share/veltrix/wallpapers/"
+  install -Dm755 ui/settings/build/veltrix-settings "$pkgdir/usr/share/veltrix/ui/settings/build/veltrix-settings"
+  install -Dm644 ui/settings/style.css "$pkgdir/usr/share/veltrix/ui/settings/style.css"
+  # The native Settings' data (PHASE1.md D4), version file included.
+  install -dm755 "$pkgdir/usr/share/veltrix/settings-data"
+  cp -r --no-preserve=mode build/settings-data/. "$pkgdir/usr/share/veltrix/settings-data/"
+  install -Dm755 ui/shell/build/veltrix "$pkgdir/usr/share/veltrix/ui/shell/build/veltrix"
+  install -Dm644 ui/shell/style.css "$pkgdir/usr/share/veltrix/ui/shell/style.css"
+  cp -r ui/shell/assets "$pkgdir/usr/share/veltrix/ui/shell/assets"
+  # The theme where themes are found (Settings, theme authors), without a second copy.
+  install -dm755 "$pkgdir/usr/share/icons"
+  ln -s /usr/share/veltrix/ui/shell/assets/icons/veltrix "$pkgdir/usr/share/icons/veltrix"
+  install -Dm755 ui/greeter/build/veltrix-greeter "$pkgdir/usr/share/veltrix/ui/greeter/build/veltrix-greeter"
+  install -Dm644 ui/greeter/style.css "$pkgdir/usr/share/veltrix/ui/greeter/style.css"
+  # The kit (kit.css + the modules the three bundles import) is NOT here: it is
+  # its own package, `veltrix-kit` — see package_veltrix-kit below.
+  install -Dm755 ui/lockscreen/build/veltrix-lock "$pkgdir/usr/share/veltrix/ui/lockscreen/build/veltrix-lock"
+
+  # Shared Hyprland config (the session loads it via -c, see bin/veltrix)
+  mkdir -p "$pkgdir/usr/share/veltrix/config"
+  cp -r config/hypr "$pkgdir/usr/share/veltrix/config/hypr"
+
+  # Payloads consumed by first-time setup (greetd templates, per-user seeds).
+  # The wallpaper already ships at its canonical path above — don't duplicate it.
+  cp -r config/greetd "$pkgdir/usr/share/veltrix/config/greetd"
+  cp -r defaults "$pkgdir/usr/share/veltrix/defaults"
+  rm -rf "$pkgdir/usr/share/veltrix/defaults/wallpaper"
+
+  # Plymouth boot splash theme
+
+  # Assistant skills — markdown playbooks bin/veltrix-agent loads on demand. This
+  # is the path a PACKAGE install takes, and it is the one that matters most: a
+  # --dev checkout reads the repo's skills/ directly, so forgetting this line
+  # would leave load_skill quietly absent for every real user while working
+  # perfectly on the maintainer's machine.
+  cp -r skills "$pkgdir/usr/share/veltrix/skills"
+
+  # Session entry + app entries
+  install -Dm644 config/wayland-sessions/veltrix.desktop "$pkgdir/usr/share/wayland-sessions/veltrix.desktop"
+  # A system-wide $BROWSER must not contradict Settings → Default Apps (see the file).
+  install -Dm644 config/uwsm/veltrix-browser "$pkgdir/usr/share/uwsm/env-hyprland.d/veltrix-browser"
+  # Default terminal for Terminal=true entries (uwsm's lookup); a user's own list wins.
+  install -Dm644 config/xdg-terminal-exec/Hyprland-xdg-terminals.list \
+    "$pkgdir/usr/share/xdg-terminal-exec/Hyprland-xdg-terminals.list"
+  mkdir -p "$pkgdir/usr/share/applications"
+  install -m644 config/applications/*.desktop "$pkgdir/usr/share/applications/"
+  # Default apps in the Veltrix session (folders → Nautilus); a user's own list wins.
+  install -m644 config/mimeapps/veltrix-mimeapps.list "$pkgdir/usr/share/applications/"
+
+  # systemd user unit (started by the Veltrix Hyprland config, never enabled —
+  # see the unit's NOTE)
+  install -Dm644 bin/veltrix.service "$pkgdir/usr/lib/systemd/user/veltrix.service"
+  install -Dm644 bin/veltrix-sessiond.service "$pkgdir/usr/lib/systemd/user/veltrix-sessiond.service"
+  install -Dm644 bin/veltrix-sessiond-legacy.service "$pkgdir/usr/lib/systemd/user/veltrix-sessiond-legacy.service"
+  # Anonymity's boot restore — a SYSTEM unit, not a user one: the nftables
+  # ruleset does not survive a reboot, so it must be re-applied before the
+  # network is up. It is enabled by the installer (install.sh), not by the
+  # package: a package install must not silently enable a service. When Tor
+  # mode is off, `veltrix-anonymity apply` exits doing nothing.
+  install -Dm644 bin/veltrix-anonymity.service "$pkgdir/usr/lib/systemd/system/veltrix-anonymity.service"
+  # Only OPP asks our agent before receiving EACH file; FTP/PCSuite bypass it.
+  install -Dm644 config/bluetooth/obex-opp-only.conf \
+    "$pkgdir/usr/lib/systemd/user/obex.service.d/50-veltrix-opp-only.conf"
+  install -Dm755 session/target/release/veltrix-sessiond "$pkgdir/usr/bin/veltrix-sessiond"
+  install -Dm755 toolkit/target/release/veltrix-display-selector "$pkgdir/usr/bin/veltrix-display-selector"
+  install -Dm644 config/wireplumber/veltrix-audio.lua "$pkgdir/usr/share/wireplumber/scripts/veltrix/audio.lua"
+  install -Dm644 config/wireplumber/60-veltrix-audio.conf "$pkgdir/usr/share/wireplumber/wireplumber.conf.d/60-veltrix-audio.conf"
+
+  # XDG portal: Veltrix's Settings backend (accent-color) + portal preferences
+  install -Dm644 config/portal/veltrix.portal "$pkgdir/usr/share/xdg-desktop-portal/portals/veltrix.portal"
+  install -Dm644 config/portal/org.freedesktop.impl.portal.desktop.veltrix.service \
+    "$pkgdir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.veltrix.service"
+  install -Dm644 config/portal/hyprland-portals.conf "$pkgdir/etc/xdg-desktop-portal/hyprland-portals.conf"
+  install -Dm644 config/portal/veltrix-portals.conf "$pkgdir/etc/xdg-desktop-portal/veltrix-portals.conf"
+  install -Dm644 config/portal/xdpw-veltrix.conf "$pkgdir/etc/xdg/xdg-desktop-portal-wlr/Veltrix"
+
+  # ── the icon theme, as a SYSTEM DEFAULT rather than a per-user write ────────
+  # GTK resolves every icon through gsettings, and it reads that value while the
+  # first window is being built — so the theme has to be right BEFORE the shell's
+  # first frame, not two seconds in when ThemeManager pushes appearance.json.
+  #
+  # This used to be done by veltrix-setup writing the user's own dconf before
+  # first login. That does not work when the account has never logged in, which
+  # is exactly the case on the path that matters — the installer runs it inside
+  # arch-chroot, where /run/user/$uid does not exist and dconf cannot commit.
+  # Worse, `gsettings set` EXITS 0 while failing and reports the failure only on
+  # stderr, which the script discarded: it printed "seeded before first login"
+  # and wrote nothing. Measured in a chroot on a real install.
+  #
+  # A system default needs no session, no runtime directory and no cooperation
+  # from the chroot, and it is a better expression of the intent: `user-db:user`
+  # comes first in the profile, so somebody who picks Adwaita keeps Adwaita —
+  # where the old code had to approximate that with "only write if the key has
+  # never been set".
+  #
+  # GENERATED from defaults/appearance.json, not committed twice: the value the
+  # shell will read and the value GTK starts with cannot disagree if there is
+  # only one place to edit.
+  install -Dm644 config/dconf/profile-user "$pkgdir/etc/dconf/profile/user"
+  # The keyfile is GENERATED by scripts/gen-dconf-defaults.sh — the same script
+  # install.sh --dev uses, so a packaged and a dev install cannot start a fresh
+  # account on different values. It carries icon-theme and, since #537, the accent
+  # and the colour scheme: gsettings is their HOME (the appearance contract in
+  # ui/lib/veltrix-kit/platform/appearance.ts), so this is what a new account and every app reading the
+  # Settings portal get before the shell has run once.
+  scripts/gen-dconf-defaults.sh defaults/appearance.json \
+    | install -Dm644 /dev/stdin "$pkgdir/etc/dconf/db/local.d/00-veltrix-appearance"
+  install -Dm644 packaging/veltrix/veltrix-dconf.hook \
+    "$pkgdir/usr/share/libalpm/hooks/90-veltrix-dconf.hook"
+
+  # The desktop's settings schemas (#573). glib2 ships the pacman hook that
+  # compiles /usr/share/glib-2.0/schemas, so installing the XML is the whole job.
+  install -Dm644 -t "$pkgdir/usr/share/glib-2.0/schemas" config/gsettings/*.gschema.xml
+
+  # fontconfig: per-language CJK variant — the 65-0- filename MUST sort before
+  # fontconfig's 65-nonlatin.conf (see the file's header comment)
+  install -Dm644 config/fontconfig/65-0-veltrix-noto-cjk.conf \
+    "$pkgdir/usr/share/fontconfig/conf.avail/65-0-veltrix-noto-cjk.conf"
+  install -d "$pkgdir/etc/fonts/conf.d"
+  ln -s /usr/share/fontconfig/conf.avail/65-0-veltrix-noto-cjk.conf \
+    "$pkgdir/etc/fonts/conf.d/65-0-veltrix-noto-cjk.conf"
+
+  # fontconfig: per-language Arabic faces (Noto Sans Arabic for UI, Noto Naskh
+  # Arabic for Quranic/serif) — same 65-0- rule, same reason. (Bilingual
+  # feature, 2026-11-12.)
+  install -Dm644 config/fontconfig/65-0-veltrix-noto-arabic.conf \
+    "$pkgdir/usr/share/fontconfig/conf.avail/65-0-veltrix-noto-arabic.conf"
+  ln -s /usr/share/fontconfig/conf.avail/65-0-veltrix-noto-arabic.conf \
+    "$pkgdir/etc/fonts/conf.d/65-0-veltrix-noto-arabic.conf"
+}
+
+# ── veltrix-kit — the platform library every Veltrix application wears ─────────
+#
+# What libadwaita is to a GNOME app (tech-debt #108, option B): installed ONCE and
+# loaded by every app at start, so a fix or a design change reaches all of them
+# with one update. Its own package so an app published OUTSIDE this repo can
+# depend on it without pulling in the desktop.
+#
+#   /usr/share/veltrix-kit/js/       the modules apps import, by absolute URI:
+#                                   file:///usr/share/veltrix-kit/js/<module>.js
+#   /usr/share/veltrix-kit/kit.css   the sheet (withKitSheet / kitSheetPath)
+#   /usr/share/veltrix-kit/src/      the TypeScript sources — the kit's TYPES: an
+#                                   app's tsconfig maps the URI above onto them
+#   /usr/share/veltrix-kit/package.json  the kit's API version
+#
+# ⚠️ Two versions, and they answer different questions. pkgver is the BUILD's
+# (a split PKGBUILD cannot give one package its own pkgver): it says which release
+# these files came from. The API version is ui/lib/veltrix-kit/package.json's, and
+# it is PROVIDED as `veltrix-kit-api=<x.y.z>` (`_kitapi` at the top): that is
+# what an app outside this repo depends on (`veltrix-kit-api>=0.1.0`), because it
+# only moves when what an app imports does. The guide for app authors is the
+# kit's README (ui/lib/veltrix-kit/README.md, installed under /usr/share/doc).
+package_veltrix-kit() {
+  pkgdesc="Veltrix's platform library: GTK4 widgets, application host, appearance engine and stylesheet for Veltrix apps"
+  license=(LGPL-3.0-or-later)
+  depends=(gjs gtk4)
+
+  cd "$srcdir/veltrix-$pkgver"
+
+  provides=("veltrix-kit-api=$_kitapi" nidara-kit)
+  replaces=(nidara-kit)
+  conflicts=(nidara-kit)
+  local kitver
+  kitver="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' ui/lib/veltrix-kit/package.json)"
+  [ "$kitver" = "$_kitapi" ] || {
+    echo "veltrix-kit: _kitapi=$_kitapi but ui/lib/veltrix-kit/package.json says '$kitver'" >&2; return 1; }
+
+  local d="$pkgdir/usr/share/veltrix-kit"
+  install -Dm644 ui/lib/veltrix-kit/kit.css "$d/kit.css"
+  # What kit.css draws by path (the dropdown/menu chevrons), next to it — the sheet
+  # names them relative to itself (`$chevron-dir` in _base-layer.scss).
+  install -Dm644 -t "$d/assets" ui/lib/veltrix-kit/assets/*.svg
+  install -Dm644 ui/lib/veltrix-kit/package.json "$d/package.json"
+  cp -r ui/lib/veltrix-kit/build/js "$d/js"
+  # The sources, as the types: every .ts, without the build output or the SCSS.
+  (cd ui/lib/veltrix-kit && find . -name '*.ts' -not -path './build/*' -print0 |
+     xargs -0 -I{} install -Dm644 {} "$d/src/{}")
+  install -Dm644 ui/lib/veltrix-kit/README.md "$pkgdir/usr/share/doc/veltrix-kit/README.md"
+  install -Dm644 ui/lib/veltrix-kit/COPYING.LESSER "$pkgdir/usr/share/licenses/veltrix-kit/COPYING.LESSER"
+}
+
+# ── veltrix-installer — the live medium's graphical installer ─────────────────
+#
+# Only nidara-iso's packages.x86_64 ever names this package, and that is the
+# whole point: the installer is a Veltrix window like any other, but a system
+# somebody is USING has no business carrying a program whose job is to erase a
+# disk. Shipping it separately is what makes "the desktop does not contain the
+# installer" a fact about the package database rather than a claim.
+#
+# It depends on `veltrix` and it is not shy about it: the window is drawn with the
+# desktop's kit, reads the running session's appearance, and expects the blank
+# `veltrix` GTK theme to be installed. `archinstall` is the engine — this package
+# collects answers and hands them over; it partitions nothing itself.
+#
+# What it installs is NOT here: /usr/share/veltrix-installer/base.json is airootfs
+# content in nidara-iso, because the package list is a product decision and this
+# is a bundle of the desktop's toolkit. See nidara-iso/INSTALLER.md.
+package_veltrix-installer() {
+  pkgdesc="Veltrix's graphical installer (live medium only)"
+  depends=(veltrix archinstall)
+  # VELTRIX fork (Phase 0): migrates a stock Nidara install the same way
+  # package_veltrix() does (see its note there).
+  provides=(nidara-installer)
+  replaces=(nidara-installer)
+  conflicts=(nidara-installer)
+
+  cd "$srcdir/veltrix-$pkgver"
+
+  # The bundle is a self-contained executable (scripts/bundle.sh wraps the JS),
+  # so it goes straight in /usr/bin — no bin/ launcher of its own, unlike the
+  # shell, which needs one to find its assets.
+  install -Dm755 ui/installer/build/veltrix-installer "$pkgdir/usr/bin/veltrix-installer"
+  install -Dm755 build/veltrix-host/veltrix-installer "$pkgdir/usr/lib/veltrix/veltrix-installer"
+  install -Dm644 ui/installer/style.css "$pkgdir/usr/share/veltrix/ui/installer/style.css"
+  # The "Choose your interface" step shows real preview images of the two
+  # desktops (downscaled concept renders, ui/installer/assets/).
+  install -Dm644 ui/installer/assets/interface-macos.jpg "$pkgdir/usr/share/veltrix/ui/installer/interface-macos.jpg"
+  install -Dm644 ui/installer/assets/interface-ipad.jpg "$pkgdir/usr/share/veltrix/ui/installer/interface-ipad.jpg"
+  install -Dm644 packaging/veltrix-installer/veltrix-installer.desktop \
+    "$pkgdir/usr/share/applications/veltrix-installer.desktop"
+}
+
+# ── veltrix-hyalo — the compositor of our own, as a preview session ────────────
+#
+# Hyalo (hyalo/, #680) on Smithay. It adds a second session to the greeter, "Veltrix —
+# Hyalo preview", next to Veltrix on Hyprland, which stays the default; nothing switches
+# until Hyalo reaches parity (#685). Pinned to this build's desktop: the session starts
+# the same shell, and the shell and Hyalo speak protocols from the same tree (protocols/).
+package_veltrix-hyalo() {
+  pkgdesc="Hyalo, Veltrix's own Wayland compositor (preview session)"
+  # VELTRIX fork (Phase 0): migrates a stock Nidara install the same way
+  # package_veltrix() does (see its note there).
+  provides=(nidara-hyalo)
+  replaces=(nidara-hyalo)
+  conflicts=(nidara-hyalo)
+  # Ours, plus what Smithay's examples brought (MIT) and Hyprland's focus-grab protocol
+  # (BSD-3-Clause, in protocols/hyprland-focus-grab-v1.xml).
+  license=(GPL-3.0-or-later MIT BSD-3-Clause)
+  # pango + cairo: the title bar's text (render/title_bar.rs). xorg-xwayland: X11 apps — Steam
+  # and most games — with Hyalo as their window manager (xwayland.rs, #683).
+  # `awww` here is the same AUR-only dep as in depends=() above (see its note
+  # there) — it is not in Arch extra.
+  depends=("veltrix=$pkgver-$pkgrel" uwsm libinput seatd libdisplay-info libxkbcommon mesa
+           systemd-libs awww pango cairo xorg-xwayland)
+
+  cd "$srcdir/veltrix-$pkgver"
+  install -Dm755 hyalo/target/release/veltrix-hyalo "$pkgdir/usr/bin/veltrix-hyalo"
+  install -Dm755 bin/veltrix-hyalo-session "$pkgdir/usr/bin/veltrix-hyalo-session"
+  install -Dm755 hyalo/session/restore-wallpaper "$pkgdir/usr/lib/veltrix-hyalo/restore-wallpaper"
+  install -Dm755 toolkit/target/release/veltrix-shell "$pkgdir/usr/bin/veltrix-shell"
+  install -Dm644 bin/veltrix-rust-shell.service "$pkgdir/usr/lib/systemd/user/veltrix-rust-shell.service"
+  # Starts the Rust shell; the TS unit belongs to the frozen Hyprland session.
+  install -Dm755 hyalo/session/start-shell "$pkgdir/usr/lib/veltrix-hyalo/start-shell"
+  install -Dm644 config/hyalo/hyalo.toml "$pkgdir/usr/share/veltrix/hyalo/hyalo.toml"
+  install -Dm644 config/wayland-sessions/veltrix-hyalo.desktop \
+    "$pkgdir/usr/share/wayland-sessions/veltrix-hyalo.desktop"
+  install -Dm644 hyalo/LICENSE-smithay-MIT.txt "$pkgdir/usr/share/licenses/veltrix-hyalo/LICENSE-smithay-MIT.txt"
+}

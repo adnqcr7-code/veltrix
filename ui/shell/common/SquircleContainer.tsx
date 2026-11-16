@@ -1,0 +1,390 @@
+import Gtk from "gi://Gtk?version=4.0"
+import { drawGlassShadow, drawSquircle, hexToFloatRgb } from "./DrawingUtils"
+import Theme from "../core/ThemeManager"
+import { chromeIsDarkFor, glassAlphaFor, glassTintFor, type GlassRole } from "./ShellGlass"
+import { RADIUS, GLASS_TINT, GLASS_SPECULAR, GLASS_STATE_MIX } from "../../lib/veltrix-kit/platform/tokens"
+import { cairoDraw } from "../../lib/veltrix-kit/platform/cairo-draw"
+import { compositorPaintsGlass, trackGlass } from "../../lib/veltrix-kit/platform/material"
+
+export enum Shape {
+    SQUIRCLE,
+    CIRCLE,
+    CAPSULE,
+    DOCK_PILL
+}
+
+interface SquircleContainerProps {
+    /** A drop shadow the container paints itself, for glass it paints itself (a near-opaque
+     *  card: `alpha`). `spread` is the room it needs outside the silhouette: it sets `inset`
+     *  to at least that, and the glass is that much smaller than the box. A pane whose glass
+     *  is Hyalo's takes none — Hyalo casts each pane's shadow (`set_shadow`). */
+    shadow?: { spread?: number, alpha?: number | (() => number), drop?: number,
+        /** A surface-level experiment may draw the outer shadow even when Hyalo paints its
+         *  glass. The silhouette is punched out, so the shadow never tints the material. */
+        compositor?: boolean }
+    child: Gtk.Widget
+    radius?: number
+    gloss?: boolean
+    css_classes?: string[]
+    hexpand?: boolean
+    vexpand?: boolean
+    color?: { r: number, g: number, b: number }
+    alpha?: number
+    hoverColor?: { r: number, g: number, b: number }
+    hoverAlpha?: number
+    onClick?: () => void
+    /** Fire onClick on button RELEASE instead of PRESS. Needed when the same
+     *  widget also carries a GestureDrag (notification banner swipe-to-dismiss):
+     *  a press-phase click fires before any motion, so the drag can never be
+     *  recognised and claim the sequence. Default false (press — snappier). */
+    clickOnRelease?: boolean
+    perfect?: boolean
+    borderColor?: { r: number, g: number, b: number, a: number }
+    hoverBorderColor?: { r: number, g: number, b: number, a: number }
+    /** On hover, lift the glass a little (`GLASS_STATE_MIX.hover`) — a hint that it
+     *  is clickable. No accent: see `GLASS_STATE_MIX`. */
+    hoverLift?: boolean
+    /** While this returns true the capsule's panel is OPEN, and the glass shows it
+     *  (`GLASS_STATE_MIX.open`), the way a menu bar item stays highlighted while its
+     *  menu is down. Read inside the draw call; `watchOpen` says when to redraw. */
+    getOpen?: () => boolean
+    watchOpen?: (cb: () => void) => (() => void)
+    /** The capsule is itself a keyboard stop (focusable). Its ring is GTK's own —
+     *  the caller's CSS gives the container `:focus-visible` + a border-radius that
+     *  matches the glass (see `.cc-island` in _control-center.scss) — because a CSS
+     *  outline can be drawn OUTSIDE the widget, with the design system's 2px gap,
+     *  where a ring painted here could not: a DrawingArea is clipped to its box.
+     *  What the key DOES is the caller's (see IslandGrid's tiles). */
+    keyboardStop?: boolean
+    n?: number
+    shape?: Shape
+    borderWidth?: number
+    margin?: number
+    inset?: number
+    padding?: number
+    useShellOpacity?: boolean
+    /** This capsule belongs to the shell skin: its glass tint follows
+     *  the shell's skin (`chromeIsDarkFor`: the mode, or its surface's adaptive skin, legible over any
+     *  wallpaper) instead of the system mode. DEFAULT true — every bar/dock/overlay
+     *  capsule is shell skin. Pass `chrome: false` ONLY for app-mode windows
+     *  (About) that should follow the system mode like a third-party app. */
+    chrome?: boolean
+    /** Which opacity this capsule's glass tracks when useShellOpacity is set:
+     *  "bar" → Theme.barOpacity, "overlay" (default) → Theme.overlayOpacity,
+     *  "launcher" → the denser App Grid floor, or "dock" → Theme.dockOpacity. */
+    opacityRole?: GlassRole
+    /** Active/"on" fill — while this returns true, the WHOLE capsule paints with
+     *  the live accent colour instead of the base glass (standard
+     *  quick-settings convention: a toggle's on-state fills its entire tile, not
+     *  just its icon). Read live inside the draw call, so an accent change repaints
+     *  for free via the Theme "changed" redraw below — no separate wiring needed. */
+    getActive?: () => boolean
+    /** Static alpha (default 0.85), or a getter for a live-varying one — a
+     *  recording indicator pulsing between two alphas reads it every redraw, so
+     *  `watchActive` just needs to tick a redraw timer for the pulse to animate. */
+    activeAlpha?: number | (() => number)
+    /** Override which colour "active" fills with — a hex string, resolved through
+     *  `hexToFloatRgb`. Omit to use the live theme accent (every toggle tile:
+     *  dark_mode, bt, vpn, …). Set for a FIXED semantic colour that must NOT move
+     *  with the user's accent choice — e.g. screen recording uses `DANGER_HEX`,
+     *  same red as every other "this needs attention" indicator. */
+    activeColorHex?: string
+    /** The fill's colour as RGB, over `activeColorHex` and the accent: the Control
+     *  Center's tiles fill with `ON_WHITE` (BaseIsland). */
+    activeColor?: { r: number, g: number, b: number }
+    /** Notifies this container to redraw when the active state flips (the
+     *  container has no way to know on its own — it's driven by the caller's own
+     *  domain signal, e.g. BluetoothService.watchPower). */
+    watchActive?: (cb: () => void) => (() => void)
+    /** Fractional variant of getActive — 0..1, fills that fraction of the shape
+     *  from the BOTTOM with the live accent (a "gauge": CC slider tiles), the rest
+     *  with the base glass, as ONE continuous shape/border (see drawSquircle's
+     *  fillFrac) instead of a separately-drawn inner fill layer. Takes priority
+     *  over getActive when both are given (in practice, never both). Read live
+     *  inside the draw call and re-queued via watchActive, same as getActive. */
+    getFill?: () => number
+}
+
+// The glass IS the widget's box (#762, 2026-10-13): a child laid out flush to the box is flush
+// to the glass. Until then it was painted 2 px in (`GLASS_INSET`), room for a Cairo rim to
+// antialias and for a 2 px shadow — Hyprland's reasons; on Hyalo the compositor draws the
+// rim and the shadow and is not clipped to the box. The one container that still reserves
+// room is one that paints its OWN glass with a shadow (`shadow` on a pane Hyalo does not
+// draw: the CC's context menu): the shadow needs the band outside its silhouette.
+
+const NO_BORDER = { r: 0, g: 0, b: 0, a: 0 }
+
+/** The one drop-shadow recipe, moved to `ui/lib/veltrix-kit/platform/glass-paint.ts` on 2026-08-24 with the
+ *  primitives it parameterises, so the greeter and the lockscreen float their glass on
+ *  the SAME numbers instead of on none. Re-exported here: this is still where the shell
+ *  reads it from, and the doc lives beside the algorithm it feeds. */
+export { GLASS_SHADOW } from "../../lib/veltrix-kit/platform/glass-paint"
+
+/** Resolves a shape's actual paint params for an allocated size. CIRCLE/CAPSULE
+ *  always collapse to a perfect arc sized to the smaller dimension (the curve
+ *  must follow the shape's own footprint, not a caller's guessed radius);
+ *  DOCK_PILL/SQUIRCLE use the requested radius/n as-is. Exported so anything
+ *  painting a squircle outside this component (e.g. the CC drag ghost) stays in
+ *  lockstep with how a real tile renders instead of re-deriving the mapping. */
+export function resolveDrawParams(
+    shape: Shape, radius: number, n: number, perfect: boolean, w: number, h: number,
+): { radius: number; n: number; perfect: boolean } {
+    if (shape === Shape.CIRCLE || shape === Shape.CAPSULE) {
+        return { radius: Math.min(w, h) / 2, n: 2.0, perfect: true }
+    }
+    if (shape === Shape.DOCK_PILL) {
+        return { radius: radius || 24, n: 3.2, perfect }
+    }
+    return { radius, n, perfect }
+}
+
+export default function SquircleContainer({
+    child,
+    radius = RADIUS.lg,
+    gloss = false,
+    css_classes = [],
+    hexpand = false,
+    vexpand = false,
+    color,
+    alpha,
+    hoverColor,
+    hoverAlpha,
+    onClick,
+    clickOnRelease = false,
+    perfect = false,
+    borderColor,
+    hoverBorderColor,
+    hoverLift = false,
+    getOpen,
+    watchOpen,
+    keyboardStop = false,
+    n = 3.2,
+    shape = Shape.SQUIRCLE,
+    borderWidth = 1.0,
+    inset,
+    padding,
+    useShellOpacity = false,
+    chrome = true,
+    opacityRole = "overlay",
+    getActive,
+    activeAlpha = 0.85,
+    activeColorHex,
+    activeColor,
+    watchActive,
+    getFill,
+    shadow,
+}: SquircleContainerProps) {
+    const container = new Gtk.Grid({
+        css_classes,
+        hexpand,
+        vexpand
+    })
+
+    const da = new Gtk.DrawingArea({
+        hexpand: true,
+        vexpand: true
+    })
+
+    let isHovered = false
+    // The shadow lives OUTSIDE the silhouette, so the inset is what reserves its room:
+    // without it the shadow is simply clipped by the widget.
+    const shadowSpread = shadow ? (shadow.spread ?? 4) : 0
+    const techInset = Math.max(inset ?? 0, shadowSpread)
+
+    if (useShellOpacity || chrome) {
+        Theme.connect("changed", () => { if (da.get_mapped()) da.queue_draw() })
+    }
+
+    // A pane of the shell's glass (not a control on one, not a near-opaque card): its
+    // shape goes to a compositor of our own, which may paint it (#684).
+    const isGlass = useShellOpacity && alpha === undefined && chrome
+
+    da.set_draw_func(cairoDraw((_, cr, w, h) => {
+        if (w <= 0 || h <= 0) return
+        // Shell-skin capsules (default) follow the shell's skin;
+        // app-mode surfaces (chrome:false, e.g. About) follow the system mode.
+        // …and a shell-skin capsule inside a surface that wears the other skin wears it
+        // too: `chromeIsDarkFor` walks up to it.
+        const dark = chrome ? chromeIsDarkFor(da) : Theme.isDark
+        // The tint: on the shell's skin, its surface's.
+        const themeColor = chrome
+            ? glassTintFor(da)
+            : dark
+                ? { r: GLASS_TINT.dark.r, g: GLASS_TINT.dark.g, b: GLASS_TINT.dark.b }
+                : { r: GLASS_TINT.light.r, g: GLASS_TINT.light.g, b: GLASS_TINT.light.b }
+        const defaultLight = { r: GLASS_TINT.light.r, g: GLASS_TINT.light.g, b: GLASS_TINT.light.b }
+        const baseColor = color || (useShellOpacity ? themeColor : defaultLight)
+        // Explicit alpha always wins (even with useShellOpacity, so a surface can
+        // stay theme-coloured + redraw-on-toggle yet be near-opaque — e.g. the CC
+        // context menu, which floats over content with no real internal blur).
+        // The slider for its role — or more, while the surface it sits in has thickened
+        // its glass to keep text legible over a bright backdrop (`glassAlphaFor`).
+        const baseAlpha = alpha !== undefined ? alpha : (useShellOpacity ? glassAlphaFor(da, opacityRole) : 0.05)
+        let shareColor = baseColor
+        let shareAlpha = baseAlpha
+        let shareBorder = borderColor
+        let fillFrac: number | undefined = undefined
+        let filled = false
+
+        if (getFill || getActive) {
+            const frac = getFill ? Math.max(0, Math.min(1, getFill())) : (getActive!() ? 1 : 0)
+            if (frac > 0) {
+                filled = true
+                const fillColor = activeColor ?? hexToFloatRgb(activeColorHex ?? Theme.accentHex)
+                const resolvedAlpha = typeof activeAlpha === "function" ? activeAlpha() : activeAlpha
+                if (frac >= 1) {
+                    shareColor = fillColor
+                    shareAlpha = resolvedAlpha
+                } else {
+                    fillFrac = frac
+                    shareColor = fillColor  // the FILLED (bottom) portion
+                    shareAlpha = resolvedAlpha  // baseColor/baseAlpha (still held above) become the empty portion
+                }
+            }
+        }
+
+        if (isHovered) {
+            if (hoverColor) shareColor = hoverColor
+            if (hoverAlpha !== undefined) shareAlpha = hoverAlpha
+            if (hoverBorderColor) shareBorder = hoverBorderColor
+        }
+
+        // Open beats hover: the pointer is usually still on the capsule it just
+        // opened, and the open state is the one that has to read.
+        const stateMix = getOpen?.() ? GLASS_STATE_MIX.open
+            : (isHovered && hoverLift) ? GLASS_STATE_MIX.hover : null
+        if (stateMix && fillFrac === undefined) {
+            // The veil composited OVER the glass, folded into the one fill: the same
+            // pixels as painting it separately, without a second path.
+            const v = dark ? stateMix.dark : stateMix.light
+            const ink = dark ? GLASS_SPECULAR : GLASS_TINT.dark
+            const a0 = shareAlpha
+            const a = a0 + v * (1 - a0)
+            const mix = (c0: number, c1: number) => (c0 * a0 * (1 - v) + c1 * v) / a
+            shareColor = { r: mix(shareColor.r, ink.r), g: mix(shareColor.g, ink.g), b: mix(shareColor.b, ink.b) }
+            shareAlpha = a
+        }
+
+        // Gtk4 provides a clean surface; OVER is the standard blending mode.
+        cr.setOperator(2) // OVER
+
+        const { radius: drawRadius, n: drawN, perfect: drawPerfect } = resolveDrawParams(shape, radius, n, perfect, w, h)
+
+        // On a compositor of our own the glass itself is the compositor's (#684): what is
+        // left here is state — the accent fill, the hover/open veil.
+        const glassIsCompositors = isGlass && compositorPaintsGlass(da)
+
+        // The shadow goes down FIRST, outside the silhouette, in the room `techInset`
+        // reserved for it above. Same geometry as the glass, so it tracks the shape.
+        // Normally not on the compositor's glass: its old always-on 2 px ring read as a frame.
+        // The Lab can opt in to a shadow only when bright-backdrop ink asks for elevation.
+        if (shadow && (!glassIsCompositors || shadow.compositor)) {
+            const shadowAlpha = typeof shadow.alpha === "function" ? shadow.alpha() : shadow.alpha ?? 0.18
+            drawGlassShadow(
+                cr, techInset, techInset, w - techInset * 2, h - techInset * 2,
+                drawRadius, drawN, drawPerfect,
+                shadow.spread ?? 4, shadowAlpha, shadow.drop ?? 1,
+            )
+        }
+
+        if (glassIsCompositors) {
+            // No rim (the compositor draws its own) and no glass body: the accent fill alone
+            // (a gauge's empty part shows the compositor's glass), or the veil alone.
+            if (filled) {
+                drawSquircle(
+                    cr, w, h, undefined,
+                    shareAlpha, false, shareColor,
+                    drawRadius, drawPerfect, NO_BORDER,
+                    drawN, borderWidth, techInset,
+                    undefined, fillFrac, baseColor, 0,
+                )
+            } else if (stateMix) {
+                const v = dark ? stateMix.dark : stateMix.light
+                drawSquircle(
+                    cr, w, h, undefined,
+                    v, false, dark ? GLASS_SPECULAR : GLASS_TINT.dark,
+                    drawRadius, drawPerfect, NO_BORDER,
+                    drawN, borderWidth, techInset,
+                )
+            }
+            return
+        }
+
+        drawSquircle(
+            cr, w, h, undefined,
+            shareAlpha, gloss, shareColor,
+            drawRadius, drawPerfect, shareBorder,
+            drawN, borderWidth, techInset,
+            undefined, fillFrac, baseColor, baseAlpha,
+        )
+    }))
+
+    const grid = new Gtk.Grid({
+        css_classes,
+        hexpand,
+        vexpand
+    })
+
+    // Background first (bottom)
+    da.hexpand = true
+    da.vexpand = true
+    da.halign = Gtk.Align.FILL
+    da.valign = Gtk.Align.FILL
+    grid.attach(da, 0, 0, 1, 1)
+
+    if (padding !== undefined) {
+        child.margin_top = padding
+        child.margin_bottom = padding
+        child.margin_start = padding
+        child.margin_end = padding
+    }
+
+    // Content second (top)
+    grid.attach(child, 0, 0, 1, 1)
+
+    if (hoverColor || hoverAlpha !== undefined || hoverBorderColor || hoverLift || onClick) {
+        const motion = new Gtk.EventControllerMotion()
+        motion.connect("enter", () => { isHovered = true; da.queue_draw() })
+        motion.connect("leave", () => { isHovered = false; da.queue_draw() })
+        grid.add_controller(motion)
+    }
+
+    if (onClick) {
+        const click = new Gtk.GestureClick()
+        // Release-phase for drag-carrying widgets (banners): a competing
+        // GestureDrag that claims the sequence mid-motion then cancels this
+        // click, so a swipe never also triggers the tap action.
+        click.connect(clickOnRelease ? "released" : "pressed", () => onClick())
+        grid.add_controller(click)
+    }
+
+    if (keyboardStop) grid.focusable = true
+
+    if (watchActive) {
+        const cleanup = watchActive(() => { if (da.get_mapped()) da.queue_draw() })
+        grid.connect("unrealize", cleanup)
+    }
+    if (watchOpen) {
+        const cleanup = watchOpen(() => { if (da.get_mapped()) da.queue_draw() })
+        grid.connect("unrealize", cleanup)
+    }
+
+    if (isGlass) {
+        trackGlass(da, () => {
+            const w = da.get_width(), h = da.get_height()
+            const p = resolveDrawParams(shape, radius, n, perfect, w, h)
+            const gw = w - techInset * 2, gh = h - techInset * 2
+            // `perfect` is drawn with circular arcs whatever `n` says (createSquirclePath).
+            return [{ x: techInset, y: techInset, w: gw, h: gh, exponent: p.perfect ? 2 : p.n,
+                radius: Math.min(p.radius, gw / 2, gh / 2) }]
+        }, { scope: grid })
+    }
+
+    // Handle for morph layers (common/MorphRevealer.ts): a morphing overlay
+    // suppresses this container's own glass paint (opacity 0 on the DA — the
+    // content child on top is untouched) while it paints an interpolated
+    // Cairo clone of the same shape, then hands back at rest.
+    ;(grid as any).glassArea = da
+
+    return grid
+}

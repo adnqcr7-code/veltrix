@@ -1,0 +1,25 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-greeter — Veltrix greeter launcher
+# Installed to /usr/bin/veltrix-greeter
+# Called by greetd via hyprland-greeter.conf exec-once
+# ─────────────────────────────────────────────────────────────────────────────
+
+BUNDLE="/usr/share/veltrix/ui/greeter/build/veltrix-greeter"
+# Per-user log path (greetd's PAM session gives the greeter user its own
+# XDG_RUNTIME_DIR); /tmp fallback keeps a failed redirect from ever gating
+# the exec on exotic setups.
+LOG="${XDG_RUNTIME_DIR:-/tmp}/veltrix-greeter.log"
+
+export GDK_BACKEND=wayland
+export GI_TYPELIB_PATH="/usr/lib/girepository-1.0:/usr/local/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+export LD_LIBRARY_PATH="/usr/lib:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export GREETD_SOCK="${GREETD_SOCK}"
+
+if [ -x "$BUNDLE" ]; then
+    cd /usr/share/veltrix/ui/greeter
+    exec "$BUNDLE" >> "$LOG" 2>&1
+fi
+
+echo "[$(date '+%H:%M:%S')] veltrix-greeter: ERROR — bundle not found at $BUNDLE" | tee -a "$LOG"
+exit 1

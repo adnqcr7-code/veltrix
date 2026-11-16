@@ -1,0 +1,2419 @@
+#!/usr/lib/veltrix/veltrix-agent
+// ─────────────────────────────────────────────────────────────────────────────
+// veltrix-agent — the brain of Veltrix's built-in Assistant.
+// Installed to /usr/bin/veltrix-agent. NOT an MCP server and NOT invoked by the
+// user directly: it is a long-running CHILD of the shell (spawned by
+// core/AgentService.ts on first use) that speaks a tiny JSON-lines protocol over
+// stdio — the inverse of veltrix-mcp (there the shell is the client; here it is).
+//
+// WHAT IT DOES: turns natural language into desktop actions. Each user turn runs
+// a streaming tool-use loop against the LOCAL Ollama (OpenAI-compatible endpoint
+// on this machine only — no key, no cloud) and executes the model's tool
+// calls by shelling out to `veltrix-ipc` — the SAME official door the CLI and
+// veltrix-mcp use. So the assistant is just another client of the gated surface:
+// Settings → AI gates (allowConfigWrite …) and the kill switch apply for free,
+// and a new IPC action becomes usable with zero changes here (run_action is a
+// passthrough — 100% coverage, like the MCP server).
+//
+// Plain GJS on purpose (same pattern as veltrix-mcp / veltrix-portal): no Node,
+// no npm deps on installed systems. HTTP is `curl -N` streaming SSE as a
+// subprocess — the house pattern (every HTTP call in the repo is curl), so this
+// adds zero dependencies.
+//
+// CONFIG (re-read from GSettings org.veltrix.ai EVERY turn, so changes take effect live):
+//   brainBackend ("" | "openai"), brainModel, brainEndpoint.
+// There is no API key in this build (VELTRIX fork, Phase 0): the Assistant
+// talks to a local Ollama only, and the daemon refuses non-loopback endpoints.
+//
+// PROTOCOL (newline-delimited JSON):
+//   shell→daemon: {t:"user",text} · {t:"cancel"} · {t:"reset"}
+//   daemon→shell: {t:"state",s:"thinking"|"acting"|"idle"} · {t:"delta",text}
+//                 {t:"tool",name,summary} · {t:"toolresult",ok,summary}
+//                 {t:"done",usage:{input,output}} · {t:"error",message}
+// ─────────────────────────────────────────────────────────────────────────────
+
+import GLib from "gi://GLib"
+import Gio from "gi://Gio"
+import GioUnix from "gi://GioUnix"
+
+// The Assistant's gates live in GSettings, `org.veltrix.ai` (#573) — the same keys
+// Settings → AI writes. No schema installed reads as `undefined`, which every gate
+// below treats exactly as it treated a missing ai.json. Each read is a fresh
+// Gio.Settings, so a gate flipped a moment ago is the one that answers.
+// ⚠️ Six copies of this function (veltrix-a11y/act/click/type/mcp/agent);
+// scripts/ci/same-app-check.mjs keeps them identical.
+function aiSetting(key) {
+    try {
+        const schema = Gio.SettingsSchemaSource.get_default()?.lookup("org.veltrix.ai", true)
+        if (!schema) return undefined
+        return new Gio.Settings({ settings_schema: schema }).get_value(key).recursiveUnpack()
+    } catch {
+        return undefined
+    }
+}
+// Hard cap on tool-use round-trips per user turn. Was 8, sized for "open the
+// control center" — one action and an answer. Reading files makes turns genuinely
+// longer (find the file → read it → correlate with state → answer), and a turn
+// that dies at the cap costs the user everything it already spent and delivers
+// nothing. 16 covers a real diagnosis without becoming a budget to burn: this is
+// still a desktop assistant, not a coding agent, and the repeated-failure guard
+// below stops the pathological case long before the cap does.
+const MAX_STEPS = 16
+// Paging for read_file. The default is what a model gets when it doesn't think
+// about it, so it has to be small enough that an unthinking read of a big file is
+// survivable; the max is the escape hatch for when it does think.
+const READ_LINES_DEFAULT = 400
+const READ_LINES_MAX = 2000
+const MAX_SEARCH_HITS = 100
+// Ceiling on ANY tool result, applied after the tool runs. Tool results are the
+// whales in the transcript — they land in `history` and ride in every later
+// request of the conversation (measured 2026-07-22: one listApps was 85% of a
+// 31 KB body) — and file reads are the first tool here able to produce hundreds of
+// KB in a single call. Set above every current IPC result, so in practice this
+// only ever bites a file read, and it tells the model how to narrow it.
+const MAX_TOOL_RESULT = 24000
+const HTTP_TIMEOUT = "120"     // curl --max-time (seconds)
+const MAX_HTTP_ATTEMPTS = 3    // 1 try + up to 2 retries on a 5xx / network blip
+const RETRY_BASE_MS = 600      // linear backoff between attempts: 600 ms, then 1200 ms
+// Ceiling on an honoured `retry-after`. Past this the wait is worse than the
+// truth: the island would sit "thinking" in silence for a minute with no way to
+// tell a rate limit from a hang, so the provider's own message is shown instead.
+const RETRY_AFTER_MAX_MS = 15000
+
+// ── Telemetry ────────────────────────────────────────────────────────────────
+// stderr is INHERITED from the shell, which veltrix-ui appends to veltrix-ui.log —
+// so these lines land next to the shell's own, in order, for free.
+//
+// Rule learned the hard way (2026-07-21): a turn that fails must be
+// reconstructible AFTER THE FACT. A user reporting "it did nothing" is useless
+// without a trace, and the daemon's own death is exactly the case that can't
+// report itself. So: lifecycle + turn boundaries + every HTTP leg + every tool.
+// NEVER log the user's prompt or the model's reply (a desktop log is not the
+// place for the conversation) — length and shape only. Never log the API key.
+const log = (msg) => printerr(`[veltrix-agent] ${msg}`)
+const hostOf = (url) => { try { return url.replace(/^https?:\/\//, "").split("/")[0] } catch { return "?" } }
+
+// ── Shell plumbing (shared shape with veltrix-mcp) ────────────────────────────
+
+function textFile(path) {
+    const [ok, bytes] = GLib.file_get_contents(path)
+    if (!ok) throw new Error(`cannot read ${path}`)
+    return new TextDecoder().decode(bytes)
+}
+
+/** The whole of org.veltrix.ai as the camelCase object the rest of this file reads
+ *  (`cfg.brainModel`, `cfg.allowFileRead`…) — the shape ai.json had. No schema
+ *  gives `{}`, which reads every gate as off, as a missing file did. */
+function readAiJson() {
+    try {
+        const schema = Gio.SettingsSchemaSource.get_default()?.lookup("org.veltrix.ai", true)
+        if (!schema) return {}
+        const cfg = {}
+        for (const key of schema.list_keys())
+            cfg[key.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = aiSetting(key)
+        return cfg
+    } catch {
+        return {}
+    }
+}
+
+// ── File frontier (tier 1) ───────────────────────────────────────────────────
+// The assistant's file tools are DAEMON-LOCAL, not IPC actions: external MCP
+// clients bring their own file tools, so there is nothing to mirror onto that
+// surface, and routing file contents through the IPC socket would put blocking
+// I/O on the shell's main loop for no gain.
+//
+// Two frontiers, and they are deliberately NOT the same shape:
+//
+//   READ — prefix roots. Veltrix's own domain: the user's desktop state, the
+//   shipped defaults (so the assistant can see what it is overriding), and the
+//   shell log (what turns it from a remote control into something that can
+//   diagnose). Not the rest of $HOME: whatever it reads is sent to the model
+//   provider, so the read frontier is a privacy boundary as much as a safety one.
+//
+//   WRITE — an EXACT allowlist of three files, because the write frontier grants
+//   deferred execution and there is no way around that: hyprland-user.lua exists
+//   to hold hl.exec_cmd(…) and hypridle.conf holds on-timeout commands, so
+//   writing them schedules commands for the next session. That is inherent to
+//   "add me a keybind", not a hole. What keeps it honest is that everything
+//   scheduled is legible plain text, gated (allowFileWrite, default off) and
+//   revertible — never an invisible action.
+//
+//   ~/.config/uwsm/env is READABLE and deliberately NOT WRITABLE: it sets the
+//   session environment, so LD_PRELOAD there is straight privilege escalation,
+//   and nothing a user asks an assistant for needs it.
+//
+// Every settings JSON is absent from the write list on purpose — the shell holds
+// them in memory and rewrites them wholesale with no FileMonitor, so an outside
+// edit is silently clobbered by the next settings change. set_config is the only
+// correct door. See skills/customize/SKILL.md.
+const HOME = GLib.get_home_dir()
+const RUNTIME_DIR = GLib.getenv("XDG_RUNTIME_DIR") || "/tmp"
+
+const READ_ROOTS = [
+    `${HOME}/.config/veltrix`,
+    `${HOME}/.config/uwsm`,
+    `${HOME}/.config/hypr`,
+    "/usr/share/veltrix",
+]
+// Single files outside those roots. The log path mirrors bin/veltrix-ui's own
+// `${XDG_RUNTIME_DIR:-/tmp}` fallback; both spellings are listed so the tool
+// works whichever one the session actually used.
+const READ_FILES = [`${RUNTIME_DIR}/veltrix-ui.log`, "/tmp/veltrix-ui.log"]
+
+// The legacy ~/.config/hypr/hyprland-user.lua is included because pre-2026-07
+// installs still load it (package.path lists ~/.config/veltrix first and Lua
+// require() takes the FIRST match, which is what Autostart.tsx's resolveUserConf
+// mirrors) — editing the file Lua actually loads matters more than tidiness.
+const WRITE_FILES = [
+    `${HOME}/.config/veltrix/hyprland-user.lua`,
+    `${HOME}/.config/hypr/hyprland-user.lua`,
+    `${HOME}/.config/veltrix/hypridle.conf`,
+]
+
+const underRoot = (path, root) => path === root || path.startsWith(root + "/")
+
+// Resolve a model-supplied path and decide whether it is inside the frontier.
+// Returns { path } or { error } — the error text goes straight back to the model
+// as the tool result, so it names what IS allowed rather than just refusing.
+function resolvePath(raw, mode) {
+    let p = String(raw ?? "").trim()
+    if (!p) return { error: "No path given." }
+    if (p === "~") p = HOME
+    else if (p.startsWith("~/")) p = HOME + p.slice(1)
+    if (!p.startsWith("/")) return { error: `Path must be absolute (or start with ~/): "${raw}"` }
+    // Purely lexical: collapses "." and ".." without touching the filesystem, so
+    // "~/.config/veltrix/../../.ssh/id_rsa" is resolved BEFORE the prefix check
+    // rather than sneaking past it.
+    const path = GLib.canonicalize_filename(p, null)
+
+    if (mode === "write") {
+        if (!WRITE_FILES.includes(path)) return {
+            error: `Not writable: ${path}. You may only write: ${WRITE_FILES.join(", ")}. `
+                + "Settings live behind set_config — never edit a settings file directly, the shell overwrites it.",
+        }
+        // Symlinks are refused on the write side only. A symlink here would let a
+        // path that passes the allowlist land somewhere else entirely, and the
+        // allowlist is three known files that have no reason to be links. (Reads
+        // do follow them: in a --dev install /usr/share/veltrix/config/hypr/
+        // hyprland.lua IS a symlink into the repo, and following it is correct.)
+        try {
+            const info = Gio.File.new_for_path(path).query_info(
+                "standard::is-symlink", Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+            if (info.get_is_symlink()) return { error: `Refusing to write through a symlink: ${path}` }
+        } catch {
+            // Does not exist yet — fine, creating it is allowed.
+        }
+        return { path }
+    }
+
+    if (READ_FILES.includes(path) || READ_ROOTS.some(r => underRoot(path, r))) return { path }
+    return {
+        error: `Not readable: ${path}. You may read ${READ_ROOTS.join(", ")} and the shell log `
+            + `(${READ_FILES[0]}). Everything else is outside your frontier — say so rather than working around it.`,
+    }
+}
+
+// Gate check, re-read per call like every other Veltrix helper (veltrix-a11y et al),
+// so flipping the switch in Settings → AI takes effect on the next message.
+function fileGate(mode) {
+    const cfg = readAiJson()
+    if (mode === "write") {
+        if (cfg.allowFileWrite !== true) return "Editing files is turned off. The user can enable it in Settings → AI → Files."
+        // Defence in depth: the shell keeps these consistent (setAllowFileWrite
+        // implies read), but `gsettings set` can put org.veltrix.ai into an
+        // inconsistent state, and "write without read" is exactly the combination
+        // that corrupts a file instead of editing it.
+        if (cfg.allowFileRead !== true) return "Editing files needs reading them first, which is turned off (Settings → AI → Files)."
+        return null
+    }
+    if (cfg.allowFileRead !== true) return "Reading files is turned off. The user can enable it in Settings → AI → Files."
+    return null
+}
+
+// ── Computer-use frontier (third-party apps) ─────────────────────────────────
+// Perceiving and driving OTHER applications does not go through `veltrix-ipc`
+// either — it goes through the four standalone helpers the MCP server already
+// uses (veltrix-a11y / veltrix-act / veltrix-type / veltrix-click). Same reasoning as
+// the file layer, plus one that is specific to these: AT-SPI calls are synchronous
+// D-Bus and can hang, which is exactly why they live in short-lived processes and
+// not on the shell's main loop.
+//
+// The helpers own the enforcement — each re-reads org.veltrix.ai, verifies the target is
+// the focused window, plays the AI-cursor choreography and honours the kill switch
+// mid-animation. So the assistant is the SAME kind of client here as MCP is, and
+// gets all of that for free. What this file adds is the two things a conversation
+// needs and a protocol adapter doesn't: tools shaped for a model with no eyes, and
+// an honest `ok` flag (see helperResult).
+//
+// The gates decide what is OFFERED, not just what is refused — see buildToolset.
+// A model told about a tool it cannot use promises the user something it cannot
+// deliver, and pays for the schema on every step to do it.
+function computerGate() {
+    const cfg = readAiJson()
+    const see = cfg.allowComputerUse === true
+    return { see, act: see && cfg.allowComputerControl === true }
+}
+
+// The gate state the cached toolset + system prompt were built from. Both are
+// built once per session; if the user grants or revokes permission mid-session,
+// both have to be thrown away or the model keeps the picture it was given at
+// spawn. Called at the turn boundary (see runTurn).
+let builtGateSig = null
+function syncComputerGate() {
+    const g = computerGate()
+    const sig = `${g.see}/${g.act}`
+    if (sig === builtGateSig) return g
+    if (builtGateSig !== null) {
+        log(`computer-use gate changed (${builtGateSig} → ${sig}) — rebuilding toolset and system prompt`)
+        systemCache = null
+        toolsetCache = null
+    }
+    builtGateSig = sig
+    return g
+}
+
+const GATE_SEE_OFF =
+    "Seeing other apps is turned off. The user can enable it in Settings → AI → \"Allow Agents to See Other Apps\"."
+const GATE_ACT_OFF =
+    "Controlling other apps is turned off. The user can enable it in Settings → AI → \"Allow Agents to Control Other Apps\" (it needs seeing them too)."
+
+// Dev-checkout pointer written by `install.sh --dev` (absent on system installs).
+function devRepo() {
+    try {
+        const [ok, bytes] = GLib.file_get_contents(`${HOME}/.config/veltrix/.dev`)
+        if (ok) return new TextDecoder().decode(bytes).trim() || null
+    } catch {}
+    return null
+}
+
+// PATH first, dev checkout second — same order as veltrix-mcp's findTool and as
+// AgentService.resolveDaemon: a dev machine may not have re-run install.sh since
+// a helper was added, and the repo copy is the one being worked on.
+function findTool(name) {
+    const inPath = GLib.find_program_in_path(name)
+    if (inPath) return inPath
+    const repo = devRepo()
+    if (repo && GLib.file_test(`${repo}/bin/${name}`, GLib.FileTest.IS_EXECUTABLE))
+        return `${repo}/bin/${name}`
+    return null
+}
+
+// Run a command synchronously, capturing stdout+stderr. Used for the fast
+// `veltrix-ipc` calls (system-prompt build + tool execution); the slow leg (the
+// LLM stream) is async curl so cancel still works mid-turn.
+function run(argv) {
+    const proc = Gio.Subprocess.new(
+        argv,
+        Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+    )
+    const [, out, err] = proc.communicate_utf8(null, null)
+    return { ok: proc.get_successful(), out: (out ?? "").trim(), err: (err ?? "").trim() }
+}
+
+// Delegates to the shell. Returns its output even on a non-zero exit, because a
+// gate refusal (e.g. allowConfigWrite off) is a self-explanatory MESSAGE, not a
+// crash — we hand it straight to the model as the tool result.
+function agsRequest(args) {
+    const r = run(["veltrix-ipc", ...args])
+    if (!r.ok && !r.out)
+        throw new Error(`veltrix-ipc failed (is the shell running?): ${r.err || "no output"}`)
+    return r.out
+}
+
+
+// ── stdio emitter + reader ───────────────────────────────────────────────────
+
+const stdout = new Gio.DataOutputStream({
+    base_stream: new GioUnix.OutputStream({ fd: 1, close_fd: false }),
+})
+function emit(obj) {
+    stdout.put_string(JSON.stringify(obj) + "\n", null)
+    stdout.flush(null)
+}
+const emitError = (m) => emit({ t: "error", message: String(m) })
+// Count deltas so a failed request can only be retried BEFORE any text has been
+// shown — a retry after that would double-render the reply. Monotonic across the
+// session; the retry loop only compares before/after within a single attempt.
+let deltasEmitted = 0
+const emitDelta = (text) => { if (text) { deltasEmitted++; emit({ t: "delta", text }) } }
+
+// ── Skills ───────────────────────────────────────────────────────────────────
+// Markdown playbooks the assistant loads ON DEMAND. Progressive disclosure is the
+// whole point and not a refinement: the in-repo `veltrix` skill is ~100k tokens
+// across its references, which is correct for a developer's agent and unusable
+// here, where every token rides on every step of every turn. So the tool
+// description carries only names + one-line descriptions (~30 tokens today) and
+// the body is fetched when the model decides it needs it.
+//
+// Same resolution order as Paths.ts/readShellVersion: a --dev checkout wins over
+// the installed copy, so editing a skill in the repo takes effect without an
+// install.
+function skillsDir() {
+    const repo = devRepo()
+    if (repo && GLib.file_test(`${repo}/skills`, GLib.FileTest.IS_DIR)) return `${repo}/skills`
+    return "/usr/share/veltrix/skills"
+}
+
+// Split YAML-ish frontmatter from the body. Deliberately not a YAML parser: the
+// contract is two flat `key: value` lines, and a skill that gets fancier than
+// that should be simplified rather than met with a parser.
+function parseSkill(text) {
+    const m = /^---\n([\s\S]*?)\n---\n?/.exec(text)
+    if (!m) return { meta: {}, body: text }
+    const meta = {}
+    for (const line of m[1].split("\n")) {
+        const kv = /^(\w+):\s*(.*)$/.exec(line)
+        if (kv) meta[kv[1]] = kv[2].trim()
+    }
+    return { meta, body: text.slice(m[0].length).trim() }
+}
+
+let skillsCache = null   // { name: { path, description } }
+function skills() {
+    if (skillsCache) return skillsCache
+    skillsCache = {}
+    const dir = skillsDir()
+    try {
+        const en = Gio.File.new_for_path(dir).enumerate_children(
+            "standard::name,standard::type", Gio.FileQueryInfoFlags.NONE, null)
+        for (;;) {
+            const info = en.next_file(null)
+            if (!info) break
+            if (info.get_file_type() !== Gio.FileType.DIRECTORY) continue
+            const name = info.get_name()
+            const path = `${dir}/${name}/SKILL.md`
+            if (!GLib.file_test(path, GLib.FileTest.EXISTS)) continue
+            let description = ""
+            try {
+                const { meta } = parseSkill(textFile(path))
+                description = meta.description || ""
+            } catch {}
+            skillsCache[name] = { path, description }
+        }
+        en.close(null)
+    } catch (e) {
+        log(`skills: none available (${dir}: ${e?.message ?? e})`)
+    }
+    return skillsCache
+}
+
+function loadSkillTool(name) {
+    const all = skills()
+    const hit = all[String(name ?? "").trim()]
+    if (!hit) return {
+        ok: false,
+        content: `No skill called "${name}". Available: ${Object.keys(all).join(", ") || "(none)"}.`,
+    }
+    try {
+        return { ok: true, content: parseSkill(textFile(hit.path)).body }
+    } catch (e) {
+        return { ok: false, content: `Could not load skill "${name}": ${e?.message ?? e}` }
+    }
+}
+
+// ── Tools offered to the model ───────────────────────────────────────────────
+// ONE passthrough tool (run_action) whose DESCRIPTION carries an index of every
+// desktop action — name + one-clause summary — instead of 32 first-class tool
+// schemas. Generated from `veltrix-ipc listActions`, so a new action still appears
+// for free (the self-maintaining property), and it weighs ~450 tokens where the 32
+// JSON schemas weighed ~2000 — a block that is re-sent on EVERY step of EVERY turn,
+// so every byte is paid per request (measured 2026-07-23).
+//
+// This keeps BOTH properties the first-class tools were adopted for, at ~¼ the cost:
+//   1. NO DISCOVERY ROUND-TRIP. Names + summaries sit in front of the model at all
+//      times (in run_action's description), so it never spends a request on a
+//      list_actions lookup before acting. The earlier run_action design paid that
+//      round-trip because the names lived BEHIND a lookup; moving them into the
+//      description removes it. A text index — not 32 schemas — is all that took.
+//   2. NO INVENTED NAMES. The index lists snake_case names, run_action takes a
+//      snake_case `action`, and execTool maps it back (camelCase accepted too).
+//
+// SETTINGS stay dedicated tools (set_config/get_config/dump_state/describe_settings):
+// structured args plus a discipline (describe_settings before guessing a key) that a
+// passthrough would blur, and describe_settings still gates its 4 KB schema on demand.
+// run_action resolves ONLY the visible actions — the config door is those dedicated
+// tools, and shell-internal plumbing stays unreachable by the model.
+const STATIC_TOOL_DEFS = [
+    {
+        name: "set_config",
+        description:
+            "Change a setting through the validated door (persists and updates the UI like Settings would). Use ONLY keys returned by describe_settings — call that first if you have not in this conversation. Gated by Settings → AI; if it refuses, tell the user how to enable it — don't retry.",
+        props: {
+            key: { type: "string", description: "Setting key from the schema" },
+            value: { type: "string", description: "New value, as a string (e.g. \"blue\", \"48\", \"true\")" },
+        },
+        required: ["key", "value"],
+    },
+    {
+        name: "get_config",
+        description: "Read shell settings: one value if `key` is given, all values otherwise.",
+        props: { key: { type: "string", description: "Setting key from the schema" } },
+        required: [],
+    },
+    {
+        name: "dump_state",
+        description:
+            "Re-read live desktop state (open overlays, dark mode, monitors, effective Hyprland config). Use it to VERIFY a change actually took effect before confirming to the user.",
+        props: {},
+        required: [],
+    },
+    {
+        name: "describe_settings",
+        description:
+            "List every setting you can read or change: key, type, valid values, current value, and whether it is writable. You do NOT know these in advance — call this ONCE before your first set_config or targeted get_config in a conversation. Required: never guess a setting key.",
+        props: {},
+        required: [],
+    },
+    // ── File tools (tier 1) ──────────────────────────────────────────────────
+    // Deliberately terse: these ride in every request of every turn, and the
+    // frontier does not need explaining here — a refusal names what IS allowed,
+    // which is cheaper than pre-emptive prose and arrives exactly when it helps.
+    // The `customize` skill carries the ownership model; load_skill fetches it.
+    {
+        name: "read_file",
+        description:
+            "Read a text file. Returns numbered lines; long files are paged, so use `offset`/`limit` and read the part you need rather than the whole thing.\n"
+            // The paths, in front of the model at all times — the same reasoning as
+            // run_action's action index. Without them it has to guess a path, take
+            // the refusal (which does name the roots) and retry: a whole wasted
+            // step, ~2000 tokens of round-trip, to save ~50 here.
+            + "What you can read:\n"
+            + `- ${HOME}/.config/veltrix/ — the user's desktop state: settings JSONs (read-only, change them with set_config), hyprland-user.lua (their keybinds/rules), hypridle.conf\n`
+            + "- /usr/share/veltrix/ — shipped defaults, including the base config/hypr/hyprland.lua that hyprland-user.lua overrides\n"
+            + `- ${READ_FILES[0]} — the shell log: what actually happened, in order. Read this before theorising about a problem.`,
+        props: {
+            path: { type: "string", description: "Absolute path, or ~/… " },
+            offset: { type: "number", description: "First line to return (1-based, default 1)" },
+            limit: { type: "number", description: `Lines to return (default ${READ_LINES_DEFAULT}, max ${READ_LINES_MAX})` },
+        },
+        required: ["path"],
+    },
+    {
+        name: "list_dir",
+        description: "List a directory: names, whether each is a file or directory, and size.",
+        props: { path: { type: "string", description: "Absolute path, or ~/… " } },
+        required: ["path"],
+    },
+    {
+        name: "search_files",
+        description:
+            "Search file contents for a pattern (extended regex) and return matching lines with their file and line number. Use this on the shell log to find an error, or across the config to find where something is set.",
+        props: {
+            pattern: { type: "string", description: "Extended regular expression" },
+            path: { type: "string", description: "File or directory to search" },
+        },
+        required: ["pattern", "path"],
+    },
+    {
+        name: "edit_file",
+        description:
+            "Replace an exact piece of text in a file you may write. `old_text` must match EXACTLY and appear exactly once — include surrounding lines to make it unique. Read the file first.\n"
+            // Same reasoning as read_file's path list: the writable set is three
+            // files, so naming them costs less than a refused call and a retry.
+            + "Writable: ~/.config/veltrix/hyprland-user.lua (keybinds, window rules, startup), ~/.config/veltrix/hypridle.conf (idle/power timeouts). Settings are NOT files — change them with set_config.",
+        props: {
+            path: { type: "string", description: "File to edit" },
+            old_text: { type: "string", description: "Exact text to replace (must be unique in the file)" },
+            new_text: { type: "string", description: "Replacement text (empty string deletes it)" },
+        },
+        required: ["path", "old_text", "new_text"],
+    },
+    {
+        name: "write_file",
+        description:
+            "Create a writable file, or replace one whole. Prefer edit_file for a change to an existing file; this refuses to overwrite a file you have not read this session.",
+        props: {
+            path: { type: "string", description: "File to write" },
+            content: { type: "string", description: "Full new contents" },
+        },
+        required: ["path", "content"],
+    },
+]
+
+// ── Computer-use tools ───────────────────────────────────────────────────────
+// Appended by buildToolset ONLY while the matching gate is on, so the common
+// case (both off, the shipped default) pays nothing for them.
+//
+// Same NAMES and parameters as the MCP tools — one vocabulary for the whole
+// project, so the computer-use section of the skill documents both consumers and
+// a verb added to the wrapper lands in both with the same shape.
+//
+// The DESCRIPTIONS are re-authored rather than copied, for two reasons that both
+// come from this being a conversation and not a protocol adapter:
+//   1. Every byte rides on every step of every turn here, while an MCP client
+//      pays for the list once per session. Hence terse — and the cross-cutting
+//      rules (focus first, preference order) are stated ONCE in the system
+//      prompt instead of repeated in eleven schemas.
+//   2. THIS CLIENT HAS NO EYES. The MCP wording sends an agent to a screenshot
+//      to read what the tree cannot show; here that would be advice to stare at
+//      a PNG it cannot see. Where vision is the only answer, these say so.
+const SEE_TOOL_DEFS = [
+    {
+        name: "query_app",
+        description:
+            "Look inside ANOTHER application's window through its accessibility tree: a flat list of controls with role, name, text, the actions each one exposes, and window-relative bounds. This is how you see outside Veltrix — you have no other view of another app. Targets the focused window unless you pass `app`. "
+            // Measured 2026-07-30: asked to read Veltrix's own Settings window, the
+            // model spent three steps here ("Veltrix Settings", then the Hyprland
+            // class) before giving up, because nothing said the inside has a
+            // different door. The index line for query_ui now points back.
+            + "OTHER apps only — Veltrix's own windows are not in this tree under any name; read those with `run_action query_ui <selector>`. "
+            + "A real window holds hundreds of controls, so pass `match` when you know what you are after; a match that finds little answers with `showing`, the labels on screen — read those before asking for a whole window. Some toolkits expose little or nothing; if the tree comes back empty, say so rather than acting blind. "
+            // Measured failure, same model, twice: with an earlier query_app in its
+            // history it answered about the CURRENT screen from that old copy and made
+            // no call at all (steps=1 tools=0), while the answer was sitting in the
+            // live screen. A file read stays true until something writes; a screen
+            // read is false the instant it is taken, and nothing said so.
+            + "The result is a SNAPSHOT of one instant, not a view that stays open: a screen changes on its own — a terminal scrolls, a dialog opens, a page loads. Before answering about what is on screen NOW, call this again. An earlier result in this conversation describes a screen that no longer exists, so reusing it is how you end up reporting something that is not there.",
+        props: {
+            app: { type: "string", description: "App name substring; omit for the focused window" },
+            match: { type: "string", description: "Keep only controls whose name, text or role CONTAINS this (substring, not a regex). \"a|b\" keeps either — ask for both ends of a drag in one call" },
+        },
+        required: [],
+    },
+]
+
+const ACT_TOOL_DEFS = [
+    {
+        name: "do_app_action",
+        description:
+            "Invoke an accessibility action on a control. Deterministic and not focus-dependent — the FIRST choice for acting on another app. "
+            // A live failure, 2026-07-27: asked to toggle Nautilus's sidebar, the
+            // model sent `win.toggle-sidebar` to a panel — a plausible GTK action
+            // name it had never seen, on a node whose `actions` array was empty.
+            // The old wording offered "an app action like view.show-hidden-files"
+            // as an example, which is precisely an invitation to invent one. Both
+            // halves of the rule matter: the action is COPIED from the node's own
+            // list, and the node has to be one that owns it.
+            + "`action` must be COPIED from that node's own `actions` array as returned by query_app — never a name you have not seen there, however plausible it sounds. "
+            + "A node whose `actions` is empty cannot be driven this way — with ONE exception below. Add `role`/`occurrence` when several controls share a name. "
+            // The 11h40m bug, 2026-07-28: asked for a 7-minute timer, the model
+            // found GNOME Clocks' "Minutes" spin button, saw an EMPTY actions array,
+            // could not focus it (GTK4 exposes no focus action), typed "7" blind,
+            // and the digits landed on whatever had focus and concatenated with what
+            // was already there — 700 minutes. Spin buttons and sliders carry a
+            // VALUE, not an action; query_app now reports it, and this is how it is
+            // written. Say so here or the model has no way to connect the two.
+            + "SPECIAL: for a node that query_app reports with a `value` block (spin buttons, sliders — their `actions` is empty), pass `action: \"set-value=<number>\"` to set it directly. "
+            + "ALWAYS prefer this over typing digits: it needs no focus, cannot concatenate with what is already in the field, and it reports back the value the widget actually took (it clamps to its own min/max).",
+        props: {
+            app: { type: "string", description: "App name substring" },
+            node: { type: "string", description: "Accessible name of the control, from query_app" },
+            action: { type: "string", description: "Copied from that control's `actions` array" },
+            role: { type: "string", description: "Disambiguate by role (e.g. \"button\")" },
+            occurrence: { type: "integer", description: "0-based index among matches" },
+        },
+        required: ["app", "node", "action"],
+    },
+    {
+        name: "type_text",
+        description:
+            "Type literal text into another app with a synthetic keyboard, for fields no accessibility action can fill. The app must be the FOCUSED window — focus it with run_action focus_window, never with SetFocus (that is a control-level action most GTK4 apps do not have). To put a NUMBER in a field, prefer do_app_action with action=\"set-value=N\". Does NOT press Enter — that is press_key.",
+        props: {
+            app: { type: "string", description: "App name" },
+            text: { type: "string", description: "Literal text to type" },
+        },
+        required: ["app", "text"],
+    },
+    {
+        name: "press_key",
+        description:
+            "Press a key or combo in another app: \"Return\", \"Tab\", \"Escape\", \"ctrl+a\". Activates the focused control, moves between fields, closes a dialog.",
+        props: {
+            app: { type: "string", description: "App name" },
+            key: { type: "string", description: "Key or combo, e.g. Return, Tab, ctrl+a" },
+        },
+        required: ["app", "key"],
+    },
+    {
+        name: "click_app",
+        description:
+            "Click a control with a synthetic pointer, aimed at the centre the accessibility tree reports for it. For controls that expose no usable action (list items, tabs, drawn widgets); prefer do_app_action when one exists. `button:\"right\"` opens its context menu.",
+        props: {
+            app: { type: "string", description: "App name" },
+            node: { type: "string", description: "Accessible name of the control, from query_app" },
+            button: { type: "string", enum: ["left", "right"], description: "Default left" },
+            role: { type: "string", description: "Disambiguate by role" },
+            occurrence: { type: "integer", description: "0-based index among matches" },
+        },
+        required: ["app", "node"],
+    },
+    {
+        name: "click_at",
+        description:
+            "Click a point measured in pixels from the window's top-left. Only for surfaces with no control to name (a canvas, a custom-drawn view). Take the numbers from a query_app node's bounds — you cannot see the screen, so a guessed coordinate clicks something unknown.",
+        props: {
+            app: { type: "string", description: "App name" },
+            x: { type: "integer", description: "X from the window's top-left" },
+            y: { type: "integer", description: "Y from the window's top-left" },
+            button: { type: "string", enum: ["left", "right"], description: "Default left" },
+        },
+        required: ["app", "x", "y"],
+    },
+    {
+        name: "hover_app",
+        description:
+            "Move the pointer onto a control without pressing anything — the only way to reach state that does not exist until the pointer is there: hover-revealed buttons, menus that open on hover. The pointer STAYS there afterwards, so what appeared stays open; query_app then reads it — but only if the toolkit publishes it. A tooltip never is one, and neither is a Qt popup (measured: Telegram's emoji panel, open on screen, was absent from its whole tree). If query_app cannot see what you revealed, tell the user you cannot read it instead of guessing.",
+        props: {
+            app: { type: "string", description: "App name" },
+            node: { type: "string", description: "Accessible name of the control, from query_app" },
+            role: { type: "string", description: "Disambiguate by role" },
+            occurrence: { type: "integer", description: "0-based index among matches" },
+        },
+        required: ["app", "node"],
+    },
+    {
+        name: "hover_at",
+        description:
+            "Hover a window-relative point — hover_app for surfaces with no control to name. Coordinates come from query_app bounds, never a guess.",
+        props: {
+            app: { type: "string", description: "App name" },
+            x: { type: "integer", description: "X from the window's top-left" },
+            y: { type: "integer", description: "Y from the window's top-left" },
+        },
+        required: ["app", "x", "y"],
+    },
+    {
+        name: "scroll_app",
+        description:
+            "Scroll with a synthetic wheel, pointer over a named control — how you bring off-screen rows into the tree so query_app can see them.",
+        props: {
+            app: { type: "string", description: "App name" },
+            node: { type: "string", description: "Accessible name of the control to scroll over" },
+            direction: { type: "string", enum: ["up", "down", "left", "right"], description: "Scroll direction" },
+            amount: { type: "integer", description: "Wheel notches (default 3)" },
+            role: { type: "string", description: "Disambiguate by role" },
+            occurrence: { type: "integer", description: "0-based index among matches" },
+        },
+        required: ["app", "node", "direction"],
+    },
+    {
+        name: "scroll_at",
+        description:
+            "Scroll with the pointer over a window-relative point — scroll_app for surfaces with no control to name. The point decides which scrollable region gets the wheel.",
+        props: {
+            app: { type: "string", description: "App name" },
+            x: { type: "integer", description: "X from the window's top-left" },
+            y: { type: "integer", description: "Y from the window's top-left" },
+            direction: { type: "string", enum: ["up", "down", "left", "right"], description: "Scroll direction" },
+            amount: { type: "integer", description: "Wheel notches (default 3)" },
+        },
+        required: ["app", "x", "y", "direction"],
+    },
+    {
+        name: "drag_app",
+        description:
+            "Drag from one named control onto another: press, glide, release. Drag-and-drop between lists, a file onto a folder. Both ends are resolved before anything is pressed.",
+        props: {
+            app: { type: "string", description: "App name" },
+            from_node: { type: "string", description: "Accessible name of the control to drag FROM" },
+            to_node: { type: "string", description: "Accessible name of the control to drop ON" },
+            from_role: { type: "string", description: "Disambiguate the FROM control by role" },
+            from_occurrence: { type: "integer", description: "Disambiguate the FROM control by index" },
+            to_role: { type: "string", description: "Disambiguate the TO control by role" },
+            to_occurrence: { type: "integer", description: "Disambiguate the TO control by index" },
+        },
+        required: ["app", "from_node", "to_node"],
+    },
+    {
+        name: "drag_at",
+        description:
+            "Drag between two window-relative points: rubber-band selection, moving a slider handle, reordering. Use drag_app when both ends are named controls; coordinates come from query_app bounds.",
+        props: {
+            app: { type: "string", description: "App name" },
+            from_x: { type: "integer", description: "Start X from the window's top-left" },
+            from_y: { type: "integer", description: "Start Y from the window's top-left" },
+            to_x: { type: "integer", description: "Drop X from the window's top-left" },
+            to_y: { type: "integer", description: "Drop Y from the window's top-left" },
+        },
+        required: ["app", "from_x", "from_y", "to_x", "to_y"],
+    },
+]
+
+// IPC action name (camelCase) → wire tool name (snake_case). Function-calling
+// convention is snake_case, and matching it is what stops the model inventing
+// `list_apps` for `listApps`.
+const toSnake = (s) => s.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
+
+// Built once per session (actions don't change under a running shell), cached
+// like the system prompt. Falls back to just the static tools if the shell is
+// mid-reload — the turn still works, minus the desktop actions, rather than
+// crashing.
+let toolsetCache = null   // { defs, actionMap: { snake: camel } }
+function buildToolset() {
+    if (toolsetCache) return toolsetCache
+    const gate = computerGate()
+    const defs = [...STATIC_TOOL_DEFS]
+    // Offered, not merely permitted. Both gates ship OFF, so this is the common
+    // case paying nothing — and when one is on, the model is told exactly the
+    // half it has (perception without control is a real, useful state: look at
+    // an app and report, touch nothing).
+    if (gate.see) defs.push(...SEE_TOOL_DEFS)
+    if (gate.act) defs.push(...ACT_TOOL_DEFS)
+    const actionMap = {}
+    const index = []
+    try {
+        const all = JSON.parse(agsRequest(["listActions"]))
+        for (const [name, def] of Object.entries(all)) {
+            if (HIDDEN_ACTIONS.has(name)) continue
+            const snake = toSnake(name)
+            actionMap[snake] = name
+            // First clause only: drop trailing sentences, "(e.g. …)" examples and
+            // inline JSON field lists ("[{…}]"). Name + first clause is enough to
+            // PICK the action; the model learns a result's shape from the first
+            // real call. This whole index rides in run_action's description and is
+            // re-sent on every step, so each byte is paid per request.
+            const desc = (def.desc || "").split(/[.[(]/)[0].trim()
+            index.push(desc && desc.toLowerCase() !== snake.replace(/_/g, " ")
+                ? `${snake} — ${desc}` : snake)
+        }
+    } catch (e) {
+        log(`buildToolset: listActions failed (${e}) — desktop actions unavailable this turn`)
+    }
+    // A single passthrough tool. If listActions failed (shell mid-reload) the index
+    // is empty and we omit it entirely — the turn still works with the settings
+    // tools, minus desktop actions, rather than offering an empty run_action.
+    if (index.length) defs.push({
+        name: "run_action",
+        description:
+            "Perform ONE desktop action: pass `action` (a name from the list below) plus any positional `args` it takes. "
+            + "This list is the COMPLETE set of actions — never invent a name and never look anything up; everything you can do is here:\n"
+            + index.sort().join("\n"),
+        props: {
+            action: { type: "string", description: "One of the action names listed in this description" },
+            args: { type: "array", items: { type: "string" }, description: "Positional arguments, if the action takes any" },
+        },
+        required: ["action"],
+    })
+    // Same shape as run_action's index and for the same reason: names + one-line
+    // descriptions in front of the model at all times, bodies behind a call.
+    // Omitted entirely when no skills are installed, rather than offering a tool
+    // that can only fail.
+    const available = skills()
+    const names = Object.keys(available).sort()
+    if (names.length) defs.push({
+        name: "load_skill",
+        description:
+            "Load a playbook with detailed instructions for a kind of task. Read the one that matches BEFORE you start — it carries rules you cannot infer, and getting them wrong is worse than being slow. Available:\n"
+            + names.map(n => `${n} — ${available[n].description || "(no description)"}`).join("\n"),
+        props: { name: { type: "string", description: `One of: ${names.join(", ")}` } },
+        required: ["name"],
+    })
+
+    toolsetCache = { defs, actionMap }
+    return toolsetCache
+}
+const openaiTools = () => buildToolset().defs.map(d => ({
+    type: "function",
+    function: { name: d.name, description: d.description, parameters: { type: "object", properties: d.props, required: d.required } },
+}))
+
+// Shorten a path for the island's tool chip: the user knows where their own
+// config lives, and the full path pushes the interesting part off the capsule.
+const prettyPath = (p) => String(p ?? "").replace(HOME, "~")
+
+function summarizeTool(tu) {
+    const i = tu.input || {}
+    switch (tu.name) {
+        case "set_config": return `set_config ${i.key}=${i.value}`
+        case "get_config": return `get_config ${i.key || "(all)"}`
+        case "dump_state": return "dump_state"
+        case "describe_settings": return "describe_settings"
+        case "read_file": return `read_file ${prettyPath(i.path)}${i.offset ? `:${i.offset}` : ""}`
+        case "list_dir": return `list_dir ${prettyPath(i.path)}`
+        case "search_files": return `search_files "${truncate(String(i.pattern ?? ""), 40)}" in ${prettyPath(i.path)}`
+        case "edit_file": return `edit_file ${prettyPath(i.path)}`
+        case "write_file": return `write_file ${prettyPath(i.path)}`
+        case "load_skill": return `load_skill ${i.name || "?"}`
+        case "run_action": return `run_action ${i.action || "?"}${Array.isArray(i.args) && i.args.length ? " " + i.args.join(" ") : ""}`
+        // Computer-use chips name the APP first: on a capsule this narrow, "which
+        // app is it touching" is the part the user is actually watching for.
+        case "query_app": return `query_app ${i.app || "(focused)"}${i.match ? ` "${truncate(String(i.match), 20)}"` : ""}`
+        case "do_app_action": return `do_app_action ${i.app} ${truncate(String(i.node ?? ""), 24)} ${i.action}`
+        case "type_text": return `type_text ${i.app} "${truncate(String(i.text ?? ""), 24)}"`
+        case "press_key": return `press_key ${i.app} ${i.key}`
+        case "click_app":
+        case "hover_app": return `${tu.name} ${i.app} ${truncate(String(i.node ?? ""), 24)}`
+        case "click_at":
+        case "hover_at": return `${tu.name} ${i.app} ${i.x},${i.y}`
+        case "scroll_app": return `scroll_app ${i.app} ${truncate(String(i.node ?? ""), 20)} ${i.direction}`
+        case "scroll_at": return `scroll_at ${i.app} ${i.x},${i.y} ${i.direction}`
+        case "drag_app": return `drag_app ${i.app} ${truncate(String(i.from_node ?? ""), 16)} → ${truncate(String(i.to_node ?? ""), 16)}`
+        case "drag_at": return `drag_at ${i.app} ${i.from_x},${i.from_y} → ${i.to_x},${i.to_y}`
+        default: return tu.name
+    }
+}
+
+// ── File tool implementations ────────────────────────────────────────────────
+// GLib/Gio directly: reading a file is a syscall, not a program to launch, so
+// there is no subprocess and no shell in any of these. search_files is the one
+// that shells out, and it does so with a FIXED argv — Gio.Subprocess takes an
+// array and never invokes a shell, so the model supplies data, never a command.
+
+// Applied to EVERY tool result. See MAX_TOOL_RESULT: the cost of a fat result is
+// paid again on every later request of the conversation, not just once.
+//
+// `advice` exists because a truncation notice that names the wrong lever is worse
+// than none: it tells the model to do something the tool cannot do, and the same
+// breath forbids re-running. The default fits the file tools (they page); a tool
+// with a different lever passes its own.
+const CAP_ADVICE = "Narrow the request (a line range, a tighter pattern) — do not re-run this unchanged."
+const capResult = (res, advice = CAP_ADVICE) =>
+    res.content && res.content.length > MAX_TOOL_RESULT
+        ? {
+            ...res,
+            content: res.content.slice(0, MAX_TOOL_RESULT)
+                + `\n… truncated at ${MAX_TOOL_RESULT} characters. ${advice}`,
+        }
+        : res
+
+function readFileTool(path, offset, limit) {
+    let raw
+    try {
+        const [ok, data] = GLib.file_get_contents(path)
+        if (!ok) return { ok: false, content: `Could not read ${path}.` }
+        raw = data
+    } catch (e) {
+        return { ok: false, content: `Could not read ${path}: ${e?.message ?? e}` }
+    }
+    let text
+    try {
+        // fatal:true so a binary file is refused with a sentence instead of
+        // becoming a screenful of replacement characters the model then reasons about.
+        text = new TextDecoder("utf-8", { fatal: true }).decode(raw)
+    } catch {
+        return { ok: false, content: `${path} is not a UTF-8 text file.` }
+    }
+
+    const lines = text.split("\n")
+    // A trailing newline leaves a final empty element; drop it so the line count
+    // matches what every other tool would report for this file.
+    if (lines.length && lines[lines.length - 1] === "") lines.pop()
+    if (!lines.length) return { ok: true, content: `(${path} is empty)` }
+
+    const start = Math.max(1, Math.floor(Number(offset) || 1))
+    const count = Math.min(READ_LINES_MAX, Math.max(1, Math.floor(Number(limit) || READ_LINES_DEFAULT)))
+    const slice = lines.slice(start - 1, start - 1 + count)
+    if (!slice.length) return {
+        ok: false,
+        content: `${path} has ${lines.length} lines; offset ${start} is past the end.`,
+    }
+
+    // Records that this path has been seen, which is what write_file's
+    // no-blind-overwrite check consults.
+    readThisSession.add(path)
+    const last = start + slice.length - 1
+    const more = last < lines.length
+        ? `\n… ${lines.length - last} more lines (continue at offset ${last + 1})`
+        : ""
+    // Numbered because the model needs a stable handle to talk to the user about
+    // ("line 12 binds Super+T") and, once write lands, to target an edit.
+    return { ok: true, content: slice.map((l, i) => `${start + i}\t${l}`).join("\n") + more }
+}
+
+function listDirTool(path) {
+    try {
+        const en = Gio.File.new_for_path(path).enumerate_children(
+            "standard::name,standard::type,standard::size",
+            Gio.FileQueryInfoFlags.NONE, null)
+        const rows = []
+        for (;;) {
+            const info = en.next_file(null)
+            if (!info) break
+            rows.push(info.get_file_type() === Gio.FileType.DIRECTORY
+                ? `${info.get_name()}/`
+                : `${info.get_name()}\t${info.get_size()} bytes`)
+        }
+        en.close(null)
+        rows.sort()
+        return { ok: true, content: rows.length ? rows.join("\n") : `(${path} is empty)` }
+    } catch (e) {
+        return { ok: false, content: `Could not list ${path}: ${e?.message ?? e}` }
+    }
+}
+
+function searchFilesTool(pattern, path) {
+    // -r walks a directory (harmless on a single file), -n gives line numbers,
+    // -I skips binaries, -E is the documented dialect, and `--` guarantees a
+    // pattern or path beginning with "-" is read as data rather than a flag.
+    // -m is grep's PER-FILE cap; the global one is applied below.
+    const r = run(["grep", "-rnI", "-E", "-m", String(MAX_SEARCH_HITS), "--", pattern, path])
+    // grep exits 1 for "no matches" — an answer, not a failure. Reporting it as a
+    // failure would invite the model to "fix" a correct call and search again.
+    if (!r.out) return { ok: true, content: r.err ? `No matches. (${truncate(r.err, 200)})` : "No matches." }
+
+    const hits = r.out.split("\n")
+    const shown = hits.slice(0, MAX_SEARCH_HITS)
+    const more = hits.length > shown.length
+        ? `\n… ${hits.length - shown.length} more matches — narrow the pattern or the path.`
+        : ""
+    return { ok: true, content: shown.join("\n") + more }
+}
+
+// ── Write side ───────────────────────────────────────────────────────────────
+// Paths read via read_file this session. write_file (a blind full overwrite) is
+// refused for anything absent from here — the skill asks the model to read before
+// it writes, and an invariant is worth more than a request. edit_file needs no
+// such check: knowing the exact text to replace IS having read it.
+const readThisSession = new Set()
+
+const AUTOSTART_BEGIN = "-- @autostart start"
+const AUTOSTART_END = "-- @autostart end"
+
+// The region of hyprland-user.lua that Settings → Apps → Autostart owns. It
+// rewrites this block from the UI's own list, so anything the assistant puts
+// inside is dropped the next time the user opens that page — silently, days
+// later. Enforced rather than documented: the model writes OUTSIDE the markers or
+// not at all.
+function autostartBlock(text) {
+    const lines = text.split("\n")
+    const s = lines.findIndex(l => l.trim() === AUTOSTART_BEGIN)
+    const e = lines.findIndex(l => l.trim() === AUTOSTART_END)
+    if (s === -1 || e === -1 || e < s) return null
+    return lines.slice(s, e + 1).join("\n")
+}
+
+function autostartGuard(before, after) {
+    const b = autostartBlock(before)
+    if (b === null) return null            // no managed block — nothing to protect
+    const a = autostartBlock(after)
+    if (a === null) return "That edit would remove the `-- @autostart start/end` block, which Settings → Apps → Autostart owns. Leave it exactly as it is and put your change outside the markers."
+    if (a !== b) return "That edit changes the text between `-- @autostart start` and `-- @autostart end`. That block belongs to Settings → Apps → Autostart and is rewritten from the UI's list, so your change there would silently disappear. Put it outside the markers — a second hl.on(\"hyprland.start\", …) block is fine."
+    return null
+}
+
+// Git-backed undo for the config layer. Best-effort by design: a failure here is
+// logged and never fails the write, because the snapshot is a safety net, not the
+// operation the user asked for. Identity is passed per-invocation so this works on
+// a machine with no global git config.
+const CONFIG_DIR = `${HOME}/.config/veltrix`
+const GIT = ["git", "-c", "user.name=Veltrix Assistant", "-c", "user.email=assistant@veltrix.local", "-C", CONFIG_DIR]
+
+// MUST run BEFORE the file is written. Getting this backwards is not a cosmetic
+// ordering nit: `git init` + `add -A` after the write would commit the ALREADY
+// CHANGED file as the baseline, so the very first thing the assistant ever did
+// would be the one thing that could never be undone. Caught in testing 2026-07-27,
+// when the first write produced a history with a single "baseline" commit holding
+// the new content and nothing to revert to.
+function gitEnsureBaseline() {
+    try {
+        if (GLib.file_test(`${CONFIG_DIR}/.git`, GLib.FileTest.EXISTS)) return
+        const init = run([...GIT, "init", "-q"])
+        if (!init.ok) { log(`git: init failed (${truncate(init.err, 120)}) — no undo history`); return }
+        run([...GIT, "add", "-A"])
+        run([...GIT, "commit", "-q", "-m", "Baseline: the config as it was before the Assistant's first change"])
+        log("git: initialised undo history in ~/.config/veltrix")
+    } catch (e) {
+        log(`git: baseline failed (${e})`)
+    }
+}
+
+function gitSnapshot(label) {
+    try {
+        if (!GLib.file_test(`${CONFIG_DIR}/.git`, GLib.FileTest.EXISTS)) return
+        run([...GIT, "add", "-A"])
+        const c = run([...GIT, "commit", "-q", "-m", label])
+        // `-q` still reports an empty commit on stdout; it means the write changed
+        // nothing, which is worth neither a log line nor an error.
+        const quiet = `${c.out} ${c.err}`.includes("nothing to commit")
+        if (!c.ok && !quiet) log(`git: commit failed (${truncate(c.err || c.out, 120)})`)
+    } catch (e) {
+        log(`git: snapshot failed (${e}) — the write itself succeeded`)
+    }
+}
+
+// Read the current contents of a write target. Missing is not an error: creating
+// hypridle.conf or a first hyprland-user.lua is legitimate.
+function currentText(path) {
+    try {
+        const [ok, data] = GLib.file_get_contents(path)
+        if (!ok) return ""
+        return new TextDecoder().decode(data)
+    } catch {
+        return ""
+    }
+}
+
+function commitWrite(path, text, label) {
+    // Baseline FIRST — see gitEnsureBaseline. The pre-change state has to be in a
+    // commit before the file changes, or the first edit is unrevertible.
+    const tracked = path.startsWith(CONFIG_DIR + "/")
+    if (tracked) gitEnsureBaseline()
+    try {
+        GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o755)
+        if (!GLib.file_set_contents(path, text)) return { ok: false, content: `Could not write ${path}.` }
+    } catch (e) {
+        return { ok: false, content: `Could not write ${path}: ${e?.message ?? e}` }
+    }
+    // The file changed under the model; the old copy in its context is now stale.
+    readThisSession.delete(path)
+    if (tracked) gitSnapshot(label)
+    const hint = path.endsWith(".lua")
+        ? " Run `run_action reload_hyprland` to apply it, then say what changed."
+        : ""
+    return { ok: true, content: `Wrote ${path} (${text.split("\n").length} lines).${hint}` }
+}
+
+function writeFileTool(path, content) {
+    if (!readThisSession.has(path) && GLib.file_test(path, GLib.FileTest.EXISTS)) return {
+        ok: false,
+        content: `Read ${path} first — write_file replaces the whole file, and this one already exists. Use read_file, then edit_file for a targeted change.`,
+    }
+    const before = currentText(path)
+    const guard = autostartGuard(before, content)
+    if (guard) return { ok: false, content: guard }
+    return commitWrite(path, content, `Assistant: rewrote ${GLib.path_get_basename(path)}`)
+}
+
+function editFileTool(path, oldText, newText) {
+    if (!oldText) return { ok: false, content: "edit_file needs `old_text` — the exact text to replace. To create a file or replace it wholesale, use write_file." }
+    const before = currentText(path)
+    if (!before) return { ok: false, content: `${path} is empty or missing — use write_file to create it.` }
+
+    // Exact and UNIQUE. A first-match replace on an ambiguous anchor edits a line
+    // the model wasn't looking at, and nothing downstream would notice.
+    const first = before.indexOf(oldText)
+    if (first === -1) return {
+        ok: false,
+        content: `That exact text is not in ${path}. Re-read the file — it may have changed, or the whitespace may differ — and match it exactly.`,
+    }
+    if (before.indexOf(oldText, first + 1) !== -1) return {
+        ok: false,
+        content: `That text appears more than once in ${path}. Include enough surrounding lines to make it unique.`,
+    }
+
+    const after = before.slice(0, first) + newText + before.slice(first + oldText.length)
+    const guard = autostartGuard(before, after)
+    if (guard) return { ok: false, content: guard }
+    return commitWrite(path, after, `Assistant: edited ${GLib.path_get_basename(path)}`)
+}
+
+// ── Computer-use tool implementations ────────────────────────────────────────
+// Each is a fixed-argv spawn of one helper. Every helper prints exactly ONE JSON
+// object — `{error:…}`, `{ok:false,…}` or `{ok:true,…}` — and that is what makes
+// the flag below possible.
+
+// Report a refusal or a failure as a FAILED tool result instead of an "ok" that
+// happens to contain an error. Three things downstream read `ok` and all three
+// are wrong otherwise: the island's tool chip (it would settle as success), the
+// two-strike guard (a call that fails identically twice must abort the turn, and
+// it compares failures), and the model itself.
+function helperResult(name, argv) {
+    const bin = findTool(name)
+    if (!bin) return {
+        ok: false,
+        content: `${name} is not installed on this system — tell the user to re-run install.sh; do not try another way.`,
+    }
+    const r = run([bin, ...argv])
+    if (!r.out) return { ok: false, content: `${name} produced no output${r.err ? `: ${r.err}` : ""}` }
+    let failed = false
+    try {
+        const parsed = JSON.parse(r.out)
+        failed = parsed?.error != null || parsed?.ok === false
+    } catch {
+        // Not JSON at all: the helper is broken or something else answered.
+        // Treat it as a failure rather than feeding the model an opaque blob.
+        failed = true
+    }
+    return { ok: !failed, content: compactJson(r.out) }
+}
+
+// A real accessibility tree does not fit in a chat-sized context, and this is not
+// a tuning detail — measured on a live session (2026-07-27): Nautilus is 102 KB
+// compacted, Telegram 503 KB, against a 24 KB tool-result cap. Handing the model a
+// blind 24 KB cut is not perception, it is noise with a cliff in the middle. Two
+// projections make the tool usable, and neither makes anything unreachable:
+//
+//   - `match` filters nodes by name / text / role substring — asking a question
+//     instead of downloading the building. It is the lever the truncation notice
+//     names, so the model always has a next move.
+//   - each node is LEANED and the ancestor `path` trimmed (last two links, each
+//     capped): dropped are the fields that carry no targeting information — the
+//     `window` string repeated on all 175 nodes, `type` (a duplicate of `role`
+//     in every node observed), `visible` (already in `states`), and the states
+//     every node has (`sensitive`/`showing`/…). The path is the single heaviest
+//     field — 51 KB of Nautilus's 102 KB, 348 KB of Telegram's 503 KB, because
+//     the chain repeats for every sibling and an ancestor's name can BE the
+//     content (a Telegram list item's accessible name is the whole message,
+//     ~900 chars, echoed down every descendant). This consumer never navigates
+//     by path; it targets name + role + occurrence.
+//   - REPEATED SIBLINGS COLLAPSE. A file manager's hundred rows are one *kind*
+//     of thing; the model needs to know a list exists and how long it is, not to
+//     read it. Keep the first few of each (path, role) group and replace the rest
+//     with a count.
+//
+// This is not tuning: WITHOUT the last two, a live Nautilus put its "Show Sidebar"
+// button — correctly named, action `click` — at node 157 of 175, byte 55,313 of
+// 60,367, i.e. PAST the cap. The model was asked to toggle the sidebar, never saw
+// the button, and guessed. Measured after: Nautilus 102 KB → 27 KB (the whole
+// window now fits in one answer), Telegram 503 KB → 34 KB.
+//
+// MCP clients keep the raw tree: they have the context for it and pay once per
+// call, where this one pays on every step of the turn.
+const A11Y_PATH_LINKS = 2
+const A11Y_LINK_CHARS = 48
+const A11Y_SIBLINGS = 3
+// A window's controls are the point of the tool, so this cap is higher than the
+// generic one — sized from measurement (a leaned Nautilus is 27 KB) so a normal
+// window arrives WHOLE rather than cut at its header bar.
+const MAX_A11Y_RESULT = 32000
+// A filtered query that came back with little is ONE STEP from the expensive
+// fallback, and the model cannot see the price it is about to pay. Measured in a
+// live run 2026-07-29: `match:"search"` on a Spanish Telegram matched 4 nodes,
+// none of them the button; the model then asked for the whole window, history
+// went 3,199 b → 40,845 b, and every one of the six remaining steps carried it —
+// ~78k of the turn's 125k input tokens, spent to learn that the control is called
+// "Buscar mensajes". The labels themselves cost 697 bytes (measured, same window).
+// So below this many hits the result carries the on-screen labels AND the size of
+// the dump it is about to ask for. Same filter as veltrix-click/veltrix-act's
+// `showing` — a name is not a label (in a chat app it is the whole message).
+const A11Y_SHOWING_HITS = 8
+const A11Y_SHOWING_MAX = 40
+// `match` accepts alternation: "a|b" keeps a node matching EITHER. Not a
+// convenience — the model reached for it unprompted and got five empty results in
+// one session (live, 2026-07-29: `match:"cs.svg|Trash"`, count 0 every time, then
+// it fell back to dumping the window twice). It was also right to want it: the two
+// ends of a drag are two names, and asking for both in one call is the correct
+// economy. A literal "|" in an accessible name loses, which is a trade worth making.
+const A11Y_MATCH_OR = "|"
+// States every node carries; they say nothing about which control to pick.
+const A11Y_NOISE_STATES = new Set([
+    "sensitive", "showing", "visible", "enabled", "focusable", "selectable", "opaque",
+])
+
+// Roles that name something you can ACT on, as opposed to something you can read.
+// The distinction is the whole value of the list below: taking labels in document
+// order repeats the mistake the projection already fixes for nodes — content comes
+// first and chrome last, so a positional cut keeps the reading and loses the doing.
+// Measured on a live Telegram window: document order spends 18 of its first 19
+// slots on table cells (Remitente, Mensaje, Entrega…), while filtering by role
+// yields 16 names that are ALL controls, with the one the model was hunting
+// ("Buscar mensajes") second. Roles observed across GTK and Qt.
+const A11Y_CONTROL_ROLES = new Set([
+    "push button", "button", "toggle button", "menu item", "check menu item",
+    "radio menu item", "menu", "page tab", "check box", "radio button", "combo box",
+    "text", "entry", "password text", "link", "spin button", "slider", "list item",
+])
+
+// The short, single-line accessible names on screen, deduped and capped, CONTROLS
+// FIRST. Free: these nodes are already in hand. `A11Y_LINK_CHARS` doubles as the
+// label ceiling — the same 48 the helpers use, and for the same reason (a name is
+// not a label; in a chat app it is the entire message).
+function labelsOf(nodes) {
+    const labelish = n => {
+        const nm = typeof n?.id === "string" ? n.id : ""
+        return nm && nm.length <= A11Y_LINK_CHARS && !nm.includes("\n") ? nm : null
+    }
+    const seen = new Set()
+    for (const n of nodes) {
+        const nm = labelish(n)
+        if (nm && A11Y_CONTROL_ROLES.has(n.role)) seen.add(nm)
+        if (seen.size >= A11Y_SHOWING_MAX) break
+    }
+    // Then fill the remaining slots with everything else that reads like a label.
+    // Controls-first is an ORDERING, not a filter, and the difference is a measured
+    // one: in a chat window the content is noise, but in a FILE MANAGER the content
+    // is the target — Nautilus draws file items as `table cell`/`table row`, so a
+    // role-only list offered "Open Trash" and not the file to drag onto it, and the
+    // model paid a 21 KB whole-window dump for the other half (live, 2026-07-29).
+    // Filling costs little: Nautilus 406 → 729 b, Telegram 401 → 743 b, both still
+    // ~50× cheaper than the dump they exist to prevent.
+    for (const n of nodes) {
+        const nm = labelish(n)
+        if (nm) seen.add(nm)
+        if (seen.size >= A11Y_SHOWING_MAX) break
+    }
+    return [...seen]
+}
+
+function leanA11yNode(n) {
+    if (!n || typeof n !== "object") return n
+    const o = {}
+    if (n.id) o.id = n.id
+    if (n.role) o.role = n.role
+    // `type` is the same string as `role` in every node observed; keep it only if
+    // some toolkit ever disagrees, so nothing is silently lost.
+    if (n.type && n.type !== n.role) o.type = n.type
+    if (n.text) o.text = n.text
+    if (Array.isArray(n.actions) && n.actions.length) o.actions = n.actions
+    if (Array.isArray(n.shortcuts) && n.shortcuts.length) o.shortcuts = n.shortcuts
+    const states = (n.states || []).filter(s => !A11Y_NOISE_STATES.has(s))
+    if (states.length) o.states = states
+    if (n.bounds) o.bounds = n.bounds
+    if (typeof n.path === "string") {
+        let links = n.path.split(" > ")
+            .map(l => (l.length > A11Y_LINK_CHARS ? l.slice(0, A11Y_LINK_CHARS) + "…" : l))
+        if (links.length > A11Y_PATH_LINKS) links = ["…", ...links.slice(-A11Y_PATH_LINKS)]
+        o.path = links.join(" > ")
+    }
+    return o
+}
+
+// Keep the first A11Y_SIBLINGS of each (path, role) run and replace the rest with
+// one entry carrying the count. Document order is preserved — reordering a tree
+// would cost the model the one thing the flat list still encodes, which is where
+// things sit relative to each other.
+function collapseA11ySiblings(nodes) {
+    const groups = new Map()
+    for (const n of nodes) {
+        const k = JSON.stringify([n.path ?? "", n.role ?? ""])
+        groups.set(k, (groups.get(k) || 0) + 1)
+    }
+    const out = [], emitted = new Map()
+    for (const n of nodes) {
+        const k = JSON.stringify([n.path ?? "", n.role ?? ""])
+        const size = groups.get(k)
+        if (size <= A11Y_SIBLINGS) { out.push(n); continue }
+        const seen = emitted.get(k) || 0
+        if (seen < A11Y_SIBLINGS) { out.push(n); emitted.set(k, seen + 1); continue }
+        if (seen === A11Y_SIBLINGS) {
+            emitted.set(k, seen + 1)
+            out.push({
+                role: n.role, path: n.path, omitted: size - A11Y_SIBLINGS,
+                note: "more of the same kind here — use `match` to reach a specific one",
+            })
+        }
+    }
+    return out
+}
+
+function queryAppTool(app, match) {
+    const r = helperResult("veltrix-a11y", app ? [app] : [])
+    if (!r.ok) return r
+    let data
+    try {
+        data = JSON.parse(r.content)
+    } catch {
+        return capResult(r)     // not the shape we know — hand it over untouched
+    }
+    if (!Array.isArray(data.nodes)) return capResult(r)
+
+    const total = data.nodes.length
+    const needle = String(match ?? "").trim().toLowerCase()
+    let nodes = data.nodes
+    const needles = needle ? needle.split(A11Y_MATCH_OR).map(s => s.trim()).filter(Boolean) : []
+    if (needles.length)
+        nodes = nodes.filter(n => [n.id, n.text, n.role, n.type].some(
+            v => typeof v === "string" && needles.some(w => v.toLowerCase().includes(w))))
+
+    // The window title lives on every node and is the same string on all of them
+    // whenever one window matched — hoist it rather than pay for 175 copies.
+    const windows = [...new Set(nodes.map(n => n.window).filter(Boolean))]
+    let lean = nodes.map(leanA11yNode)
+    const beforeCollapse = lean.length
+    lean = collapseA11ySiblings(lean)
+
+    // Built fresh, with the ORIENTATION FIELDS FIRST: what this is, how much of it
+    // there is, and what to do next. Appending that after 30 KB of nodes puts the
+    // one actionable sentence behind everything else in the result.
+    const out = {
+        source: data.source,
+        app: data.app ?? app ?? null,
+        ...(windows.length === 1 ? { window: windows[0] } : {}),
+        ...(needles.length ? { match, scanned: total } : {}),
+        count: lean.length,
+        ...(beforeCollapse !== lean.length ? { of_nodes: beforeCollapse } : {}),
+    }
+    // Below the threshold the next move is almost always the whole-window dump, so
+    // answer it here: the labels that ARE on screen (which is where the local
+    // language lives), and what the dump would cost. Computed only on this path —
+    // a filtered query that found what it wanted must not pay for either.
+    const showing = needles.length && lean.length <= A11Y_SHOWING_HITS ? labelsOf(data.nodes) : null
+    if (showing) {
+        const kb = Math.round(
+            JSON.stringify(collapseA11ySiblings(data.nodes.map(leanA11yNode))).length / 1024)
+        const priced = `Calling again without \`match\` returns the WHOLE window (~${kb} KB here), `
+            + "and it then rides on every later step of this turn — try another word first."
+        out.hint = nodes.length
+            ? `only ${nodes.length} of ${total} nodes matched "${match}". If none is the control you want, `
+                + "`showing` lists the labels actually on screen — the control is often named in the user's "
+                + `own language, not English. Pick one VERBATIM. ${priced}`
+            : `no node matched "${match}" among ${total} nodes in this window — it was NOT empty. `
+                + "`showing` lists the labels actually on screen (the control is probably named in the "
+                + `user's own language); pick one VERBATIM, or filter by a role like "button". ${priced}`
+    } else if (data.hint) out.hint = data.hint
+    if (showing) out.showing = showing
+    if (data.apps) out.apps = data.apps
+    out.nodes = lean
+
+    const content = JSON.stringify(out)
+    if (content.length <= MAX_A11Y_RESULT) return { ok: true, content }
+    return {
+        ok: true,
+        content: content.slice(0, MAX_A11Y_RESULT)
+            + `\n… cut here: this window is too big for one answer. Call query_app again with \`match\` set to what you are `
+            + "after (a control's name, or a role like \"button\") — do not re-run this unchanged.",
+    }
+}
+
+// Agent-friendly direction + notch count → the signed (dx, dy) wheel notches the
+// injector expects (dy>0 = down, dx>0 = right). Same mapping as veltrix-mcp's.
+function scrollDeltas(direction, amount) {
+    const n = Number.isInteger(amount) && amount > 0 ? amount : 3
+    switch (direction) {
+        case "up":    return [0, -n]
+        case "left":  return [-n, 0]
+        case "right": return [n, 0]
+        default:      return [0, n]   // "down"
+    }
+}
+
+// Optional positional tail for the *-app modes: [role] [occurrence]. A later
+// argument forces the earlier one to be present, so an omitted role is padded
+// with "" rather than skipped — dropping it would shift the occurrence into the
+// role slot and filter by a role called "2".
+function nodeTail(role, occurrence) {
+    const tail = []
+    if (role || occurrence != null) tail.push(String(role || ""))
+    if (occurrence != null) tail.push(String(occurrence))
+    return tail
+}
+
+const num = (v) => (typeof v === "number" ? v : parseInt(String(v ?? ""), 10))
+const missingXY = (i) => !Number.isFinite(num(i?.x)) || !Number.isFinite(num(i?.y))
+
+function execTool(tu) {
+    try {
+        let out
+        const args = () => Array.isArray(tu.input?.args) ? tu.input.args.map(String) : []
+        switch (tu.name) {
+            case "set_config":
+                if (!tu.input?.key) return { ok: false, content: "set_config needs key and value" }
+                out = agsRequest(["setConfig", String(tu.input.key), String(tu.input.value ?? "")])
+                break
+            case "get_config":
+                out = agsRequest(tu.input?.key ? ["getConfig", String(tu.input.key)] : ["getConfig"])
+                break
+            case "dump_state":
+                out = agsRequest(["dumpState"])
+                break
+            case "describe_settings":
+                out = agsRequest(["describeConfig"])
+                break
+            case "run_action": {
+                const name = String(tu.input?.action || "").trim()
+                if (!name) return { ok: false, content: "run_action needs an `action` name — pick one from the list in its description." }
+                // Wire name is snake_case; map back to the camelCase IPC action.
+                // Accept a camelCase name too (a model that echoed the real name).
+                // Resolves ONLY the visible actions in actionMap — the config door
+                // is the dedicated tools, and hidden plumbing stays unreachable, so
+                // this opens no gate the tool list doesn't already advertise.
+                const { actionMap } = buildToolset()
+                const action = actionMap[name] || actionMap[toSnake(name)] || null
+                if (!action) return {
+                    ok: false,
+                    content: `No action named "${name}". Use exactly one of the names listed in run_action's description; do not invent one.`,
+                }
+                out = agsRequest([action, ...args()])
+                break
+            }
+            case "read_file": {
+                const gate = fileGate("read")
+                if (gate) return { ok: false, content: gate }
+                const r = resolvePath(tu.input?.path, "read")
+                if (r.error) return { ok: false, content: r.error }
+                return capResult(readFileTool(r.path, tu.input?.offset, tu.input?.limit))
+            }
+            case "list_dir": {
+                const gate = fileGate("read")
+                if (gate) return { ok: false, content: gate }
+                const r = resolvePath(tu.input?.path, "read")
+                if (r.error) return { ok: false, content: r.error }
+                return capResult(listDirTool(r.path))
+            }
+            case "search_files": {
+                const gate = fileGate("read")
+                if (gate) return { ok: false, content: gate }
+                const pattern = String(tu.input?.pattern ?? "")
+                if (!pattern) return { ok: false, content: "search_files needs a `pattern`." }
+                const r = resolvePath(tu.input?.path, "read")
+                if (r.error) return { ok: false, content: r.error }
+                return capResult(searchFilesTool(pattern, r.path))
+            }
+            case "edit_file": {
+                const gate = fileGate("write")
+                if (gate) return { ok: false, content: gate }
+                const r = resolvePath(tu.input?.path, "write")
+                if (r.error) return { ok: false, content: r.error }
+                return capResult(editFileTool(r.path, String(tu.input?.old_text ?? ""), String(tu.input?.new_text ?? "")))
+            }
+            case "load_skill":
+                return capResult(loadSkillTool(tu.input?.name))
+            // ── Computer-use ────────────────────────────────────────────────
+            // The gate is re-read per call even though buildToolset only offers
+            // these while it is on: a turn can outlive the switch (the user can
+            // revoke mid-conversation, and the kill switch exists to be used).
+            // Defence in depth only — the helper enforces it again, and it is
+            // the helper's check that can still catch a revocation that lands
+            // while the cursor animation is playing.
+            case "query_app": {
+                if (!computerGate().see) return { ok: false, content: GATE_SEE_OFF }
+                return queryAppTool(String(tu.input?.app ?? "").trim(), tu.input?.match)
+            }
+            case "do_app_action": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                // An OMITTED node is a signal, not a slip: it means the caller had
+                // no name to give, which is what a nameless control looks like from
+                // the outside. Measured on the bench 2026-08-01 — the model sent an
+                // empty node twice in one turn against a switch that has no
+                // accessible name. Restating the signature only invites a third try,
+                // so name the tool that does not need a name.
+                if (i.app && i.action && !i.node)
+                    return { ok: false, content: "do_app_action aims by accessible NAME, and this call had none. "
+                        + "If the control has no name in query_app (`id: null`), no name will work: click it by "
+                        + "position with click_at, passing the `bounds` query_app gave for it." }
+                if (!i.app || !i.node || !i.action)
+                    return { ok: false, content: "do_app_action needs app, node and action." }
+                return capResult(helperResult("veltrix-act",
+                    [String(i.app), String(i.node), String(i.action), ...nodeTail(i.role, i.occurrence)]))
+            }
+            case "type_text": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || i.text == null || i.text === "")
+                    return { ok: false, content: "type_text needs app and text." }
+                return capResult(helperResult("veltrix-type", ["text", String(i.app), String(i.text)]))
+            }
+            case "press_key": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || !i.key) return { ok: false, content: "press_key needs app and key." }
+                return capResult(helperResult("veltrix-type", ["key", String(i.app), String(i.key)]))
+            }
+            case "click_app":
+            case "hover_app": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || !i.node) return { ok: false, content: `${tu.name} needs app and node.` }
+                const mode = tu.name === "hover_app" ? "hover-app"
+                    : i.button === "right" ? "rclick-app" : "app"
+                return capResult(helperResult("veltrix-click",
+                    [mode, String(i.app), String(i.node), ...nodeTail(i.role, i.occurrence)]))
+            }
+            case "click_at":
+            case "hover_at": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || missingXY(i)) return { ok: false, content: `${tu.name} needs app, x and y.` }
+                const mode = tu.name === "hover_at" ? "hover-at"
+                    : i.button === "right" ? "rclick-at" : "at"
+                return capResult(helperResult("veltrix-click",
+                    [mode, String(i.app), String(num(i.x)), String(num(i.y))]))
+            }
+            case "scroll_app": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || !i.node || !i.direction)
+                    return { ok: false, content: "scroll_app needs app, node and direction." }
+                const [dx, dy] = scrollDeltas(i.direction, i.amount)
+                return capResult(helperResult("veltrix-click",
+                    ["scroll-app", String(i.app), String(i.node), String(dx), String(dy),
+                        ...nodeTail(i.role, i.occurrence)]))
+            }
+            case "scroll_at": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || missingXY(i) || !i.direction)
+                    return { ok: false, content: "scroll_at needs app, x, y and direction." }
+                const [dx, dy] = scrollDeltas(i.direction, i.amount)
+                return capResult(helperResult("veltrix-click",
+                    ["scroll-at", String(i.app), String(num(i.x)), String(num(i.y)), String(dx), String(dy)]))
+            }
+            case "drag_app": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || !i.from_node || !i.to_node)
+                    return { ok: false, content: "drag_app needs app, from_node and to_node." }
+                // Four optional slots, [from-role] [from-occ] [to-role] [to-occ]:
+                // pad up to the LAST one that was supplied, then stop — same
+                // reason as nodeTail, doubled.
+                const tail = [
+                    i.from_role || "",
+                    i.from_occurrence != null ? String(i.from_occurrence) : "",
+                    i.to_role || "",
+                    i.to_occurrence != null ? String(i.to_occurrence) : "",
+                ]
+                let last = -1
+                tail.forEach((v, n) => { if (v !== "") last = n })
+                return capResult(helperResult("veltrix-click",
+                    ["drag-app", String(i.app), String(i.from_node), String(i.to_node),
+                        ...(last >= 0 ? tail.slice(0, last + 1) : [])]))
+            }
+            case "drag_at": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                const pts = [i.from_x, i.from_y, i.to_x, i.to_y].map(num)
+                if (!i.app || pts.some(v => !Number.isFinite(v)))
+                    return { ok: false, content: "drag_at needs app, from_x, from_y, to_x and to_y." }
+                return capResult(helperResult("veltrix-click",
+                    ["drag-at", String(i.app), ...pts.map(String)]))
+            }
+            case "write_file": {
+                const gate = fileGate("write")
+                if (gate) return { ok: false, content: gate }
+                const r = resolvePath(tu.input?.path, "write")
+                if (r.error) return { ok: false, content: r.error }
+                if (tu.input?.content == null) return { ok: false, content: "write_file needs `content`." }
+                return capResult(writeFileTool(r.path, String(tu.input.content)))
+            }
+            default: {
+                // The model named a tool that isn't offered. Name the real ones so
+                // the correction is actionable instead of a dead end.
+                //
+                // The common case is not a hallucination at all: run_action's
+                // description lists every ACTION by name (list_apps, focus_window,
+                // setIsland…), and the model calls one of those as if it were a tool.
+                // Measured 2026-07-28 with `list_apps`. Saying "no such tool" to a
+                // name that plainly exists in the prompt is the least useful possible
+                // answer, so check the action index and route it.
+                const ts = buildToolset()
+                const asAction = ts.actionMap[tu.name] ? tu.name
+                    : ts.actionMap[toSnake(tu.name)] ? toSnake(tu.name) : null
+                if (asAction) return {
+                    ok: false,
+                    content: `"${tu.name}" is an ACTION, not a tool — those are not called directly. `
+                        + `Retry as: run_action with action="${asAction}"`
+                        + (tu.input && Object.keys(tu.input).length
+                            ? ` and its positional values in \`args\` (you passed ${JSON.stringify(tu.input)}).` : "."),
+                }
+                return {
+                    ok: false,
+                    content: `There is no tool called "${tu.name}". Available tools: ${ts.defs.map(d => d.name).join(", ")}.`,
+                }
+            }
+        }
+        // Same lossless squeeze as the system prompt, and it matters MORE here:
+        // a tool result is appended to `history` and re-sent on every later
+        // request of the conversation, so its pretty-printing is paid again and
+        // again. Measured 2026-07-21: listWindows −32%, listApps −25%.
+        return capResult({ ok: true, content: compactJson(out) || "(ok)" })
+    } catch (e) {
+        return { ok: false, content: String(e?.message ?? e) }
+    }
+}
+
+// ── System prompt (built once per session; reset() clears it) ────────────────
+let systemCache = null
+// The shell pretty-prints its JSON for humans reading `veltrix-ipc` in a
+// terminal. The model does not need the indentation, and it is ~13% of the
+// system prompt (measured 2026-07-21: 12.5 KB → 10.8 KB across the three dumps).
+// Lossless, so there is no reason not to. Falls back to the original string if
+// it somehow isn't JSON.
+function compactJson(s) {
+    try { return JSON.stringify(JSON.parse(s)) } catch { return s }
+}
+
+// Actions the assistant should not be TOLD about. Three kinds, and the listing is
+// ~1.7 KB lighter without them (measured 2026-07-21):
+//   1. Already offered as dedicated tools with better descriptions (the settings
+//      cluster), or redundant with run_action's own index (listActions) — listing
+//      them again invites the model to reach the same thing two ways.
+//   2. Shell-internal plumbing: the lockscreen and the computer-use visual layer
+//      call these on the shell's behalf. Nobody asks their desktop to
+//      "notifyComputerAction", and the kill switch is the USER's control.
+//   3. Actions it must not be able to REACH — the only category here that is about
+//      AUTHORITY rather than tokens or redundancy. `agentNewConversation` discards
+//      this very conversation: called mid-turn it would strand the tool_call whose
+//      tool_result the next request has to carry, and "start over" belongs to the
+//      user and to whoever drives an eval, never to a move inside a turn.
+// This list is not merely advisory, which is what makes (3) sound: `run_action`
+// resolves ONLY through `actionMap`, built with the same filter below, so a hidden
+// name is UNREACHABLE and not just unadvertised. External callers keep it — a
+// terminal via `veltrix-ipc`, and MCP, whose run_action is an unfiltered
+// passthrough by design (its client is a person's agent, not this daemon).
+// A DENYLIST on purpose: `run_action` stays a passthrough and a newly added
+// action still shows up for free, which is the property that keeps this whole
+// prompt self-maintaining.
+const HIDDEN_ACTIONS = new Set([
+    "describeConfig", "getConfig", "setConfig", "dumpState", "listActions",
+    "hideForLock", "showAfterLock", "notifyComputerAction", "agentPointer", "disableComputerControl",
+    "agentNewConversation", "widgetCatalog", "settingsMonitor", "settingsWallpaper", "takeNetworkCancel", // Settings control plane; model writes use set_config.
+])
+
+
+function buildSystemPrompt() {
+    if (systemCache) return systemCache
+    const lang = GLib.getenv("LANG") || "en"
+    // Rules that span the whole computer-use toolset live HERE, once, instead of
+    // in eleven tool descriptions — the same trade the action index makes. They
+    // appear only while the gate that grants them is on, so a desktop with both
+    // off carries none of this text.
+    const gate = computerGate()
+    const beyondVeltrix = []
+    if (gate.see) beyondVeltrix.push(
+        "- You can also look inside OTHER applications with query_app, which reads that window's accessibility tree. It is your only view of another app — you cannot see the screen. Describe what the tree reports, never what you imagine the app looks like, and say plainly when it reports nothing.",
+        // The one trap perception opens: `screenshot` is in the action index and
+        // sounds like eyes. It saves a PNG and hands back a path — the picture
+        // never reaches this conversation, and a model that forgets that starts
+        // describing a screen it has not seen.
+        "- run_action screenshot saves a picture and returns its FILE PATH. You never see the image itself, so take one only when the USER wants the file, and never describe its contents.",
+    )
+    if (gate.act) beyondVeltrix.push(
+        "- You can act on other applications. In order of preference: do_app_action (deterministic, no synthetic input) first, then press_key/type_text on a focused control, then click_app/hover_app, and the coordinate forms (click_at/hover_at/scroll_at/drag_at) LAST — only with numbers taken from a query_app node's bounds, never guessed.",
+        "- All of those act on the FOCUSED window and refuse otherwise: call run_action focus_window first. Afterwards re-read with query_app before you tell the user it worked. The user can revoke this at any moment and moving their mouse cancels an action in flight — if that happens, say so, don't retry silently.",
+        // The user watching cannot see through your own panel. Reported by them
+        // 2026-07-28 as a design fault, and they are right: acting under your own UI
+        // is indistinguishable from acting behind their back.
+        "- YOU ARE DRAWN ON THIS SCREEN. The Assistant sits in the Activity Island, which covers part of the display; dump_state reports the rect as overlays.islandBounds, and a click that lands inside it comes back with a `warning`. When you must act in that area, call run_action setIsland closed first, do the work so the user can watch it, then run_action setIsland agent to come back. Closing it does not end your turn or lose this conversation.",
+        // Measured 2026-07-29 with the panel open on screen: the pointer never
+        // moves back, so a hover holds — until the island's full-screen dismissal
+        // region returns and the app under the cursor gets a pointer LEAVE.
+        "- HOVER IS THE SHARP CASE OF THAT. What a hover reveals dies the instant your panel comes back, because the island takes the pointer. So close it BEFORE hovering, not after: setIsland closed → hover_app → query_app → setIsland agent.",
+    )
+    systemCache = [
+        "You are Assistant, the built-in helper for the Veltrix desktop (a Wayland desktop environment for Arch Linux, compositor Hyprland).",
+        "You help the user operate their desktop with natural language by calling tools.",
+        // Rich enough to ANSWER from — see the "describing yourself" rule below.
+        // This summary is LOAD-BEARING, not flavour: the rule below tells the model
+        // to answer "what can you do?" from it without calling a tool. So anything
+        // missing here the model will actively DENY. Measured 2026-07-28: with both
+        // computer-use gates ON, asked to add a timer, it answered "no puedo — mis
+        // funciones me permiten controlar ajustes, abrir aplicaciones o administrar
+        // ventanas" — a near-verbatim recital of this line, which said nothing about
+        // driving other apps. It took the user insisting twice to get it to try.
+        // Hence the gated tail: the sentence has to grow when the capability does.
+        "What you can do: open/close shell surfaces (control center, notifications, search, app grid, overview, settings); manage windows and workspaces; launch apps; change settings (appearance, accent, dark mode, dock, notifications, night light); read desktop state; read the desktop's own configuration files, its shipped defaults and the shell log."
+            + (gate.see ? " You can also READ what is on screen inside other applications." : "")
+            + (gate.act ? " And you can OPERATE other applications — press their buttons, set their values, type into them — so a request the desktop itself cannot serve (\"set a 7-minute timer\") is usually done by launching the right app and driving its interface. Do that rather than saying you cannot." : ""),
+        "Rules:",
+        "- Be concise: you answer in a small chat panel.",
+        "- The user is in charge. Do only what they ask; ask first before anything destructive or irreversible.",
+        "- If the message does NOT involve the desktop (a greeting, a general question, chit-chat), just answer. Do not call any tool.",
+        "- Asked what you can do? Answer from that summary in your own words — do not call a tool just to describe yourself.",
+        // Desktop actions go through the single run_action tool: its description
+        // lists every action name + summary, so the model picks one and calls it in
+        // ONE step — no discovery lookup. Settings keep their own tools because that
+        // schema is large and guessing a key is the costly mistake.
+        "- To do something on the desktop, call run_action with an action name from the list in its description, plus any positional arguments it needs. The list is complete — pick a name from it, never invent one, and never look actions up.",
+        "- Settings are the exception: call describe_settings once before your first set_config or targeted get_config, then use the keys it returns. Never guess a setting key.",
+        "- If a tool call fails, read the error and correct the call — do not repeat it unchanged. After acting, verify with dump_state/get_config when useful, then briefly confirm what changed.",
+        // The point of the file tools. Without this the model treats them as a
+        // way to answer "what does my config say", which is the least of it: the
+        // difference between a remote control and an assistant is looking at the
+        // log before offering a theory.
+        "- When something is WRONG (a glitch, a surface not opening, an app misbehaving), investigate before you answer: read the shell log and the relevant config file, say what you found, then propose the fix. Do not guess at a cause you have not looked for.",
+        "- You can read Veltrix's own config and defaults, not the user's other files. If something is outside what you can reach, say so plainly instead of working around it.",
+        // The routing rule, and the single most costly mistake available here: a
+        // settings JSON edited by hand looks right and is silently overwritten by
+        // the shell minutes later. The tools refuse it, but saying it here stops
+        // the model spending a step finding that out.
+        // The routing rule below is the SUMMARY; the `customize` skill is the full
+        // ownership model (which files the shell owns, why a hand-edited settings
+        // JSON disappears, the @autostart block). Pointing at it here is what makes
+        // progressive disclosure actually happen — a skill nobody loads is a file.
+        "- Before your FIRST file change in a conversation, call load_skill on the skill that matches (for desktop customization that is `customize`). It carries rules you cannot infer from the file itself.",
+        "- Routing a change: a SETTING goes through set_config. A keybind, window rule or startup program goes in ~/.config/veltrix/hyprland-user.lua (read it, then edit_file) — then call run_action reload_hyprland to apply it. Never edit a settings JSON directly; the shell owns those and would overwrite you.",
+        ...beyondVeltrix,
+        // The language of the MESSAGE wins, always. The desktop locale is a hint
+        // for the ambiguous case, never the rule: people routinely run an English
+        // desktop and talk to it in their own language, and switching languages
+        // mid-conversation is normal. (User's call 2026-07-21 — the previous
+        // wording made LANG the definition of "the user's language", which a
+        // literal-minded model would obey by answering English to a Spanish
+        // message.)
+        "- Reply in the SAME language the user wrote their message in, and follow them if they switch.",
+        `- Only when that is genuinely unclear (a first message too short to tell), fall back to the desktop locale (LANG=${lang}).`,
+    ].join("\n")
+    return systemCache
+}
+
+// ── Conversation history (neutral, backend-agnostic) ─────────────────────────
+// { role:"user", text }
+// { role:"assistant", text, toolUses:[{id,name,input}] }
+// { role:"tool", results:[{id,name,content}] }
+const history = []
+
+// Index in `history` where the CURRENT user turn begins. Everything before it is
+// a completed prior turn. Set at the top of runTurn; reset with the history.
+let turnStartIndex = 0
+
+
+// Tool RESULTS are the whales in the transcript, and the reason both the cost and
+// the cache complaint exist. Measured 2026-07-22: a single `listApps` is 5.8 KB,
+// and once it lands in history it rides in EVERY later request forever — 85% of a
+// 31 KB body, growing to a 57k-token turn, and the ceiling that pinned the implicit
+// cache at 3% (only the fixed prefix caches; a history that changes every turn never
+// does). Once a PRIOR turn's result has been reasoned over, the model has already
+// taken what it needed — the payload no longer has to travel. So for the REQUEST we
+// stub the content of tool results from before the current turn, keeping every step,
+// id, pairing and thought-signature intact (only the payload string shrinks). This
+// is the standard "clear old tool results" context move; doing it at request-build
+// time keeps the real `history` full for the UI and the logs. Current-turn results
+// stay whole — the model is still working on them. The model is told it can re-run
+// the action, which it does for the rare follow-up that needs the old data again.
+const RESULT_STUB = "(earlier result omitted to save context — re-run the action if you need this again)"
+// A loaded SKILL is the one tool result that must survive stubbing. The rule above
+// holds for DATA — the model read listApps, took what it needed, the payload no
+// longer has to travel. A skill is not data: it is the instructions the model is
+// supposed to keep obeying for the rest of the conversation. Stubbing it meant
+// turn 1 followed the ownership model and turn 2 saw "(earlier result omitted —
+// re-run the action if you need this again)", so the model either re-loaded it
+// (paying the same ~2.3k tokens again, as NEW content that defeats prefix caching
+// precisely when the conversation was about to benefit from it) or carried on with
+// half-remembered rules. Both are worse than just keeping it.
+const isSkillResult = (r) => r.name === "load_skill"
+
+// ── Session persistence ──────────────────────────────────────────────────────
+// The daemon is a CHILD of the shell, so `Super+Shift+R` (or a crash, or a
+// logout) takes it down and the model's context with it: the user came back to a
+// conversation the assistant no longer remembered having. That is annoying in
+// tier 1 and disqualifying for tier 2, where the assistant editing the shell and
+// reloading it means killing its own parent.
+//
+// This is the cheap half of the fix (the roadmap's "v1.1"): survive across
+// restarts by writing state down, rather than by re-parenting the daemon onto its
+// own systemd unit. It covers reload/crash/logout BETWEEN turns, which is every
+// case that actually happens today. A turn in flight is still lost — that needs
+// the sibling-service topology, and it can wait until tier 2 forces it.
+//
+// NOT in ~/.config/veltrix, deliberately, breaking the house "all user state is
+// JSON under ~/.config/veltrix" convention for one specific reason: that directory
+// is now a GIT REPO (the write tools' undo history), so persisting conversations
+// there would commit the user's chat, permanently, into a repo they never asked
+// for. A conversation is not configuration — it is much closer to the log, which
+// already lives outside ~/.config. XDG_STATE_HOME is exactly this: state that
+// should survive a restart but is not config.
+const STATE_DIR = `${GLib.getenv("XDG_STATE_HOME") || `${HOME}/.local/state`}/veltrix/agent`
+const SESSION_FILE = `${STATE_DIR}/session.json`
+const SESSION_VERSION = 1
+// Bound the file. Tool results are already stubbed for prior turns before this is
+// written (see saveSession), so the weight is mostly text, but an unbounded chat
+// would still grow forever on disk — and re-feeding 500 turns to the model on the
+// next boot would be its own bill. Keeps the most recent entries.
+const MAX_PERSISTED = 120
+
+function saveSession() {
+    try {
+        GLib.mkdir_with_parents(STATE_DIR, 0o700)
+        // Persist the STUBBED view, not the raw history: prior turns' tool results
+        // are already omitted from every request, so keeping their full payloads on
+        // disk would store megabytes the model will never see again. Skills survive
+        // (isSkillResult), which is exactly what should be restored — they are the
+        // instructions, not the data.
+        const entries = historyForRequest().slice(-MAX_PERSISTED)
+        const payload = JSON.stringify({ version: SESSION_VERSION, updated: Date.now(), history: entries })
+        // The 0700 directory above is what protects this — the file holds the
+        // conversation in plaintext, and mkdir's mode is the part GJS can actually
+        // guarantee (GLib.chmod is not introspected).
+        GLib.file_set_contents(SESSION_FILE, payload)
+        log(`session saved: ${entries.length} entries, ${payload.length}b`)
+    } catch (e) {
+        // Never fatal: a conversation that cannot be saved is still a conversation.
+        log(`session save failed: ${e?.message ?? e}`)
+    }
+}
+
+function loadSession() {
+    try {
+        if (!GLib.file_test(SESSION_FILE, GLib.FileTest.EXISTS)) return
+        const data = JSON.parse(textFile(SESSION_FILE))
+        if (data?.version !== SESSION_VERSION || !Array.isArray(data.history)) {
+            log(`session ignored: version ${data?.version} (expected ${SESSION_VERSION})`)
+            return
+        }
+        history.push(...data.history)
+        // Everything restored is a PRIOR turn by definition, so the next request
+        // stubs it — which is a no-op, since it was persisted stubbed.
+        turnStartIndex = history.length
+        log(`session restored: ${history.length} entries`)
+    } catch (e) {
+        log(`session restore failed: ${e?.message ?? e} — starting fresh`)
+        history.length = 0
+        turnStartIndex = 0
+    }
+}
+
+function clearSession() {
+    try {
+        if (GLib.file_test(SESSION_FILE, GLib.FileTest.EXISTS)) GLib.unlink(SESSION_FILE)
+    } catch (e) {
+        log(`session clear failed: ${e?.message ?? e}`)
+    }
+}
+
+function historyForRequest() {
+    return history.map((m, i) =>
+        m.role === "tool" && i < turnStartIndex
+            ? { ...m, results: (m.results || []).map(r => isSkillResult(r) ? r : { ...r, content: RESULT_STUB }) }
+            : m)
+}
+
+
+function toOpenaiMsgs(m) {
+    if (m.role === "user") return [{ role: "user", content: m.text }]
+    if (m.role === "assistant") {
+        const msg = { role: "assistant", content: m.text || null }
+        if ((m.toolUses || []).length)
+            msg.tool_calls = m.toolUses.map(tu => {
+                const call = { id: tu.id, type: "function", function: { name: tu.name, arguments: JSON.stringify(tu.input || {}) } }
+                // Echo any opaque per-call extras the provider attached (e.g. a
+                // reasoning/thought signature) exactly as received — some
+                // OpenAI-compatible providers reject the next request if they are
+                // dropped; the rest ignore the field.
+                if (tu.extra) call.extra_content = tu.extra
+                return call
+            })
+        return [msg]
+    }
+    return (m.results || []).map(r => ({ role: "tool", tool_call_id: r.id, content: r.content }))
+}
+
+// ── Request builders ─────────────────────────────────────────────────────────
+
+// SECOND cache breakpoint, on the newest turn's last content block.
+//
+// Why two: a breakpoint caches everything from the start of the request up to
+// itself, and render order is tools → system → messages. The system breakpoint
+// below therefore covers a span that NEVER GROWS (~1.2k tokens here) — and a
+// prefix under the model's minimum is silently not cached at all. That minimum
+// is NOT monotonic across generations and our ~1.2k span lands on both sides of
+// it: 512 tokens on Opus 5 (cached), 1024 on Opus 4.8 / Sonnet 5 / Sonnet 4.6
+// (borderline), 2048 on Opus 4.7 and 4096 on Opus 4.6/4.5 and Haiku 4.5 (never
+// cached). So on the current flagship the fixed prompt DOES cache — the earlier
+// note here, and tech-debt #39.7, both assumed a flat 4096 and were wrong for
+// today's models. Do NOT pad the prompt to cross a threshold on the older ones.
+
+
+function buildOpenaiReq(cfg, system) {
+    const endpoint = (cfg.brainEndpoint || "http://localhost:11434/v1").replace(/\/+$/, "")
+    // VELTRIX fork (Phase 0): local Ollama ONLY. A stored endpoint pointing at
+    // any other host (e.g. carried over from a pre-fork config) is refused here
+    // rather than ever sent a request.
+    const _host = (/^https?:\/\/([^/:]+)/.exec(endpoint) || [])[1] || ""
+    if (_host !== "localhost" && _host !== "127.0.0.1" && _host !== "::1")
+        throw new Error(`Assistant endpoint must be local (localhost); refusing ${_host || endpoint}`)
+    const messages = [{ role: "system", content: system }, ...historyForRequest().flatMap(toOpenaiMsgs)]
+    const body = {
+        model: cfg.brainModel || "",
+        stream: true,
+        stream_options: { include_usage: true },
+        tools: openaiTools(),
+        messages,
+    }
+    const headers = [["content-type", "application/json"]]
+    return { url: `${endpoint}/chat/completions`, headers, body: JSON.stringify(body), toolBytes: JSON.stringify(body.tools).length }
+}
+
+
+
+
+function makeOpenaiHandler() {
+    let text = ""
+    // Insertion-ordered so the calls stay in the order the model asked for them.
+    // Keyed by stream index when there is one, by call id otherwise — see the
+    // accumulation loop.
+    const slots = new Map()
+    let lastKey = null
+    let finishReason = null
+    let usage = { input: 0, output: 0, cached: 0 }
+    let errorMsg = null
+    return {
+        onLine(line) {
+            if (!line.startsWith("data:")) return
+            const payload = line.slice(5).trim()
+            if (!payload || payload === "[DONE]") return
+            let data
+            try { data = JSON.parse(payload) } catch { return }
+            if (data.error) { errorMsg = data.error.message || String(data.error); return }
+            if (data.usage) {
+                usage.input = data.usage.prompt_tokens ?? usage.input
+                usage.output = data.usage.completion_tokens ?? usage.output
+                // OpenAI-compatible providers cache repeated prefixes IMPLICITLY
+                // (no request flag) and report the hit here. This is the number
+                // that says whether the ~3.4k-token system prompt is actually
+                // being paid for on every request or served from cache — the
+                // difference between "expensive" and "looks expensive".
+                usage.cached = data.usage.prompt_tokens_details?.cached_tokens ?? usage.cached
+            }
+            const choice = data.choices?.[0]
+            if (!choice) return
+            const delta = choice.delta || {}
+            if (delta.content) { text += delta.content; emitDelta(delta.content) }
+            for (const tc of delta.tool_calls || []) {
+                // WHICH call does this chunk belong to? OpenAI streams an `index`
+                // on every chunk (first one also carries the id, continuations
+                // don't). Google's compat layer omits `index` entirely and
+                // identifies calls by id alone — so `tc.index ?? 0` filed EVERY
+                // call under 0: two calls became one slot with their arguments
+                // concatenated into invalid JSON ({"action":"listWindows"}{}) and
+                // the name overwritten by the last. Measured 2026-07-21; the
+                // symptom was a "run_action ?" chip and a silently dropped call.
+                // Order of preference: explicit index → call id → continue the
+                // slot we were filling (a pure continuation chunk has neither).
+                const key = tc.index != null ? `i${tc.index}`
+                    : tc.id ? `d${tc.id}`
+                    : lastKey ?? "i0"
+                lastKey = key
+                let slot = slots.get(key)
+                if (!slot) slots.set(key, slot = { id: tc.id, name: "", argParts: [], extra: null })
+                if (tc.id) slot.id = tc.id
+                if (tc.function?.name) slot.name = tc.function.name
+                // Spec says `arguments` is a STRING of JSON. Read permissively:
+                // some compat endpoints hand back an already-parsed object, and
+                // joining that into a string yields "[object Object]".
+                if (tc.function?.arguments != null) {
+                    const a = tc.function.arguments
+                    slot.argParts.push(typeof a === "string" ? a : JSON.stringify(a))
+                }
+                // Some OpenAI-compatible providers attach an opaque per-call extra
+                // (e.g. extra_content.google.thought_signature) and REJECT the next
+                // request with a 400 unless it is echoed back verbatim. Opaque to
+                // us: carry it, never interpret it. Providers that never send the
+                // field are unaffected.
+                if (tc.extra_content) slot.extra = tc.extra_content
+            }
+            if (choice.finish_reason) finishReason = choice.finish_reason
+        },
+        result() {
+            const tus = [...slots.values()].map((s, k) => {
+                const rawArgs = s.argParts.join("")
+                let input = {}
+                // A swallowed parse failure here is indistinguishable from "the
+                // model sent no arguments" — which is exactly how a malformed
+                // call got misread as the model's fault (2026-07-21). Say so.
+                try { input = rawArgs ? JSON.parse(rawArgs) : {} } catch (e) {
+                    log(`tool args did not parse for ${s.name || "?"}: ${e} — raw: ${truncate(rawArgs, 300)}`)
+                }
+                return { id: s.id || `call_${k}`, name: s.name, input, rawArgs, extra: s.extra }
+            })
+            // Trust the PRESENCE of tool calls over finish_reason. Measured
+            // 2026-07-21 against an OpenAI-compatible endpoint: it streams a
+            // tool call and then finishes
+            // with "stop", not "tool_calls". Keying off finish_reason alone
+            // dropped the call on the floor and ended the turn with nothing to
+            // say — the second turn of every conversation that needed a tool.
+            // A model that asked for a tool must get its result back; a stray
+            // finish_reason is the provider's business, not the loop's.
+            const wantsTools = tus.length > 0 || finishReason === "tool_calls"
+            return { text, toolUses: tus, stopReason: wantsTools ? "tool_use" : "end", finishReason, usage, errorMsg }
+        },
+    }
+}
+
+// ── curl SSE transport ───────────────────────────────────────────────────────
+let currentCurl = null
+
+function readAllLines(dataIn, onLine) {
+    return new Promise((resolve) => {
+        const loop = () => {
+            dataIn.read_line_async(GLib.PRIORITY_DEFAULT, null, (src, res) => {
+                let line
+                try { [line] = src.read_line_finish_utf8(res) } catch { return resolve() }
+                if (line === null) return resolve()   // EOF
+                try { onLine(line) } catch (e) { logError(e) }
+                loop()
+            })
+        }
+        loop()
+    })
+}
+
+async function streamCurl(req, onLine) {
+    const argv = ["curl", "-sS", "-N", "--no-buffer", "--fail-with-body", "--max-time", HTTP_TIMEOUT,
+        // Emit the final HTTP status to STDERR (via `%{stderr}`), never onto the
+        // SSE stdout stream: the retry path must tell a transient 5xx / dropped
+        // connection (retryable) apart from a 4xx (auth / bad request — retrying
+        // just burns time and money). Drained and stripped below so this marker
+        // never leaks into the error the user sees.
+        // `retry-after` rides along the same way: every provider here answers a
+        // rate limit with it, and honouring the number they give beats guessing a
+        // backoff. Digits only when parsed below — the header's other legal form is
+        // an HTTP date (with spaces and commas), which simply won't match and falls
+        // back to the linear backoff rather than being misread.
+        "-w", "%{stderr}veltrix-http:%{http_code} veltrix-retry:%header{retry-after}",
+        "-X", "POST"]
+    for (const [k, v] of req.headers) argv.push("-H", `${k}: ${v}`)
+    argv.push("--data-binary", "@-", req.url)
+
+    const proc = Gio.Subprocess.new(
+        argv,
+        Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+    )
+    currentCurl = proc
+
+    // Write the whole request body, then close stdin. curl consumes the (small)
+    // body before the server streams the response, so this never deadlocks.
+    const stdin = proc.get_stdin_pipe()
+    try {
+        stdin.write_all(new TextEncoder().encode(req.body), null)
+        stdin.close(null)
+    } catch {
+        // curl already gone (e.g. force_exit); fall through to read/exit handling.
+    }
+
+    let raw = ""
+    const dataIn = new Gio.DataInputStream({ base_stream: proc.get_stdout_pipe() })
+    await readAllLines(dataIn, (line) => { raw += line + "\n"; onLine(line) })
+    await new Promise((res) => proc.wait_async(null, () => res()))
+
+    // curl's OWN failures (DNS, TLS, --max-time, connection refused) only ever
+    // appear on stderr, which used to be piped and then dropped — so a dead
+    // endpoint reached the user as the generic "Request failed". Safe to drain
+    // synchronously here: the process has already exited, and `-sS` keeps this
+    // to one line.
+    const errRaw = drainStream(proc.get_stderr_pipe())
+    // `veltrix-http:NNN` comes from the -w write-out above; it is 000 (→ 0) when no
+    // response was received at all (DNS / TLS / refused / timeout), which the retry
+    // path reads as a network blip.
+    const httpMatch = /veltrix-http:(\d+)/.exec(errRaw)
+    const httpCode = httpMatch ? parseInt(httpMatch[1], 10) : 0
+    const retryMatch = /veltrix-retry:(\d+)/.exec(errRaw)
+    const retryAfter = retryMatch ? parseInt(retryMatch[1], 10) : 0   // seconds, 0 = absent
+    const err = errRaw.replace(/veltrix-http:\d+/, "").replace(/veltrix-retry:\S*/, "").trim()
+    const exitCode = proc.get_exit_status()
+    const ok = proc.get_successful()
+    currentCurl = null
+    // On an HTTP error the PROVIDER's explanation is in the body — that is the whole
+    // point of --fail-with-body — while curl's stderr says only "returned error: 400".
+    // Logging the stderr and dropping the body left a 400 as an unexplained event
+    // (2026-07-28: a turn died and the reason had to be inferred from request sizes).
+    // Body first whenever we got one, and only fall back to stderr for curl's OWN
+    // failures (DNS/TLS/timeout), where there is no body and stderr is all there is.
+    if (!ok) {
+        const detail = raw.trim() ? `body="${truncate(raw.trim().replace(/\s+/g, " "), 400)}"`
+            : err ? `stderr="${truncate(err, 200)}"` : "no body"
+        log(`curl failed: exit=${exitCode} http=${httpCode || "net"}${retryAfter ? ` retry-after=${retryAfter}s` : ""} ${detail}`)
+    }
+    return { ok, raw, err, httpCode, exitCode, retryAfter }
+}
+
+// Read a stream to EOF. Only for pipes of an exited process (see streamCurl).
+function drainStream(stream) {
+    if (!stream) return ""
+    try {
+        const din = new Gio.DataInputStream({ base_stream: stream })
+        let out = ""
+        for (;;) {
+            const [line] = din.read_line_utf8(null)
+            if (line === null) break
+            out += line + "\n"
+        }
+        return out.trim()
+    } catch {
+        return ""
+    }
+}
+
+// Provider errors are the ONLY diagnosis the user gets when a turn fails, so they
+// must arrive whole. The old 300-char cap chopped Google's "this model is retired,
+// migrate to <url>" mid-URL — the actionable half (user-caught 2026-07-21).
+const ERR_MAX = 2000
+
+function bestError(raw, curlErr) {
+    const trimmed = (raw || "").trim()
+    // Nothing came back at all → the failure is curl's, and its stderr line is
+    // the only thing that says WHY (timeout / refused / TLS / unknown host).
+    if (!trimmed) return curlErr ? truncate(curlErr, ERR_MAX) : "Request failed — check the provider, endpoint, and API key."
+    try {
+        const j = JSON.parse(trimmed)
+        const m = j?.error?.message || (typeof j?.error === "string" ? j.error : null)
+        if (m) return m
+    } catch {}
+    // Salvage path: a body that doesn't parse (truncated stream, two objects
+    // concatenated, a proxy's HTML wrapper) can still carry the message — pull it
+    // out rather than dumping raw braces at the user.
+    // Closed string first; then the same thing UNTERMINATED, because a stream that
+    // got cut is exactly when the user most needs to read what the provider said.
+    const m = /"message"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(trimmed)
+        || /"message"\s*:\s*"((?:[^"\\]|\\.)*)$/.exec(trimmed)
+    if (m) {
+        try { return JSON.parse(`"${m[1]}"`) } catch { return m[1] }
+    }
+    return truncate(trimmed, ERR_MAX)
+}
+
+const truncate = (s, n) => (s && s.length > n ? s.slice(0, n) + "…" : s || "")
+
+// Async, non-blocking wait (GLib timer) used for retry backoff — the main loop
+// keeps running, so an in-flight `cancel` message is still processed during the pause.
+function sleep(ms) {
+    return new Promise((res) => {
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => { res(); return GLib.SOURCE_REMOVE })
+    })
+}
+
+// ── The turn loop ────────────────────────────────────────────────────────────
+let busy = false
+let cancelled = false
+
+async function runTurn(userText) {
+    const cfg = readAiJson()
+    const backend = cfg.brainBackend || ""
+    // Usage accounting for the single (OpenAI-compatible, local Ollama) backend.
+    // `cached` is the subset served from cache (cheap); total − cached is what
+    // was billed at full rate.
+    const turnUsage = { input: 0, output: 0, cached: 0, thought: 0 }
+    const t0 = GLib.get_monotonic_time()
+    let step = 0
+    let lastFailure = null     // signature of the previous failed tool call (loop guard)
+    try {
+        if (!backend) {
+            log("turn refused: no provider configured")
+            emitError("No assistant provider is configured. Open Settings → AI to choose one.")
+            return
+        }
+        history.push({ role: "user", text: userText })
+        // Boundary for historyForRequest(): this user message and everything after
+        // it is the current turn (kept full); everything before is prior turns
+        // (tool results stubbed).
+        turnStartIndex = history.length - 1
+        // The computer-use gates decide which tools exist and which rules the
+        // prompt carries, and BOTH are cached per session — so a user who grants
+        // permission mid-conversation would otherwise keep talking to an assistant
+        // that was never told. Checked at the turn boundary only: rebuilding
+        // mid-turn would change the tool list between two steps of one request
+        // chain, which is how a provider ends up with a tool_result for a tool it
+        // was not offered.
+        syncComputerGate()
+        const system = buildSystemPrompt()
+        emit({ t: "state", s: "thinking" })
+        log(`turn start: provider=${cfg.brainProvider || "?"} backend=${backend} model=${cfg.brainModel || "(default)"} chars=${userText.length} history=${history.length}`)
+
+        while (step++ < MAX_STEPS) {
+            if (cancelled) return
+            // VELTRIX fork (Phase 0): ONE backend — the OpenAI-compatible
+            // shape against a local Ollama. No key, nothing leaves the machine.
+            const req = buildOpenaiReq(cfg, system)
+            // Factory, not an instance: the retry loop below re-creates the handler
+            // per attempt, because a failed leg may have half-accumulated text or
+            // tool JSON and a retry has to start clean.
+            const makeHandler = makeOpenaiHandler
+            // Three-way split, because "the request is big" is not actionable.
+            // sys and tools are FIXED per session (and cacheable); hist is what
+            // GROWS. Which one dominates decides whether to shrink the prompt or
+            // the loop. (Counting tools separately matters since the catalogues
+            // became tools: lumping them into "hist" made a bare greeting look
+            // like it carried 2.5 KB of conversation.)
+            const sysBytes = system.length
+            const toolBytes = req.toolBytes ?? 0
+            log(`step ${step}: POST ${hostOf(req.url)} body=${req.body.length}b (sys=${sysBytes}b tools=${toolBytes}b hist=${req.body.length - sysBytes - toolBytes}b)`)
+
+            // A 5xx or a dropped/refused connection is usually a transient blip, and
+            // the request has NOT been acted on yet (tools run only after the stream
+            // closes) — so a fresh attempt is safe. Two hard limits keep it honest:
+            // never retry once any text has been streamed to the UI (a retry would
+            // double-render it), and never retry a full timeout (exit 28 — re-running
+            // a 120 s hang three times only triples the wait; a genuine flicker fails
+            // fast and gets the retry). Fresh handler each attempt; only the final
+            // attempt's result is used and counted.
+            //
+            // 429 IS RETRYABLE, and leaving it out was a real hole: it is the single
+            // most likely transient failure for a busy or rate-limited local server,
+            // and it arrived as a hard error mid-conversation. The retry set is
+            // 408 / 409 / 429 / 5xx plus connection errors — the standard transient
+            // set for HTTP APIs. Everything else 4xx (400 bad request, 404 wrong
+            // model) is still surfaced immediately — retrying a client error only
+            // burns time. (No API key exists in this build, so there is no 401 path.)
+            let handler, ok, raw, err, httpCode, exitCode, retryAfter
+            for (let attempt = 1; attempt <= MAX_HTTP_ATTEMPTS; attempt++) {
+                handler = makeHandler()
+                const deltasBefore = deltasEmitted
+                ;({ ok, raw, err, httpCode, exitCode, retryAfter } = await streamCurl(req, (l) => handler.onLine(l)))
+                if (cancelled) { log(`step ${step}: cancelled by user`); return }
+                if (ok) break
+                const streamed = deltasEmitted > deltasBefore
+                const transient = httpCode >= 500 || httpCode === 429 || httpCode === 408 || httpCode === 409
+                    || (httpCode === 0 && exitCode !== 28)
+                // The provider said how long to wait: obey it, up to the point where
+                // waiting silently is worse than telling the user (see the constant).
+                const waitMs = retryAfter ? retryAfter * 1000 : RETRY_BASE_MS * attempt
+                const retryable = !streamed && transient && waitMs <= RETRY_AFTER_MAX_MS
+                if (!retryable || attempt === MAX_HTTP_ATTEMPTS) {
+                    if (transient && waitMs > RETRY_AFTER_MAX_MS)
+                        log(`step ${step}: not retrying — provider asked for ${retryAfter}s, past the ${RETRY_AFTER_MAX_MS}ms ceiling`)
+                    break
+                }
+                const backoff = waitMs
+                log(`step ${step}: attempt ${attempt}/${MAX_HTTP_ATTEMPTS} failed (http=${httpCode || "net"}${retryAfter ? `, retry-after=${retryAfter}s` : ""}) — retrying in ${backoff}ms`)
+                await sleep(backoff)
+                if (cancelled) { log(`step ${step}: cancelled during retry backoff`); return }
+            }
+
+            const r = handler.result()
+            // finish= is the provider's RAW value; stop= is how the loop read it.
+            // Keep both: the two disagreeing is exactly how a compat endpoint
+            // was caught dropping tool calls.
+            // sig= counts per-call opaque extras captured (a provider's reasoning
+            // signature, echoed back on the next request — see the converter above).
+            const sigs = r.toolUses.filter(tu => tu.extra).length
+            // cached= is the share of the input served from the provider's cache.
+            // A session where it stays 0 after the first request means the fixed
+            // prompt is being billed in full every single time.
+            const cacheNote = r.usage.cached || r.usage.cacheWrite
+                ? ` cached=${r.usage.cached}${r.usage.cacheWrite ? `+w${r.usage.cacheWrite}` : ""}`
+                : ""
+            log(`step ${step}: ok=${ok} text=${r.text.length}c tools=${r.toolUses.length}${r.toolUses.length ? ` sig=${sigs}/${r.toolUses.length}` : ""} stop=${r.stopReason || "?"} finish=${r.finishReason || "?"} tok=${r.usage.input}/${r.usage.output}${r.usage.thought ? ` think=${r.usage.thought}` : ""}${cacheNote}`)
+            // Count BEFORE any early return: a turn that fails still cost money,
+            // and the failures are the expensive ones (a 25k-token turn that
+            // ended at the step cap reported ZERO usage — user-caught 07-21).
+            turnUsage.input += r.usage.input
+            turnUsage.output += r.usage.output
+            turnUsage.cached += r.usage.cached
+            turnUsage.thought += r.usage.thought ?? 0
+
+            if (r.errorMsg) { log(`step ${step}: provider error: ${truncate(r.errorMsg, 200)}`); emitError(r.errorMsg); return }
+            if (!ok) { emitError(bestError(raw, err)); return }
+
+            // The per-call extras ride in history with the calls (toolUses[].extra,
+            // see the converter above): echoed back verbatim on the next request,
+            // never interpreted. The native lanes' `thinking` / `thoughtSig` fields
+            // are gone — nothing sets them, so they are not carried here.
+            history.push({ role: "assistant", text: r.text, toolUses: r.toolUses })
+
+            if (r.stopReason === "tool_use" && r.toolUses.length) {
+                emit({ t: "state", s: "acting" })
+                const results = []
+                let stuckOn = null, stuckWhy = ""
+                for (const tu of r.toolUses) {
+                    if (cancelled) return
+                    emit({ t: "tool", name: tu.name, summary: summarizeTool(tu) })
+                    const res = execTool(tu)
+                    log(`tool ${summarizeTool(tu)} → ${res.ok ? "ok" : "FAIL"} ${truncate(res.content, 120).replace(/\n/g, " ")}`)
+                    emit({ t: "toolresult", ok: res.ok, summary: truncate(res.content, 200) })
+                    results.push({ id: tu.id, name: tu.name, content: res.content, ok: res.ok })
+
+                    // A model that repeats a call it was just told is invalid will
+                    // usually keep repeating it: on 2026-07-21 the identical bad
+                    // run_action ran SEVEN times, burning the step budget and
+                    // ~25k input tokens on one question. Two strikes is enough to
+                    // know it isn't converging — and the user pays per attempt.
+                    const sig = `${tu.name}:${tu.rawArgs || ""}`
+                    if (!res.ok) {
+                        if (sig === lastFailure) { stuckOn = summarizeTool(tu); stuckWhy = res.content }
+                        lastFailure = sig
+                    } else if (sig === lastFailure) {
+                        lastFailure = null
+                    }
+                }
+                // History FIRST, always: every tool call needs its matching result
+                // or the next request is malformed and the provider rejects it.
+                history.push({ role: "tool", results })
+                if (stuckOn) {
+                    log(`aborting turn: identical failing tool call repeated (${stuckOn})`)
+                    // SAY WHAT REFUSED, and do not prescribe a remedy we cannot know
+                    // is one. The old text ended with "try rewording what you asked
+                    // for", which on 2026-08-12 sent the user to fix their sentence
+                    // while the actual failure was ours: the desktop had dropped the
+                    // window focus the model had correctly established (see
+                    // core/InputYield). A loop guard is well placed to report the
+                    // reason it saw twice and badly placed to guess whose fault it is.
+                    emitError(`I stopped the assistant: ${stuckOn} kept failing, and repeating it would just run up the bill.${stuckWhy ? ` The desktop said: ${truncate(stuckWhy.trim(), 180)}` : ""}`)
+                    return
+                }
+                emit({ t: "state", s: "thinking" })
+                continue
+            }
+            // Truncation and policy refusals are ABNORMAL ENDS TOO, and both were
+            // missed by the first never-silent pass: a reply cut off at the token
+            // ceiling looks like a finished answer that just stops mid-sentence,
+            // and a refusal arrives as an empty completion and got reported as
+            // "the model ended without replying" — which is wrong and unhelpful.
+            // Turn.error exists exactly for this: the partial text is kept and the
+            // reason is shown beside it.
+            const finish = String(r.finishReason || "")
+            if (finish === "max_tokens" || finish === "length") {
+                log(`turn hit the output ceiling (${finish}) with ${r.text.length}c`)
+                emitError("The answer was cut off — it hit the reply length limit. Ask for a shorter version, or ask it to continue.")
+                return
+            }
+            if (finish === "refusal" || finish === "content_filter") {
+                log(`provider refused the turn (${finish})`)
+                emitError("The provider declined to answer this. Rephrasing may help; if not, it is a limit of the model you selected.")
+                return
+            }
+
+            // No tool calls → the model answered. An answer with NO text is still
+            // an abnormal end: the UI would paint an empty bubble, i.e. silence.
+            if (!r.text.trim()) {
+                log(`turn ended with empty completion (stop=${r.stopReason || "?"})`)
+                emitError("The model ended the turn without replying. Try again, or pick a different model in Settings → AI.")
+                return
+            }
+            break
+        }
+        // Fell out of the loop still calling tools: the model never converged on
+        // an answer. Say so — this used to end as a silent `done`.
+        if (step > MAX_STEPS) {
+            log(`turn hit the ${MAX_STEPS}-step cap without a final answer`)
+            emitError(`Stopped after ${MAX_STEPS} tool steps without a final answer.`)
+            return
+        }
+    } finally {
+        // `done` carries the turn's cost and NOTHING else, so it belongs in the
+        // finally: it used to sit on the success path only, which meant the
+        // expensive failures were exactly the ones the island never counted.
+        // Written at the turn boundary, which is also the only point where the
+        // history is in a consistent state (every tool_use has its result — a
+        // half-written turn restored later would be rejected by the provider).
+        saveSession()
+        emit({ t: "done", usage: turnUsage })
+        log(`turn end: steps=${Math.min(step, MAX_STEPS)} tok=${turnUsage.input}/${turnUsage.output}${turnUsage.thought ? ` think=${turnUsage.thought}` : ""} cached=${turnUsage.cached} ${Math.round((GLib.get_monotonic_time() - t0) / 1000)}ms`)
+        emit({ t: "state", s: "idle" })
+    }
+}
+
+// ── Protocol dispatch ────────────────────────────────────────────────────────
+
+function handleMessage(msg) {
+    switch (msg?.t) {
+        case "user":
+            if (busy) { log("dropped a user turn: still busy"); return }   // one turn at a time; the shell disables input while busy
+            cancelled = false
+            busy = true
+            runTurn(String(msg.text || ""))
+                // The last net: anything thrown outside runTurn's own handling
+                // still reaches the user as a message instead of dying quietly.
+                .catch((e) => { log(`turn threw: ${e?.stack || e}`); emitError(String(e?.message ?? e)) })
+                .finally(() => { busy = false })
+            break
+        case "cancel":
+            log("cancel")
+            cancelled = true
+            if (currentCurl) { try { currentCurl.force_exit() } catch {} }
+            break
+        case "reset":
+            log("reset: history cleared")
+            history.length = 0
+            turnStartIndex = 0
+            // "New conversation" must mean it on disk too, or the next restart
+            // resurrects the thread the user just discarded.
+            clearSession()
+            systemCache = null
+            toolsetCache = null
+            // Re-scanned on the next turn, so a skill edited in a --dev checkout
+            // takes effect on "new conversation" instead of needing a respawn.
+            skillsCache = null
+            // The model's memory of what it read is gone with the history, so the
+            // no-blind-overwrite check must forget too — otherwise a fresh
+            // conversation inherits permission to overwrite a file it can no
+            // longer see.
+            readThisSession.clear()
+            cancelled = true
+            if (currentCurl) { try { currentCurl.force_exit() } catch {} }
+            break
+    }
+}
+
+const loop = new GLib.MainLoop(null, false)
+const stdin = new Gio.DataInputStream({
+    base_stream: new GioUnix.InputStream({ fd: 0, close_fd: false }),
+})
+function readLoop() {
+    stdin.read_line_async(GLib.PRIORITY_DEFAULT, null, (src, res) => {
+        let line
+        try { [line] = src.read_line_finish_utf8(res) } catch (e) { log(`stdin read failed: ${e} — exiting`); return loop.quit() }
+        if (line === null) { log("shell closed stdin — exiting"); return loop.quit() }   // normal shutdown
+        if (line.trim()) {
+            try { handleMessage(JSON.parse(line)) } catch (e) { log(`bad message: ${e}`); emitError(`bad message: ${e}`) }
+        }
+        readLoop()
+    })
+}
+
+log("started")
+// Before the first message, so a restored conversation is already the model's
+// context when the user's next turn arrives.
+loadSession()
+readLoop()
+loop.run()

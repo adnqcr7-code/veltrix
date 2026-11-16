@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  VELTRIX Anonymity (Tor mode) — privileged actions.
+
+  What these authorise: running /usr/bin/veltrix-anonymity as root, for
+  exactly one verb each. The helper is deliberately narrow: it takes no
+  URL, path, version or hash from its caller, it can only apply the fixed
+  Tor ruleset generated from constants in its own source, and there is
+  no credential anywhere for a compromised caller to steal — no sudo
+  password is saved, in any file, keyring or environment variable, not
+  even briefly. That is the same design as the background updater
+  (org.veltrix.update.policy) and the Content Safety action
+  (org.veltrix.content-safety.policy): pkexec spawns the helper on
+  demand and exits; the polkit policy is the whole authorisation
+  surface, and it is one file.
+
+  The three actions deliberately do NOT share one authorisation level.
+  Turning protection ON is always safe, so it needs no password:
+  a compromised process that turns Tor mode on can at worst block the
+  machine's traffic until Tor starts (a nuisance, not a leak). Turning
+  protection OFF is the sensitive direction: malware that could
+  silently turn Tor mode off could silently de-anonymise the user, so
+  `off` needs the admin password — the prompt IS the user's consent.
+  Installing the tor package is also a password action: it is a package
+  install, and it must never happen silently.
+
+  allow_active=yes (on): the user sitting at the machine (the active
+  local session) turns Tor mode on without a password.
+  allow_any / allow_inactive=auth_admin (all three): a remote or
+  inactive session still needs an admin password, so Tor mode cannot be
+  switched from anywhere but the machine itself.
+
+  The org.freedesktop.policykit.exec.path annotation pins each action
+  to this one binary, and argv1 pins the verb. pkexec refuses to run
+  anything else under them.
+-->
+<policyconfig>
+  <action id="org.veltrix.anonymity.on">
+    <description>Turn on VELTRIX Tor mode (route all traffic through Tor)</description>
+    <message>Authentication is required to turn on Tor mode</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/veltrix-anonymity</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">on</annotate>
+  </action>
+
+  <action id="org.veltrix.anonymity.off">
+    <description>Turn off VELTRIX Tor mode (restore normal routing)</description>
+    <message>Authentication is required to turn off Tor mode</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/veltrix-anonymity</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">off</annotate>
+  </action>
+
+  <action id="org.veltrix.anonymity.install-tor">
+    <description>Install the Tor package for VELTRIX Tor mode</description>
+    <message>Authentication is required to install Tor</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/veltrix-anonymity</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">install-tor</annotate>
+  </action>
+</policyconfig>

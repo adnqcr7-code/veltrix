@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+import Gtk from "gi://Gtk?version=4.0"
+import { dialogButtonRow } from "./dialog-buttons"
+import { setWindowAppId } from "./platform/app-id"
+
+export interface FormResponse {
+    id: string
+    label: string
+    /** Red / danger styling */
+    destructive?: boolean
+    /** Accent / suggested-action styling */
+    suggested?: boolean
+    /** Initial button sensitivity (default: true) */
+    sensitive?: boolean
+}
+
+export interface FormDialogHandle {
+    readonly window: Gtk.Window
+    close: (id?: string) => void
+    setResponseSensitive: (id: string, sensitive: boolean) => void
+    setResponseLabel: (id: string, label: string) => void
+}
+
+export interface VeltrixFormDialogOpts {
+    parent?: Gtk.Window | null
+    title?: string
+    heading: string
+    body?: string
+    appId?: string
+    width?: number
+    content: Gtk.Widget
+    responses: FormResponse[]
+    onResponse?: (id: string, handle: FormDialogHandle) => void
+}
+
+/**
+ * showVeltrixFormDialog — modal form dialog with floating glass styling.
+ *
+ * Universal form dialog primitive for veltrix-kit. Creates and presents an
+ * undecorated, floating-glass modal Gtk.Window with a header (heading + subtitle),
+ * a body slot for arbitrary form inputs, a horizontal separator, and a footer
+ * response button row matching `showVeltrixAlert`.
+ */
+export function showVeltrixFormDialog(opts: {
+    parent?: Gtk.Window | null
+    title?: string
+    heading: string
+    body?: string
+    appId?: string
+    width?: number
+    content: Gtk.Widget
+    responses: FormResponse[]
+    onResponse?: (id: string, handle: FormDialogHandle) => void
+}): FormDialogHandle {
+    const { parent, title, heading, body, appId, width, content, responses, onResponse } = opts
+
+    // ── Window ────────────────────────────────────────────────────────────────
+    const dialog = new Gtk.Window({
+        title: title ?? heading,
+        modal: true,
+        resizable: false,
+        decorated: false,
+        default_width: width ?? 380,
+        css_classes: ["veltrix-alert-dialog", "veltrix-form-dialog"],
+    })
+    setWindowAppId(dialog, appId ?? "veltrix-settings")
+    if (parent) dialog.set_transient_for(parent)
+
+    // ── Layout ────────────────────────────────────────────────────────────────
+    const root = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+    })
+
+    // Heading
+    root.append(new Gtk.Label({
+        label: heading,
+        wrap: true,
+        justify: Gtk.Justification.CENTER,
+        css_classes: ["veltrix-alert-heading"],
+        margin_top: 24,
+        margin_start: 24,
+        margin_end: 24,
+    }))
+
+    // Subtitle / Body (optional)
+    if (body) {
+        root.append(new Gtk.Label({
+            label: body,
+            wrap: true,
+            justify: Gtk.Justification.CENTER,
+            css_classes: ["veltrix-alert-body"],
+            margin_top: 8,
+            margin_start: 24,
+            margin_end: 24,
+        }))
+    }
+
+    // Content container slot
+    const contentBox = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        margin_start: 24,
+        margin_end: 24,
+        margin_top: 16,
+        // No bottom margin: the response row (dialog-buttons) carries the 24px gap
+        // itself, as in showVeltrixAlert — both margins would stack to 44.
+        margin_bottom: 0,
+    })
+    contentBox.append(content)
+    root.append(contentBox)
+
+    const buttonMap = new Map<string, Gtk.Button>()
+    let isClosed = false
+
+    const cancelId = (responses.find(r => !r.destructive) ?? responses[0])?.id ?? ""
+
+    const handle: FormDialogHandle = {
+        window: dialog,
+        close: (_id?: string) => {
+            if (isClosed) return
+            isClosed = true
+            dialog.destroy()
+        },
+        setResponseSensitive: (id: string, sensitive: boolean) => {
+            const btn = buttonMap.get(id)
+            if (btn) btn.sensitive = sensitive
+        },
+        setResponseLabel: (id: string, label: string) => {
+            const btn = buttonMap.get(id)
+            if (btn) btn.label = label
+        },
+    }
+
+    const triggerResponse = (id: string) => {
+        if (isClosed) return
+        if (onResponse) {
+            onResponse(id, handle)
+        } else {
+            handle.close(id)
+        }
+    }
+
+    // Close-request / Escape → cancel action
+    dialog.connect("close-request", () => {
+        triggerResponse(cancelId)
+        return true
+    })
+
+    // ── Buttons ───────────────────────────────────────────────────────────────
+    const row = dialogButtonRow(responses, triggerResponse)
+    row.buttons.forEach((btn, id) => buttonMap.set(id, btn))
+    root.append(row.box)
+    dialog.set_child(root)
+    dialog.present()
+
+    return handle
+}

@@ -1,0 +1,205 @@
+import Gtk from "gi://Gtk?version=4.0"
+import ccLayout, { GRID_WIDTH, SIZE_TIER, SizeTier } from "./CCLayoutManager"
+import { WidgetSize } from "../../common/widget-kit"
+import widgetConfig from "../../core/WidgetConfig"
+import registry from "../../widgets/index"
+import { uiIcon } from "../../core/Icons"
+import { t } from "../../core/i18n"
+import SquircleContainer, { GLASS_SHADOW } from "../../common/SquircleContainer"
+import { RADIUS, rowInsetFor } from "../../../lib/veltrix-kit/platform/tokens"
+import { menuRow, menuSeparator } from "../../common/MenuRow"
+import { iconDirection } from "../../../lib/rtl"
+
+// Right-click context menu for CC tiles.
+// Replaces the old cycling "1×1 → 2×1" pill with a standardized size picker
+// (Small / Medium / Large) plus Remove. Built as a floating Gtk.Box hosted in
+// the grid overlay (NOT a Gtk.Popover — see project_veltrix_ui: the GTK binary's
+// popover CSS fallback can't be reset cleanly).
+
+const MENU_W = 188
+const ROW_H = 40
+const TIER_LABEL = {
+    [SizeTier.SMALL]:  "cc.menu.size.small",
+    [SizeTier.MEDIUM]: "cc.menu.size.medium",
+    [SizeTier.LARGE]:  "cc.menu.size.large",
+} as const
+
+// Distinct tiers a widget offers, in ascending order, each tied to its concrete
+// footprint. Dedupes by tier (a widget never declares two sizes of one tier).
+function tierSizes(id: string): Array<{ tier: SizeTier; size: WidgetSize }> {
+    const def = registry.get(id)
+    if (!def) return []
+    const seen = new Set<SizeTier>()
+    const out: Array<{ tier: SizeTier; size: WidgetSize }> = []
+    for (const size of def.supportedSizes) {
+        const tier = SIZE_TIER[size]
+        if (seen.has(tier)) continue
+        seen.add(tier)
+        out.push({ tier, size })
+    }
+    return out.sort((a, b) => a.tier - b.tier)
+}
+
+export interface CCContextMenu {
+    scrim: Gtk.Widget
+    menu: Gtk.Widget
+    open: (id: string, anchorX: number, anchorY: number, gridHeight: number) => void
+    close: () => void
+    isOpen: () => boolean
+}
+
+export interface CCContextMenuOpts {
+    // "Show details" row action — opens the tile's detail panel. The row only
+    // renders for widgets that declare buildCCDetail AND while detailEnabled()
+    // holds (the grid passes `() => !editMode`; a detail opened mid-rearrange
+    // would fight the edit overlay).
+    onShowDetail?: (id: string) => void
+    detailEnabled?: () => boolean
+}
+
+export function createCCContextMenu(opts: CCContextMenuOpts = {}): CCContextMenu {
+    let open = false
+
+    // RTL: direction is process-fixed in the shell (set in main() before any
+    // window exists), so capture it once — doOpen feeds a physical pixel x
+    // into the logical margin_start below (bilingual fix pass, 2026-11-12).
+    const rtl = iconDirection() === Gtk.TextDirection.RTL
+
+    const rows = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        spacing: 2,
+        // The halo from the GLASS, all four sides — the row hover fill spans this box.
+        // Squircle corner (default `n`), so 6: same call as the system menu, and the same
+        // reason the bar's circular panel gets a different number from the same radius.
+        // The card paints its own glass and shadow, so its glass is the shadow's spread
+        // inside its box (SquircleContainer `shadow`).
+        margin_top: rowInsetFor(RADIUS.lg) + GLASS_SHADOW.spread, margin_bottom: rowInsetFor(RADIUS.lg) + GLASS_SHADOW.spread,
+        margin_start: rowInsetFor(RADIUS.lg) + GLASS_SHADOW.spread, margin_end: rowInsetFor(RADIUS.lg) + GLASS_SHADOW.spread,
+    })
+
+    const card = SquircleContainer({
+        child: rows,
+        radius: RADIUS.lg,
+        gloss: true,
+        // Near-opaque: GTK can't blur a widget against sibling content on the same
+        // surface, so the menu must occlude the tiles beneath it. useShellOpacity
+        // keeps it theme-coloured (dark/light) + redrawing on theme toggle.
+        useShellOpacity: true,
+        alpha: 0.97,
+        borderColor: { r: 1, g: 1, b: 1, a: 0.1 },
+        css_classes: ["cc-context-menu"],
+        // Outer glass of a floating element — it sits OVER the tiles, not inside one.
+        // Same recipe as the system menu's wrapper.
+        shadow: GLASS_SHADOW,
+    })
+
+    const menu = new Gtk.Box({
+        halign: Gtk.Align.START, valign: Gtk.Align.START,
+        visible: false,
+        width_request: MENU_W,
+    })
+    menu.append(card)
+
+    // Full-area transparent scrim — click outside dismisses the menu. halign/valign
+    // FILL makes it cover the overlay without hexpand/vexpand (which would propagate
+    // up and let the menu's margin widen the right-anchored grid column → left shift).
+    const scrim = new Gtk.Box({
+        halign: Gtk.Align.FILL, valign: Gtk.Align.FILL,
+        hexpand: false, vexpand: false, visible: false,
+    })
+    const scrimClick = new Gtk.GestureClick()
+    scrimClick.connect("released", () => close())
+    scrim.add_controller(scrimClick)
+
+    const clearRows = () => {
+        let c = rows.get_first_child()
+        while (c) { rows.remove(c); c = rows.get_first_child() }
+    }
+
+    const close = () => {
+        if (!open) return
+        open = false
+        menu.visible = false
+        scrim.visible = false
+        clearRows()
+    }
+
+    // Whether this open would include the "Show details" row (also feeds doOpen's
+    // height estimate so the menu doesn't get clamped short of its last row).
+    const hasDetailRow = (id: string): boolean =>
+        !!(registry.get(id)?.buildCCDetail && opts.onShowDetail && (opts.detailEnabled?.() ?? true))
+
+    const populate = (id: string) => {
+        clearRows()
+        const cur = ccLayout.effectiveSize(id)
+        const tiers = tierSizes(id)
+
+        // "Show details" first — the primary action; sizing/removal are management.
+        if (hasDetailRow(id)) {
+            rows.append(menuRow({
+                label: t("cc.menu.details"),
+                onClick: () => { close(); opts.onShowDetail!(id) },
+            }))
+            rows.append(menuSeparator())
+        }
+
+        // Only offer sizes when there's an actual choice (>1 tier). A single-size
+        // widget shows just Remove — no lone disabled row. A FIXED widget has no Remove
+        // (contract.ts ccFixed), so no separator is owed after its sizes either.
+        const removable = !widgetConfig.ccFixed(id)
+        if (tiers.length > 1) {
+            for (const { tier, size } of tiers) {
+                const isCurrent = size === cur
+                const fits = isCurrent || ccLayout.canResize(id, size)
+                rows.append(menuRow({
+                    label: t(TIER_LABEL[tier]),
+                    checked: isCurrent,
+                    sensitive: !isCurrent && fits,
+                    trailing: !isCurrent && !fits
+                        ? new Gtk.Label({ label: t("cc.menu.size-full"), css_classes: ["veltrix-atomic-label-dim"], valign: Gtk.Align.CENTER })
+                        : undefined,
+                    onClick: () => { ccLayout.resize(id, size); close() },
+                }))
+            }
+            if (removable) rows.append(menuSeparator())
+        }
+
+        // Clear the authoritative placement flag too, else syncCCLayout re-adds the
+        // widget on next load (the CC layout and widgetConfig must agree).
+        if (removable) rows.append(menuRow({
+            label: t("cc.menu.remove"),
+            icon: uiIcon("nd-user-trash"),
+            danger: true,
+            onClick: () => { widgetConfig.setCC(id, false); ccLayout.remove(id); close() },
+        }))
+        // "Show details" and nothing after it (a fixed, single-size widget): no trailing rule.
+        const last = rows.get_last_child()
+        if (last instanceof Gtk.Separator) rows.remove(last)
+    }
+
+    const doOpen = (id: string, anchorX: number, anchorY: number, gridHeight: number) => {
+        populate(id)
+        // A fixed, single-size widget without details has nothing to offer: no empty menu.
+        if (!rows.get_first_child()) return
+        // Estimate height to clamp inside the grid (details + size rows when >1 + remove + padding).
+        const nTiers = tierSizes(id).length
+        const nRows = (hasDetailRow(id) ? 1 : 0) + (nTiers > 1 ? nTiers : 0) + (widgetConfig.ccFixed(id) ? 0 : 1)
+        const estH = nRows * ROW_H + 28
+        const x = Math.max(0, Math.min(anchorX, GRID_WIDTH - MENU_W))
+        const y = Math.max(0, Math.min(anchorY, Math.max(0, gridHeight - estH)))
+        // x is a PHYSICAL pixel offset from the grid's left edge, but the menu
+        // is halign START and margin_start is LOGICAL: under RTL START is the
+        // right edge and margin_start measures from the right, so the menu must
+        // be placed GRID_WIDTH - x - MENU_W from the right to land at physical
+        // x. (v1 fed x straight in, mirroring the menu within the grid.)
+        menu.margin_start = rtl ? Math.max(0, GRID_WIDTH - x - MENU_W) : x
+        menu.margin_top = y
+        open = true
+        scrim.visible = true
+        menu.visible = true
+    }
+
+    return { scrim, menu, open: doOpen, close, isOpen: () => open }
+}
+
+export default createCCContextMenu

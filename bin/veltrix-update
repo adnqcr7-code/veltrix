@@ -1,0 +1,520 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-update — update an installed Veltrix. Installed to /usr/bin/veltrix-update.
+#
+# Three paths, tried in order, and a message for the case that is none:
+#   DEV     — if a dev install registered its own clone (~/.config/veltrix/.dev,
+#             written by `install.sh --dev`) AND that tree is a git checkout,
+#             update from THERE, following the dev branch. Hands over to that
+#             clone's install.sh so the updater itself updates with the repo.
+#   GITHUB  — a release-tarball install (bootstrap.sh from a GitHub release):
+#             .dev points at an extracted tree with no .git, or a .release
+#             marker exists. Fetches the latest GitHub release, downloads that
+#             release's bootstrap.sh + tarball, verifies the tarball against
+#             the hash GitHub publishes for it (the API's asset digest, or
+#             the release's .sha256 sidecar as fallback), and re-runs the
+#             bootstrap — the same install that put the system here. Refuses,
+#             loudly, when the release has no tarball, no bootstrap.sh, or no
+#             verifiable hash, and does nothing when no newer release exists.
+#             FAST UPDATE (2026-11-14): when the release also carries a
+#             delta asset for the installed version
+#             (veltrix-<latest>-delta-from-<current>.tar.gz), the updater
+#             tries that FIRST — it only downloads the files that changed,
+#             and the bootstrap applies it in place so the Rust rebuild
+#             skips unchanged crates. Any delta failure (missing asset,
+#             unverifiable hash, a delta the bootstrap rejects) falls back
+#             to the full tarball, which is the same result, just slower.
+#             The full tarball is always the authoritative path; the delta
+#             is an optimisation that is never required.
+#   PACKAGE — the desktop is installed as the pacman package `veltrix`
+#             (`veltrix` before the 2026-08-30 rename; both are handled): new
+#             releases arrive through the [veltrix] repo on a plain full upgrade,
+#             pacman owns files and deps, no git involved. veltrix-setup then
+#             re-applies the idempotent system/user setup (new config seeds,
+#             greetd refresh, new services).
+#
+# ⚠️ There used to be a FOURTH, "STABLE (script-era)": clone the newest release tag
+# into a temp dir and install from there, migrating a pre-package install to the
+# package on the way. It is gone with install.sh's system path (2026-09-02,
+# nidara-iso PRODUCT.md → step 3). Migrating IS installing the package now, so
+# that branch prints the three commands instead of being a second implementation
+# of them. Nothing else in this file used the clone, which is why REPO_URL left
+# with it.
+# ─────────────────────────────────────────────────────────────────────────────
+set -e
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/veltrix"
+
+# ── Version comparison ────────────────────────────────────────────────────────
+# True when $1 (latest, e.g. 1.2, or an old-scheme 0.13.0-v5) is strictly
+# newer than $2 (current). Two tag schemes, both understood (the scheme
+# changed at 1.2): old releases carry a -vN packaging suffix; releases
+# from 1.2 on are plain dotted versions. Compare the dotted part first,
+# then the suffix (missing = 0). A plain dotted split turns "0-v4" into
+# 0, so v4 and v5 compare EQUAL and the update would never fire. The
+# dotted compare is what makes 1.2 newer than 0.13.0-v7 (1 > 0 in the
+# first component). Mirrors isNewerVersion in
+# ui/shell/core/UpdateCheck.ts and ui/shell/surfaces/settings/pages/About.tsx
+# — keep the three in step.
+veltrix_release_newer() {
+    local _latest="${1#v}" _current="${2#v}"
+    # An unresolvable version never compares as newer — the TS twins
+    # (isNewerVersion) decline the same way; keep the three in step.
+    # The callers already refuse an empty/unresolvable current before
+    # comparing, so this only ever fires on a caller bug.
+    case "$_latest" in ""|"unknown") return 1 ;; esac
+    case "$_current" in ""|"unknown") return 1 ;; esac
+    local _l_base="$_latest" _l_rel=0 _c_base="$_current" _c_rel=0
+    case "$_latest" in
+        *-v[0-9]*)
+            _l_rel="${_latest##*-v}"; _l_base="${_latest%-v*}"
+            case "$_l_rel" in *[!0-9]*) _l_rel=0; _l_base="$_latest" ;; esac
+            ;;
+    esac
+    case "$_current" in
+        *-v[0-9]*)
+            _c_rel="${_current##*-v}"; _c_base="${_current%-v*}"
+            case "$_c_rel" in *[!0-9]*) _c_rel=0; _c_base="$_current" ;; esac
+            ;;
+    esac
+    local -a _la _ca
+    IFS='.' read -ra _la <<< "$_l_base"
+    IFS='.' read -ra _ca <<< "$_c_base"
+    local _i _n=${#_la[@]} _lv _cv
+    [ ${#_ca[@]} -gt "$_n" ] && _n=${#_ca[@]}
+    for (( _i=0; _i<_n; _i++ )); do
+        _lv="${_la[$_i]:-0}"; _cv="${_ca[$_i]:-0}"
+        _lv="${_lv//[^0-9]/}"; _cv="${_cv//[^0-9]/}"
+        _lv="${_lv:-0}"; _cv="${_cv:-0}"
+        if [ "$_lv" -ne "$_cv" ]; then
+            [ "$_lv" -gt "$_cv" ] && return 0 || return 1
+        fi
+    done
+    [ "$_l_rel" -gt "$_c_rel" ]
+}
+
+# True when $1 is exactly 64 lowercase hex chars (a SHA-256 hash).
+_is_sha256() {
+    [ "${#1}" -eq 64 ] || return 1
+    case "$1" in *[!0-9a-f]*) return 1 ;; esac
+    return 0
+}
+
+# ── DEV path: update from the developer's own registered clone ─────────────────
+if [ -f "$CONFIG_DIR/.dev" ]; then
+    DEV_SRC="$(cat "$CONFIG_DIR/.dev" 2>/dev/null)"
+    if [ -n "$DEV_SRC" ] && [ -f "$DEV_SRC/install.sh" ]; then
+        if [ -d "$DEV_SRC/.git" ]; then
+            exec bash "$DEV_SRC/install.sh" --update
+        fi
+        # No .git: an extracted release tarball, not a clone — the GITHUB
+        # path below owns it. Fall through; do NOT exit here.
+    else
+        echo "veltrix-update: dev marker present but '$DEV_SRC' has no install.sh." >&2
+        echo "Re-run ./install.sh --dev from your clone to re-register it." >&2
+        exit 1
+    fi
+fi
+
+# ── Carried local patches: refuse to blindly reinstall over them ──────────────
+# An agent that keeps a local (not-contributed) repo fix for this user records
+# the clone carrying it in .patches — see the in-repo veltrix skill,
+# references/agent-contribution.md ("Carrying a GLOBAL fix locally"). The
+# stateless update below installs pure upstream, which would silently stop
+# applying those patches.
+if [ -f "$CONFIG_DIR/.patches" ]; then
+    PATCH_SRC="$(cat "$CONFIG_DIR/.patches" 2>/dev/null)"
+    echo "veltrix-update: this install carries local patches (clone: ${PATCH_SRC:-unknown})." >&2
+    echo "A plain update would reinstall pure upstream and silently drop them." >&2
+    echo "Ask your agent to update instead — it rebases the patches onto the new release" >&2
+    echo "and reinstalls (procedure in the repo's veltrix skill). To discard the patches" >&2
+    echo "and return to pure upstream:" >&2
+    echo "    rm ~/.config/veltrix/.patches && veltrix-update" >&2
+    exit 1
+fi
+
+# ── GITHUB path: installed from a release tarball (bootstrap.sh) ─────────────
+# A tarball install is recognizable: .dev points at an extracted tree (no
+# .git — the DEV path above only takes real clones), or a .release marker
+# exists. The update source is the GitHub release, never the local tree:
+# fetch releases/latest, and when a newer release exists, download THAT
+# release's bootstrap.sh + tarball, verify the tarball against the hash
+# GitHub publishes for it (the API's asset digest, or the release's .sha256
+# sidecar as fallback), and re-run the bootstrap — the same install that
+# put this system here. The bootstrap re-registers the new tree as
+# .dev/.source and records the new release in .release; the extra-apps
+# question is not re-asked (a recorded choice is never asked twice).
+#
+# Fail-closed, in order: the API unreachable or unparseable → abort; no newer
+# release → say so and do nothing; the release missing its tarball or
+# bootstrap.sh, or publishing no verifiable hash for the tarball → abort.
+# Nothing is written or deleted before the hash verifies, so a failed
+# update leaves the current install untouched. The sidecar is still worth
+# publishing with every release (belt and braces, and the bootstrap's own
+# ${TARBALL_URL}.sha256 fallback reads it), but the API digest alone is
+# enough for this path to verify.
+#
+# The downloaded bootstrap.sh goes to a temp dir OUTSIDE
+# ~/Downloads/veltrix-install: the bootstrap used to wipe that whole tree
+# first (a bootstrap.sh inside it would have deleted itself mid-run), and
+# the temp dir is still the right place — it keeps the bootstrap out of
+# the tree it updates, and it is the same trust as the first install,
+# which also downloads bootstrap.sh before running it. (The bootstrap no
+# longer wipes the work dir — since the fast-update change it stages the
+# download and syncs into the registered tree — but the temp dir stays.)
+#
+# VELTRIX_OS_RELEASES_API_URL overrides the API endpoint. Test-only (same
+# convention as bootstrap.sh's VELTRIX_OS_* overrides); a shipped install
+# leaves it unset.
+REPO="adnqcr7-code/veltrix"
+RELEASES_API="${VELTRIX_OS_RELEASES_API_URL:-https://api.github.com/repos/$REPO/releases/latest}"
+
+_github_install=false
+if [ -f "$CONFIG_DIR/.dev" ]; then
+    _dev_src="$(cat "$CONFIG_DIR/.dev" 2>/dev/null)"
+    if [ -n "$_dev_src" ] && [ -f "$_dev_src/install.sh" ] && [ ! -d "$_dev_src/.git" ]; then
+        _github_install=true
+    fi
+fi
+[ -f "$CONFIG_DIR/.release" ] && _github_install=true
+
+if $_github_install; then
+    _current="$(cat "$CONFIG_DIR/.release" 2>/dev/null || true)"
+    if [ -z "$_current" ]; then
+        # No marker (installs from before the marker existed): fall back to
+        # the installed VERSION — the dev tree first, then the system copy.
+        # Any -vN release is newer than bare 0.13.0, so these machines still
+        # get exactly one update notification, then the marker exists.
+        if [ -n "${_dev_src:-}" ] && [ -f "$_dev_src/VERSION" ]; then
+            _current="$(cat "$_dev_src/VERSION" 2>/dev/null || true)"
+        elif [ -f /usr/share/veltrix/VERSION ]; then
+            _current="$(cat /usr/share/veltrix/VERSION 2>/dev/null || true)"
+        fi
+    fi
+    [ -n "$_current" ] || {
+        echo "veltrix-update: this looks like a release install, but the installed" >&2
+        echo "               version cannot be determined (no .release marker, no" >&2
+        echo "               VERSION file). Reinstall from the latest release." >&2
+        exit 1
+    }
+
+    command -v python3 >/dev/null 2>&1 || {
+        echo "veltrix-update: python3 is required to read the GitHub release (it ships with the install)." >&2
+        exit 1
+    }
+    if ! _api_json="$(curl -fsSL --max-time 15 "$RELEASES_API")"; then
+        echo "veltrix-update: could not reach the GitHub releases API — check your network and retry." >&2
+        echo "               (Install untouched.)" >&2
+        exit 1
+    fi
+    # Parse the release: tag + the assets this path needs. The tarball is
+    # the veltrix-*.tar.gz asset (not GitHub's auto-generated "<tag>.tar.gz"
+    # source archive) — and NOT a delta: a delta is also a
+    # veltrix-*.tar.gz asset, and GitHub's API lists assets newest-first,
+    # so the delta (uploaded after the tarball) comes first and a plain
+    # prefix/suffix match mistakes it for the full tarball. That is exactly
+    # what broke the 1.2 → 1.2.1 update: the updater downloaded the delta as
+    # if it were the full tarball, extracted it, and failed the source-tree
+    # check ("no install.sh/VERSION"). Delta assets carry "-delta-from-" in
+    # the name and are excluded here; the delta is matched by its exact name
+    # below. The tarball's hash comes from the API's own digest for that
+    # asset ("sha256:<hex>", verified against the published v4 hash), with
+    # the release's .sha256 sidecar asset as fallback. The DELTA is the
+    # veltrix-<latest>-delta-from-<current>.tar.gz asset for the installed
+    # version (passed as argv[1]); its hash follows the same digest-then-
+    # sidecar rule. A release without a delta asset for this version simply
+    # has no delta — the full tarball is used instead.
+    if ! _release_info="$(printf '%s' "$_api_json" | python3 -c '
+import json, sys
+try:
+    rel = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+current = sys.argv[1] if len(sys.argv) > 1 else ""
+tag = rel.get("tag_name") or ""
+tarball_name = ""
+tarball_url = ""
+tarball_digest = ""
+for a in rel.get("assets") or []:
+    n = a.get("name") or ""
+    if n.startswith("veltrix-") and n.endswith(".tar.gz") and "-delta-from-" not in n:
+        tarball_name, tarball_url = n, a.get("browser_download_url") or ""
+        tarball_digest = a.get("digest") or ""
+        break
+def url_for(pred):
+    for a in rel.get("assets") or []:
+        if pred(a.get("name") or ""):
+            return a.get("browser_download_url") or ""
+    return ""
+def digest_for(name):
+    for a in rel.get("assets") or []:
+        if (a.get("name") or "") == name:
+            return a.get("digest") or ""
+    return ""
+delta_name = ""
+if tarball_name.startswith("veltrix-") and tarball_name.endswith(".tar.gz") and current:
+    tarball_ver = tarball_name[len("veltrix-"):-len(".tar.gz")]
+    delta_name = "veltrix-%s-delta-from-%s.tar.gz" % (tarball_ver, current)
+print(tag)
+print(tarball_name)
+print(tarball_url)
+print(url_for(lambda n: n == "bootstrap.sh"))
+print(url_for(lambda n: tarball_name != "" and n == tarball_name + ".sha256"))
+print(tarball_digest)
+print(url_for(lambda n: delta_name != "" and n == delta_name))
+print(digest_for(delta_name) if delta_name else "")
+print(url_for(lambda n: delta_name != "" and n == delta_name + ".sha256"))
+' "$_current")"; then
+        echo "veltrix-update: the GitHub API answer did not parse — aborting, install untouched." >&2
+        exit 1
+    fi
+    # The last read hits EOF (the trailing line is empty once command
+    # substitution strips it), so the group must not fail under set -e.
+    { IFS= read -r _latest_tag
+      IFS= read -r _tarball_name
+      IFS= read -r _tarball_url
+      IFS= read -r _bootstrap_url
+      IFS= read -r _sidecar_url
+      IFS= read -r _tarball_digest
+      IFS= read -r _delta_url
+      IFS= read -r _delta_digest
+      IFS= read -r _delta_sidecar_url
+    } <<< "$_release_info" || true
+    [ -n "$_latest_tag" ] || {
+        echo "veltrix-update: the latest release has no tag — aborting, install untouched." >&2
+        exit 1
+    }
+    _latest="${_latest_tag#v}"
+    # The tag and the tarball name come from the API response — a remote
+    # input, not a local file — so both are shape-checked before anything
+    # is compared against them or downloaded from a URL built on them.
+    # A tag that is not a plain dotted version (optionally with the old
+    # -vN suffix) aborts the update instead of being trusted: the
+    # comparison would otherwise treat its non-numeric parts as 0 and
+    # could offer — or hide — an update on garbage.
+    if [[ ! "$_latest" =~ ^[0-9]+(\.[0-9]+)*(-v[0-9]+)?$ ]]; then
+        echo "veltrix-update: the latest release tag '$_latest_tag' is not a version — aborting, install untouched." >&2
+        exit 1
+    fi
+    case "$_tarball_name" in
+        veltrix-*.tar.gz) : ;;
+        *)
+            echo "veltrix-update: release $_latest_tag has an unexpected tarball name '$_tarball_name' — aborting, install untouched." >&2
+            exit 1
+            ;;
+    esac
+    case "$_tarball_name" in */*|*..*) echo "veltrix-update: tarball name '$_tarball_name' contains a path — aborting, install untouched." >&2; exit 1 ;; esac
+    if ! veltrix_release_newer "$_latest" "$_current"; then
+        echo "veltrix-update: already up to date (installed $_current; latest release is $_latest)."
+        exit 0
+    fi
+    [ -n "$_tarball_url" ] || {
+        echo "veltrix-update: release $_latest_tag has no veltrix-*.tar.gz asset — aborting, install untouched." >&2
+        exit 1
+    }
+    [ -n "$_bootstrap_url" ] || {
+        echo "veltrix-update: release $_latest_tag has no bootstrap.sh asset — aborting, install untouched." >&2
+        exit 1
+    }
+    # The expected hash: the API digest first, the sidecar asset as
+    # fallback. A malformed digest fails closed (never install on a hash
+    # that does not parse); a missing digest falls back to the sidecar.
+    _expected="${_tarball_digest#sha256:}"
+    if [ -n "$_expected" ] && ! _is_sha256 "$_expected"; then
+        echo "veltrix-update: the API digest for $_tarball_name is malformed — aborting, install untouched." >&2
+        exit 1
+    fi
+    if [ -z "$_expected" ] && [ -n "$_sidecar_url" ]; then
+        if _sidecar_hash="$(curl -fsSL --max-time 15 "$_sidecar_url" | awk '{print $1}')"; then
+            if _is_sha256 "$_sidecar_hash"; then
+                _expected="$_sidecar_hash"
+            else
+                echo "veltrix-update: the sidecar did not contain a valid SHA-256 hash — aborting, install untouched." >&2
+                exit 1
+            fi
+        else
+            echo "veltrix-update: could not download the release's .sha256 sidecar — aborting, install untouched." >&2
+            exit 1
+        fi
+    fi
+    [ -n "$_expected" ] || {
+        echo "veltrix-update: release $_latest_tag publishes no verifiable hash for" >&2
+        echo "               $_tarball_name (no API digest, no .sha256 sidecar) —" >&2
+        echo "               refusing to install an unverified tarball. Install untouched." >&2
+        exit 1
+    }
+    # The delta's expected hash, same rule (API digest, then sidecar).
+    # Unlike the tarball, a delta without a verifiable hash is NOT an
+    # abort — the delta is an optimisation, so it is simply skipped and
+    # the full tarball (whose hash is verified above) is used instead.
+    _delta_expected="${_delta_digest#sha256:}"
+    if [ -n "$_delta_url" ] && [ -n "$_delta_expected" ] && ! _is_sha256 "$_delta_expected"; then
+        echo "veltrix-update: the API digest for the delta is malformed — skipping the delta, using the full tarball." >&2
+        _delta_url=""; _delta_expected=""
+    fi
+    if [ -n "$_delta_url" ] && [ -z "$_delta_expected" ] && [ -n "$_delta_sidecar_url" ]; then
+        if _delta_sidecar_hash="$(curl -fsSL --max-time 15 "$_delta_sidecar_url" | awk '{print $1}')"; then
+            if _is_sha256 "$_delta_sidecar_hash"; then
+                _delta_expected="$_delta_sidecar_hash"
+            else
+                echo "veltrix-update: the delta sidecar did not contain a valid SHA-256 hash — skipping the delta, using the full tarball." >&2
+                _delta_url=""; _delta_expected=""
+            fi
+        else
+            echo "veltrix-update: could not download the delta's .sha256 sidecar — skipping the delta, using the full tarball." >&2
+            _delta_url=""; _delta_expected=""
+        fi
+    fi
+    if [ -n "$_delta_url" ] && [ -z "$_delta_expected" ]; then
+        echo "veltrix-update: the release publishes no verifiable hash for the delta — skipping the delta, using the full tarball." >&2
+        _delta_url=""
+    fi
+
+    _tmp="$(mktemp -d)"
+    trap 'rm -rf "$_tmp"' EXIT
+    if ! curl -fSL --proto=https -o "$_tmp/bootstrap.sh" "$_bootstrap_url"; then
+        echo "veltrix-update: could not download the release's bootstrap.sh — aborting, install untouched." >&2
+        exit 1
+    fi
+    echo "veltrix-update: updating $_current → $_latest from GitHub ($_latest_tag)…"
+    # Interactive on purpose (no --noconfirm anywhere below): the bootstrap
+    # runs a full system upgrade and asks the sudo password where needed —
+    # the user sees it and can refuse it, in this terminal.
+    #
+    # FAST UPDATE: when the release carries a delta for the installed
+    # version AND a registered extracted tree exists to apply it to, try
+    # the delta first — it downloads only the changed files and the
+    # bootstrap applies them in place. Any delta failure falls back to
+    # the full tarball, which converges the tree (its rsync --delete
+    # replaces the whole tree) and is the same result, just slower. The
+    # fallback is why a delta failure is a slowdown, never a broken
+    # install — and why the delta is attempted only when the tree exists
+    # (a .release marker alone, with no tree, cannot take a delta).
+    _updated=false
+    if [ -n "$_delta_url" ] && [ -n "$_delta_expected" ] \
+        && [ -n "${_dev_src:-}" ] && [ -f "$_dev_src/install.sh" ] && [ ! -d "$_dev_src/.git" ]; then
+        echo "veltrix-update: a delta is available for $_current — trying the fast update (only the changed files)…"
+        if bash "$_tmp/bootstrap.sh" --delta "$_delta_url" "$_delta_expected" --full-name "$_tarball_name"; then
+            _updated=true
+        else
+            echo "veltrix-update: the delta update failed — falling back to the full tarball (slower, same result)." >&2
+        fi
+    fi
+    if [ "$_updated" = false ]; then
+        if ! bash "$_tmp/bootstrap.sh" "$_tarball_url" "$_expected"; then
+            echo "veltrix-update: the update failed — your current install is untouched." >&2
+            echo "               (Photograph the output above and report it; do not re-run blindly.)" >&2
+            exit 1
+        fi
+    fi
+    # The bootstrap records the release from the tarball name; the tag is
+    # authoritative, so write it as well (belt and braces).
+    printf '%s\n' "$_latest" > "$CONFIG_DIR/.release"
+    echo "veltrix-update: $_current → $_latest."
+    # Reload the running shell so the new bundle takes effect now; greeter
+    # and lockscreen pick theirs up on next use.
+    if systemctl --user is-active --quiet veltrix.service 2>/dev/null; then
+        systemctl --user restart veltrix.service || true
+        echo "veltrix-update: shell reloaded."
+    fi
+    # Same inode-watch reason as the PACKAGE path: the upgrade replaced
+    # /usr/share/veltrix/config/hypr/hyprland.lua under the live compositor.
+    if [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ] || [ -n "$HYALO_SOCKET" ]; then
+        veltrix-wm reload >/dev/null 2>&1 || true
+    fi
+    # The user's own scripts for this event, if any (see bin/veltrix-hook).
+    veltrix-hook update-completed "$_current" "$_latest" || true
+    exit 0
+fi
+
+# ── PACKAGE path: installed via pacman → update via pacman ───────────────────
+# NOTE this must stay AFTER the .patches guard: a patched install is a locally
+# built package, and a blind -Syu would replace it with pure upstream the
+# moment the repo serves a newer release — silently dropping the patches.
+# ⚠️ The package was renamed `veltrix` → `veltrix` on 2026-08-30, and the
+# upgrade below is the very thing that performs the rename on a machine that has
+# not taken it yet: `old_v` is read BEFORE it, possibly under the old name, and
+# `new_v` AFTER, necessarily under the new one. So both reads ask "whichever of
+# the two is installed" instead of naming one. A version read from a name pacman
+# has just retired comes back EMPTY and does not fail — it would make the
+# comparison below announce a change that did not happen, or miss one that did.
+_installed_desktop_pkg() {
+    for _p in veltrix veltrix; do
+        if pacman -Qq "$_p" >/dev/null 2>&1; then printf '%s\n' "$_p"; return 0; fi
+    done
+    return 1
+}
+
+if _pkg="$(_installed_desktop_pkg)"; then
+    old_v="$(pacman -Q "$_pkg" | awk '{print $2}')"
+    echo "veltrix-update: the desktop is pacman-managed ($_pkg $old_v) — running a full system upgrade…"
+    # Interactive on purpose (no --noconfirm): this is a FULL system upgrade,
+    # the user should see what it pulls in. Declining aborts the update.
+    sudo pacman -Syu
+    # Re-resolve: the upgrade may have changed the package's NAME under us.
+    _pkg="$(_installed_desktop_pkg)" || { echo "veltrix-update: the desktop package is gone after the upgrade — aborting." >&2; exit 1; }
+    new_v="$(pacman -Q "$_pkg" | awk '{print $2}')"
+    veltrix-setup
+    if [ "$old_v" = "$new_v" ]; then
+        echo "veltrix-update: already up to date ($_pkg $new_v)."
+    else
+        echo "veltrix-update: $_pkg $old_v → $new_v."
+        # Reload the running shell so the new bundle takes effect now; greeter
+        # and lockscreen pick theirs up on next use.
+        if systemctl --user is-active --quiet veltrix.service 2>/dev/null; then
+            systemctl --user restart veltrix.service || true
+            echo "veltrix-update: shell reloaded."
+        fi
+        # The upgrade replaced /usr/share/veltrix/config/hypr/hyprland.lua under
+        # the live compositor: Hyprland's config watch fires mid-extract, errors
+        # "cannot open … hyprland.lua", and the banner sticks — the watch died
+        # with the old inode, so it never sees the new file land. Reload now
+        # that it's in place. (Hyalo polls its files and sees the new one land; the
+        # reload is harmless there.) No-op outside a graphical session.
+        if [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ] || [ -n "$HYALO_SOCKET" ]; then
+            veltrix-wm reload >/dev/null 2>&1 || true
+        fi
+        # The user's own scripts for this event, if any (see bin/veltrix-hook).
+        # LAST, and only when the version actually moved: hooks are synchronous
+        # and each may take its full timeout, so firing them earlier would hold
+        # the shell reload behind somebody's script.
+        veltrix-hook update-completed "$old_v" "$new_v" || true
+    fi
+    exit 0
+fi
+
+# ── No package, no dev clone: an install from before the package model ───────
+# There is nothing left here to drive such an update. `install.sh` lost its system
+# path on 2026-09-02 (nidara-iso PRODUCT.md, "What does NOT change" → step 3), so
+# the stateless clone-and-install this branch used to do has no implementation and
+# no reason to have one: migrating to the package IS the three commands below, and
+# they are the same ones a first-time install runs.
+#
+# Judged safe to drop rather than reimplement: the package model landed in August
+# 2026 and pre-package installs are not believed to exist in the wild. If one
+# does, it is not broken by this — it is told exactly what to run, which is more
+# than the old path explained while it was doing it.
+echo "veltrix-update: this install predates the package model — there is no package" >&2
+echo "               and no registered dev clone to update from." >&2
+echo "" >&2
+echo "Install the package once; every later update is then 'veltrix-update' or a" >&2
+echo "plain 'pacman -Syu', and pacman owns the files:" >&2
+echo "" >&2
+echo "    # TODO — the [veltrix] repo and its signing key do not exist yet;" >&2
+echo "    # see the README. The key commands are commented out on purpose and" >&2
+echo "    # must not run until a release publishes the repo and the real key." >&2
+echo "    # (The fingerprint that used to be printed here was upstream Nidara's" >&2
+echo "    # key; it must not be trusted for this fork.)" >&2
+echo "    # curl --proto=https -O https://adnqcr7-code.github.io/veltrix-repo/veltrix.gpg" >&2
+echo "    # sudo pacman-key --add veltrix.gpg" >&2
+echo "    # sudo pacman-key --lsign-key <FINGERPRINT — published with the first release>" >&2
+echo "" >&2
+echo "    # then add to /etc/pacman.conf:" >&2
+echo "    #   [veltrix]" >&2
+echo "    #   SigLevel = Required DatabaseOptional" >&2
+echo "    #   Server = https://adnqcr7-code.github.io/veltrix-repo/\$arch" >&2
+echo "" >&2
+echo "    sudo pacman -Syu veltrix && veltrix-setup" >&2
+echo "" >&2
+echo "The files this install wrote into /usr are handed over by that upgrade." >&2
+echo "Your configuration in ~/.config/veltrix/ is not touched." >&2
+exit 1

@@ -1,0 +1,20 @@
+# /etc/dconf/profile/user — installed by veltrix.
+#
+# WHY THIS FILE HAS TO EXIST, measured rather than assumed: dconf's built-in
+# default profile is `user-db:user` and NOTHING ELSE. A compiled system database
+# at /etc/dconf/db/local is simply not consulted until a profile names it — with
+# the database in place and this file removed, a virgin account reads 'Adwaita';
+# with it back, 'WhiteSur'. Both arms run.
+#
+# (VELTRIX fork, Phase 0: the system default icon theme is now WhiteSur, not
+# Papirus. The measurement above predates that change and must be re-verified
+# on the Dell — see docs/dell-validation-phase0.md.)
+#
+# ORDER IS THE WHOLE POINT. `user-db:user` comes FIRST, so anything the person
+# chose wins over anything we default. Verified: an account that deliberately set
+# Adwaita keeps Adwaita while the system default says WhiteSur.
+#
+# No package owned this path before us (checked with `pacman -Qo`), which is why
+# we can own it outright — the same situation as /etc/os-release.
+user-db:user
+system-db:local

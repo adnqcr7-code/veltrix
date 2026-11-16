@@ -1,0 +1,19 @@
+# One native GJS runner per name below; each is its own file in /usr/lib/veltrix/
+# so /proc/PID/exe names the program. Read by build.sh, scripts/bundle.sh,
+# the packaging and scripts/ci/native-host-check.py — add a name HERE only.
+#
+# Bundles (scripts/bundle.sh --native-host=<name>):
+veltrix-shell
+veltrix-settings
+veltrix-greeter
+veltrix-lock
+veltrix-installer
+# Helper scripts in bin/ (their shebang is #!/usr/lib/veltrix/<name>):
+veltrix-a11y
+veltrix-act
+veltrix-agent
+veltrix-click
+veltrix-mcp
+veltrix-portal
+veltrix-share-chooser
+veltrix-type

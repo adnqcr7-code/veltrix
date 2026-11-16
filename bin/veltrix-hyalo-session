@@ -1,0 +1,38 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-hyalo-session — the "Veltrix — Hyalo preview" session (#681)
+# Installed to /usr/bin by the veltrix-hyalo package; started by the greeter through
+# /usr/share/wayland-sessions/veltrix-hyalo.desktop.
+#
+# The same environment as the Hyprland session (bin/veltrix), then Hyalo under uwsm. Hyalo's
+# autostart (/usr/share/veltrix/hyalo/hyalo.toml) runs `uwsm finalize` and starts the shell.
+# Veltrix on Hyprland stays the default session; this one is for testing until Hyalo reaches
+# parity (#680).
+# ─────────────────────────────────────────────────────────────────────────────
+
+exec 1>/dev/null 2>&1
+
+export GDK_BACKEND=wayland,x11
+export XDG_SESSION_TYPE=wayland
+export VELTRIX_SESSION=rust
+export MOZ_ENABLE_WAYLAND=1
+export ELECTRON_OZONE_PLATFORM_HINT=auto
+export OZONE_PLATFORM=wayland
+export QT_QPA_PLATFORMTHEME=xdgdesktopportal
+export CLUTTER_BACKEND=wayland
+# GTK_IM_MODULE stays unset on purpose — see bin/veltrix.
+export INPUT_METHOD=fcitx
+export QT_IM_MODULE=fcitx
+export XMODIFIERS=@im=fcitx
+export SDL_IM_MODULE=fcitx
+export GI_TYPELIB_PATH="/usr/lib/girepository-1.0:/usr/local/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+export LD_LIBRARY_PATH="/usr/lib:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# First-login seeding, as in bin/veltrix.
+if [ ! -d "$HOME/.config/veltrix" ] && command -v veltrix-setup >/dev/null 2>&1; then
+    veltrix-setup --user > "${XDG_RUNTIME_DIR:-/tmp}/veltrix-first-login.log" 2>&1 || true
+fi
+
+# `--session`: this is a real session, so Hyalo runs its autostart. Its log goes to the
+# journal through uwsm's unit (`journalctl --user -u 'wayland-wm@*'`).
+exec uwsm start -e -D Veltrix -N "Veltrix — Hyalo preview" -- veltrix-hyalo --session

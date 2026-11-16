@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "jsx": "react",
+    // Default lib for target ES2020 + the ES2021 Intl slice. GJS's SpiderMonkey
+    // ships full ICU — `Intl.ListFormat` and friends work at runtime — but the
+    // ES2020 lib does not DECLARE them, and `target` cannot be raised to reach
+    // them: it is pinned at ES2020 on purpose (it is what keeps
+    // `useDefineForClassFields` off, without which define-semantics would shadow
+    // the property accessors on every GObject subclass — see scripts/bundle.sh).
+    // esbuild reads target/jsx from this file and ignores `lib`, so the bundle is
+    // byte-identical with and without this line (checked).
+    "lib": ["ES2020", "ES2021.Intl", "DOM"],
+    "module": "ES2022",
+    "moduleResolution": "node",
+    // Lets a module spell a sibling with its real ".ts" extension. Needed by
+    // `surfaces/settings/configLocations.ts`, which the CI contract check IMPORTS
+    // with `node --experimental-strip-types` — Node does not resolve extensionless
+    // specifiers, and importing the real derivation is what keeps that check from
+    // growing a second copy of the walk it is meant to verify. Safe here because
+    // `noEmit` is on: nothing is written that could keep the extension.
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": false,
+    "target": "ES2020"
+  },
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    "**/*.d.ts",
+    "@girs/**/*"
+  ]
+}

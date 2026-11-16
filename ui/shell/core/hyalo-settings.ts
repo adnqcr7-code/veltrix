@@ -1,0 +1,212 @@
+// hyalo-settings.ts — `CompositorSettings` on Hyalo (#682).
+//
+// Hyalo keeps what Settings chose in `~/.config/veltrix/hyalo-settings.toml`, the layer it
+// reads between its shipped defaults and the user's own `hyalo.toml` (which wins, as
+// `hyprland-user.lua` does). The shell never writes that file: it sends a patch in the
+// config's own shape (`settings`), and Hyalo merges it, checks the whole stack, writes the
+// file and reloads once (hyalo/compositor/src/config.rs, `apply_settings`). One writer, so
+// two settings changed one after the other cannot drop each other's tables — which they
+// would have when MonitorConfig wrote the file whole. A patch that changes nothing writes
+// nothing and reloads nothing, so re-stating settings on "config-reloaded" cannot loop.
+//
+// Reads ask `config`: the three layers merged, the keyboard with the system's layout filled
+// in — what is in force, not what Settings last said.
+//
+// What Hyalo does not have yet is a no-op here and false in `caps`: its per-surface blur
+// (#684).
+
+import * as hyalo from "./hyalo-ipc"
+import type { HyaloVrr } from "./hyalo-ipc"
+import { GLASS_BLUR } from "./VeltrixTheme"
+import {
+    TRANSFORM_NAMES, type CompositorSettings, type IdleConfig, type InputKey, type InputSettings, type MonitorSetting,
+} from "./compositor-types"
+
+/** The config in force, or null when Hyalo cannot be asked. */
+function config(): any | null {
+    return hyalo.request({ request: "config" })?.ok?.config ?? null
+}
+
+/** A change to the settings layer. A refusal is said with "Hyalo refused", which the CI
+ *  smoke looks for (scripts/ci/hyalo-smoke.sh). */
+function patch(what: string, p: object, strict = false) {
+    const reply = hyalo.request({ request: "settings", patch: p })
+    const error = !reply ? "Hyalo could not be reached" : reply.error
+    if (error) {
+        console.error(`[HyaloSettings] Hyalo refused ${what}: ${error}`)
+        if (strict) throw Error(`${what}: ${error}`)
+    }
+}
+
+/** Where each input setting lives in Hyalo's config. Hyprland's sensitivity and profile
+ *  reach every pointing device; Hyalo has them per kind, so both kinds get them. */
+const INPUT: Record<InputKey, string[]> = {
+    pointerSpeed: ["pointer.accel_speed", "touchpad.accel_speed"],
+    accelProfile: ["pointer.accel_profile", "touchpad.accel_profile"],
+    mouseNaturalScroll: ["pointer.natural_scroll"],
+    numlockOnBoot: ["keyboard.numlock"],
+    kbLayout: ["keyboard.layout"],
+    kbVariant: ["keyboard.variant"],
+    kbRepeatDelay: ["keyboard.repeat_delay"],
+    kbRepeatRate: ["keyboard.repeat_rate"],
+    touchpadNaturalScroll: ["touchpad.natural_scroll"],
+    touchpadTap: ["touchpad.tap"],
+}
+
+function at(obj: any, path: string): any {
+    return path.split(".").reduce((o, k) => o?.[k], obj)
+}
+
+function put(obj: any, path: string, value: unknown) {
+    const keys = path.split(".")
+    let o = obj
+    for (const k of keys.slice(0, -1)) o = o[k] ??= {}
+    o[keys[keys.length - 1]] = value
+}
+
+/** Settings' VRR choice (0 off, 1 on, 2 on demand = any fullscreen window) as Hyalo's `vrr`. */
+function hyaloVrr(vrr: number): HyaloVrr {
+    return vrr === 2 ? "fullscreen" : vrr === 1
+}
+
+export function createHyaloSettings(): CompositorSettings {
+    return {
+        caps: { animations: true, vrrOnDemand: "fullscreen", windowControls: true, recordedPointer: true, mirror: false },
+
+        async readInput(current) {
+            const input = config()?.input
+            if (!input) return current
+            const next = { ...current }
+            for (const [key, [path]] of Object.entries(INPUT) as [InputKey, string[]][]) {
+                const v = at(input, path)
+                if (typeof v === typeof current[key]) (next as any)[key] = v
+            }
+            return next
+        },
+
+        setInput(next: InputSettings, changed) {
+            const input = {}
+            for (const key of changed) for (const path of INPUT[key]) put(input, path, next[key])
+            patch(`input ${changed.join(", ")}`, { input })
+        },
+
+        // What the configuration asks, not whether it is on now: with "fullscreen" it is off
+        // until a window goes fullscreen.
+        readVrr(current) {
+            const outputs = hyalo.getOutputs().filter(o => o.vrr_supported)
+            if (!outputs.length) return current
+            if (outputs.some(o => o.vrr === "fullscreen")) return 2
+            return outputs.some(o => o.vrr === true) ? 1 : 0
+        },
+
+        applyMonitor(name, m) {
+            const err = hyalo.setOutput(name, {
+                scale: m.scale,
+                transform: TRANSFORM_NAMES[m.transform] ?? "normal",
+                ...(m.mode ? { mode: m.mode } : {}),
+            })
+            if (err) throw Error(`Hyalo refused ${name}: ${err}`)
+        },
+
+        // Per output, on those that have it (the rest would refuse).
+        applyVrr(vrr) {
+            for (const o of hyalo.getOutputs().filter(o => o.vrr_supported)) {
+                const err = hyalo.setOutput(o.name, { vrr: hyaloVrr(vrr) })
+                if (err) throw Error(`Hyalo refused VRR on ${o.name}: ${err}`)
+            }
+        },
+
+        saveMonitors(monitors: ReadonlyMap<string, MonitorSetting>, vrr: number) {
+            const vrrCapable = new Set(hyalo.getOutputs().filter(o => o.vrr_supported).map(o => o.name))
+            const outputs: Record<string, object> = {}
+            for (const [name, m] of monitors) {
+                outputs[name] = {
+                    // null removes it: back to the preferred mode.
+                    mode: m.mode ?? null,
+                    scale: m.scale,
+                    transform: TRANSFORM_NAMES[m.transform] ?? "normal",
+                    vrr: vrrCapable.has(name) ? hyaloVrr(vrr) : false,
+                }
+            }
+            patch("display", { outputs }, true)
+        },
+
+        saveWorkspaceModes(defaultMode, overrides) {
+            // Every workspace the shell offers is stated, a `null` where it follows the default,
+            // so one set back to "default" leaves the layer.
+            const modes: Record<string, string | null> = {}
+            for (let ws = 1; ws <= 5; ws++) modes[String(ws)] = null
+            Object.assign(modes, overrides)
+            patch("workspace modes", { workspaces: { default_mode: defaultMode, modes } })
+        },
+
+        // Hyalo warms the gamma ramps itself (hyalo/compositor/src/night_light.rs).
+        setNightLight(kelvin) {
+            const reply = hyalo.request({ request: "night_light", temperature: kelvin })
+            if (!reply) console.error("[HyaloSettings] night light: Hyalo could not be reached")
+            else if (reply.error) console.error(`[HyaloSettings] Hyalo refused the night light: ${reply.error}`)
+        },
+
+        // The background our windows declare (toolkit/PHASE1.md D6): the colour is the app's;
+        // the opacity and the blur under it, these. Another app's translucent window gets the
+        // translucent blur (hyalo/compositor/src/render/window.rs).
+        setWindowBackgrounds({ level, reduceTransparency, levels }) {
+            const pair = (l: { opacity: number, blur: { size: number, passes: number } }) =>
+                ({ opacity: l.opacity, size: l.blur.size, passes: l.blur.passes })
+            patch("window background", { windows: { background: {
+                level, reduce_transparency: reduceTransparency,
+                tinted: pair(levels.tinted), translucent: pair(levels.translucent),
+            } } })
+        },
+
+        setWindowControls(side, buttons) {
+            patch("window controls", { windows: { controls: { side, buttons } } })
+        },
+
+        // Hyalo's title bar (hyalo/compositor/src/render/title_bar.rs).
+        setWindowTitleFont(family) {
+            patch("window title font", { windows: { title_bar: { font: family } } })
+        },
+
+        // The pointer in a recording (hyalo/compositor/src/protocols/screencopy.rs).
+        readRecordedPointer() {
+            return config()?.cursor?.recorded ?? true
+        },
+        setRecordedPointer(on) {
+            patch("recorded pointer", { cursor: { recorded: on } })
+        },
+
+        // Hyalo does idle itself (hyalo/compositor/src/idle.rs): no hypridle, no file of ours.
+        // The effective suspend is what battery/ac say: a legacy `suspend` the
+        // layer still holds goes stale the moment Config1 writes the per-source
+        // keys (normalize only copies legacy where a layer lacks the new keys),
+        // so the auto-sleep toggle — which reads this — takes the max of the
+        // three instead of trusting `suspend` alone. In the Settings-only
+        // world all three always agree, so this changes nothing there.
+        readIdle(): IdleConfig {
+            const i = config()?.idle
+            const suspend = Math.max(i?.suspend ?? 0, i?.suspend_battery ?? 0, i?.suspend_ac ?? 0)
+            return { screenOff: i?.screen_off ?? 300, lock: i?.lock ?? 600, suspend }
+        },
+        setIdle(cfg) {
+            patch("idle", { idle: { screen_off: cfg.screenOff, lock: cfg.lock, suspend: cfg.suspend } })
+        },
+
+        // Hyalo's animations (a minimized window into the dock and back): `[animations]
+        // enabled` off while reducing; not reducing REMOVES the key, so the layers below — the
+        // user's own hyalo.toml included — say again what they said, never a hard-coded "on".
+        setReduceMotion(reduce) { patch("reduce motion", { animations: { enabled: reduce ? false : null } }) },
+        blurBaseline: () => ({ ...GLASS_BLUR }),
+        setAccent() { /* no tab groups (CompositorState caps.groups) */ },
+
+        effectiveLayout() {
+            const l = config()?.layout
+            return {
+                gapsIn: l?.gaps_in ?? null,
+                gapsOut: l?.gaps_out ?? null,
+                rounding: null,
+                borderSize: l?.border ?? null,
+            }
+        },
+    }
+}

@@ -1,0 +1,562 @@
+#!/usr/lib/veltrix/veltrix-act
+// ─────────────────────────────────────────────────────────────────────────────
+// veltrix-act — DETERMINISTIC action on third-party apps for the computer-use
+// layer (Phase 2a). Installed to /usr/bin/veltrix-act. Invokes a NAMED AT-SPI
+// action on a NAMED accessible — the deterministic interaction hook, same
+// philosophy as the shell's own `openWindowMenu` ("without a synthetic click").
+// NO coordinates, NO synthetic input: it targets the accessible directly, so it
+// is auditable and not focus-dependent (unlike a blind click at a position).
+//
+//   veltrix-act <app> <node-name> <action> [role] [occurrence]
+//   e.g.  veltrix-act nautilus "Name" view.show-hidden-files
+//         veltrix-act telegram "Buscar mensajes" SetFocus button
+//
+// The agent perceives a node (its name + available action names) with
+// `veltrix-a11y`/`query_app`, then acts on it here by name. Coverage matches
+// perception: GTK4 exposes rich activatable actions (incl. its GActions); Qt
+// often exposes only SetFocus (focus yes, click no — clicking Qt waits for the
+// synthetic-input phase 2b).
+//
+// SEPARATE binary from veltrix-a11y on purpose: perception stays read-only, and
+// action is a distinct, separately-gated capability (the maintainer guardian
+// rule — do_action must never be smuggled into the perception helper).
+//
+// Plain GJS (gi://Atspi), same no-Node pattern as veltrix-a11y/veltrix-portal.
+//
+// Governance: BOTH `allowComputerControl` AND `allowComputerUse` must be true in
+// org.veltrix.ai (Settings → AI). Control requires perception; both default OFF.
+// Consent layer, not a security boundary — any local process can already drive
+// the a11y bus. The shell renders an always-visible indicator + kill switch
+// while control is granted.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import Atspi from "gi://Atspi"
+import GLib from "gi://GLib"
+import Gio from "gi://Gio"
+
+// The compositor's state — Hyprland's or Hyalo's — in Hyprland's JSON shapes, through ONE
+// CLI (bin/veltrix-wm, #682): PATH first, then a sibling of this script (dev checkout).
+// Never `hyprctl` directly: on Hyalo there is none.
+const WM = (() => {
+    const inPath = GLib.find_program_in_path("veltrix-wm")
+    if (inPath) return inPath
+    try {
+        const sib = `${GLib.path_get_dirname(GLib.filename_from_uri(import.meta.url)[0])}/veltrix-wm`
+        if (GLib.file_test(sib, GLib.FileTest.IS_EXECUTABLE)) return sib
+    } catch {}
+    return "veltrix-wm"
+})()
+
+// The Assistant's gates live in GSettings, `org.veltrix.ai` (#573) — the same keys
+// Settings → AI writes. No schema installed reads as `undefined`, which every gate
+// below treats exactly as it treated a missing ai.json. Each read is a fresh
+// Gio.Settings, so a gate flipped a moment ago is the one that answers.
+// ⚠️ Six copies of this function (veltrix-a11y/act/click/type/mcp/agent);
+// scripts/ci/same-app-check.mjs keeps them identical.
+function aiSetting(key) {
+    try {
+        const schema = Gio.SettingsSchemaSource.get_default()?.lookup("org.veltrix.ai", true)
+        if (!schema) return undefined
+        return new Gio.Settings({ settings_schema: schema }).get_value(key).recursiveUnpack()
+    } catch {
+        return undefined
+    }
+}
+const MAX_NODES = 4000   // a match scan can touch more nodes than a perception cap
+const MAX_DEPTH = 40
+
+function emit(obj) { print(JSON.stringify(obj, null, 2)) }
+
+// Fire-and-forget: tell the shell an action just landed so the bar's AI-control
+// indicator shows its "active" pulse (decays back to "armed" after a few seconds).
+// Never blocks or fails the action if the shell isn't reachable.
+//
+// Gio, NOT spawn_command_line_async: the latter cannot redirect stdio, so the child
+// INHERITS ours and the IPC client's reply ("ok") lands on OUR stdout — right after
+// the JSON we just printed. That breaks the one-JSON-per-helper contract the daemon
+// parses. Worst of all here, because we only ping when the action SUCCEEDED
+// (`result === true`): the tool reported failure exactly when it had worked.
+function pingShell() {
+    try {
+        Gio.Subprocess.new(["veltrix-ipc", "notifyComputerAction"],
+            Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE)
+    } catch {}
+}
+
+function safe(fn, fallback) {
+    try { const v = fn(); return v == null ? fallback : v } catch { return fallback }
+}
+
+// Both gates required; both default OFF (no schema → disabled).
+function controlEnabled() {
+    return aiSetting("allow-computer-control") === true && aiSetting("allow-computer-use") === true
+}
+
+function children(acc) {
+    const count = safe(() => acc.get_child_count(), 0)
+    const out = []
+    for (let i = 0; i < count; i++) {
+        const c = safe(() => acc.get_child_at_index(i), null)
+        if (c) out.push(c)
+    }
+    return out
+}
+
+function isShowing(acc) {
+    const set = safe(() => acc.get_state_set(), null)
+    return !!set && safe(() => set.contains(Atspi.StateType.SHOWING), false)
+}
+
+function nameOf(acc) { return safe(() => acc.get_name(), "") || "" }
+function roleOf(acc) { return safe(() => acc.get_role_name(), "?") }
+
+function boundsOf(acc) {
+    const iface = safe(() => acc.get_component_iface(), null)
+    if (!iface) return { w: 0, h: 0 }
+    const r = safe(() => iface.get_extents(Atspi.CoordType.WINDOW), null)
+    if (!r) return { w: 0, h: 0 }
+    return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }
+}
+
+function actionsOf(acc) {
+    const iface = safe(() => acc.get_action_iface(), null)
+    if (!iface) return { iface: null, names: [] }
+    const n = safe(() => iface.get_n_actions(), 0)
+    const names = []
+    for (let i = 0; i < n; i++) names.push(safe(() => iface.get_action_name(i), ""))
+    return { iface, names }
+}
+
+// ── one name per app ───────────────────────────────────────────────────────────
+// KEEP IDENTICAL in veltrix-a11y, veltrix-click and veltrix-type — see the long
+// comment in veltrix-a11y for the why. Short version: one app wears three names
+// (Hyprland class / AT-SPI name / .desktop name), substrings cannot bridge them
+// once a version digit moves sides, and a live run on 2026-08-01 paid six steps
+// because perception and action each accepted only one of the three.
+const NAME_NOISE = new Set(["org", "com", "io", "net", "app", "desktop"])
+const nameTokens = (s) => (s || "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")   // camelCase  → "Widget Factory"
+    .replace(/([a-zA-Z])(\d)/g, "$1 $2")   // Factory4   → "Factory 4"
+    .replace(/(\d)([a-zA-Z])/g, "$1 $2")   // gtk4       → "gtk 4"
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(t => t && !NAME_NOISE.has(t))
+
+function sameApp(a, b) {
+    const la = (a || "").toLowerCase(), lb = (b || "").toLowerCase()
+    if (!la || !lb) return false
+    if (la === lb || la.includes(lb) || lb.includes(la)) return true
+    // Tokenize the ORIGINAL strings, never the lowercased ones: the word breaks of
+    // "WidgetFactory" live in its capitals, and lowercasing first is exactly the
+    // bug this function exists to kill (it fused "widgetfactory" into one token).
+    const ta = nameTokens(a), tb = nameTokens(b)
+    if (ta.length && tb.length) {
+        const [small, big] = ta.length <= tb.length ? [ta, tb] : [tb, ta]
+        const set = new Set(big)
+        if (small.every(t => set.has(t))) return true
+    }
+    // Last resort for a side that reaches us already lowercased — Hyprland's class
+    // does — where the camelCase seams are gone for good: drop digits and
+    // separators and compare bare letters. >2 chars so noise cannot match.
+    const bare = (s) => s.toLowerCase().replace(/[^a-z]/g, "")
+    const x = bare(a), y = bare(b)
+    return x.length > 2 && y.length > 2 && (x.includes(y) || y.includes(x))
+}
+
+// A miss reports the names actually on screen, exactly as veltrix-click does — the
+// two helpers are aimed by the SAME name, so a dead end in one is a dead end in
+// both. Measured 2026-07-28: `do_app_action Clocks "Hola Manola" SetFocus` missed
+// and the reply listed APPLICATIONS, which is the wrong question answered (the app
+// had matched); recovery cost a whole query_app round trip. The names are free —
+// nameOf() is already called for every node on this walk.
+//
+// The filter is the point, not a detail: an accessible name is not a label (in a
+// chat app it is the entire message — the same thing that made a raw a11y dump
+// 503 KB), so only short single-line names qualify. A suggestion list that costs
+// more than the round trip it saves is a regression. Keep these in step with
+// veltrix-click's copies if you touch them.
+const MAX_SUGGESTIONS = 40
+const MAX_SUGGESTION_LEN = 48
+const isLabelish = nm => nm.length <= MAX_SUGGESTION_LEN && !nm.includes("\n")
+
+// ── Targeted A11Y Bus Candidate Discovery ─────────────────────────────────────
+// KEEP LOGIC IN STEP with veltrix-a11y: query the a11y bus registry and compositor
+// directly via D-Bus and /proc to discover candidate applications WITHOUT
+// triggering AT-SPI peer-to-peer connection establishment (which leaks 3 pidfds
+// per connection in GTK3/ATK bridge due to upstream issue in bridge.c:684-693).
+//
+// CONSCIOUS DUPLICATION NOTE: This helper is intentionally kept inline within
+// each standalone CLI tool in bin/ rather than factored into a shared library.
+// The repository packages tools in bin/ as self-contained executables installed
+// to /usr/bin. A shared module would require packaging modifications in PKGBUILD
+// and install.sh, which is explicitly disallowed, and would break dev-worktree
+// execution isolation in GJS.
+function getHyprWindows() {
+    try {
+        const [ok, out] = GLib.spawn_command_line_sync(`${WM} clients`)
+        if (!ok) return new Map()
+        const list = JSON.parse(new TextDecoder().decode(out))
+        const map = new Map()
+        for (const w of list) {
+            if (w.pid) {
+                if (!map.has(w.pid)) map.set(w.pid, [])
+                map.get(w.pid).push(w)
+            }
+        }
+        return map
+    } catch {
+        return new Map()
+    }
+}
+
+function appNamesForPid(pid, hyprMap) {
+    const names = new Set()
+    const wins = hyprMap.get(pid) || []
+    for (const hw of wins) {
+        if (hw.class) names.add(hw.class)
+        if (hw.initialClass) names.add(hw.initialClass)
+    }
+    try {
+        const [ok, bytes] = GLib.file_get_contents(`/proc/${pid}/cmdline`)
+        if (ok && bytes.length) {
+            const raw = new TextDecoder().decode(bytes)
+            const argv0 = raw.split("\0")[0]
+            if (argv0) {
+                const base = GLib.path_get_basename(argv0)
+                if (base) names.add(base)
+            }
+        }
+    } catch {}
+    try {
+        const [ok, bytes] = GLib.file_get_contents(`/proc/${pid}/comm`)
+        if (ok && bytes.length) {
+            const comm = new TextDecoder().decode(bytes).trim()
+            if (comm) names.add(comm)
+        }
+    } catch {}
+    return [...names]
+}
+
+function getA11yBusAddress() {
+    let addr = GLib.getenv("AT_SPI_BUS_ADDRESS")
+    if (addr) return addr
+    try {
+        const res = Gio.DBus.session.call_sync(
+            "org.a11y.Bus",
+            "/org/a11y/bus",
+            "org.a11y.Bus",
+            "GetAddress",
+            null,
+            null,
+            Gio.DBusCallFlags.NONE,
+            1000,
+            null
+        )
+        const [busAddr] = res.deepUnpack()
+        return busAddr
+    } catch {
+        return null
+    }
+}
+
+function getA11yBusCandidates() {
+    const addr = getA11yBusAddress()
+    if (!addr) return null
+    try {
+        const conn = Gio.DBusConnection.new_for_address_sync(
+            addr,
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            null,
+            null
+        )
+        const res = conn.call_sync(
+            "org.a11y.atspi.Registry",
+            "/org/a11y/atspi/accessible/root",
+            "org.a11y.atspi.Accessible",
+            "GetChildren",
+            null,
+            null,
+            Gio.DBusCallFlags.NONE,
+            1000,
+            null
+        )
+        const [children] = res.deepUnpack()
+        const hyprMap = getHyprWindows()
+        const candidates = []
+        const apps = []
+
+        for (let i = 0; i < children.length; i++) {
+            const [busName, path] = children[i]
+            let pid = 0
+            try {
+                const pidRes = conn.call_sync(
+                    "org.freedesktop.DBus",
+                    "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus",
+                    "GetConnectionUnixProcessID",
+                    new GLib.Variant("(s)", [busName]),
+                    null,
+                    Gio.DBusCallFlags.NONE,
+                    1000,
+                    null
+                )
+                const [p] = pidRes.deepUnpack()
+                pid = p
+            } catch {}
+
+            const names = pid ? appNamesForPid(pid, hyprMap) : []
+            const wins = hyprMap.get(pid) || []
+            const primaryName = (wins[0]?.class) || names[0] || busName
+            apps.push(primaryName)
+
+            candidates.push({
+                index: i,
+                busName,
+                path,
+                pid,
+                names,
+                primaryName,
+            })
+        }
+        return { candidates, apps }
+    } catch {
+        return null
+    }
+}
+
+// Collect every showing node in the target app(s) whose name matches `nodeName`
+// (case-insensitive exact, then substring) and, if given, whose role matches.
+function findMatches(filter, nodeName, roleFilter) {
+    const want = nodeName.toLowerCase()
+    const exact = []
+    const partial = []
+    const seen = new Set()
+    let scanned = 0
+
+    const visit = (acc, depth) => {
+        if (scanned >= MAX_NODES || depth > MAX_DEPTH) return
+        if (!isShowing(acc)) return
+        scanned++
+        const nm = nameOf(acc)
+        if (nm) {
+            if (seen.size < MAX_SUGGESTIONS && isLabelish(nm)) seen.add(nm)
+            const role = roleOf(acc)
+            if (!roleFilter || role === roleFilter) {
+                const low = nm.toLowerCase()
+                if (low === want) exact.push(acc)
+                else if (low.includes(want)) partial.push(acc)
+            }
+        }
+        for (const c of children(acc)) visit(c, depth + 1)
+    }
+
+    const busDiscovery = getA11yBusCandidates()
+    if (busDiscovery) {
+        const { candidates, apps } = busDiscovery
+        const matched = []
+        // Two-pass app selection: strict substring first, so an exact filter keeps
+        // meaning exactly what it meant, then tolerant rescue via sameApp() for different
+        // naming conventions (Hyprland window class vs process name vs command-line).
+        for (const tolerant of [false, true]) {
+            for (const cand of candidates) {
+                const match = cand.names.some(n => tolerant ? sameApp(n, filter) : n.toLowerCase().includes(filter))
+                if (match && !matched.includes(cand)) {
+                    matched.push(cand)
+                }
+            }
+            if (matched.length) break
+        }
+
+        // Fast miss: no running application matches the filter.
+        // Return immediately WITHOUT touching AT-SPI! Zero fds leaked, zero warnings.
+        if (!matched.length) {
+            return { matches: [], apps, showing: [], appFound: false }
+        }
+
+        // Target found: resolve ONLY the matching application(s) via Atspi.
+        // Index assumption: atspi_accessible_get_child_at_index() sends GetChildAtIndex
+        // to the root accessible object (/org/a11y/atspi/accessible/root) in at-spi2-registryd,
+        // which indexes the exact same registry->apps GPtrArray returned by GetChildren.
+        // Race guard: if an application registers or dies between GetChildren and
+        // get_child_at_index, indices shift and cand.index points to a neighbor.
+        // atspi_accessible_get_process_id() queries GetConnectionUnixProcessID on the
+        // bus daemon (NOT the target app), so checking app.get_process_id() costs 0 fds.
+        // If it does not match cand.pid, we abort the fast path and fall back to classic enumeration.
+        Atspi.init()
+        const desktop = safe(() => Atspi.get_desktop(0), null)
+        if (desktop) {
+            let raceDetected = false
+            for (const cand of matched) {
+                const app = safe(() => desktop.get_child_at_index(cand.index), null)
+                if (!app) {
+                    raceDetected = true
+                    break
+                }
+                const resolvedPid = safe(() => app.get_process_id(), 0)
+                if (cand.pid && resolvedPid !== cand.pid) {
+                    raceDetected = true
+                    break
+                }
+                for (const win of children(app)) visit(win, 0)
+            }
+            if (!raceDetected) {
+                return { matches: exact.length ? exact : partial, apps, showing: [...seen], appFound: true }
+            }
+        }
+    }
+
+    // Fallback: traditional enumeration if D-Bus candidate discovery failed or index race detected.
+    // ⚠️ Reset the accumulators first. The fast path may have already visited one
+    // matched app before a LATER candidate tripped the race guard, and the fallback
+    // walks every match again — without this, those nodes are counted twice and the
+    // `scanned` budget is spent before the real walk starts.
+    exact.length = 0
+    partial.length = 0
+    seen.clear()
+    scanned = 0
+
+    Atspi.init()
+    const desktop = safe(() => Atspi.get_desktop(0), null)
+    if (!desktop) return { matches: [], apps: [], showing: [], appFound: false }
+
+    const apps = []
+    const allApps = children(desktop)
+    const named = allApps.map(app => [app, nameOf(app) || "?"])
+    for (const [, appName] of named) apps.push(appName)
+
+    let targets = named.filter(([, n]) => n.toLowerCase().includes(filter))
+    if (!targets.length) targets = named.filter(([, n]) => sameApp(n, filter))
+    const appFound = targets.length > 0
+    for (const [app] of targets)
+        for (const win of children(app)) visit(win, 0)
+    // Prefer exact-name matches; fall back to substring matches.
+    return { matches: exact.length ? exact : partial, apps, showing: [...seen], appFound }
+}
+
+function describe(acc) {
+    return { name: nameOf(acc), role: roleOf(acc), bounds: boundsOf(acc) }
+}
+
+function main() {
+    if (!controlEnabled()) {
+        emit({ error: "computer-control is disabled — enable 'Allow Agents to Control Other Apps' in Settings → AI (it requires perception too; both default off)" })
+        return
+    }
+
+    const app = (ARGV[0] ?? "").trim()
+    const nodeName = (ARGV[1] ?? "").trim()
+    const action = (ARGV[2] ?? "").trim()
+    const roleFilter = (ARGV[3] ?? "").trim() || null
+    const occRaw = (ARGV[4] ?? "").trim()
+    const occurrence = occRaw === "" ? null : parseInt(occRaw, 10)
+
+    if (!app || !nodeName || !action) {
+        emit({ error: "usage: veltrix-act <app> <node-name> <action|set-value=N> [role] [occurrence]" })
+        return
+    }
+
+    const { matches, apps, showing, appFound } = findMatches(app.toLowerCase(), nodeName, roleFilter)
+    if (!matches.length) {
+        // Two different misses, two different next questions. The app not matching
+        // is the only case where a list of APPLICATIONS is the answer; once the app
+        // is found, what the caller needs is the names on its screen.
+        if (!appFound) {
+            emit({ error: `no app matching "${app}" is running — \`apps\` lists the accessible applications right now`, apps })
+            return
+        }
+        // The third possibility this used to leave out: the control is right there
+        // and simply HAS NO NAME. A whole app can be like that — GTK4's own widget
+        // factory exposes nameless switches, combo boxes and tabs — and this helper
+        // aims by name only, so no wording about picking a better name can rescue
+        // it. On the bench 2026-08-01 the model burned three steps here, twice
+        // sending an EMPTY node name, because nothing said the door was elsewhere.
+        // A name-addressed tool that cannot name the coordinate-addressed one is a
+        // dead end that reads like a naming mistake.
+        emit({
+            error: `no showing node named "${nodeName}"${roleFilter ? ` (role ${roleFilter})` : ""} found in app "${app}"`
+                + (showing.length
+                    ? " — `showing` lists the short, single-line names on screen right now (control labels); pick one VERBATIM. Not there? The control may only appear once something else is set, or its name is long/multi-line — then use query_app with a match."
+                    : " — nothing label-like is showing; check the right window is focused, or use query_app to see the tree.")
+                + " If query_app shows the control with no name at all, it cannot be reached from here: click it by position instead, with click_at and the `bounds` from query_app.",
+            showing,
+        })
+        return
+    }
+    if (matches.length > 1 && occurrence === null) {
+        emit({
+            error: `ambiguous: ${matches.length} nodes match "${nodeName}" — disambiguate with a role and/or occurrence index`,
+            candidates: matches.slice(0, 20).map((m, i) => ({ occurrence: i, ...describe(m) })),
+        })
+        return
+    }
+
+    const target = occurrence !== null ? matches[occurrence] : matches[0]
+    if (!target) {
+        emit({ error: `occurrence ${occurrence} out of range (${matches.length} matches)` })
+        return
+    }
+
+    // Two BUILT-IN verbs that are not AT-SPI "actions" at all, handled before the
+    // Action interface is consulted. They exist because of a measured dead end: a
+    // GTK4 spin button ("Minutes" in GNOME Clocks) exposes an EMPTY action list, so
+    // `SetFocus` failed, the agent typed the digits blind, and they landed on
+    // whatever had focus and concatenated with what was already there — asking for
+    // 7 minutes produced 11 h 40 min (= 700 minutes). Verified against a real
+    // GtkSpinButton 2026-07-28: `value=true component=true`, i.e. the number was
+    // always settable directly; only the Action interface was empty.
+    //
+    // `set-value=N` is strictly better than typing for anything numeric: no focus,
+    // no keystrokes, no accumulation, and it reports the value the widget actually
+    // took (clamped to its own min/max) rather than what we hoped it took.
+    const setValue = /^set-value=(-?\d+(?:\.\d+)?)$/.exec(action)
+    if (setValue) {
+        const want = parseFloat(setValue[1])
+        const val = safe(() => target.get_value_iface(), null)
+        if (!val) {
+            emit({ error: `node "${nodeName}" has no AT-SPI value to set (not a spin button / slider)`, node: describe(target) })
+            return
+        }
+        const ok = safe(() => Atspi.Value.prototype.set_current_value.call(val, want), false)
+        // Read back rather than trust the setter: a spin button clamps silently, and
+        // "it returned true" is not the same claim as "it now holds 7".
+        const got = safe(() => Atspi.Value.prototype.get_current_value.call(val), null)
+        if (ok === true) pingShell()
+        emit({ ok: ok === true && got === want, app, node: describe(target), action: "set-value",
+            requested: want, value: got,
+            ...(got !== want ? { note: "the widget clamped or rejected the value — check its min/max" } : {}) })
+        return
+    }
+    // NO `focus` VERB — do not add one back. `Atspi.Component.grab_focus` is the
+    // obvious companion to set-value, and it does not work: measured 2026-07-28
+    // against a live GtkSpinButton, it returns FALSE even with its own window
+    // already focused (`veltrix-wm activewindow` = the probe). GTK4 dropped ATK and
+    // its own AT-SPI backend does not implement Component.GrabFocus, so on the
+    // toolkit this desktop is built from the verb would fail every time — a tool
+    // that always returns false is worse than no tool, and it would cost prompt
+    // bytes on every request to say so. Focus a WINDOW with `focusWindow`; to put a
+    // value somewhere, set the value instead of aiming the keyboard at it.
+
+    // Every failure below advertises the built-in: the reason the timer went wrong
+    // was an agent that knew only `SetFocus` and had no way to learn otherwise.
+    const BUILTINS = ["set-value=<number>"]
+    const { iface, names } = actionsOf(target)
+    if (!iface) {
+        emit({ error: `node "${nodeName}" exposes no AT-SPI actions`, node: describe(target), available: BUILTINS })
+        return
+    }
+    const idx = names.findIndex(n => n === action)
+    if (idx < 0) {
+        emit({ error: `action "${action}" not available on this node`, node: describe(target), available: [...names, ...BUILTINS] })
+        return
+    }
+
+    // The defensive .prototype.call idiom: an AtspiAction is the same boxed
+    // object as the Accessible, so call the Action interface method explicitly
+    // (same lesson as get_text colliding with Atspi.Accessible.get_text).
+    const result = safe(() => Atspi.Action.prototype.do_action.call(iface, idx), false)
+    if (result === true) pingShell()
+
+    emit({ ok: result === true, app, node: describe(target), action, result })
+}
+
+main()

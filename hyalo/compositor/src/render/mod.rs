@@ -1,0 +1,759 @@
+//! What an output shows, as a list of render elements, front to back — the same list for
+//! every backend; each backend hands it to Smithay's damage tracker (winit) or DRM
+//! compositor (tty), which redraw only what changed and scan buffers out directly when
+//! nothing needs compositing over them.
+//!
+//! The order is ours, not `Space`'s: Smithay's stock `space::render_output` sorts layer
+//! surfaces by insertion, not by layer (an Overlay mapped before a Top drew below it — found
+//! in the prototype), and a surface's glass has to go right below that surface.
+
+pub mod controls;
+pub mod decor;
+pub mod drawn;
+pub mod glass;
+pub mod glass_gl;
+pub mod glass_tokens;
+pub mod mirror;
+pub mod scrim;
+pub mod snapshot;
+pub mod stats;
+pub mod timing;
+pub mod title_bar;
+pub mod window;
+
+use smithay::{
+    backend::{
+        drm::DrmDeviceFd,
+        renderer::{
+            Color32F, ImportAll, ImportMem, Renderer, RendererSuper,
+            element::{
+                Kind,
+                memory::MemoryRenderBufferRenderElement,
+                surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+            },
+            gles::{GlesError, GlesFrame, GlesRenderer},
+            multigpu::{self, MultiRenderer, gbm::GbmGlesBackend},
+        },
+    },
+    desktop::{PopupManager, Space, Window, layer_map_for_output},
+    input::Seat,
+    input::pointer::{CursorImageAttributes, CursorImageStatus},
+    output::Output,
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    utils::{Logical, Physical, Point, Rectangle, Scale},
+    wayland::{compositor::with_states, shell::wlr_layer::Layer},
+};
+
+pub use glass::GlassElement;
+pub use scrim::ScrimElement;
+
+use crate::state::Hyalo;
+
+/// The renderer of the tty backend: one GL renderer per GPU, copying between them when the
+/// GPU that renders is not the one that scans out.
+pub type UdevRenderer<'a> =
+    MultiRenderer<'a, 'a, GbmGlesBackend<GlesRenderer, DrmDeviceFd>, GbmGlesBackend<GlesRenderer, DrmDeviceFd>>;
+
+/// What every renderer we draw with can do: Smithay's usual imports, plus reaching the GL
+/// frame underneath, which the glass draws into directly.
+pub trait HyaloRenderer: Renderer<TextureId = Self::HyaloTexture> + ImportAll + ImportMem {
+    /// Named here so the bounds travel with the trait (a `where` on the trait would not).
+    type HyaloTexture: smithay::backend::renderer::Texture + Clone + Send + 'static;
+
+    fn gles_frame<'a, 'frame, 'buffer>(frame: &'a mut Self::Frame<'frame, 'buffer>) -> &'a mut GlesFrame<'frame, 'buffer>
+    where
+        'buffer: 'frame,
+        Self: 'frame;
+
+    fn from_gles_error(err: GlesError) -> Self::Error;
+
+    /// The GL renderer underneath (the one that renders, on a multi-GPU setup).
+    fn gles(&mut self) -> &mut GlesRenderer;
+
+    /// The GL texture `surface`'s buffer was imported as for this renderer (the GPU that
+    /// renders), if it has been: what Hyalo's title bar samples (title_bar.rs).
+    fn surface_texture(&mut self, surface: &WlSurface) -> Option<smithay::backend::renderer::gles::GlesTexture>;
+}
+
+fn surface_state<T>(surface: &WlSurface, f: impl FnOnce(&smithay::backend::renderer::utils::RendererSurfaceState) -> Option<T>) -> Option<T> {
+    smithay::wayland::compositor::with_states(surface, |states| {
+        let data = states.data_map.get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()?;
+        f(&data.lock().unwrap())
+    })
+}
+
+impl HyaloRenderer for GlesRenderer {
+    type HyaloTexture = smithay::backend::renderer::gles::GlesTexture;
+    fn gles_frame<'a, 'frame, 'buffer>(frame: &'a mut GlesFrame<'frame, 'buffer>) -> &'a mut GlesFrame<'frame, 'buffer>
+    where
+        'buffer: 'frame,
+    {
+        frame
+    }
+
+    fn from_gles_error(err: GlesError) -> GlesError {
+        err
+    }
+
+    fn gles(&mut self) -> &mut GlesRenderer {
+        self
+    }
+
+    fn surface_texture(&mut self, surface: &WlSurface) -> Option<smithay::backend::renderer::gles::GlesTexture> {
+        let id = self.context_id();
+        surface_state(surface, |s| s.texture::<smithay::backend::renderer::gles::GlesTexture>(id).cloned())
+    }
+}
+
+impl<'r> HyaloRenderer for UdevRenderer<'r> {
+    type HyaloTexture = smithay::backend::renderer::multigpu::MultiTexture;
+    fn gles_frame<'a, 'frame, 'buffer>(
+        frame: &'a mut <Self as RendererSuper>::Frame<'frame, 'buffer>,
+    ) -> &'a mut GlesFrame<'frame, 'buffer>
+    where
+        'buffer: 'frame,
+        Self: 'frame,
+    {
+        frame.as_mut()
+    }
+
+    fn from_gles_error(err: GlesError) -> Self::Error {
+        multigpu::Error::Render(err)
+    }
+
+    fn gles(&mut self) -> &mut GlesRenderer {
+        self.as_mut()
+    }
+
+    fn surface_texture(&mut self, surface: &WlSurface) -> Option<smithay::backend::renderer::gles::GlesTexture> {
+        let multi = self.context_id();
+        let gles = self.as_mut().context_id();
+        surface_state(surface, |s| {
+            s.texture::<multigpu::MultiTexture>(multi)?.get::<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>(&gles)
+        })
+    }
+}
+
+smithay::backend::renderer::element::render_elements! {
+    pub OutputElement<R> where R: HyaloRenderer;
+    Surface=WaylandSurfaceRenderElement<R>,
+    Drawn=drawn::Clipped<WaylandSurfaceRenderElement<R>>,
+    DrawnChange=drawn::DrawnChange,
+    Scaled=window::AtScale<WaylandSurfaceRenderElement<R>>,
+    Rounded=window::RoundedElement<R>,
+    Glass=GlassElement,
+    Scrim=ScrimElement,
+    Controls=controls::ControlsElement,
+    TitleBar=title_bar::TitleBarElement,
+    Decor=decor::DecorElement,
+    Snapshot=snapshot::SnapshotElement,
+    Cursor=MemoryRenderBufferRenderElement<R>,
+    Debug=smithay::backend::renderer::element::solid::SolidColorRenderElement,
+}
+
+impl<R: HyaloRenderer> std::fmt::Debug for OutputElement<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Surface(e) => f.debug_tuple("Surface").field(e).finish(),
+            Self::Drawn(e) => f.debug_tuple("Drawn").field(e).finish(),
+            Self::DrawnChange(e) => f.debug_tuple("DrawnChange").field(e).finish(),
+            Self::Scaled(e) => f.debug_tuple("Scaled").field(e).finish(),
+            Self::Rounded(e) => f.debug_tuple("Rounded").field(e).finish(),
+            Self::Glass(e) => f.debug_tuple("Glass").field(e).finish(),
+            Self::Scrim(e) => f.debug_tuple("Scrim").field(e).finish(),
+            Self::Controls(e) => f.debug_tuple("Controls").field(e).finish(),
+            Self::TitleBar(e) => f.debug_tuple("TitleBar").field(e).finish(),
+            Self::Decor(e) => f.debug_tuple("Decor").field(e).finish(),
+            Self::Snapshot(e) => f.debug_tuple("Snapshot").field(e).finish(),
+            Self::Cursor(e) => f.debug_tuple("Cursor").field(e).finish(),
+            Self::Debug(e) => f.debug_tuple("Debug").field(e).finish(),
+            Self::_GenericCatcher(_) => f.write_str("_GenericCatcher"),
+        }
+    }
+}
+
+/// Behind everything: shown only where nothing covers the output (no wallpaper yet).
+pub const CLEAR_COLOR: Color32F = Color32F::new(0.06, 0.06, 0.07, 1.0);
+
+/// A surface tree and its popups, front to back, each with its glass right below it, and the
+/// veil under that glass below the glass — unless it is on the `floor`: the shell's chrome
+/// casts ONE floor of veils under all of it (`chrome_scrims`, drawn by the caller), combined by
+/// their maximum, so the Control Center's never darkens the dock, in the same layer, twice.
+#[allow(clippy::too_many_arguments)]
+fn push_surface<R: HyaloRenderer>(
+    out: &mut Vec<OutputElement<R>>,
+    renderer: &mut R,
+    surface: &WlSurface,
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+    output_size: smithay::utils::Size<i32, Physical>,
+    floor: bool,
+    when: std::time::Instant,
+) {
+    push_surface_over_glass(out, renderer, surface, location, scale, output_size, floor, when, &mut |_, _| {});
+}
+
+/// What is drawn between a surface's glass and its content.
+type Between<'a, R> = dyn FnMut(&mut Vec<OutputElement<R>>, &mut R) + 'a;
+
+/// `push_surface`, with `between` drawn in front of the surface's own glass and behind
+/// everything the surface draws on it (its content, its layers, its popups).
+#[allow(clippy::too_many_arguments)]
+fn push_surface_over_glass<R: HyaloRenderer>(
+    out: &mut Vec<OutputElement<R>>,
+    renderer: &mut R,
+    surface: &WlSurface,
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+    output_size: smithay::utils::Size<i32, Physical>,
+    floor: bool,
+    when: std::time::Instant,
+    between: &mut Between<'_, R>,
+) {
+    let mut layer = |out: &mut Vec<OutputElement<R>>, s: &WlSurface, loc: Point<i32, Physical>, kind: Kind, between: Option<&mut Between<'_, R>>| {
+        // Surfaces whose buffer is partly ink (veltrix-material-v1 `add_ink_coverage`) are drawn
+        // through the shader that recolours it.
+        let inked = window::inked_surfaces(s);
+        // A tree with layers a client handed Hyalo to animate (protocols/layers.rs) is drawn
+        // where they are shown, whole: its drawn region (#761) describes the buffer at rest.
+        if let Some(layered) = crate::protocols::layers::render_tree(renderer, s, loc, scale, output_size, kind, when) {
+            out.extend(layered.interleave(|e| window::inked_element(renderer, &inked, e, when), layer_paint));
+        } else {
+            let elements: Vec<WaylandSurfaceRenderElement<R>> = render_elements_from_surface_tree(renderer, s, loc, scale, 1.0, kind);
+            // A surface that declared where it draws (#761) is drawn only there, and repainted where
+            // that changed. (Its ink coverage is not drawn: the drawn region's own element draws it.)
+            let plain = |inner: WaylandSurfaceRenderElement<R>, renderer: &mut R| {
+                if inked.iter().any(|(id, _)| id == smithay::backend::renderer::element::Element::id(&inner)) {
+                    window::inked_element(renderer, &inked, window::AtScale { inner, scale, clip: None }, when)
+                } else {
+                    OutputElement::Surface(inner)
+                }
+            };
+            match crate::protocols::material::drawn(s) {
+                None => out.extend(elements.into_iter().map(|e| plain(e, renderer))),
+                Some(d) => {
+                    match &d.rects {
+                        None => out.extend(elements.into_iter().map(|e| plain(e, renderer))),
+                        Some(rects) => {
+                            let region = drawn::region_on_output(rects, loc, scale);
+                            out.extend(elements.into_iter().map(|inner| OutputElement::Drawn(drawn::Clipped { inner, region: region.clone() })));
+                        }
+                    }
+                    let tree = smithay::desktop::utils::bbox_from_surface_tree(s, (0, 0));
+                    out.push(OutputElement::DrawnChange(drawn::DrawnChange::new(d.id, d.changes, tree, loc, scale)));
+                }
+            }
+        }
+        if let Some(between) = between {
+            between(out, renderer);
+        }
+        out.extend(GlassElement::for_surface(s, loc, scale, output_size, when).into_iter().map(OutputElement::Glass));
+        // The veils under the shell's glass are its floor's (one element for all of them);
+        // anything else draws its own.
+        if !floor {
+            let veils = scrim::scrims_for(s, loc, scale, when);
+            let e = with_states(s, |states| ScrimElement::new(&states.data_map, veils, output_size));
+            out.extend(e.map(OutputElement::Scrim));
+        }
+    };
+    crate::protocols::layers::prepare_input_popups(surface, when);
+    for (popup, offset) in PopupManager::popups_for_surface(surface) {
+        let offset = (offset - popup.geometry().loc).to_f64().to_physical(scale).to_i32_round();
+        layer(out, popup.wl_surface(), location + offset, Kind::Unspecified, None);
+    }
+    layer(out, surface, location, Kind::ScanoutCandidate, Some(between));
+}
+
+/// One surface tree with its glass right below it and that glass's shadow below the glass —
+/// push_surface's own step, without the popups (render/window.rs handles a window's). Its
+/// surfaces are sized at `scale`, which is not the output's while a window shrinks into the
+/// dock (`window::AtScale`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_tree<R: HyaloRenderer>(
+    out: &mut Vec<OutputElement<R>>,
+    renderer: &mut R,
+    surface: &WlSurface,
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+    output_size: smithay::utils::Size<i32, Physical>,
+    kind: Kind,
+    when: std::time::Instant,
+) {
+    let inked = window::inked_surfaces(surface);
+    match crate::protocols::layers::render_tree(renderer, surface, location, scale, output_size, kind, when) {
+        Some(layered) => out.extend(layered.interleave(|e| window::inked_element(renderer, &inked, e, when), layer_paint)),
+        None => {
+            let elements: Vec<WaylandSurfaceRenderElement<R>> = render_elements_from_surface_tree(renderer, surface, location, scale, 1.0, kind);
+            out.extend(elements.into_iter().map(|inner| window::inked_element(renderer, &inked, window::AtScale { inner, scale, clip: None }, when)));
+        }
+    }
+    push_material(out, surface, location, scale, output_size, when);
+}
+
+/// What lies under a layer (protocols/layers.rs `LayerPaint`) as an element of the frame.
+pub(super) fn layer_paint<R: HyaloRenderer>(p: crate::protocols::layers::LayerPaint) -> OutputElement<R> {
+    match p {
+        crate::protocols::layers::LayerPaint::Glass(g) => OutputElement::Glass(*g),
+        crate::protocols::layers::LayerPaint::Shadow(s) => OutputElement::Scrim(s),
+    }
+}
+
+/// A surface's declared glass (`veltrix-material-v1`) and the veil under it, as it is `when`.
+pub(super) fn push_material<R: HyaloRenderer>(
+    out: &mut Vec<OutputElement<R>>,
+    surface: &WlSurface,
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+    output_size: smithay::utils::Size<i32, Physical>,
+    when: std::time::Instant,
+) {
+    out.extend(GlassElement::for_surface(surface, location, scale, output_size, when).into_iter().map(OutputElement::Glass));
+    let veils = scrim::scrims_for(surface, location, scale, when);
+    let e = with_states(surface, |states| ScrimElement::new(&states.data_map, veils, output_size));
+    out.extend(e.map(OutputElement::Scrim));
+}
+
+/// The veils a surface tree and its popups cast, for the chrome's floor.
+fn chrome_scrims(surface: &WlSurface, location: Point<i32, Physical>, scale: Scale<f64>, now: std::time::Instant) -> Vec<scrim::ScrimPx> {
+    let mut out = Vec::new();
+    crate::protocols::layers::prepare_input_popups(surface, now);
+    for (popup, offset) in PopupManager::popups_for_surface(surface) {
+        let offset = (offset - popup.geometry().loc).to_f64().to_physical(scale).to_i32_round();
+        out.extend(scrim::scrims_for(popup.wl_surface(), location + offset, scale, now));
+    }
+    out.extend(scrim::scrims_for(surface, location, scale, now));
+    out
+}
+
+/// A drag's picture: drawn at the pointer plus `offset`, which the client moves with each
+/// commit (`wl_surface.offset` / attach's x, y), under the pointer.
+pub struct DndIcon {
+    pub surface: WlSurface,
+    pub offset: Point<i32, Logical>,
+}
+
+/// What a frame is made from: the parts of the state rendering reads, borrowed apart from the
+/// backend (which renders them).
+pub struct Scene<'a> {
+    pub dimmed: bool,
+    pub space: &'a Space<Window>,
+    pub wm: &'a crate::wm::Wm,
+    pub pointer: Point<f64, Logical>,
+    pub cursor_status: &'a CursorImageStatus,
+    pub dnd_icon: Option<&'a DndIcon>,
+    pub lock: &'a crate::lock::LockState,
+    /// How windows are drawn: corners, the blur behind them (render/window.rs).
+    pub windows: &'a crate::config::WindowsConfig,
+    /// The moment the frame shows: what Hyalo's own animations are drawn at (render/timing.rs).
+    pub when: std::time::Instant,
+    /// Reduce motion (`[animations] enabled = false`): what Hyalo eases itself shows at once.
+    pub reduce_motion: bool,
+}
+
+impl<'a> Scene<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        space: &'a Space<Window>,
+        wm: &'a crate::wm::Wm,
+        seat: &Seat<Hyalo>,
+        cursor_status: &'a CursorImageStatus,
+        dnd_icon: Option<&'a DndIcon>,
+        lock: &'a crate::lock::LockState,
+        windows: &'a crate::config::WindowsConfig,
+        animations: bool,
+        when: std::time::Instant,
+        dimmed:bool,
+    ) -> Self {
+        let pointer = seat.get_pointer().unwrap().current_location();
+        Self { dimmed,space, wm, pointer, cursor_status, dnd_icon, lock, windows, when, reduce_motion: !animations }
+    }
+}
+
+/// The windows shown on `output`, front to back, split where top layers go between them: a
+/// fullscreen window covers the bar, so it — and anything stacked above it, like a special
+/// workspace — is drawn over the top layers; every other window under them.
+pub fn windows_front_to_back(space: &Space<Window>, wm: &crate::wm::Wm, output: &Output) -> (Vec<Window>, Vec<Window>) {
+    let all: Vec<Window> = space.elements_for_output(output).rev().cloned().collect();
+    let fullscreen = all.iter().position(|w| {
+        wm.by_window(w).is_some_and(|m| m.fullscreen == crate::wm::Fullscreen::Fullscreen)
+    });
+    match fullscreen {
+        Some(i) => {
+            let mut above = all;
+            let below = above.split_off(i + 1);
+            (above, below)
+        }
+        None => (Vec::new(), all),
+    }
+}
+
+/// Everything on `output`, front to back.
+pub fn output_elements<R: HyaloRenderer>(
+    state: &Scene<'_>,
+    renderer: &mut R,
+    output: &Output,
+    cursor: Option<&crate::cursor::CursorImage>,
+) -> Vec<OutputElement<R>> {
+    if crate::mirror::follower(output) {
+        return mirror::elements(state, renderer, output, cursor);
+    }
+    scene_elements(state, renderer, output, cursor, true)
+}
+
+fn scene_elements<R: HyaloRenderer>(
+    state: &Scene<'_>,
+    renderer: &mut R,
+    output: &Output,
+    cursor: Option<&crate::cursor::CursorImage>,
+    identify: bool,
+) -> Vec<OutputElement<R>> {
+    let mut out = Vec::new();
+    if identify && !state.lock.is_locked() {
+        out.extend(crate::display::identify::elements(renderer, output));
+    }
+    let Some(output_geo) = state.space.output_geometry(output) else {
+        return out;
+    };
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let output_size = output_geo.size.to_f64().to_physical_precise_round(scale);
+    if state.dimmed {
+        use smithay::backend::renderer::element::{Kind, solid::{SolidColorBuffer, SolidColorRenderElement}};
+        struct DimBuffer(std::sync::Mutex<SolidColorBuffer>);
+        output.user_data().insert_if_missing(|| DimBuffer(std::sync::Mutex::new(
+            SolidColorBuffer::new(output_geo.size, Color32F::new(0.0, 0.0, 0.0, 0.65)),
+        )));
+        let mut buffer = output.user_data().get::<DimBuffer>().unwrap().0.lock().unwrap();
+        buffer.resize(output_geo.size);
+        out.push(OutputElement::Debug(SolidColorRenderElement::from_buffer(
+            &buffer, (0, 0), scale, 1.0, Kind::Unspecified,
+        )));
+    }
+
+    if let Some(image) = cursor.filter(|_| !state.wm.cursor_hidden) {
+        push_cursor(&mut out, state, renderer, output_geo.loc, scale, image);
+    }
+
+    let map = layer_map_for_output(output);
+    let layer_loc = |l: &smithay::desktop::LayerSurface| {
+        crate::shell::layer::layer_geometry(&map, l).unwrap_or_default().loc.to_f64().to_physical_precise_round(scale)
+    };
+    // Locked (lock.rs): the lock surface over the wallpaper, and nothing of the session — its
+    // windows and the shell's layers are not drawn at all, not even under an opaque sheet. A new
+    // lock shows the session until its lock surface here has drawn (`draws_locked`).
+    if state.lock.draws_locked(output) {
+        state.lock.note_rendered(output);
+        if let Some(surface) = state.lock.surface_for(output) {
+            push_surface(&mut out, renderer, surface, Point::from((0, 0)), scale, output_size, false, state.when);
+        }
+        for l in map.layers_on(Layer::Background).rev() {
+            push_surface(&mut out, renderer, l.wl_surface(), layer_loc(l), scale, output_size, false, state.when);
+        }
+        return with_overlay(out, output);
+    }
+    let (above, below) = windows_front_to_back(state.space, state.wm, output);
+    // Hyalo's own animations, as they are when this frame shows (render/timing.rs).
+    let now = state.when;
+    // A window shrinking into the dock or growing back out of it (wm/minimize.rs): where its
+    // whole box is drawn now, scaled. `None` = where it is, as it is.
+    let placement = |m: &crate::wm::Managed| state.wm.placement(m, now);
+    // Going to another workspace (wm/motion.rs `Slide`): its windows and the ones left behind
+    // drawn moved sideways by a share of the output's width — not a pinned one.
+    let slide = state.wm.slide(&output.name(), now);
+    let slid = |m: &crate::wm::Managed| -> Option<crate::wm::minimize::Placement> {
+        let (s, p) = slide?;
+        let shift = s.shift(m.workspace, p).filter(|_| !m.pinned)?;
+        let dx = shift * output_geo.size.w as f64;
+        Some(crate::wm::minimize::Placement { origin: m.frame().loc.to_f64() + Point::from((dx, 0.0)), scale: 1.0 })
+    };
+    let push_windows = |out: &mut Vec<OutputElement<R>>, renderer: &mut R, windows: &[Window]| {
+        for w in windows {
+            let managed = state.wm.by_window(w);
+            let place = managed.and_then(placement).or_else(|| managed.and_then(slid));
+            // Opening (wm/motion.rs): a picture of it as it is now, scaled about its middle
+            // and faded. If the picture cannot be taken, the window as it is.
+            if let Some(m) = managed.filter(|m| placement(m).is_none())
+                && let Some(look) = state.wm.opening(m.id, now)
+            {
+                match snapshot::take(renderer.gles(), state, w, scale.x) {
+                    Ok(picture) => {
+                        let at = place.map_or(m.frame().loc.to_f64(), |p| p.origin);
+                        let frame = Rectangle::new(at - output_geo.loc.to_f64(), m.frame().size.to_f64()).to_physical(scale);
+                        out.push(OutputElement::Snapshot(snapshot::SnapshotElement::new(&picture, frame, look.scale, look.alpha)));
+                        // What the picture leaves out, under it: the window's glass, the blur
+                        // behind it and its veils, drawn live at the picture's scale and formed
+                        // as far as it has faded in — or the window opened without them and
+                        // they appeared at once when it had (owner, 2026-10-18).
+                        let size = m.frame().size.to_f64();
+                        let origin = at + Point::from((size.w, size.h)).upscale((1.0 - look.scale) / 2.0);
+                        let mut live = Vec::new();
+                        let place = crate::wm::minimize::Placement { origin, scale: look.scale };
+                        push_window(&mut live, renderer, state, w, Some(place), output_geo.loc, scale, output_size);
+                        if let Some(surface) = crate::wm::surface_of(w) {
+                            with_states(&surface, |states| {
+                                out.extend(live.into_iter().filter_map(|e| match e {
+                                    OutputElement::Glass(g) => Some(OutputElement::Glass(g.forming(look.alpha as f32, &states.data_map))),
+                                    OutputElement::Scrim(v) => Some(OutputElement::Scrim(v.forming(look.alpha, &states.data_map))),
+                                    _ => None,
+                                }));
+                            });
+                        }
+                        continue;
+                    }
+                    Err(err) => tracing::debug!(%err, id = m.id, "no picture of an opening window"),
+                }
+            }
+            push_window(out, renderer, state, w, place, output_geo.loc, scale, output_size);
+        }
+    };
+    // Windows closing: pictures of them, fading where they were — over the windows still there,
+    // and a fullscreen one over the shell's chrome, as it was.
+    let push_closing = |out: &mut Vec<OutputElement<R>>, fullscreen: bool| {
+        for c in state.wm.closing.iter().rev().filter(|c| c.fullscreen == fullscreen) {
+            let Some(look) = c.motion.look(now) else { continue };
+            let frame = Rectangle::new(c.frame.loc - output_geo.loc.to_f64(), c.frame.size).to_physical(scale);
+            out.push(OutputElement::Snapshot(snapshot::SnapshotElement::new(&c.picture, frame, look.scale, look.alpha)));
+        }
+    };
+    // Windows going into the dock or coming back out of it, their dialogs in front of them:
+    // drawn right in front of the dock's glass — a window lands where its thumbnail is, and
+    // that is over the dock's glass, not under it — but behind its icons (owner, 2026-11-02:
+    // in front of the whole layer, a window growing back out over a magnified dock covered
+    // its icons, then went under them), and out of the stack while they move. A
+    // window going in is out of the space already; one coming back is in it, and goes back to
+    // its place in the stack when it gets there.
+    let moving: Vec<Window> = state
+        .wm
+        .animations
+        .iter()
+        .filter_map(|a| state.wm.get(a.id))
+        .filter(|m| placement(m).is_some())
+        .flat_map(|m| {
+            let dialogs = state.wm.windows.iter().rev().filter(|d| d.id != m.id && state.wm.within(d, m.id));
+            dialogs.chain(std::iter::once(m)).map(|d| d.window.clone()).collect::<Vec<_>>()
+        })
+        .collect();
+    let still = |windows: Vec<Window>| -> Vec<Window> {
+        if moving.is_empty() {
+            return windows;
+        }
+        windows.into_iter().filter(|w| !moving.contains(w)).collect()
+    };
+    let (above, below) = (still(above), still(below));
+    // The dock's layer here: Top, or Overlay over a fullscreen window and with the app grid.
+    let dock = state
+        .wm
+        .minimize_targets
+        .get(&output.name())
+        .and_then(|t| map.layers().find(|l| l.namespace() == t.namespace))
+        .cloned();
+    // A layer: the dock's with the moving windows between its glass and its icons.
+    let push_layer = |out: &mut Vec<OutputElement<R>>, renderer: &mut R, l: &smithay::desktop::LayerSurface| {
+        if dock.as_ref() == Some(l) && !moving.is_empty() {
+            push_surface_over_glass(out, renderer, l.wl_surface(), layer_loc(l), scale, output_size, true, state.when, &mut |out, renderer| {
+                push_windows(out, renderer, &moving)
+            });
+        } else {
+            push_surface(out, renderer, l.wl_surface(), layer_loc(l), scale, output_size, true, state.when);
+        }
+    };
+    // The veils the shell's chrome (top and overlay layers) casts: one floor under all of it,
+    // combined by their maximum like one surface's (two that overlap never darken twice).
+    let floor: Vec<scrim::ScrimPx> = [Layer::Overlay, Layer::Top]
+        .into_iter()
+        .flat_map(|layer| map.layers_on(layer).map(|l| chrome_scrims(l.wl_surface(), layer_loc(l), scale, now)).collect::<Vec<_>>())
+        .flatten()
+        .collect();
+    for l in map.layers_on(Layer::Overlay).rev() {
+        push_layer(&mut out, renderer, l);
+    }
+    // X11 menus, tooltips and drop-downs (xwayland.rs): where their client puts them, over the
+    // windows and the bar, the last one shown in front.
+    for x in state.wm.x11_overrides.iter().rev() {
+        let Some(surface) = x.wl_surface() else { continue };
+        let at = x.last_configure().loc - output_geo.loc;
+        push_surface(&mut out, renderer, &surface, at.to_f64().to_physical_precise_round(scale), scale, output_size, false, state.when);
+    }
+    push_closing(&mut out, true);
+    push_windows(&mut out, renderer, &above);
+    // No dock to land in (it went away meanwhile): in front of the shell's chrome, as ever.
+    if dock.is_none() {
+        push_windows(&mut out, renderer, &moving);
+    }
+    for l in map.layers_on(Layer::Top).rev() {
+        push_layer(&mut out, renderer, l);
+    }
+    out.extend(ScrimElement::new(output.user_data(), floor, output_size).map(OutputElement::Scrim));
+    push_closing(&mut out, false);
+    push_windows(&mut out, renderer, &below);
+    // The workspace left behind, sliding out: hidden, so out of the space — drawn from the
+    // model, front to back, behind the one coming in.
+    if let Some((s, _)) = slide {
+        let left: Vec<Window> = state.wm.on_workspace(s.from).filter(|m| !m.pinned).map(|m| m.window.clone()).collect();
+        push_windows(&mut out, renderer, &left.into_iter().rev().collect::<Vec<_>>());
+    }
+    for layer in [Layer::Bottom, Layer::Background] {
+        for l in map.layers_on(layer).rev() {
+            push_surface(&mut out, renderer, l.wl_surface(), layer_loc(l), scale, output_size, false, state.when);
+        }
+    }
+    with_overlay(out, output)
+}
+
+/// Everything on `output` as `output_elements` has it, for a picture drawn again offscreen
+/// (screenshot.rs: `msg screenshot`, screencopy, a screen shared): the glass as it shows, measuring
+/// nothing. A picture captures the backdrop again, its region rounded its own way, and its
+/// readback fed the same answers and ink the screen shows: while a check took pictures, a
+/// capsule's answer flipped with each one and never settled (#889, 2026-10-21).
+pub fn picture_elements<R: HyaloRenderer>(
+    state: &Scene<'_>,
+    renderer: &mut R,
+    output: &Output,
+    cursor: Option<&crate::cursor::CursorImage>,
+) -> Vec<OutputElement<R>> {
+    output_elements(state, renderer, output, cursor)
+        .into_iter()
+        .map(|e| match e {
+            OutputElement::Glass(g) => OutputElement::Glass(g.measuring_nothing()),
+            e => e,
+        })
+        .collect()
+}
+
+/// The debug overlay over everything (stats.rs, #766): where each glass element samples.
+fn with_overlay<R: HyaloRenderer>(mut out: Vec<OutputElement<R>>, output: &Output) -> Vec<OutputElement<R>> {
+    if !stats::overlay_enabled() {
+        return out;
+    }
+    stats::scene_damage(output, &out);
+    let regions: Vec<_> = out.iter().filter_map(|e| if let OutputElement::Glass(g) = e { Some(g.region()) } else { None }).collect();
+    let overlay = stats::overlay(&output.name(), &regions);
+    out.splice(0..0, overlay.into_iter().map(OutputElement::Debug));
+    out
+}
+
+/// Everything of window `w` on an output at `output_loc` — its surfaces, popups, corners,
+/// controls or title bar, line, shadow and backdrop — where the space has it, or at `place`
+/// (scaled: wm/minimize.rs). Also how a window is drawn alone into a picture of it
+/// (render/snapshot.rs).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_window<R: HyaloRenderer>(
+    out: &mut Vec<OutputElement<R>>,
+    renderer: &mut R,
+    state: &Scene<'_>,
+    w: &Window,
+    place: Option<crate::wm::minimize::Placement>,
+    output_loc: Point<i32, Logical>,
+    scale: Scale<f64>,
+    output_size: smithay::utils::Size<i32, Physical>,
+) {
+    let managed = state.wm.by_window(w);
+    // A minimized window is out of the space: drawn where the model has it.
+    let Some(at) = state.space.element_location(w).or_else(|| managed.map(|m| m.rect.loc)) else { return };
+    let fullscreen = managed.is_some_and(|m| m.fullscreen == crate::wm::Fullscreen::Fullscreen);
+    let visible_size = managed.map_or_else(|| w.geometry().size, |m| m.visible_size());
+    let bar = managed.filter(|_| !fullscreen).map_or(0, |m| m.bar());
+    // Everything of the window is drawn from its surface's origin, its box and the
+    // scale: moved and scaled together, its corners, line and shadow follow (decor.rs,
+    // window.rs). A point `q` of the window's whole box, from its top-left, lands at
+    // `origin + q × k`.
+    let (loc, geo, wscale, origin_of) = match place {
+        None => {
+            let loc = (at - w.geometry().loc - output_loc).to_f64().to_physical_precise_round(scale);
+            let geo = Rectangle::new(at - output_loc, visible_size).to_f64().to_physical_precise_round(scale);
+            let origin = (at - w.geometry().loc - output_loc).to_f64();
+            (loc, geo, scale, (origin, 1.0))
+        }
+        Some(p) => {
+            let k = p.scale;
+            let base = p.origin - output_loc.to_f64();
+            let gl = w.geometry().loc.to_f64();
+            let surface = base + Point::<f64, Logical>::from((-gl.x, bar as f64 - gl.y)).upscale(k);
+            let client = base + Point::<f64, Logical>::from((0.0, bar as f64)).upscale(k);
+            let geo = Rectangle::new(client.to_physical(scale), visible_size.to_f64().upscale(k).to_physical(scale));
+            (surface.to_physical(scale).to_i32_round(), geo, Scale::from(scale.x * k), (surface, k))
+        }
+    };
+    let look = window::look(
+        w,
+        fullscreen,
+        managed.is_none_or(|m| m.rounded),
+        managed.is_none_or(|m| m.backdrop),
+        managed.is_some_and(|m| m.follow_level),
+        state.windows,
+    );
+    // The controls over its header (protocols/window_controls.rs), or in Hyalo's title
+    // bar (title_bar.rs): never on a fullscreen window.
+    let controls = managed.filter(|_| !fullscreen).and_then(|m| {
+        let (r, buttons) = crate::protocols::window_controls::managed_rect(m, &state.windows.controls)?;
+        let (origin, k) = origin_of;
+        let rect = Rectangle::new(origin + r.loc.upscale(k), r.size.upscale(k)).to_physical(scale);
+        let hover = state.wm.controls_hover.filter(|h| h.window == m.id);
+        let controls = controls::Controls {
+            buttons,
+            hover: hover.and_then(|h| buttons.as_slice().iter().position(|b| *b == h.button)),
+            pressed: hover.is_some_and(|h| h.pressed),
+            active: state.wm.focused == Some(m.id),
+            dark: crate::wm::surface_of(&m.window).is_some_and(|s| crate::protocols::window_controls::dark_ink(&s)),
+            moving: place.is_some(),
+            ink: None,
+            reduce_motion: state.reduce_motion,
+        };
+        Some((rect, controls))
+    });
+    let (controls, title_bar) = match managed.filter(|_| bar > 0) {
+        Some(m) => (None, Some(title_bar::TitleBar {
+            height: bar as f64,
+            title: crate::wm::title(w),
+            family: state.windows.title_bar.font.clone(),
+            active: state.wm.focused == Some(m.id),
+            controls,
+            controls_apart: false,
+        })),
+        None => (controls, None),
+    };
+    // Its line and its shadow (decor.rs), focused or not: not on a fullscreen window, nor
+    // where a rule took its corners (games).
+    let decor = managed.filter(|m| !fullscreen && m.rounded).map(|m| state.wm.focused == Some(m.id));
+    let clip_to_cell = managed.is_some_and(|m| !m.floating && m.fullscreen == crate::wm::Fullscreen::None);
+    window::push(out, renderer, w, look, clip_to_cell, loc, geo, wscale, output_size, state.windows, controls, title_bar, decor, state.when);
+}
+
+/// The pointer: the client's own cursor surface, or our themed one.
+fn push_cursor<R: HyaloRenderer>(
+    out: &mut Vec<OutputElement<R>>,
+    state: &Scene<'_>,
+    renderer: &mut R,
+    output_loc: Point<i32, Logical>,
+    scale: Scale<f64>,
+    (themed, hotspot): &crate::cursor::CursorImage,
+) {
+    let pointer = state.pointer - output_loc.to_f64();
+    match &state.cursor_status {
+        CursorImageStatus::Hidden => {}
+        CursorImageStatus::Surface(surface) => {
+            let hotspot = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<std::sync::Mutex<CursorImageAttributes>>()
+                    .map(|a| a.lock().unwrap().hotspot)
+                    .unwrap_or_default()
+            });
+            let loc = (pointer - hotspot.to_f64()).to_physical(scale).to_i32_round();
+            out.extend(render_elements_from_surface_tree(renderer, surface, loc, scale, 1.0, Kind::Cursor));
+        }
+        CursorImageStatus::Named(_) => {
+            let loc = (pointer.to_physical(scale) - hotspot.to_f64()).to_i32_round::<i32>();
+            if let Ok(e) =
+                MemoryRenderBufferRenderElement::from_buffer(renderer, loc.to_f64(), themed, None, None, None, Kind::Cursor)
+            {
+                out.push(OutputElement::Cursor(e));
+            }
+        }
+    }
+    // A drag's picture, under the pointer (front to back: after it). Without it a file
+    // dragged from a file manager showed only the pointer.
+    if let Some(icon) = state.dnd_icon.filter(|i| smithay::utils::IsAlive::alive(&i.surface)) {
+        let loc = (pointer + icon.offset.to_f64()).to_physical(scale).to_i32_round();
+        out.extend(render_elements_from_surface_tree(renderer, &icon.surface, loc, scale, 1.0, Kind::Unspecified));
+    }
+}

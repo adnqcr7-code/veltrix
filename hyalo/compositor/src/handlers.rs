@@ -1,0 +1,405 @@
+//! The Smithay handler traits that are only wiring: the commit path, the seat, selections,
+//! dmabuf, outputs.
+
+use smithay::reexports::wayland_server::protocol::wl_data_device_manager::DndAction as WlDndAction;
+use smithay::{
+    backend::{allocator::dmabuf::Dmabuf, renderer::utils::on_commit_buffer_handler},
+    input::{
+        Seat, SeatHandler, SeatState,
+        dnd::{DnDGrab, DndGrabHandler, DndTarget, GrabType, Source},
+        keyboard::LedState,
+        pointer::{CursorImageStatus, Focus, PointerHandle},
+    },
+    reexports::wayland_server::{
+        Client, Resource,
+        protocol::{wl_buffer, wl_surface::WlSurface},
+    },
+    utils::{Logical, Point, Serial},
+    wayland::{
+        buffer::BufferHandler,
+        compositor::{CompositorClientState, CompositorHandler, CompositorState, get_parent, is_sync_subsurface},
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        fractional_scale::FractionalScaleHandler,
+        output::OutputHandler,
+        pointer_constraints::{PointerConstraintsHandler, with_pointer_constraint},
+        selection::{
+            SelectionHandler,
+            data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus},
+            primary_selection::{PrimarySelectionHandler, PrimarySelectionState, set_primary_focus},
+        },
+        shm::{ShmHandler, ShmState},
+    },
+};
+
+use crate::{
+    protocols::material,
+    state::{ClientState, Hyalo},
+};
+
+impl CompositorHandler for Hyalo {
+    fn compositor_state(&mut self) -> &mut CompositorState {
+        &mut self.compositor_state
+    }
+
+    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        if let Some(x) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+            return &x.compositor_state;
+        }
+        &client.get_data::<ClientState>().unwrap().compositor_state
+    }
+
+    fn commit(&mut self, surface: &WlSurface) {
+        // Read before the buffer handler takes it: this commit brings new content.
+        let attached = smithay::wayland::compositor::with_states(surface, |s| {
+            matches!(
+                s.cached_state.get::<smithay::wayland::compositor::SurfaceAttributes>().current().buffer,
+                Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(_))
+            )
+        });
+        on_commit_buffer_handler::<Self>(surface);
+        if attached {
+            self.record_frame(surface);
+        }
+        self.backend.early_import(surface);
+        if !is_sync_subsurface(surface) {
+            let mut root = surface.clone();
+            while let Some(parent) = get_parent(&root) {
+                root = parent;
+            }
+            if let Some(window) = self.window_for_surface(&root) {
+                window.on_commit();
+            }
+            // A window being shared waits for this (capture.rs).
+            self.complete_capture_window(&root);
+        }
+        material::on_commit(surface);
+        crate::protocols::layers::on_commit(surface);
+        crate::protocols::window_controls::on_commit(self, surface);
+        self.xdg_commit(surface);
+        self.layer_commit(surface);
+        // A drag's picture moves by what each commit says, so the point it was grabbed by
+        // stays under the pointer (anvil's way).
+        if let Some(icon) = self.dnd_icon.as_mut().filter(|i| &i.surface == surface) {
+            smithay::wayland::compositor::with_states(surface, |s| {
+                let delta = s
+                    .cached_state
+                    .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                    .current()
+                    .buffer_delta
+                    .take()
+                    .unwrap_or_default();
+                icon.offset += delta;
+            });
+        }
+
+        let outputs = self.outputs_for_surface(surface);
+        if outputs.is_empty() {
+            // A cursor or drag icon, or a surface not placed yet: cheap to redraw everything.
+            self.queue_redraw(None);
+        }
+        for o in &outputs {
+            self.queue_redraw(Some(o));
+        }
+    }
+
+    fn destroyed(&mut self, surface: &WlSurface) {
+        use smithay::reexports::wayland_server::Resource;
+        if self.dnd_feedback.surface_destroyed(&surface.id()) {
+            self.cursor_status = self.dnd_cursor();
+            self.queue_redraw(None);
+        }
+        // A client that quits without destroying its window first (or is killed) has its
+        // objects destroyed in the order it made them: the surface before its toplevel. The
+        // closing picture is taken while the surface still holds its last frame (wm/motion.rs).
+        if let Some(id) = self.wm.by_surface(surface).map(|m| m.id) {
+            self.start_closing(id);
+        }
+    }
+}
+
+impl Hyalo {
+    /// A buffer arrived somewhere in a window's tree (a subsurface's, a layer's too): its
+    /// time, for `msg frames` (wm/mod.rs `Managed::frames`).
+    fn record_frame(&mut self, surface: &WlSurface) {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        let now = std::time::Duration::from(self.clock.now()).as_secs_f64() * 1000.;
+        let Some(id) = self.wm.by_surface(&root).map(|m| m.id) else { return };
+        let Some(m) = self.wm.get_mut(id) else { return };
+        m.frames.push_back(now);
+        while m.frames.front().is_some_and(|t| now - t > crate::wm::FRAMES_KEPT_MS) {
+            m.frames.pop_front();
+        }
+    }
+}
+
+impl BufferHandler for Hyalo {
+    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+}
+
+impl ShmHandler for Hyalo {
+    fn shm_state(&self) -> &ShmState {
+        &self.shm_state
+    }
+}
+
+impl SeatHandler for Hyalo {
+    type KeyboardFocus = crate::focus::KeyboardFocus;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
+
+    fn seat_state(&mut self) -> &mut SeatState<Hyalo> {
+        &mut self.seat_state
+    }
+
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // Kept, but not shown while the cursor is Hyalo's (`update_controls_hover`).
+        self.client_cursor = image.clone();
+        if !self.wm.chrome_cursor {
+            self.cursor_status = image;
+            self.queue_redraw(None);
+        }
+    }
+
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&crate::focus::KeyboardFocus>) {
+        let dh = &self.display_handle;
+        let client = focused.and_then(|f| f.surface()).and_then(|s| dh.get_client(s.id()).ok());
+        set_data_device_focus(dh, seat, client.clone());
+        set_primary_focus(dh, seat, client);
+    }
+
+    fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
+        self.backend.update_led_state(led_state);
+    }
+}
+
+// Tablets are #683's; cursor-shape-v1 needs the trait to exist for its tool cursors.
+impl smithay::input::tablet::TabletSeatHandler for Hyalo {
+    type ToolFocus = WlSurface;
+}
+
+impl SelectionHandler for Hyalo {
+    type SelectionUserData = ();
+
+    /// The Wayland clipboard changed: offered to X11 clients too (xwayland.rs).
+    fn new_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        source: Option<smithay::wayland::selection::SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if let Some(xwm) = self.x11.wm.as_mut() {
+            if let Err(err) = xwm.new_selection(ty, source.map(|s| s.mime_types())) {
+                tracing::debug!(?err, ?ty, "the X11 selection");
+            }
+            // Smithay queues the claim on the X selection without sending it: it went out with
+            // the next X event, so an X11 app pasting right after a Wayland copy still got its
+            // own last copy (the check caught it one run in two, 2026-10-07). A request that
+            // waits for its reply sends everything queued before it; this one changes nothing.
+            let _ = xwm.get_randr_primary_output();
+        }
+    }
+
+    /// A Wayland client pastes what an X11 client copied.
+    fn send_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        mime_type: String,
+        fd: std::os::unix::io::OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        if let Some(xwm) = self.x11.wm.as_mut()
+            && let Err(err) = xwm.send_selection(ty, mime_type, fd)
+        {
+            tracing::debug!(?err, ?ty, "an X11 selection for a Wayland client");
+        }
+    }
+}
+
+impl DataDeviceHandler for Hyalo {
+    fn data_device_state(&mut self) -> &mut DataDeviceState {
+        &mut self.data_device_state
+    }
+
+    /// The client under a drag says what it would do with it: the pointer shows it at once
+    /// (state.rs `dnd_cursor`).
+    fn action_choice(&mut self, available: WlDndAction, preferred: WlDndAction) -> WlDndAction {
+        let chosen = smithay::wayland::selection::data_device::default_action_chooser(available, preferred);
+        if self.dnd_started.is_some() {
+            self.dnd_feedback.choose(chosen);
+            self.cursor_status = self.dnd_cursor();
+            self.wm.chrome_cursor = true;
+            self.queue_redraw(None);
+        }
+        chosen
+    }
+}
+
+impl PrimarySelectionHandler for Hyalo {
+    fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
+        &mut self.primary_selection_state
+    }
+}
+
+impl DndGrabHandler for Hyalo {
+    /// The drag's picture goes; a drop that was taken lets the client it landed in raise what
+    /// it starts with it (activation.rs, `DropGrant`).
+    fn dropped(&mut self, target: Option<DndTarget<'_, Self>>, validated: bool, _seat: Seat<Self>, _location: Point<f64, Logical>) {
+        self.dnd_icon = None;
+        let since = self.dnd_started.take();
+        self.end_dnd_cursor();
+        self.drop_grant = match (target, since) {
+            (Some(target), Some(since)) if validated => target
+                .into_inner()
+                .client()
+                .map(|c| crate::activation::DropGrant { client: c.id(), since, at: std::time::Instant::now() }),
+            _ => None,
+        };
+        self.queue_redraw(None);
+    }
+
+    fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
+        self.dnd_icon = None;
+        self.dnd_started = None;
+        self.end_dnd_cursor();
+        self.queue_redraw(None);
+    }
+}
+impl WaylandDndGrabHandler for Hyalo {
+    fn dnd_requested<S: Source>(
+        &mut self,
+        source: S,
+        icon: Option<WlSurface>,
+        seat: Seat<Self>,
+        serial: Serial,
+        type_: GrabType,
+    ) {
+        // Drawn under the pointer until the drop (render/mod.rs `push_cursor`).
+        self.dnd_icon = icon.map(|surface| crate::render::DndIcon { surface, offset: (0, 0).into() });
+        self.dnd_started = Some(serial);
+        self.dnd_feedback.clear();
+        self.cursor_status = self.dnd_cursor();
+        self.wm.chrome_cursor = true;
+        match type_ {
+            GrabType::Pointer => {
+                let ptr = seat.get_pointer().unwrap();
+                let Some(start_data) = ptr.grab_start_data() else {
+                    source.cancel();
+                    return;
+                };
+                let grab = DnDGrab::new_pointer(&self.display_handle, start_data, source, seat);
+                ptr.set_grab(self, grab, serial, Focus::Keep);
+            }
+            // Touch input is #683's.
+            GrabType::Touch => source.cancel(),
+        }
+    }
+}
+
+impl OutputHandler for Hyalo {}
+
+impl smithay::wayland::selection::ext_data_control::DataControlHandler for Hyalo {
+    fn data_control_state(&mut self) -> &mut smithay::wayland::selection::ext_data_control::DataControlState {
+        &mut self.ext_data_control
+    }
+}
+
+impl smithay::wayland::selection::wlr_data_control::DataControlHandler for Hyalo {
+    fn data_control_state(&mut self) -> &mut smithay::wayland::selection::wlr_data_control::DataControlState {
+        &mut self.wlr_data_control
+    }
+}
+// The hint itself is all wm::focus_window reads; nothing to do when it changes.
+impl smithay::wayland::shell::xdg::dialog::XdgDialogHandler for Hyalo {}
+impl FractionalScaleHandler for Hyalo {}
+
+impl PointerConstraintsHandler for Hyalo {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        // Activate it at once when the surface already has the pointer.
+        if pointer.current_focus().as_ref() == Some(surface) {
+            with_pointer_constraint(surface, pointer, |constraint| {
+                if let Some(c) = constraint {
+                    c.activate();
+                }
+            });
+        }
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _location: Point<f64, Logical>,
+    ) {
+    }
+}
+
+impl DmabufHandler for Hyalo {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        self.backend.dmabuf_state()
+    }
+
+    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+        if self.backend.import_dmabuf(&dmabuf) {
+            let _ = notifier.successful::<Hyalo>();
+        } else {
+            notifier.failed();
+        }
+    }
+}
+
+smithay::delegate_dispatch2!(Hyalo);
+
+// ── Input methods (text-input-v3 + input-method-v2) ──────────────────────────────────────────
+//
+// fcitx5 is an input-method-v2 client; applications speak text-input-v3 (GTK4 natively). Smithay
+// moves the text-input focus with the keyboard focus (`wayland/seat/keyboard.rs`), and every
+// keyboard focus change in Hyalo goes through `set_keyboard_focus` — so a layer surface that took
+// the keyboard through a focus grab (the shell's search) gets the input method too. On Hyprland
+// it did not: its grab path never emitted the focus event the IME relay listens to (#679 #10,
+// #503). The input method's candidate window is a popup of the surface being typed into, drawn
+// with that surface's popups (render/mod.rs), placed just below the caret (`place_input_popup`).
+impl smithay::wayland::input_method::InputMethodHandler for Hyalo {
+    fn new_popup(&mut self, mut surface: smithay::wayland::input_method::PopupSurface) {
+        crate::protocols::layers::remember_input_popup(&surface);
+        // Smithay initializes the rectangle but does not send the initial event
+        // when an IME creates its popup after the field's first commit.
+        let rect = surface.text_input_rectangle();
+        surface.set_text_input_rectangle(rect.loc.x, rect.loc.y, rect.size.w, rect.size.h);
+        crate::protocols::layers::place_input_popup(&surface);
+        if let Err(err) = self.popups.track_popup(smithay::desktop::PopupKind::from(surface)) {
+            tracing::warn!(?err, "input method popup not tracked");
+        }
+    }
+
+    fn popup_repositioned(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        crate::protocols::layers::remember_input_popup(&surface);
+        crate::protocols::layers::place_input_popup(&surface);
+        self.queue_redraw(None);
+    }
+
+    fn dismiss_popup(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        if let Some(parent) = surface.get_parent().map(|p| p.surface.clone()) {
+            let _ = smithay::desktop::PopupManager::dismiss_popup(&parent, &smithay::desktop::PopupKind::from(surface));
+        }
+    }
+
+    /// Where the text being typed sits: a window's geometry, or a layer surface's whole area.
+    fn parent_geometry(&self, parent: &WlSurface) -> smithay::utils::Rectangle<i32, Logical> {
+        if let Some(window) = self.window_for_surface(parent) {
+            return window.geometry();
+        }
+        self.space
+            .outputs()
+            .find_map(|o| {
+                let map = smithay::desktop::layer_map_for_output(o);
+                map.layers()
+                    .find(|l| l.wl_surface() == parent)
+                    .map(|l| smithay::utils::Rectangle::from_size(l.bbox().size))
+            })
+            .unwrap_or_default()
+    }
+}

@@ -1,0 +1,779 @@
+/* veltrix-wl — Veltrix's Wayland shim.
+ *
+ * GJS cannot speak raw Wayland: libwayland-client has no GObject introspection,
+ * and `gdk_wayland_surface_get_wl_surface` is marked introspectable="0" in
+ * GdkWayland-4.0.gir. Two things the shell needs are therefore unreachable from
+ * TypeScript, and both live here — in-process, so a captured frame comes back as
+ * a GdkTexture instead of travelling through a pipe as a file descriptor.
+ *
+ *  1. WINDOW CAPTURE (ext-image-copy-capture). Hyprland re-renders the window on
+ *     demand into an export framebuffer — verified in ScreenshareFrame.cpp and in
+ *     the field — so a window on a hidden workspace captures fine and costs one
+ *     render pass, not continuous rendering. This is what makes real thumbnails
+ *     affordable in the Overview and the window switcher. A window is found by the
+ *     shell's address for it: on Hyprland through hyprland-toplevel-mapping, on Hyalo
+ *     through ext-foreign-toplevel-list's own `identifier`, which Hyalo sets to that
+ *     address (hyalo/compositor/src/capture.rs) — Hyalo draws the window alone, from
+ *     its surface tree, so a hidden workspace captures there too.
+ *
+ *  2. VISIBLE REGION (hyprland-surface-v1 v2). Hyprland charges layer blur by the
+ *     surface's BOX, not by the pixels that end up visible, so Veltrix's three
+ *     monitor-sized layers tax every repaint of every window. Declaring the region
+ *     a surface actually paints recovers ~88% of that. See tech-debt §46.
+ *
+ *  3. FOCUS GRAB (hyprland-focus-grab-v1). Keyboard focus for a layer surface
+ *     WITHOUT layer-shell's EXCLUSIVE interactivity, plus compositor-side
+ *     outside-click dismissal. Replaces two long-standing kludges: the full-screen
+ *     invisible "catcher" buttons, and the EXCLUSIVE/ON_DEMAND dance whose release
+ *     is double-buffered (core/InputYield, HyprlandState.afterGrabRelease).
+ *
+ * Symbol prefix `veltrix_wl`, namespace `VeltrixWl` — from GJS:
+ *
+ *     import VeltrixWl from "gi://VeltrixWl";
+ */
+
+#pragma once
+
+#include <gdk/gdk.h>
+#include <gio/gio.h>
+#include <glib-object.h>
+
+G_BEGIN_DECLS
+
+#define VELTRIX_WL_ERROR (veltrix_wl_error_quark ())
+
+/**
+ * VeltrixWlError:
+ * @VELTRIX_WL_ERROR_UNAVAILABLE: not a Wayland session, or a required global is missing
+ * @VELTRIX_WL_ERROR_NO_WINDOW: no toplevel with the requested Hyprland address
+ * @VELTRIX_WL_ERROR_CAPTURE_FAILED: the compositor refused or aborted the capture
+ * @VELTRIX_WL_ERROR_TIMEOUT: the compositor never answered
+ * @VELTRIX_WL_ERROR_NO_OUTPUT: no output with the requested connector name
+ */
+typedef enum {
+  VELTRIX_WL_ERROR_UNAVAILABLE,
+  VELTRIX_WL_ERROR_NO_WINDOW,
+  VELTRIX_WL_ERROR_CAPTURE_FAILED,
+  VELTRIX_WL_ERROR_TIMEOUT,
+  VELTRIX_WL_ERROR_NO_OUTPUT,
+} VeltrixWlError;
+
+GQuark veltrix_wl_error_quark (void);
+
+/**
+ * veltrix_wl_init:
+ * @error: (nullable): return location for an error
+ *
+ * Binds what the shim needs against GDK's Wayland connection. Safe to call more
+ * than once; later calls are no-ops that report the first result.
+ *
+ * Failing here is not fatal to the shell — every entry point below degrades to a
+ * no-op or an error, so callers can treat the shim as an enhancement.
+ *
+ * Returns: %TRUE if the shim is usable
+ */
+gboolean veltrix_wl_init (GError **error);
+
+/**
+ * veltrix_wl_is_available:
+ *
+ * Returns: %TRUE if veltrix_wl_init() succeeded
+ */
+gboolean veltrix_wl_is_available (void);
+
+/**
+ * veltrix_wl_has_visible_region:
+ *
+ * Whether the compositor takes a visible region: Hyalo through veltrix-material-v1
+ * (set_drawn_region), Hyprland through hyprland_surface_manager_v1 at version 2 or
+ * later. Hyprland's version 1 has no set_visible_region, so the optimisation
+ * silently does nothing there — check this before assuming it took effect.
+ *
+ * Returns: %TRUE if visible regions are supported
+ */
+gboolean veltrix_wl_has_visible_region (void);
+
+/**
+ * veltrix_wl_has_capture:
+ *
+ * Returns: %TRUE if window capture is supported by this compositor
+ */
+gboolean veltrix_wl_has_capture (void);
+
+/* ---------------------------------------------------------------- capture */
+
+/**
+ * veltrix_wl_capture_window:
+ * @address: Hyprland window address, as reported by `hyprctl clients` / listWindows
+ * @max_width: longest allowed width in pixels, or 0 for the window's own size
+ * @max_height: longest allowed height in pixels, or 0 for the window's own size
+ * @cancellable: (nullable): a #GCancellable
+ * @callback: (scope async): called when the capture finishes
+ * @user_data: data for @callback
+ *
+ * Captures a window and scales it down to fit @max_width × @max_height,
+ * preserving aspect ratio. Never scales up.
+ *
+ * The window does NOT need to be visible: a window on another workspace captures
+ * its last committed content. The scaling matters — a 2560×1440 window is 14 MB
+ * of pixels, and a thumbnail strip that keeps them all at full size will hurt.
+ *
+ * Runs on a worker thread with its own Wayland connection, so it never blocks the
+ * main loop and never touches GDK's event queue.
+ */
+void veltrix_wl_capture_window (guint64              address,
+                               int                  max_width,
+                               int                  max_height,
+                               GCancellable        *cancellable,
+                               GAsyncReadyCallback  callback,
+                               gpointer             user_data);
+
+/**
+ * veltrix_wl_capture_window_finish:
+ * @result: the #GAsyncResult handed to the callback
+ * @error: (nullable): return location for an error
+ *
+ * Returns: (transfer full) (nullable): the captured frame, or %NULL on error
+ */
+GdkTexture *veltrix_wl_capture_window_finish (GAsyncResult  *result,
+                                             GError       **error);
+
+/* --------------------------------------------------------- visible region */
+
+/**
+ * veltrix_wl_visible_region_begin:
+ * @surface: the #GdkSurface to describe
+ *
+ * Starts building the region @surface actually paints. Follow with one or more
+ * veltrix_wl_visible_region_add_rect() calls and finish with
+ * veltrix_wl_visible_region_commit().
+ *
+ * DANGER, and it is the whole risk of this API: anything OUTSIDE the committed
+ * region is not drawn at all. Hyprland clips with a hard GL scissor
+ * (OpenGL.cpp), and an empty intersection cancels the element entirely
+ * (SurfacePassElement.cpp) — there is exactly 1px of tolerance. Hyalo draws the
+ * surface's content only inside it too (render/drawn.rs). The failure mode
+ * is "the surface vanished", not "the surface looks worse". Declare a region only
+ * from geometry you own, and be generous at the edges.
+ */
+void veltrix_wl_visible_region_begin (GdkSurface *surface);
+
+/**
+ * veltrix_wl_visible_region_add_rect:
+ * @surface: the #GdkSurface being described
+ * @x: rectangle x, in BUFFER pixels (surface-local, times the surface's scale)
+ * @y: rectangle y
+ * @width: rectangle width
+ * @height: rectangle height
+ *
+ * Adds a rectangle to the region opened by veltrix_wl_visible_region_begin().
+ * Buffer pixels are what Hyprland's protocol takes; on Hyalo, whose protocol takes
+ * logical pixels, the rectangle is converted back with the surface's scale,
+ * rounded outward.
+ */
+void veltrix_wl_visible_region_add_rect (GdkSurface *surface,
+                                        int         x,
+                                        int         y,
+                                        int         width,
+                                        int         height);
+
+/**
+ * veltrix_wl_visible_region_commit:
+ * @surface: the #GdkSurface being described
+ *
+ * Sends the accumulated region.
+ *
+ * Wayland applies surface state on wl_surface.commit, which GTK issues on its own
+ * frame cycle — so this takes effect on the next frame the surface actually
+ * paints.
+ *
+ * ⚠️ A surface whose content does not change may never commit, and then the
+ * region sits in the compositor's pending state indefinitely, doing nothing.
+ * gtk_widget_queue_draw() is NOT enough on its own: GTK skips the frame when the
+ * render node comes out identical. This is a real trap — it cost a full A/B round
+ * here, with the region delivered, %TRUE returned, and no visible effect.
+ * Declare the region as part of a change that repaints, not as a separate step.
+ *
+ * Returns: %TRUE if the region reached the compositor. %FALSE means the hint was
+ *   dropped — no support, or the surface is not mapped yet — which is not an
+ *   error, just the un-optimised path. Worth checking once while wiring a new
+ *   surface up: a silent %FALSE looks exactly like a working optimisation that
+ *   saves nothing.
+ */
+gboolean veltrix_wl_visible_region_commit (GdkSurface *surface);
+
+/**
+ * veltrix_wl_visible_region_clear:
+ * @surface: the #GdkSurface to reset
+ *
+ * Drops any declared region: the whole surface is visible again. This is the
+ * escape hatch — call it before anything that changes what the surface paints in
+ * a way the region does not describe yet.
+ */
+void veltrix_wl_visible_region_clear (GdkSurface *surface);
+
+/* ------------------------------------------------------------- focus grab */
+
+/**
+ * veltrix_wl_has_focus_grab:
+ *
+ * Whether the compositor advertises hyprland_focus_grab_manager_v1.
+ *
+ * Returns: %TRUE if focus grabs are supported
+ */
+gboolean veltrix_wl_has_focus_grab (void);
+
+/**
+ * VeltrixWlFocusGrabClearedFunc:
+ * @user_data: the data passed to veltrix_wl_focus_grab_acquire()
+ *
+ * Called when the compositor takes the grab away — see
+ * veltrix_wl_focus_grab_acquire() for the three things that do that. It is NOT
+ * called when the grab is dropped by veltrix_wl_focus_grab_release(): that path
+ * is the caller's own decision and it already knows.
+ */
+typedef void (*VeltrixWlFocusGrabClearedFunc) (gpointer user_data);
+
+/**
+ * veltrix_wl_focus_grab_acquire:
+ * @surface: the #GdkSurface that should own keyboard and pointer
+ * @cleared: (nullable) (scope notified) (closure user_data) (destroy destroy):
+ *   called when the compositor clears the grab
+ * @user_data: data for @cleared
+ * @destroy: (nullable): called when @user_data is no longer needed
+ *
+ * Restricts input to @surface. While the grab holds:
+ *
+ *  - @surface receives keyboard focus even with layer-shell interactivity NONE
+ *    (CFocusGrab drives CFocusState::rawSurfaceFocus directly, which does not
+ *    look at interactivity). This is the point: EXCLUSIVE is what puts a surface
+ *    in Hyprland's m_exclusiveLSes, and that list makes the compositor REFUSE to
+ *    move window focus at all — the reason core/InputYield had to exist.
+ *  - a pointer press outside @surface clears the grab and dismisses, without any
+ *    widget of ours having to cover the screen to notice it.
+ *  - the pointer merely MOVING outside is clamped to @surface, so nothing under
+ *    us gets phantom hover.
+ *  - on release the compositor refocuses the window the user came from, honouring
+ *    input:follow_mouse. We no longer do that by hand.
+ *
+ * ⚠️ There is exactly ONE grab slot in the compositor (CSeatManager::m_seatGrab)
+ * and xdg-shell popups use the SAME slot for their own grab. So a #GtkPopover
+ * with autohide opening anywhere in the process will evict this grab, and
+ * @cleared will fire. Three things clear a grab, and they are indistinguishable
+ * from the client side:
+ *
+ *   1. the user pressed outside @surface (the dismissal we want),
+ *   2. a popup grab took the slot,
+ *   3. a layer surface mapped with interactivity != NONE (LayerSurface.cpp).
+ *
+ * Treat @cleared as "you no longer hold input", not as "the user dismissed you",
+ * and re-acquire if the surface is still meant to be up.
+ *
+ * Acquiring while another grab of ours is live releases that one first.
+ *
+ * Returns: %TRUE if the grab reached the compositor. %FALSE means no support or
+ *   an unmapped surface — the caller must keep its old mechanism in that case.
+ */
+gboolean veltrix_wl_focus_grab_acquire (GdkSurface                   *surface,
+                                       VeltrixWlFocusGrabClearedFunc  cleared,
+                                       gpointer                      user_data,
+                                       GDestroyNotify                destroy);
+
+/**
+ * veltrix_wl_focus_grab_add_surface:
+ * @surface: another #GdkSurface the live grab should accept
+ *
+ * Widens the active grab's whitelist. The protocol's whitelist is a SET, and this
+ * is the reason it is: a press inside any whitelisted surface is delivered
+ * normally and does NOT dismiss.
+ *
+ * 🔑 Why a surface that is merely adjacent needs to be in the set. On an outside
+ * press the compositor delivers the button to whatever holds pointer focus — and
+ * while a grab is up the pointer is CLAMPED to the grabbed surface — and only then
+ * clears the grab. So the press never reaches the thing you clicked: an outside
+ * click dismisses and does nothing else. When a second surface of ours is supposed
+ * to stay clickable through the grab (the bar strip, under the island's modes, so
+ * capsule-to-capsule switching stays ONE click), it has to be whitelisted rather
+ * than left outside.
+ *
+ * No-op when no grab is held. Takes effect immediately, like acquire.
+ *
+ * Returns: %TRUE if the widened whitelist reached the compositor
+ */
+gboolean veltrix_wl_focus_grab_add_surface (GdkSurface *surface);
+
+/**
+ * veltrix_wl_focus_grab_release:
+ *
+ * Gives the grab back. Unlike dropping layer-shell keyboard interactivity — which
+ * is double-buffered and only applies on the surface's next commit, a ~12 ms race
+ * that cost us afterGrabRelease() — this takes effect when the compositor reads
+ * the request. No-op when nothing is held.
+ */
+void veltrix_wl_focus_grab_release (void);
+
+/**
+ * veltrix_wl_focus_grab_active:
+ *
+ * Returns: %TRUE while a grab acquired here is believed to be held
+ */
+gboolean veltrix_wl_focus_grab_active (void);
+
+
+/**
+ * VeltrixWlDragIntent:
+ * @VELTRIX_WL_DRAG_INTENT_NONE: no accepted target
+ * @VELTRIX_WL_DRAG_INTENT_OPEN: open with the target, Copy cursor
+ * @VELTRIX_WL_DRAG_INTENT_PIN: make a reference, Alias cursor
+ *
+ * Cursor feedback only; does not negotiate or accept a Wayland drop.
+ */
+typedef enum {
+  VELTRIX_WL_DRAG_INTENT_NONE,
+  VELTRIX_WL_DRAG_INTENT_OPEN,
+  VELTRIX_WL_DRAG_INTENT_PIN,
+} VeltrixWlDragIntent;
+
+/**
+ * veltrix_wl_has_drag_feedback:
+ *
+ * Returns: %TRUE if Hyalo offers optional destination-intent cursor feedback
+ */
+gboolean veltrix_wl_has_drag_feedback (void);
+
+/**
+ * veltrix_wl_set_drag_feedback:
+ * @surface: the current destination's root surface
+ * @serial: the wl_data_device.enter serial for the current visit
+ * @intent: what a drop here would do
+ *
+ * Hyalo ignores stale visits, other surfaces and ended drags. Copy negotiation
+ * and permission checks remain independent. Without support, use the ordinary
+ * negotiated cursor. The caller still accepts/refuses the ordinary data offer.
+ *
+ * Returns: %TRUE if queued, not proof of acceptance or an active drag
+ */
+gboolean veltrix_wl_set_drag_feedback (GdkSurface *surface, guint serial,
+                                      VeltrixWlDragIntent intent);
+
+
+/**
+ * veltrix_wl_has_material:
+ *
+ * Returns: %TRUE if the compositor offers veltrix-material-v1 (Hyalo, the
+ *   compositor of our own — #680; Hyprland does not).
+ */
+gboolean veltrix_wl_has_material (void);
+
+/**
+ * veltrix_wl_material_begin:
+ * @surface: a mapped #GdkSurface
+ *
+ * Starts a new list of glass shapes for @surface (the previous one is dropped).
+ */
+void veltrix_wl_material_begin (GdkSurface *surface);
+
+/**
+ * veltrix_wl_material_add_shape:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @x: left, surface-local logical pixels
+ * @y: top
+ * @width: width
+ * @height: height
+ * @corner_radius: each corner's radius
+ * @exponent: each corner is a superellipse quadrant with this exponent (2 = arc)
+ *
+ * Adds one glass shape.
+ */
+void veltrix_wl_material_add_shape (GdkSurface *surface,
+                                   double x, double y, double width, double height,
+                                   double corner_radius, double exponent);
+
+/**
+ * veltrix_wl_material_add_shape_clipped:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @x: left, surface-local logical pixels
+ * @y: top
+ * @width: width
+ * @height: height
+ * @corner_radius: each corner's radius
+ * @exponent: each corner is a superellipse quadrant with this exponent (2 = arc)
+ * @opacity: the whole glass in this shape over the plain backdrop, 0..1
+ * @clip_x: left of what of the shape may show, same coordinates
+ * @clip_y: its top
+ * @clip_width: its width; 0 = no clip
+ * @clip_height: its height; 0 = no clip
+ *
+ * Adds one glass shape as the toolkit shows it: faded (a panel fading in or out) and
+ * clipped (a card scrolled half out of its list). Shapes are drawn in the order they are
+ * added.
+ */
+void veltrix_wl_material_add_shape_clipped (GdkSurface *surface,
+                                           double x, double y, double width, double height,
+                                           double corner_radius, double exponent, double opacity,
+                                           double clip_x, double clip_y,
+                                           double clip_width, double clip_height);
+
+/**
+ * veltrix_wl_material_add_shape_pointed:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @x: left, surface-local logical pixels
+ * @y: top
+ * @width: width
+ * @height: height
+ * @corner_radius: each corner's radius
+ * @exponent: each corner is a superellipse quadrant with this exponent (2 = arc)
+ * @opacity: the whole glass in this shape over the plain backdrop, 0..1
+ * @clip_x: left of what of the shape may show, same coordinates
+ * @clip_y: its top
+ * @clip_width: its width; 0 = no clip
+ * @clip_height: its height; 0 = no clip
+ * @base_x: the pointer's base, centred on the shape's edge: x
+ * @base_y: y
+ * @tip_x: the pointer's tip: x
+ * @tip_y: y
+ * @pointer_width: the pointer's base width
+ * @tip_radius: the tip's arc
+ * @base_radius: the concave arc where the pointer meets the edge
+ *
+ * As veltrix_wl_material_add_shape_clipped(), with a pointer (a tooltip's, a menu's): body
+ * and pointer are one glass.
+ */
+void veltrix_wl_material_add_shape_pointed (GdkSurface *surface,
+                                           double x, double y, double width, double height,
+                                           double corner_radius, double exponent, double opacity,
+                                           double clip_x, double clip_y,
+                                           double clip_width, double clip_height,
+                                           double base_x, double base_y, double tip_x, double tip_y,
+                                           double pointer_width, double tip_radius, double base_radius);
+
+/**
+ * veltrix_wl_material_commit:
+ * @surface: the #GdkSurface
+ * @blur_size: the blur's kawase offset, logical pixels
+ * @blur_passes: downsampling levels; 0 = no blur
+ *
+ * Sends the shapes and the blur; they take effect with @surface's next commit, which
+ * is made at the end of the current frame if GTK draws nothing in it. Call it from a
+ * frame-clock phase before PAINT (the shell's material client calls it from LAYOUT).
+ *
+ * Returns: %FALSE if the compositor has no veltrix-material-v1
+ */
+gboolean veltrix_wl_material_commit (GdkSurface *surface, double blur_size, guint blur_passes);
+
+/**
+ * veltrix_wl_material_set_glass:
+ * @surface: the #GdkSurface
+ * @refraction: edge displacement, logical pixels
+ * @rim: specular rim strength, 0..1
+ *
+ * Asks the compositor to paint the whole glass (refractive glass); the client paints content
+ * only. How the glass treats the backdrop under each shape is its tone
+ * (veltrix_wl_material_set_tone()).
+ */
+void veltrix_wl_material_set_glass (GdkSurface *surface, double refraction, double rim);
+
+/**
+ * veltrix_wl_material_set_tone:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @saturation: about the Rec.709 luma, 1 = unchanged
+ * @ceiling: the luma l goes to l·(1 − (1 − ceiling)·l): white lands on it, 1 = unchanged
+ * @lift: where black lands (levels), 0 = unchanged
+ * @gain: where white would land (levels), 1 = unchanged
+ * @wash_r: the wash laid over, red 0..1
+ * @wash_g: green
+ * @wash_b: blue
+ * @wash_a: its opacity, 0 = none
+ * @ambient: the ambient's opacity on a large shape, 0..1, 0 = none
+ * @ambient_lift: the ambient's own levels: where black lands
+ * @ambient_gain: where white would
+ *
+ * The tone of the shapes added after this call, until the next one: the stages, in this order,
+ * of veltrix-material-v1.set_tone. Resets the ink tone. Pending until
+ * veltrix_wl_material_commit(); reset by veltrix_wl_material_begin().
+ */
+void veltrix_wl_material_set_tone (GdkSurface *surface, double saturation, double ceiling,
+                                  double lift, double gain,
+                                  double wash_r, double wash_g, double wash_b, double wash_a,
+                                  double ambient, double ambient_lift, double ambient_gain);
+
+/**
+ * veltrix_wl_material_set_ink_tone:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @saturation: as veltrix_wl_material_set_tone()
+ * @ceiling: as veltrix_wl_material_set_tone()
+ * @lift: as veltrix_wl_material_set_tone()
+ * @gain: as veltrix_wl_material_set_tone()
+ * @wash_r: as veltrix_wl_material_set_tone()
+ * @wash_g: as veltrix_wl_material_set_tone()
+ * @wash_b: as veltrix_wl_material_set_tone()
+ * @wash_a: as veltrix_wl_material_set_tone()
+ * @ambient: as veltrix_wl_material_set_tone()
+ * @ambient_lift: as veltrix_wl_material_set_tone()
+ * @ambient_gain: as veltrix_wl_material_set_tone()
+ *
+ * The tone those shapes take while their ink group's content is dark
+ * (veltrix-material-v1.set_ink_tone). Until it is set, they keep their tone whatever their ink.
+ */
+void veltrix_wl_material_set_ink_tone (GdkSurface *surface, double saturation, double ceiling,
+                                      double lift, double gain,
+                                      double wash_r, double wash_g, double wash_b, double wash_a,
+                                      double ambient, double ambient_lift, double ambient_gain);
+
+/**
+ * veltrix_wl_material_set_shape_blur:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @size: the kawase offset, logical px
+ * @passes: the number of passes; 0 = the surface's blur (veltrix_wl_material_commit())
+ *
+ * The blur of the shapes added after this call, until the next one, in place of the
+ * surface's (veltrix-material-v1.set_shape_blur). Only on a surface whose glass the client
+ * paints: where the compositor paints it, the blur is the glass's own, by each shape's size.
+ * Pending until veltrix_wl_material_commit(); reset by veltrix_wl_material_begin().
+ */
+void veltrix_wl_material_set_shape_blur (GdkSurface *surface, double size, guint passes);
+
+/**
+ * veltrix_wl_material_set_shadow:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @opacity_small: 0..1, on a shape whose shorter side is up to 64 logical px
+ * @opacity_large: 0..1, from 160; 0 = no shadow
+ * @blur_small: the gaussian's deviation, logical px, on a small shape
+ * @blur_large: the same on a large one
+ * @offset: how far down it falls, logical px
+ *
+ * The shadow the shapes added after it cast, until the next call: black, blurred, moved down,
+ * only outside the surface's shapes, by each shape's size between the two ends
+ * (veltrix-material-v1.set_shadow). Pending until veltrix_wl_material_commit(); cleared by
+ * veltrix_wl_material_begin(). Ships with a Hyalo that knows the request: the protocol stays v1.
+ */
+void veltrix_wl_material_set_shadow (GdkSurface *surface, double opacity_small, double opacity_large,
+                                    double blur_small, double blur_large, double offset);
+
+/**
+ * veltrix_wl_material_set_lensing:
+ * @surface: the #GdkSurface
+ * @size_fraction: of each shape's shorter side, 0..1; 0 = set_glass's refraction everywhere
+ *
+ * Each shape's edge displacement becomes the larger of set_glass's refraction and this
+ * fraction of its shorter side: a large pane bends more than a small control.
+ */
+void veltrix_wl_material_set_lensing (GdkSurface *surface, double size_fraction);
+
+/**
+ * veltrix_wl_material_add_veil_region:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @x: surface-local, logical; the region may reach past the surface
+ * @y: surface-local, logical
+ * @width: logical
+ * @height: logical
+ * @falloff: how far the veil fades outside the region, logical pixels
+ * @strength: its opacity under the region, 0..1
+ * @exponent: the fade's shape, (1 − d/falloff)^exponent
+ *
+ * A FIXED black veil under every shape whose centre lies inside the region — not measured —
+ * even under it and fading outside it
+ * (veltrix-material-v1.add_veil_region). Pending until veltrix_wl_material_commit(); cleared by
+ * veltrix_wl_material_begin().
+ */
+void veltrix_wl_material_add_veil_region (GdkSurface *surface,
+                                         double x, double y, double width, double height,
+                                         double falloff, double strength, double exponent);
+
+/**
+ * veltrix_wl_material_set_fusion:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @group: the fusion group of the shapes added from now on; 0 = none
+ * @spacing: logical pixels: two shapes of the group closer than this are joined
+ *
+ * The shapes added after this call, until the next one, belong to @group: the compositor
+ * draws a group as ONE pane of glass, the smooth union of their outlines. Pending until
+ * veltrix_wl_material_commit(); back to 0 with veltrix_wl_material_begin().
+ */
+void veltrix_wl_material_set_fusion (GdkSurface *surface, guint group, double spacing);
+
+/**
+ * veltrix_wl_material_set_fusion_merge:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @merge: 0..1: the group's smooth union (0) to its envelope, one shape spanning it (1)
+ *
+ * How far the group of the last veltrix_wl_material_set_fusion() is drawn towards its
+ * envelope: one shape over its members — the island's capsule and chips as one capsule. Call
+ * it after set_fusion, before the group's shapes. Pending until veltrix_wl_material_commit();
+ * back to 0 with set_fusion and veltrix_wl_material_begin().
+ */
+void veltrix_wl_material_set_fusion_merge (GdkSurface *surface, double merge);
+
+/**
+ * veltrix_wl_material_clear_glass:
+ * @surface: the #GdkSurface
+ *
+ * Back to blur only: the client paints its own glass.
+ */
+void veltrix_wl_material_clear_glass (GdkSurface *surface);
+
+/**
+ * veltrix_wl_material_has_ink:
+ *
+ * Returns: %TRUE if the compositor measures the ink (it offers veltrix-material-v1)
+ */
+gboolean veltrix_wl_material_has_ink (void);
+
+/**
+ * veltrix_wl_material_add_ink_box:
+ * @surface: the #GdkSurface passed to veltrix_wl_material_begin()
+ * @id: the ink group (one per pane of glass, of the caller's choosing)
+ * @x: left, surface-local logical pixels
+ * @y: top
+ * @width: width
+ * @height: height
+ *
+ * Declares where content of ink group @id sits (text, symbolic icons). Cleared by
+ * veltrix_wl_material_begin().
+ */
+void veltrix_wl_material_add_ink_box (GdkSurface *surface, guint id,
+                                     double x, double y, double width, double height);
+
+/**
+ * veltrix_wl_material_set_ink:
+ * @surface: the #GdkSurface
+ * @dark_above: the content turns dark when even the darkest point under it is brighter
+ *   than this (WCAG relative luminance, 0..1)
+ * @light_below: and light again only below this
+ *
+ * Asks the compositor to measure the ink boxes; the answer is the ink function's
+ * (veltrix_wl_material_set_ink_func()). A shape whose content turns dark takes its ink tone
+ * (veltrix_wl_material_set_ink_tone()).
+ */
+void veltrix_wl_material_set_ink (GdkSurface *surface, double dark_above, double light_below);
+
+/**
+ * veltrix_wl_material_clear_ink:
+ * @surface: the #GdkSurface
+ *
+ * No measurement: every group is light again (the caller resets its own content).
+ */
+void veltrix_wl_material_clear_ink (GdkSurface *surface);
+
+/**
+ * VeltrixWlMaterialInkFunc:
+ * @surface: the #GdkSurface the ink group belongs to
+ * @id: the ink group
+ * @dark: %TRUE: its content should be dark; %FALSE: light
+ * @user_data: data passed to veltrix_wl_material_set_ink_func()
+ *
+ * The compositor's decision for one ink group changed.
+ */
+typedef void (*VeltrixWlMaterialInkFunc) (GdkSurface *surface, guint id, gboolean dark,
+                                         gpointer user_data);
+
+/**
+ * veltrix_wl_material_set_ink_func:
+ * @func: (nullable) (scope notified) (closure user_data) (destroy destroy): called on the
+ *   main loop when an ink group's decision changes
+ * @user_data: data for @func
+ * @destroy: (nullable): called when @user_data is no longer needed
+ *
+ * One function for the whole process; a second call replaces the first.
+ */
+void veltrix_wl_material_set_ink_func (VeltrixWlMaterialInkFunc func,
+                                      gpointer                user_data,
+                                      GDestroyNotify          destroy);
+
+/* ------------------------------------------------------------ window controls */
+
+/**
+ * veltrix_wl_has_window_controls:
+ *
+ * Returns: %TRUE if the compositor draws window controls over an app's header
+ *   (veltrix-window-controls-v1: Hyalo — #708 point 5; Hyprland does not).
+ */
+gboolean veltrix_wl_has_window_controls (void);
+
+/**
+ * VeltrixWlWindowControlsLayoutFunc:
+ * @surface: the toplevel's #GdkSurface
+ * @side: 0 right (close last), 1 left (close first)
+ * @width: the box to reserve, logical pixels
+ * @height: the box to reserve, logical pixels
+ * @user_data: data passed to veltrix_wl_window_controls_set_layout_func()
+ *
+ * The box a window must leave for its controls, and the side it goes on: sent once the
+ * controls are requested, and again when the user changes the side.
+ */
+typedef void (*VeltrixWlWindowControlsLayoutFunc) (GdkSurface *surface, guint side, double width,
+                                                  double height, gpointer user_data);
+
+/**
+ * veltrix_wl_window_controls_set_layout_func:
+ * @func: (nullable) (scope notified) (closure user_data) (destroy destroy): called on the
+ *   main loop with each window's layout
+ * @user_data: data for @func
+ * @destroy: (nullable): called when @user_data is no longer needed
+ *
+ * One function for the whole process; a second call replaces the first.
+ */
+void veltrix_wl_window_controls_set_layout_func (VeltrixWlWindowControlsLayoutFunc func,
+                                                gpointer                         user_data,
+                                                GDestroyNotify                   destroy);
+
+/**
+ * veltrix_wl_window_controls_request:
+ * @surface: a toplevel's #GdkSurface (realized)
+ *
+ * Asks the compositor for this window's controls; its layout comes back through the
+ * function set with veltrix_wl_window_controls_set_layout_func(). No controls are drawn
+ * until a position is set.
+ *
+ * Returns: %FALSE if the compositor draws none (then the app keeps its own close button)
+ */
+gboolean veltrix_wl_window_controls_request (GdkSurface *surface);
+
+/**
+ * veltrix_wl_window_controls_set_position:
+ * @surface: the #GdkSurface passed to veltrix_wl_window_controls_request()
+ * @x: the reserved box's left edge, surface-local logical pixels
+ * @y: its top edge
+ *
+ * Where the controls go; lands with the surface's next commit (one is made after the next
+ * frame if GTK draws nothing).
+ *
+ * Returns: %FALSE if the compositor draws no controls
+ */
+gboolean veltrix_wl_window_controls_set_position (GdkSurface *surface, double x, double y);
+
+/**
+ * veltrix_wl_window_controls_unset_position:
+ * @surface: the #GdkSurface passed to veltrix_wl_window_controls_request()
+ *
+ * No controls on this window until a position is set again.
+ */
+void veltrix_wl_window_controls_unset_position (GdkSurface *surface);
+
+/**
+ * veltrix_wl_window_controls_set_buttons:
+ * @surface: the #GdkSurface passed to veltrix_wl_window_controls_request()
+ * @buttons: the buttons this window has, the protocol's bits: close 1, minimize 2, maximize 4
+ *   (an About window: 1, close alone)
+ *
+ * Which buttons the window wants; close is always kept. Lands with the surface's next commit,
+ * and the compositor answers with a new layout when the box changes. The compositor shows only
+ * those the user chose and the window can do.
+ *
+ * Returns: %FALSE if the compositor draws no controls
+ */
+gboolean veltrix_wl_window_controls_set_buttons (GdkSurface *surface, guint buttons);
+
+/**
+ * veltrix_wl_window_controls_set_ink:
+ * @surface: the #GdkSurface passed to veltrix_wl_window_controls_request()
+ * @dark: %TRUE when the header under the controls is light: draw them dark
+ *
+ * The ink the compositor draws the controls with — the app knows what its header is. Lands
+ * with the surface's next commit; light until it is sent.
+ *
+ * Returns: %FALSE if the compositor draws no controls
+ */
+gboolean veltrix_wl_window_controls_set_ink (GdkSurface *surface, gboolean dark);
+
+G_END_DECLS

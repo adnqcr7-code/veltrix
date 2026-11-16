@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# scripts/run.sh — run a bundle from source. Replaces `ags run` (2026-08-18).
+#
+#   scripts/run.sh <entry.ts> [application args…]
+#
+# The dev loop's engine: bin/veltrix-ui calls this when ~/.config/veltrix/.dev
+# exists, and `npm run dev` is the same thing by hand. It bundles the entry with
+# scripts/bundle.sh (same flags as a release build — dev and prod must not
+# diverge in the transform), drops the JS in $XDG_RUNTIME_DIR and runs it.
+# The shell embeds libgjs in its private native host; other entries use gjs.
+#
+# ⚠️ LD_PRELOAD is set HERE for the same reason bundle.sh writes it into the
+# wrapper: without libgtk4-layer-shell the shell boots with no bar and no dock,
+# and says nothing about why.
+# ⚠️ The kit is loaded at RUNTIME, as the release does (#108 phase 3): the kit's
+# modules are compiled into ui/lib/veltrix-kit/build/js on every run and the
+# bundle imports them from there — the checkout's kit, never the installed one.
+# ⚠️ CWD is the entry file's directory, like `ags run`. core/Paths.ts falls back
+# to get_current_dir() when VELTRIX_SHELL_ROOT is unset, so a different cwd here
+# silently moves where assets and style.css are looked up.
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+[ $# -ge 1 ] || { echo "usage: run.sh <entry> [gjs args…]" >&2; exit 2; }
+
+entry="$1"; shift
+[ -f "$entry" ] || { echo "run.sh: no such entry file: $entry" >&2; exit 1; }
+
+here="$(dirname "$(realpath "$0")")"
+entry_abs="$(realpath "$entry")"
+entry_dir="$(dirname "$entry_abs")"
+
+# One JS per entry file name — two bundles run side by side (shell + a probe)
+# without fighting over the path.
+out="${XDG_RUNTIME_DIR:-/tmp}/veltrix-run-$(basename "${entry_abs%.*}").js"
+
+kit_js="$(dirname "$here")/ui/lib/veltrix-kit/build/js"
+node "$here/bundle.mjs" kit "$kit_js"
+"$here/bundle.sh" --js "$entry_abs" "$out" --kit-external="$kit_js"
+
+layer_shell="${VELTRIX_GTK4_LAYER_SHELL:-}"
+if [ -z "$layer_shell" ]; then
+    _libdir="$(pkg-config --variable=libdir gtk4-layer-shell-0 2>/dev/null || true)"
+    layer_shell="${_libdir:-/usr/lib}/libgtk4-layer-shell.so"
+fi
+
+cd "$entry_dir"
+if [ "$entry_abs" = "$(dirname "$here")/ui/shell/app.ts" ]; then
+    "$(dirname "$here")/lib/veltrix-host/build.sh"
+    exec env LD_PRELOAD="$layer_shell" "$(dirname "$here")/lib/veltrix-host/build/veltrix-shell" "$out" "$@"
+fi
+exec env LD_PRELOAD="$layer_shell" gjs -m "$out" "$@"

@@ -1,0 +1,141 @@
+// RTL mirrors for Veltrix's GTK sheets — `:dir(rtl)` overrides.
+//
+// ─── WHY THIS FILE EXISTS ────────────────────────────────────────────────────
+// GTK4 CSS has NO logical margin/padding properties. `margin-inline-start`,
+// `margin-start` and `padding-inline-end` are not properties at all: the
+// theme parser logs "No property named ..." and drops them (verified in gjs,
+// 2026-11-12 — see docs/bilingual-report.md). The mechanism that works is
+// `:dir(rtl)` overrides with physical properties, one per one-sided rule.
+// A `:dir(rtl)` override carries one more pseudo-class than its base rule, so
+// it wins on specificity wherever it loads; it still has to load in the same
+// provider as the base rule, which the four entry sheets do by `@use`ing
+// this partial last (shell style.scss, settings style.scss, greeter style.scss,
+// installer style.scss — the kit's sheet loads in the same provider before the
+// app's, so these overrides out-order the kit rules too).
+//
+// ─── SHORTHAND RE-AUDIT (bilingual fix pass, 2026-11-12) ────────────────────
+// The v1 audit grepped longhands only and missed shorthand `margin:`/`padding:`
+// rules entirely. Full re-audit of all 24 SCSS files under ui/ (every 4-value
+// shorthand; 1-, 2- and 3-value shorthands are symmetric by construction — a
+// single horizontal value): exactly three asymmetric shorthands exist, all
+// fixed below — `.wifi-details`, `.veltrix-sidebar-capsule`,
+// `.veltrix-window-header` — plus the linked preset-button radii/border collapse
+// in _settings.scss. Symmetric 4-value shorthands need no override:
+// installer style.scss:104 `padding: 16px 24px 24px 24px`, :397
+// `margin: 4px 0 2px 0`. No `left:`/`right:` properties, no `text-align:
+// left|right`, and no per-corner `border-*-radius` properties exist anywhere
+// in the SCSS outside comments and the `:dir(rtl)` rules themselves.
+// Single-value `border-radius` is symmetric and needs no mirror; the only
+// asymmetric multi-value radii are the linked preset buttons in
+// _settings.scss:355/:358, covered by the `:dir(rtl)` block below.
+//
+// The direction itself comes from `ui/lib/rtl.ts` (applyLocaleDirection,
+// called in each bundle's main()); this file only mirrors the geometry.
+// Values here are literals, not `$space-*` variables, so the partial compiles
+// identically from all four entry sheets.
+//
+// ─── WHAT IS DELIBERATELY NOT HERE ──────────────────────────────────────────
+// * Symmetric rules (equal on both sides) need no override: `.nc-group-ctrl-header`
+//   (8px both sides), `.cc-detail-sep` (12px both sides), the greeter's shake
+//   keyframes, `margin-left: 0`.
+// * `menubutton arrow.left/right` (kit _base-layer.scss:184-185): GTK assigns
+//   the `.left`/`.right` class from the widget's direction, and the icon
+//   sources are already bound start/end to those classes — it mirrors on its
+//   own. (Live observation still Dell-gated.)
+// * The greeter's `dropdown > button arrow` and `.locale-bar-icon`, and the
+//   installer's `expander`: bundle-local, in their own sheets' RTL sections
+//   at the end of ui/greeter/style.scss and ui/installer/style.scss.
+// * The greeter's `dropdown > button > box > label` zero: the kit's 8px gap
+//   IS flipped here (it is right for an icon-bearing trigger), and the
+//   greeter re-zeroes it in its own RTL section, where the decision lives.
+
+// ── Shell: Wi-Fi popover ────────────────────────────────────────────────────
+// Base: ui/shell/styles/_components.scss:297 `.wifi-current-main { padding-left: 4px }`.
+.wifi-current-main:dir(rtl) { padding-left: 0; padding-right: 4px; }
+
+// ── Shell: Notification Center ─────────────────────────────────────────────
+// Base: _control-center.scss:299 `.nc-badge-header { margin-left: 8px }` ($space-2).
+.nc-badge-header:dir(rtl) { margin-left: 0; margin-right: 8px; }
+// Base: _control-center.scss:396 `.nc-action-row { margin-right: 4px }`.
+.nc-action-row:dir(rtl) { margin-right: 0; margin-left: 4px; }
+// Base: _control-center.scss:439 `.nc-content-box { padding-right: 8px }` —
+// reserves the scrollbar lane on the RIGHT. GTK puts the vertical scrollbar
+// on the LEFT under RTL (verified in gjs under Xvfb, 2026-11-12), so the lane flips.
+.nc-content-box:dir(rtl) { padding-right: 0; padding-left: 8px; }
+
+// ── Shell: Settings ─────────────────────────────────────────────────────────
+// Base: _settings.scss:57 `.veltrix-window-breadcrumb { margin-left: 2px }`.
+.veltrix-window-breadcrumb:dir(rtl) { margin-left: 0; margin-right: 2px; }
+// Base: _settings.scss:210 `.search-result-chip { margin-left: 4px }`.
+.search-result-chip:dir(rtl) { margin-left: 0; margin-right: 4px; }
+
+// ── Shell: Agent Island transcript ──────────────────────────────────────────
+// Base: _bar.scss:448 `.agent-transcript { padding-right: 14px }` — the same
+// scrollbar-lane reservation as .nc-content-box above; flips for the same reason.
+.agent-transcript:dir(rtl) { padding-right: 0; padding-left: 14px; }
+
+// ── Kit: checkbutton label ──────────────────────────────────────────────────
+// Base: ui/lib/veltrix-kit/styles/_components.scss:147
+// `checkbutton > label { margin-left: 8px }` ($space-2). The label sits beside
+// the check box; under RTL the box is on the right and the gap follows it.
+// (There is no radiobutton twin of this rule in the kit, so none is added here.)
+checkbutton > label:dir(rtl) { margin-left: 0; margin-right: 8px; }
+
+// ── Kit: list titles and footers ────────────────────────────────────────────
+// Base: _components.scss:323 `.veltrix-list-title { margin-left: 4px }`,
+// :335 `.veltrix-list-footer { margin-left: 4px }`. The 4px is the section
+// header's left edge; under RTL it is the right edge.
+.veltrix-list-title:dir(rtl),
+.veltrix-list-footer:dir(rtl) { margin-left: 0; margin-right: 4px; }
+
+// ── Kit: sidebar controls ───────────────────────────────────────────────────
+// Base: _components.scss:680
+// `.veltrix-sidebar-controls { margin-left: 12px - 8px - 1px }` — 3px from the
+// window's LEFT edge (the card's 8 margin + 1 border, then this). The sidebar
+// is START-anchored, so under RTL that edge is the right one.
+.veltrix-sidebar-controls:dir(rtl) { margin-left: 0; margin-right: 3px; }
+
+// ── Kit: dropdown trigger ───────────────────────────────────────────────────
+// Base: _components.scss:956 `dropdown > button > box > label { margin-left: 8px }`.
+// The gap between an icon and its label; under RTL the icon is on the right.
+// ⚠️ The greeter deliberately zeroes this gap (its triggers are label + arrow,
+// never an icon) — see the greeter's own RTL section, which re-zeroes both sides.
+dropdown > button > box > label:dir(rtl) { margin-left: 0; margin-right: 8px; }
+
+// ── Shell: Wi-Fi details indent (shorthand re-audit) ────────────────────────
+// Base: ui/shell/styles/_components.scss:316
+// `.wifi-details { margin: 2px 12px 8px 46px }` — the 46px left indent aligns
+// the details under the Wi-Fi name (12 row padding + 24 badge + 10 gap). Under
+// RTL the badge is on the right, so the indent moves to the right.
+.wifi-details:dir(rtl) { margin: 2px 46px 8px 12px; }
+
+// ── Kit: sidebar capsule + window header (shorthand re-audit) ───────────────
+// Base: ui/lib/veltrix-kit/styles/_components.scss:663
+// `.veltrix-sidebar-capsule { margin: 8px 0 8px 8px }` — the 8px is the outer-edge
+// gap; the sidebar is START-anchored, so under RTL that edge is the right one.
+.veltrix-sidebar-capsule:dir(rtl) { margin: 8px 8px 8px 0; }
+// Base: _components.scss:647
+// `.veltrix-window-header { padding: 0 12px 8px 8px }` — 12px right vs 8px left:
+// under RTL the window-controls capsule sits on the left and gets the 12px.
+.veltrix-window-header:dir(rtl) { padding: 0 8px 8px 12px; }
+
+// ── Shell: linked preset-button radii + border collapse (shorthand re-audit) ─
+// Base: ui/shell/styles/_settings.scss:352–358 — `.linked >
+// button.settings-preset-btn` collapses the inner border with
+// `border-right-width: 0` and rounds the outer corners of `:first-child`
+// (left) / `:last-child` (right). Under RTL `:first-child` is physically
+// rightmost, so its rounded corners belong on the right, `:last-child`'s on
+// the left, and the collapsed border is `border-left-width`.
+.linked > button.settings-preset-btn:dir(rtl) {
+    border-right-width: 1px;
+    border-left-width: 0;
+}
+.linked > button.settings-preset-btn:dir(rtl):first-child {
+    /* Literal var() — the shared partial uses no $ variables, so it compiles
+       identically from all four entry sheets; this is $veltrix-radius-sm. */
+    border-radius: 0 var(--veltrix-radius-sm) var(--veltrix-radius-sm) 0;
+}
+.linked > button.settings-preset-btn:dir(rtl):last-child {
+    border-radius: var(--veltrix-radius-sm) 0 0 var(--veltrix-radius-sm);
+    border-left-width: 1px;
+}

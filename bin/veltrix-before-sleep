@@ -1,0 +1,17 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-before-sleep — hypridle before_sleep_cmd
+# Installed to /usr/bin/veltrix-before-sleep
+# Locks the session before suspend.
+#
+# It also used to save the volume to /tmp/.veltrix-vol for after-sleep to restore
+# (2026-05-09, "waits for WP stabilisation"). That pair is gone: WirePlumber
+# persists and restores endpoint volume by itself, so the save/restore only
+# added a second writer with no owner — see veltrix-after-sleep for the
+# measurement.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Lock via logind: hypridle receives the dbus lock event and runs lock_cmd
+# (veltrix-lock) detached. Must NOT call veltrix-lock here directly — it blocks
+# until unlock, and hypridle holds the sleep inhibitor until this returns.
+loginctl lock-session 2>/dev/null || true

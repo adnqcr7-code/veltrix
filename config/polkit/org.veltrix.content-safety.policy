@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  org.veltrix.content-safety — the polkit action for Settings → Safety.
+  `pkexec veltrix-content-safety on|off` runs the helper as root; without this
+  file pkexec falls back to the generic org.freedesktop.policykit.exec
+  prompt ("run as super user"), which never names what is happening. The
+  org.freedesktop.policykit.exec.path annotation (pkexec(1)) makes pkexec
+  use THIS action — with its message — for exactly that program path.
+  Same gap exists for veltrix-language; this file covers only the
+  content-safety helper. Installed to /usr/share/polkit-1/actions/ by the
+  PKGBUILD and by install.sh. The prompt text on the Dell is still a
+  Dell-gate check: confirm it names Content Safety.
+-->
+<policyconfig>
+  <action id="org.veltrix.content-safety.apply">
+    <description>Change Content Safety protection</description>
+    <message>Authentication is required to change Content Safety protection (CleanBrowsing DNS and the hosts file)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/veltrix-content-safety</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

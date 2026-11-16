@@ -1,0 +1,28 @@
+{
+  "$comment": [
+    "Radio groups of the native toolkit (#882): the segmented choice (also the preset choice) and the swatch choice. Taken from the Settings of the time, which was the spec (ui/shell/styles/_settings.scss): button.settings-preset-btn and button.accent-circle-btn. The swatch rule went with the cyan-only picker removal (2026-11-12); the swatch numbers below are now carried by nk-widgets' swatch choice, which has no live use since that removal. Final values require owner live review.",
+    "Default applies to every dark/reduceTransparency variant; variants override whole fields like list.json. Exported once as choices in each components.json mode variant."
+  ],
+  "default": {
+    "segmented": {
+      "paddingX": 14,
+      "paddingY": 5,
+      "border": 1,
+      "borderColor": "--veltrix-border",
+      "fontSize": "fse-small",
+      "selectedColor": "--veltrix-accent",
+      "selectedText": "--veltrix-accent-fg",
+      "source": "button.settings-preset-btn: padding 5px 14px, 1px border var(--veltrix-border), font-size $fse-small, radius $veltrix-radius-sm (components common.radius); selected = .veltrix-btn--primary, the accent with accent-fg text."
+    },
+    "swatch": {
+      "diameter": 30,
+      "border": 3,
+      "ring": 2,
+      "gap": 8,
+      "selectedColor": "--veltrix-text",
+      "hoverColor": "--veltrix-text-dim",
+      "source": "Former button.accent-circle-btn (removed with the cyan-only picker removal, 2026-11-12): min 30px, 3px border, selected = border and a 2px outer ring of --veltrix-text, hover border --veltrix-text-dim. Gap: space-2 between swatches (provisional). Numbers now carried by nk-widgets' swatch choice."
+    }
+  },
+  "variants": []
+}

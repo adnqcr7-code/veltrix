@@ -1,0 +1,102 @@
+@use 'base' as *;
+
+/* --- Window Transparency Logic --- */
+window.veltrix-dock-window,
+#veltrix-dock {
+    @include veltrix-reset;
+    margin: 0;
+    padding: 0;
+
+    // (`&>box` deleted 2026-08-10 — DEAD, the sixth. It expanded to both
+    // `window.veltrix-dock-window > box` and `#veltrix-dock > box`, and the dock
+    // window's direct child is a `Gtk.Overlay` — `DockCore.tsx` does
+    // `win.set_child(windowOverlay)` — so neither could ever match.
+    //
+    // MEASURED, not reasoned: declare the selector with a sentinel padding,
+    // rebuild the dock's exact nesting on the broadway backend, and read back
+    // which nodes got it. 0 here; 1 for a control tree whose child really is a
+    // box, which is what makes the 0 mean anything. Confirmed live too, since a
+    // plain `Gtk.Window` probe cannot stand in for a layer-shell surface:
+    // `veltrix-ipc queryUI .cd-layout` → path `GtkWindow.fullscreen > GtkOverlay`.
+    //
+    // ⚠️ tech-debt used to warn that removing the redundant `windowOverlay`
+    // would make this selector START matching. That was WRONG: `layout` is a
+    // `Gtk.Overlay` as well (`DockAxis.ts`, both axes), so the direct child stays
+    // an overlay either way — the probe's third variant also returned 0. That
+    // cleanup was safe all along and the warning guarded nothing.
+    //
+    // `decoration` stays: a GTK-internal CSS node, not a widget, so no
+    // widget-tree walk can see it and nothing here proves it dead either way.
+    decoration {
+        @include veltrix-reset;
+    }
+}
+
+/* --- Dock contents ---
+   Everything below is painted by surfaces/dock/ inside the dock's own window
+   (DockCore builds it once as `name: "veltrix-dock"` for both orientations), so
+   it all lives under the dock scope — see design-system.md's scope table.
+
+   (`#the-dock-bar` deleted 2026-08-10 — DEAD: no widget in the shell carries
+   that name. Fifth dead selector found by mapping declared classes back to the
+   files that render them; the other four are noted in _bar.scss and below.) */
+#veltrix-dock,
+.veltrix-dock-window {
+    // A dock item is a GtkBox, not a button: GTK's built-in theme gives a box no background,
+    // border, shadow, hover or ripple, so the resets that used to live here (a `:hover` block,
+    // `&>ripple/highlight/outline/focus-ring/decoration`, a background-color transition, and
+    // the same for .cd-revealer and .cd-icon-container) styled nothing — they dated from when
+    // AGS pulled libadwaita in. Removed 2026-09-15; scripts/dev/dock-css-probe.ts renders the
+    // dock's widget tree with :hover and .cd-dragging forced and found 0 pixels changed.
+    .cd-item.cd-dragging {
+        opacity: 0.3;
+    }
+
+    /* --- Keyboard walk (Super+Ctrl+D) ---
+       The ICON is the stop (DockItem says why it is not its box). App icons have no
+       common silhouette — each is the app's own drawing — so the ring is the design
+       system's, on a radius-md box round the icon. The radius sits on the BASE rule:
+       `outline` follows it, and on the state alone it would come out square
+       (design-system.md → focus). */
+    .cd-icon-container > .cd-icon,
+    .cd-icon-container > image {
+        border-radius: $veltrix-radius-md;
+        &:focus-visible { @include veltrix-focus-ring; }
+    }
+
+    /* --- Separator - dark hairline --- */
+    .cd-separator {
+        min-width: 1px;
+        background-color: var(--veltrix-text-disabled);
+        margin: 0;
+        box-shadow: none;
+        border-radius: 0px;
+    }
+
+    /* --- Symbolic icon colour ---
+       A `*-symbolic` icon is a mask that takes the text colour. The dock draws its icons as
+       DockIcon (`.cd-icon`), which tints symbolic ones with its CSS `color`; `image` is the
+       Gtk.Image fallback, which GTK tints the same way. Full-colour icons ignore `color`.
+       This used to be `#cd-icon-box-launcher image` only, and nothing drew the launcher as an
+       image any more — so the launcher kept its SVG's placeholder #444444 in dark mode. */
+    .cd-icon-container .cd-icon,
+    .cd-icon-container image {
+        color: var(--veltrix-text);
+        // The elevation shadow (owner, 2026-10-07). DockIcon draws its own, from the same
+        // numbers (`ELEVATION_SHADOW`), so this reaches only the Gtk.Image fallback.
+        // It was `none` while the dock ran on Hyprland, which blurs a layer wherever its
+        // alpha clears `ignore_alpha` and grew a halo round any shadow; Hyalo does not.
+        -gtk-icon-shadow: var(--veltrix-shadow-md);
+    }
+}
+
+/* ── Vertical Dock ─────────────────────────────────────────────────────────
+   (`window#veltrix-dock-vertical` deleted 2026-08-07 — DEAD: both orientations
+   are the same window, built once in DockCore with `name: "veltrix-dock"`, so
+   that selector had never matched anything. The transparency it asked for is
+   already given by the `#veltrix-dock` block at the top of this file.) */
+
+/* The dock context menu popover reuses the shared .veltrix-menu-popover reset
+   (_components.scss) — same glass-bubble surface as the app-grid context menu. */
+
+

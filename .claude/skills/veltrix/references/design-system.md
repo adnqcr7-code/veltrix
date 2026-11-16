@@ -1,0 +1,4987 @@
+# Veltrix — Design system & SCSS conventions
+
+Read this when editing any SCSS, adding a new visual component, changing tokens, or deciding whether to use Adwaita or pure GTK4 for a new surface.
+
+## The style stack, bottom to top — and who is allowed to change each layer
+
+Written 2026-09-20, because three mechanisms kept being read as one and the confusion produced
+real bugs (a kit toggle that looked like Veltrix in the shell and like GNOME in the installer, and
+a maintainer — me — who measured under one substrate and generalised to the other).
+
+**1 · The GTK theme — which for OUR processes is none.** GTK4 carries its own stylesheet INSIDE the
+library, as a gresource (this is not libadwaita, which is fully removed). ⚠️ **On GTK 4.22 it is
+called `Default`, not `Adwaita`** — `gresource list /usr/lib/libgtk-4.so.1` shows
+`theme/Default/gtk.css` and there is no Adwaita among them. A clean Arch has no
+`/usr/share/themes/Adwaita` either: that directory holds `Default` and `Emacs`, and both are GTK3
+KEYBINDING themes (`gtk-3.0/gtk-keys.css`), not widget themes.
+
+🔑 **GTK also ships an EMPTY theme, and it is how we have none.** `theme/Empty/gtk.css` is in the
+same gresource, so `GTK_THEME=Empty` loads zero theme rules with no file of ours anywhere. That is
+what `ui/lib/veltrix-kit/platform/gtk-theme.ts` selects, and every bundle but the shell calls it
+(`useNoGtkTheme()`). Read that file before touching any of this — it holds the reasoning.
+
+⚠️ **It said `veltrix` until 2026-09-20**, naming a three-line `gtk.css` we installed into
+`/usr/share/themes/`. Three things were wrong with it, and only the third is about pixels:
+
+- it was a file to ship, package and keep out of every theme list — `ThemeManager` carried three
+  guards against our own artefact, because `/usr/share/themes/` is the SHARED namespace and any
+  theme chooser offered it;
+- loading a theme in order to neutralise it is paying twice for having none;
+- **a `GTK_THEME` naming nothing falls back to GTK's FULL built-in theme, silently.** Measured:
+  `GTK_THEME=NoSuchTheme42` renders pixel-identical to `GTK_THEME=Default`, not to a blank. So any
+  process that missed the install step — the installer on a live medium built without
+  `veltrix`, a `--dev` checkout before `install.sh` reached that line — ran the full default
+  theme while the code said "blank", and nothing said so. `Empty` cannot go missing.
+
+`GTK_THEME=Empty` is pixel-identical to the blank theme it replaced: **0 of 495 000**
+(`scripts/dev/kit-gallery-probe.ts`).
+
+**2 · gsettings `gtk-theme` is a different lever, for OTHER people's apps.** `ThemeManager` writes
+it (`org.gnome.desktop.interface gtk-theme`) and third-party applications read it; `GTK_THEME` is
+an environment variable and reaches nothing outside the process that sets it. Its seed is `Default`
+— the name GTK's built-in answers to. ⚠️ It seeded `Adwaita` until 2026-09-20, which named a ghost:
+nothing on disk, and everything worked only because an unresolvable name falls back to the
+built-in. A value nothing can resolve is also a value no dropdown can offer, which is why Settings'
+theme row displayed a name that was not among its own options AND opened an empty list — one bug
+seen from two ends (tech-debt #107).
+
+**3 · Provider priority — what actually decides.** Our CSS loads at
+`STYLE_PROVIDER_PRIORITY_USER` (`ui/lib/veltrix-kit/platform/host.ts`) and `USER + 20` (`ui/lib/veltrix-kit/platform/appearance-css.ts`),
+both ABOVE the theme's priority. The constants, read from GTK 4.22 itself on 2026-09-20:
+**FALLBACK 1 · THEME 200 · SETTINGS 400 · APPLICATION 600 · USER 800** — so a theme sits at 200,
+our sheet at 800 and the token engine at 820. This is the number that settles what a user's theme
+can and cannot do to us, and it is why no theme has ever needed neutralising where we declare
+something. **So wherever we declare a property, we already beat Adwaita** —
+the blank theme is not what makes our CSS win. Measured: with Adwaita underneath or with the blank
+theme, three of the installer's six pages render PIXEL-IDENTICAL.
+
+**4 · Resets — a declaration whose only job is to have something to win with.** Priority decides a
+CONFLICT; where we say nothing there is no conflict and whatever is underneath simply speaks.
+⚠️ **Since 2026-09-23 what is underneath is the BASE LAYER, not a theme**, and that changes which
+resets are alive: a `veltrix-reset` that strips a `button`'s fill inside the CC is still doing work
+(it strips the base layer's `--veltrix-surface`), while one that suppressed a node only a THEME
+painted — `ripple`, `focus-ring`, `decoration`, `:drop(active)`, `scrolledwindow > overshoot`, a
+theme's focus rectangle on list rows — is dead weight. `_reset.scss` lost all of the second kind in
+step 6 (it had `button, calendar { color }`, justified by an `Adw.init()` gone since 2026-08-18;
+the base layer now says exactly that). **The resets were for the SHELL,
+the last bundle that ran on a theme (until 2026-09-23)**; they become dead weight the day it stops, and
+not one day earlier — a reset removed while its node is still undrawn takes the pixel with it
+(tech-debt #107, the ordering rule). ✅ The shell stopped running on a theme on 2026-09-23 (step 5),
+so step 6 — deleting what only neutralised it — is now open, and still one reset at a time, measured.
+
+**5 · The bundle sheets — and, under them, the BASE LAYER.** `ui/lib/veltrix-kit/styles/` is the kit's;
+`ui/shell/styles/` is the shell's and only the shell compiles it; then each bundle's own sheet.
+`style-ownership-check` gates the first against the second. ⚠️ Since 2026-09-23 (tech-debt #108
+phase 2) the kit's sheet is compiled ONCE, to `ui/lib/veltrix-kit/kit.css` (`styles/kit.scss` = the
+base layer + the components), and the shell, greeter and lock load it at RUNTIME ahead of their own
+sheet, in the SAME provider — `withKitSheet()`, `ui/lib/veltrix-kit/platform/kit-css.ts`. Only the
+installer still compiles it in, until the ISO is published. Read "The kit's sheet is loaded, not
+compiled in" in `architecture.md` before touching how any app loads CSS.
+🔑 **`ui/lib/veltrix-kit/styles/_base-layer.scss` (2026-09-20) is the layer beneath all of them**: bare element
+selectors, every one of them (0,0,1), for the nodes no class of ours can reach — the toplevels GTK
+builds itself. ⚠️ It is `@use`d **from each bundle's own sheet** (`ui/installer/style.scss`,
+`ui/greeter/style.scss`, and `ui/shell/style.scss` since 2026-09-23), deliberately NOT from the kit's
+`_components.scss`: on 2026-09-20 wiring it there put it in the shell while the shell still wore a
+theme, and cost 35 134 changed pixels on the bar alone — a layer meant to replace a theme, added
+under a process that still has one, is the two-substrate bug again. Per-bundle wiring keeps the
+substrate and the layer moving in ONE change. Read the file's header before adding a rule: it
+carries the A/B commands and the rule that a rule lands only after the node has been looked at.
+🔑 **The base layer copies GTK's GEOMETRY and supplies OUR paint** — `button` is GTK's
+`4px 9px` / 24px min-height, `list > row` GTK's 2px, `calendar` GTK's `tnum` digits, a dropdown's
+box GTK's 6px gap. Found by the shell's flip, one regression each: a base rule that invents its
+own box moves every widget of ours that declared colours but trusted the theme for the box.
+The one deliberate visual change is the chevron: `dropdown arrow` is OUR `nd-pan-down` glyph by
+path (`-gtk-recolor(url(…))`), where the theme drew its icon theme's triangle — commandment 10.
+🔑 **The A/B has three instruments now**, one per substrate question: `kit-gallery-probe`
+(`FONT_DIALOG=1` / `FILE_DIALOG=1` shoot the toplevels GTK builds for its own dialogs),
+`installer-pages-probe`, and `shell-gallery-probe` — which enumerates the shell's compiled sheet
+rather than curating a list, and mounts each `<element>.<class>` inside a window carrying its scope,
+because a rule scoped to `#veltrix-bar` applies nowhere else.
+⚠️ **`shell-gallery-probe` is not enough for the shell**, and says so: 220 of the shell's selectors
+are bare classes it cannot mount. The flip of 2026-09-23 was verified on the LIVE shell — reload,
+open every overlay and every Settings page through `veltrix-ipc` (`toggleCC`, `settingsPage <id>`…),
+`veltrix-ipc screenshot`, and diff against the same run on `main`'s CSS. Crop each diff to the
+surface's own rect (Settings: its `hyprctl clients` geometry) — third-party windows behind the
+glass change between runs and swamp a full-screen diff. And rebuild `ui/shell/style.css` for EACH
+arm: the shell reads the compiled file, so a baseline taken after compiling the change is the change.
+
+**6 · Tokens.** Static fallbacks in each sheet (the dark set, for the first frame) plus the runtime
+engine (`theme-tokens.ts` → `initAppearance()`), which emits the live ramp from the real accent,
+mode and opacity. `token-contract-check` gates "defined where painted"; `token-orphan-check` gates
+the other direction.
+
+**7 · Cairo.** Everything custom-painted — capsules, the rim of light, dots, rings. Not CSS at all,
+which is why `--veltrix-edge` could be deleted: the rim lives here (tech-debt #106).
+
+**8 · Icons, which are TWO systems.** App icons follow freedesktop names and the user's app icon
+theme; interface icons are the `nd-` spec and only a theme declaring `X-Veltrix-Icon-Spec` can
+change them.
+
+### The substrate: settled for three bundles, and one still owes it
+
+✅ **DECIDED by the owner, 2026-09-20 — commandment 11, tech-debt #107.** *"Si no usamos Adwaita,
+no usamos Adwaita, no lo usamos reseteado."* Our own processes run on NO GTK theme and we draw what
+we use. Loading a theme in order to neutralise it is paying twice for having none. Do NOT
+re-propose keeping a theme underneath our surfaces; the reasoning was had, with measurements.
+
+| | greeter · lock · installer | shell (incl. Settings) |
+|---|---|---|
+| substrate | `GTK_THEME=Empty` — nothing | the user's gsettings `gtk-theme` |
+| resets | unnecessary | they ARE the mechanism |
+| a widget we forgot to draw | invisible, and therefore findable | wears somebody else's clothes |
+
+Running two substrates is what produced a component that looks like Veltrix in one process and like
+GNOME in another. Three of the four are now on the same one; the shell is the remaining step, and
+what holds it up is measured rather than feared — see below.
+
+**The kit's bill for having no theme was two rules**, and both are the kit's own problem rather
+than the shell's: `scripts/dev/kit-gallery-probe.ts` renders one of each kit component under both
+substrates — 345 differing pixels of 495 000, and they are exactly (a) the `dropdown`'s arrow,
+which vanishes, and (b) the entry `placeholder`, which stops being dimmed and becomes
+indistinguishable from typed text. Everything else — rows, buttons in three variants, the circle
+button, the badge, entries, the list card — is identical.
+
+**The installer's whole bill was three**, measured the same way across its six pages: those two
+plus the password entry's peek icon, which stops being dimmed. Three of the six pages are
+pixel-identical either way.
+
+✅ **Resolved 2026-09-23 — the shell is themeless.** The two dialogs below turned out to be one:
+`Gtk.FileDialog` goes through the **portal** by default on GTK 4.22 (it only mapped in-process with
+`GDK_DEBUG=no-portals`), so the file chooser Settings opens is drawn by `xdg-desktop-portal-gtk` —
+another process, a third-party app for theming purposes, not ours to dress. The font dialog is
+dressed by the base layer. The paragraph below is the record of what held the flip up.
+
+🔴 **What stopped the SHELL, and it was not the widgets.** It is the two dialogs GTK builds ITSELF
+inside our process, both of which live in Settings: `Gtk.FontDialog` (the font picker) and
+`Gtk.FileDialog`. They are toplevels of GTK's own, carrying none of our classes, so the shell's
+scoped rules cannot reach them and `GTK_USE_PORTAL` is not set either. Captured 2026-09-20 under
+both substrates: with no theme the font dialog is legible and **undressed** — no frame on the
+search entry, none on the font list, no trough on the size slider, no chrome on the spin buttons,
+and no button chrome at all, so *Cancelar* and *Seleccionar* run together as two bare words. That
+🔑 **And the owner's answer, same day, is that this is the wrong way round.** Dressing GTK's
+internal nodes is not the cost of commandment 11, it is its DESTINATION: the stylesheet of a
+process that loads no theme *is* that process's theme. What the font dialog exposes is that our CSS
+is all per-surface scoped classes and has no BASE layer of element selectors — and a widget GTK
+builds itself can never carry one of our classes, so element selectors are the only lever that
+reaches it. A provider added with `add_provider_for_display` reaches our process and nothing
+outside it, so those rules were never leaking anywhere. Read tech-debt #107 step 5 before writing
+any of it: the layer is real, and it is built by measuring surface by surface, because bare-element
+rules are the sharp edge this repo has already paid for once.
+
+⚠️ The probes are no longer blind to this. `installer-pages-probe` and `kit-gallery-probe` default
+to NO theme — what the surfaces actually run on — and take `PLATFORM_THEME=1` for the other arm of
+the A/B. They used to do the opposite, and a probe that forces a substrate its surface does not use
+is measuring a machine nobody has; that mistake has now been made in both directions on the same
+file, once each way.
+
+### Who may change each layer — and what happens to OUR apps when they do
+
+✅ **DECIDED by the owner, 2026-09-20** — the same day as commandment 11 and the second half of the
+same question. It was asked forwards, not about the shell: *"habrá apps nuestras que sean como apps
+de terceros, y si un usuario quiere cambiar el tema espera que cambie todo, desde la calculadora
+hasta nuestras apps"*. Veltrix will publish applications that ship OUTSIDE this repo, and a
+calculator of ours is an app like any other.
+
+**The answer: `veltrix-kit` is the platform library, and a Veltrix application is never reskinned by a
+foreign GTK theme.** The kit is to a Veltrix app what libadwaita is to a GNOME app — a dependency
+that carries the look, not a substrate somebody swaps underneath it. What a user can change, and how
+far each lever reaches:
+
+| lever | who moves it | what it reaches | what it does NOT reach |
+|---|---|---|---|
+| `GTK_THEME=Empty` (env, per process) | us, in code — `useNoGtkTheme()` | only the process that sets it | everything else; it is an environment variable |
+| gsettings `gtk-theme`, mirrored to `~/.config/gtk-{3,4}.0/settings.ini` by `AppearanceSync` | **the user**, in Settings | third-party GTK3/GTK4 applications | our own processes, once the shell is on `Empty` too — and today it reaches only the holes in our sheet |
+| the Settings **portal** — accent, colour scheme, contrast, font | **the user** | **everything**: our shell, our apps AND third-party apps | — |
+| `~/.config/gtk-4.0/gtk.css`, written by hand | the user | any GTK4 app of theirs, ours included | ⚠️ unmeasured — see the bottom of this section |
+
+**Why "themeable" is not a switch anybody can flip.** By the priority numbers in point 3 above, a
+foreign theme can never beat a rule of ours; it shows through the HOLES in our sheet and nowhere
+else. So making our apps follow the user's theme means REMOVING our sheet from them — which removes
+the kit, the Cairo glass, the squircle window and the custom slider (9 of the kit's 24 files paint
+with Cairo, and there is no `Gtk.Scale` in this repo at all). That is a different product, not a
+setting. The alternative costed and rejected the same day was two skins per kit component — ours and
+a bare-GTK one a theme could dress — which is what KDE does and what KDE pays a whole subsystem for.
+
+**And the expectation being replaced is a GTK3 one.** libadwaita ignores `gtk-theme` on purpose: a
+GNOME user who installs a GTK theme today sees Nautilus, Calculator and Text Editor unchanged, and
+`adw-gtk3` exists for the opposite job — dressing the GTK3 leftovers to match. The axis that
+survived into GTK4 is accent / colour scheme / contrast / font, which is the portal row above, and
+that one already reaches everything including other people's apps.
+
+🔑 **So the coherence this buys is a DEFAULT, not a theme engine.** The way a Veltrix desktop looks
+Veltrix from our calculator to GIMP is: our apps carry the kit, and third-party apps get a Veltrix GTK
+theme we ship and seed as `themeFamily`. ⚠️ That theme is a **separate artefact from our sheet**, not
+the same file installed twice — it has to speak GTK's own vocabulary (`headerbar`,
+`.suggested-action`) instead of our 97 `.veltrix-*` classes, it has to cover GTK3 to reach anything
+much, and it can never carry the Cairo half. Its BODY is the base layer of tech-debt #107 step 5,
+which is the order to build things in: base layer, then the shell's flip, then the theme for others.
+
+⚠️ **One door is still open and unmeasured.** GTK loads the user's own `~/.config/gtk-4.0/gtk.css`
+at USER level — the SAME 800 as `host.ts` — and equal priorities are settled by insertion order,
+not by priority. The token engine at 820 is above it either way. Nothing of ours writes that file
+today (`AppearanceSync` touches only `settings.ini`), so this is theoretical, but until somebody
+measures it "the user's theme reaches none of our processes" is proven of `gtk-theme` and unproven
+of a hand-written `gtk.css`.
+
+## Veltrix vocabulary
+
+- Glass capsules; blur ~40px (SCSS preview) or real blur from Hyprland (production).
+- 1px inner white border, soft outer shadow, top sheen.
+- **Accent color is for active/selected state only.** Never for normal borders or normal buttons.
+- **Accent is NEVER a text colour** — not even for the active/selected state. It doesn't contrast reliably on every background. Active/selected text reads in the mode-aware token (`--veltrix-text`/`-secondary`/`-dim`, `#fff` dark / `#000` light); the accent conveys the state via **background fill, tinted background (`--veltrix-accent-10`), or border** instead (e.g. active workspace number, calendar "today", selected segment, chips/badges, suggested alert button = bold not accent). The one exception is white text *on* an accent fill (`--veltrix-accent-fg`). Symbolic **icons** may still tint to accent (not text).
+
+## A list of CHOICES is one tab stop; a list of CONTROLS is one per row
+
+GTK4 makes every `GtkListBoxRow` focusable, so Tab walks them one by one. That is right for a
+Settings group — each row holds a switch or an entry somebody has to reach — and wrong for a list
+of data: the installer's country list is 249 rows, and reaching the footer from it took 249
+presses (#403, D-04).
+
+**`VeltrixPickList`** (`veltrix-kit/list.ts`) is the second case: a `Gtk.ListBox` whose `focus`
+vfunc returns false for `TAB_FORWARD`/`TAB_BACKWARD` **when the focus is already inside it**, so
+Tab moves past the whole list, while Up/Down/Enter stay GtkListBox's own. It is what
+`GtkListView` and `GtkColumnView` do in their own `focus` vfunc; this is that behaviour for the
+list widget we actually use. `VeltrixList(title, classes, footer, { pick: true })` builds one, and
+`VeltrixSidebar` is one.
+
+The test for which kind you have is not the length: **does a row hold a control, or is the row
+itself the answer?** The partition table's rows hold dropdowns and are `focusable: false`, so its
+tab ring is control-to-control — a third shape, and the right one there.
+
+⚠️ **The focus ring is `:focus-visible`, and GTK4 turns that off the moment the POINTER moves** —
+motion alone, no click needed. The ring is real (2px accent, inset 2px, from
+`veltrix-row-states`), and a screenshot taken after a synthetic `hover-at` or `click-at` shows
+nothing at all. Verified both ways on 2026-09-03 with a loud temporary colour; it cost twenty
+minutes of hunting a CSS bug that was not there. Screenshot the ring straight after the keys that
+moved it, and never after touching the pointer.
+
+Every wizard step also **takes the caret when it opens** — the searchable steps into their search
+box, the disk step onto its mode row, the account step onto its first field. Without it, a step
+reached by pressing Return on Continue leaves the focus ON Continue (or, before this, nowhere at
+all), so the first thing a keyboard user does is walk backwards into the page they just opened.
+
+## A form's faults belong to its fields, and it reports all of them
+
+A validated form (today only the installer's account step) puts each fault **inside the row it
+belongs to**, under that field's own entry, and shows **every** fault at once. Both halves were
+learned the hard way (#400): one label under the card sat below five stacked rows — below the
+fold on the window of the day — so Continue went dead with the reason off screen; and a
+`validate()` that filled a single string stopped at the first fault, so fixing what you were
+told left the button dead for a reason nobody had mentioned yet.
+
+Two rules that keep such a form from shouting at somebody who has done nothing wrong:
+
+- **One `formTouched` flag, not one per field.** Quiet on arrival; from the first keystroke
+  ANYWHERE, every empty required field says so. Per-field "touched" leaves the silent refusal
+  in place for a field the person never visited, and no flag at all greets an untouched form
+  with red under every entry.
+- **Connect the `changed` handlers AFTER the initial fill.** `set_text` emits `changed` exactly
+  like a keystroke, so a page that restores a draft would arrive already "touched" and open
+  with the errors of a form nobody has returned to yet.
+
+The message is not red — this DE spends red on recording and on failure only. What makes it
+read as a correction is that it is the one full-strength line on a card of dim subtitles, and
+that it is attached to the control it is about. In the kit, `VeltrixFieldRow` (`lib/veltrix-kit/row.ts`)
+packages this pattern universally: a stacked row housing the control and a `.veltrix-field-error`
+caption ($fse-small, weight 500, full-strength ink) with `setError(message)` and
+`setValidationState("none" | "warning" | "error")` (#400, #466).
+
+## A table is the same rows, in columns
+
+`VeltrixTable` (`lib/veltrix-kit/table.ts`) is the list card with column headings over it: a
+`.veltrix-list` holding `.veltrix-row` children, each row a line of cells instead of
+title+control. Reach for it when a line carries several values that each need naming — the
+installer's manual partitioning (partition, size, contents, mount point, format, filesystem)
+is the first, and it is what the component was built for (#399).
+
+Three things about it that are not obvious:
+
+- **The rows are rows.** It is not a `Gtk.Grid` and must not become one: `.veltrix-row`'s hover
+  fill, its `min-height` token and its radius belong to ONE widget spanning the line, and in a
+  grid a line is n unrelated children. Columns are aligned instead by **one `Gtk.SizeGroup`
+  per column**, joining that column's heading to every cell under it.
+- **A size group beats `halign`.** Every member requests the column's width, so a control that
+  wanted to sit in the middle of its column is instead stretched across it (measured: a
+  checkbox 62px wide with its indicator against the left edge). Control cells are therefore
+  WRAPPED — the wrapper takes the column, the control aligns inside it — and the column's
+  `align` is what says where. Text cells ellipsise and never wrap, for the same reason a row
+  title does not.
+- **A table cannot be squeezed, so its pane is MEASURED from it.** The table is as wide as the
+  sum of its widest cells; below that the columns compress one at a time. Any surface adopting
+  one measures the table and sizes its pane from that number — `WINDOW_LAYOUT.wizardContent`
+  is derived that way, and the derivation is written out in `ui/lib/veltrix-kit/platform/tokens.ts`. Sizing is stable
+  by contract: `VeltrixTable` reserves column widths from control models (`reserveFromModel`, default
+  true for `Gtk.DropDown`), sizing the column to the model's widest item in pixels via Pango layout
+  (`create_pango_layout` + `get_pixel_size()`) rather than jumping as options are selected (#464).
+  The reservation allocates at most one hidden dummy control per column (not per row) and updates
+  dynamically if wider models appear or through `notify::model`.
+- **Empty state vs. clearing for rebuild.** `appendMessage(text)` sets a `Gtk.ListBox` placeholder
+  and dims the headings (`.veltrix-table-header--dim`) so the table's structural shape remains
+  intact without full contrast over empty space (#467). Calling `appendMessage` on a table with rows
+  is ignored so headings do not dim over visible data. In contrast, `clear()` keeps headings at
+  full contrast because emptying to refill (e.g. Refresh) should read as an atomic rebuild rather
+  than a vacant state.
+- **Row validation states (`setValidationState`).** Rows in `VeltrixTable` can be marked with
+  `row.setValidationState("none" | "warning" | "error")` (#466). `.veltrix-table-row--warning` lifts
+  the row (`--veltrix-surface-hover`) and promotes dimmed cells to full-contrast ink at weight 500.
+  ⚠️ **An ERROR row does not change its fill** (owner's call, 2026-09-22). It used to lift to
+  `--veltrix-surface-raised`, which in the installer's partition table is also what the selected row
+  wears — a failing row and the clicked one were indistinguishable. It now shows the table's
+  **error mark**: pass `VeltrixTable(columns, classes, { icon, iconName })` and every row and the
+  headings reserve a 16 px leading column, empty unless the row is in `error`, where
+  `.veltrix-table-mark` (an icon in `--veltrix-text`, never red) appears. That is the second earned
+  case for a mark (it *discriminates* items that otherwise look identical) and it stays inside the
+  red budget. The installer passes `nd-dialog-warning` (Lucide `triangle-alert`, spec v4). The
+  sentence that explains the fault still goes under the table, naming the row. A `VeltrixFieldRow`
+  in error keeps its lift — its message is inside the row and a form has no selected row.
+
+The headings are **sentence case, not the uppercase micro-caps of `.veltrix-list-title`**. That
+label is a GROUP header, said once over a card, where the extra weight is structure; six of
+them across one line compete with the data underneath — and uppercase plus letter-spacing is
+~25% wider in every locale, on the one page whose width is derived from what its columns
+measure (es: 758 → 700 for the same table).
+
+## Section headers bind DOWN, not symmetric
+
+A settings group is a `VeltrixList(title)` (`lib/veltrix-kit/list.ts`): an uppercase
+`.veltrix-list-title` label above a `.veltrix-list` card, wrapped in a `veltrix-list-group` box.
+The **gap below the title (title→its card) is deliberately tight and the gap above it
+(previous group→title) is large** — the header must read as belonging to the card it labels,
+not floating halfway between two cards (macOS System Settings / Adwaita `AdwPreferencesGroup`
+convention). Concretely: the group box is **`spacing: 0`**, the title→card gap is owned entirely
+by `.veltrix-list-title`'s **`margin-bottom` (8px, the single source)**, and the group↔group gap
+is the page-level **`settings-page` `spacing: 24`**. Don't "balance" these into a symmetric gap —
+it was symmetric once (`spacing:12` + `margin-bottom:6` ≈ page `24`, visually ~equal) and read as
+the title detached from its content.
+
+Consequence for **footnotes appended after a card** (a `.veltrix-row-subtitle` caption added with
+`group.box.append(note)` — Power/Dock/Autostart do this): because the box is now `spacing:0`, give
+the note an explicit **`margin_top: 8`** so it binds up to the card it annotates (the same 8px
+attachment gap; don't rely on the old box spacing, which is gone). A page that hand-rolls its own
+group instead of `VeltrixList` (AppIcons wraps the ListBox in a ScrolledWindow) must likewise use
+`spacing: 0` on its `veltrix-list-group` box, not `12`.
+
+**Prefer the built-in footer to a hand-rolled note.** `VeltrixList(title, extraClasses, footer)`
+takes explanatory prose and prints it as `.veltrix-list-footer` under the card, indented to the
+title's left edge with the same 8px attachment gap. Use it for the scope a title cannot carry —
+Settings → AI states WHICH agents each permission group governs there, because some apply to every
+agent and some only to the built-in Assistant. Per-row explanation still belongs in the row's own
+subtitle.
+
+`VeltrixList` returns **both** chrome labels — `titleLabel` and `footerLabel` — for surfaces that
+re-translate themselves in place: the installer's summary rebuilds its rows on every language
+change and cannot reach its own group headers any other way, and digging them out of `box`'s
+children is how a caller starts depending on the order things were appended in.
+
+`VeltrixList` also **returns** that label as `footerLabel`, for prose that is true of only some
+states — Settings → Dock's side-position note is shown and hidden through it. That was the one
+reason a page had to hand-roll a footnote; there is none now, and the last four hand-rolled ones
+(Power, Dock, Widgets, Autostart) are gone. ⚠️ They had drifted three ways in the meantime, the same
+way the five hand-rolled empty rows had (`VeltrixEmptyRow` in `row.ts`): different classes, different
+margins, and two of them `halign: START`. Note the size change that came with using the real thing —
+a group footer is `$fse-caption` (0.86em), not the `$fse-small` a row subtitle uses. **A footnote
+under a card is a group footer, so it is caption-sized.** A page-level note with no card to bind to
+is a different statement (`.settings-placeholder`, outside the card); Widgets' reorder note was the
+former dressed as the latter, and now rides the last rendered category group.
+
+## Wrapping prose FILLS its column — never `halign: START` (a CI GATE)
+
+Any label that can wrap (row subtitles, list footers) must be built
+**`halign: FILL, hexpand: true, xalign: 0, wrap: true`**. It is not a style preference:
+
+`scripts/ci/wrapping-prose-check.mjs` holds this down, because writing it down did not: the rule was
+already here and six labels violated it anyway. That is not carelessness — the failure is INVISIBLE
+until a string is long enough to wrap, which depends on the locale and the text-size setting, so on
+your machine in English at 1.0 every one of them looked fine. Measured offscreen at the card's real
+width (712px): the same note comes out 472px wide under `halign: START` and 692px under FILL — same
+line count for today's strings, a visibly narrower column for any string that does wrap. Escape hatch
+is `// wrapping-prose-ok:` plus a reason; nothing uses it yet.
+
+⚠️ **The gate has a blind spot: it skips any label that sets `xalign`**, on the assumption that a
+label spelling out its text alignment already fills. `VeltrixEmptyRow` was `halign: START, xalign: 0`
+and passed for weeks — until the installer's "no matches" message had to wrap and came out **21px
+wide inside a 592px row**, one syllable per line (measured 2026-09-03). `xalign` says where the text
+sits INSIDE the allocation; it has nothing to say about how wide the allocation is. Write all four
+properties, and do not read a pass from this gate as proof.
+
+A `halign: START` label is allocated its NATURAL width, and a wrapping `GtkLabel`'s natural width
+is **GTK's own line-balancing heuristic**, not the space available. So every description picks its
+own break column and the page reads as random — one row on a single line, the next broken at some
+other width, for no reason a user can see. Measured live on Settings → AI (2026-07-27, via
+`veltrix-ipc queryUI .veltrix-row-subtitle`): fourteen subtitles in one page came out **310, 332,
+369, 372, 442, 456, 480, 486, 493, 501, 540, 556, 567 and 589 px** wide. With FILL they are 610 px
+across every toggle row, and the only remaining variation is the rows whose trailing control is
+wider (a dropdown, a path label) — which is structural and reads as such.
+
+`max_width_chars` does NOT fix this. It only caps the natural width, so it removes the widest
+outliers and leaves the heuristic in charge underneath — it looked identical on screen.
+
+**Verify wrapping with `veltrix-ipc queryUI <selector>`, not with your eyes on a screenshot**: it
+reports each node's real `bounds`, so "do these all break at the same column?" is a set of numbers
+rather than a judgement call.
+
+### A TITLE is the opposite case: one line, ellipsised (2026-08-11)
+
+`VeltrixRow`'s title is **`wrap: false, ellipsize: END`**, and it is not the same decision as the
+subtitle above it — prose wraps, a label does not:
+
+- a wrapping label's **minimum** width is its longest word, so a wrapping title makes the whole row
+  squeezable down to that. That is how a settings page ends up "almost vertical": before the pane
+  had a floor, the text column reached **47 px** and descriptions came out one word per line.
+- `veltrix-row--single/--double` **declare** the row's height (48/72). A title that may take two
+  lines makes that declaration true for some rows and false for others — precisely the "lists
+  breathe differently from page to page" the height tokens exist to end.
+
+What actually overflows there is not setting names (they fit at 800 px in every shipped locale)
+but hardware strings: Settings → Audio renders `Starship/Matisse HD Audio Controller Analog Stereo`
+as a title, and it took three lines. Ellipsis is the right answer to that, wrapping is not.
+
+⚠️ And do NOT reach for `max_width_chars` to tame one: it caps the label's natural width, so it
+truncates strings the row had room for. Two of those stubs were left over from when the pane could
+shrink (Audio's device rows, cut at 234 px inside a 688 px row) and were removed with the pane's
+width becoming a constant. The row's own width is the only bound a title needs.
+
+⚠️ **A row that carries `.veltrix-row` is not the same thing as a row built by `VeltrixRow`**, and
+the class is what makes the difference invisible: it supplies the chrome (hover, radius, margin)
+while the height class, the title's ellipsis and the subtitle's fill live on the COMPONENT. Twelve
+Settings rows sat in that gap until 2026-08-11 — Sound's six had no declared height at all, and
+Power's three profile rows measured 44 px against a 48 px token in a page whose other rows were 72.
+If a list is empty, its row is **`VeltrixEmptyRow(text)`** (dimmed, left-aligned to the same edge as
+a real title, and neither selectable nor activatable — a message that takes the hover state claims
+to be a control). A page-level "there is no hardware at all" statement is the different thing:
+`.settings-placeholder`, outside the card. See tech-debt #65 for both, and for why that class
+silently styled nothing for five months.
+
+⚠️ **`focusable` and `can-focus` are two different properties, and putting the second on a row
+makes every entry inside it untypeable.** GTK4's `focusable` is "this widget itself accepts the
+focus"; `can-focus` is "this widget **or any of its descendants** may". A row is a container with
+no behaviour, so `focusable: false` is right and `can_focus: false` is never what is meant — but
+the second reads like a stronger spelling of the first, which is how it got onto
+`VeltrixStackedRow` (#281, collateral in a chrome-metrics change) and stayed for a release. That
+row exists to hold a `Gtk.Entry`, so the effect was that **the installer's account step could not
+be typed into at all** — no password, no way to finish an installation — and that Settings → AI's
+model, endpoint and API-key fields were dead, which is every route a user has to configuring the
+Assistant. The failure has no error and no log line: the row still hovers, still takes clicks, and
+just shows no caret. What makes it expensive to find is that the window keeps working — a
+window-level `Gtk.EventControllerKey` (Escape-to-close) still fires, because keys reach the
+toplevel and only then look for a focus widget that is not there. **If typing does nothing but
+Escape still closes the window, look for `can-focus` on an ancestor, not at the entry.**
+
+## The Settings window has ONE geometry law — `WINDOW_LAYOUT` in `ui/lib/veltrix-kit/platform/tokens.ts`
+
+**The content pane is a CONSTANT 800 px.** Not a maximum, not a band: the same width on all 18
+pages, in every locale, at every text scale. Widening the window adds empty margin; narrowing it
+spends that margin, then makes the sidebar float, then hits the window's minimum. Written out,
+with S = sidebar (250), C = content (800), and W the width INSIDE the window's 1px glass rims
+(so a window is `W + 2` wide — the breakpoint is deliberately in rim-space, because at exactly
+`W = S + C` the docked pane must get exactly C):
+
+| available width W | sidebar | content |
+|---|---|---|
+| `W ≥ S + C` | docked | C, centred in W − S |
+| `C ≤ W < S+C` | floating (popover) | C, centred in W |
+| `F ≤ W < C` | floating | W — the pane YIELDS (see the floor below) |
+| `W < F` | — | refused by `set_size_request`; a compositor that forces it anyway gets horizontal SCROLL, not a clip |
+
+It is continuous: at `W = S + C` both rows give the same content width, so the sidebar leaving does
+not resize the page under the pointer.
+
+⚠️ **The floor is the DISTRESS width `F` (560), not the pane** — and that is a compositor fact, not
+a preference. `set_size_request` reaches Hyprland as `xdg_toplevel.set_min_size` and **Hyprland
+tiles at whatever the layout says anyway**: with the floor at the pane's 802 and Settings in a
+673px tile, GTK laid the window out at 802, the compositor cut the last 129px, and a row's trailing
+button went with it. Unreachable controls are worse than tight text. ⚠️ Nor can the floor be made
+conditional on being tiled — **Hyprland never clears the `tiled` toplevel state**: measured on a
+window it had just floated and resized to 600×800, GTK still carried `tiled-top`, `tiled-left`,
+`tiled-right`, `tiled-bottom` and `maximized`. A floor that reads that state never comes back.
+
+None of which is the elastic band: `C` is the width pages are DESIGNED at — the size the window
+opens at, and every width where the sidebar docks — and `F` is only what happens in a window too
+small for the design, where the question is merely which way to fail.
+
+**Three things enforce it, and all three have to stay in step** — `VeltrixClamp(page, C, true, C)`
+(min === max), `VeltrixSplitView({ collapseAt: S + C })`, and `win.set_size_request(C + rims, …)`
+in `VeltrixWindow`. The window derives the last two from `contentWidth`, so a caller only states C.
+
+### The installer has the HEIGHT half of it — `WIZARD_LAYOUT`, same file
+
+The law above is about width; the height was a literal `760` that `VeltrixWindow` hands every
+two-pane window. Because the window was 760, the country list was written `height: 300` and the
+language list `height: 320` — hand-picked to fit inside it. **Layout was being adapted to a size
+instead of the size following the layout**, and it cost three things: dragging the window taller
+left dead space (the list still measured 300), `300 ÷ 72 = 4.2` so a row was always cut in half at
+the bottom, and on the region page the card the country fills in began after a 300px block whatever
+the window's size, reading as though it belonged to a different question.
+
+The rule now: **the list states a budget in ROWS and is the only thing on the page that vexpands;
+everything else is measured.**
+
+```
+open height = glass.measure()          footer + the card's own padding
+            + contentColumn.measure()  header + the page, list at its FLOOR
+            + (listRows − minListRows) × ROW_HEIGHT.double
+            , capped at maxMonitorFraction of the SMALLEST monitor
+```
+
+Only `listRows` is a number somebody chose (6). The rest is GTK adding up a heading, a paragraph
+wrapped in whatever language this is, a search box and whatever sits under the list — none of which
+can be written down honestly, because a paragraph's height is a property of the language. Measured
+2026-09-03: 852 × 875, six whole rows, against the 760 it opened at with 4.2 rows.
+
+⚠️ **The list is measured at its FLOOR and the rows are added back at the window**, not asked for
+in the list. That is what lets a page carrying more than a list — the region page has a card and a
+keyboard-test box under it — fit the SAME window: its extra content eats into the list's share
+instead of pushing the page into a scroll. Verified on screen: welcome opens with 6 whole rows,
+region shows ~4½ and its card, neither page scrolls.
+
+⚠️ **A window cannot measure its own content.** `VeltrixSplitView` hangs the content column off a
+zero-minimum `Gtk.Overlay` so the pane's minimum width never reaches the window, and GTK4's Overlay
+measures only its BASE child — so the column is invisible to `win.measure()` in BOTH directions,
+height included. `win.measure(VERTICAL, …)` answers with the window's own `size_request` floor and
+looks perfectly plausible while telling you nothing. That is why `VeltrixWindowResult` exposes
+`contentColumn`, and why the sum above has two terms instead of one.
+
+⚠️ **A window OPENS at the breakpoint plus `WINDOW_LAYOUT.openGutter` (48), and that gutter is not
+optional.** The law says the pane is "centred in W − S"; at exactly `W = S + C` centring something in
+its own width leaves it flush against the sidebar on one side and the glass rim on the other. Half
+the gutter on each side is the air. `VeltrixWindow` has always added it — and the installer's own
+height work re-derived the opening width without it, opening 852 instead of 898 and looking cramped
+the moment it was on screen (2026-09-03). **Read the width back off the window (`win.default_width`);
+never compute it a second time.**
+
+⚠️ **And the gutter alone is not the page's margin.** The installer's page filled its pane edge to
+edge, so 23px of gutter was ALL the air a card had; Settings never looked like that because
+`.settings-page` carries `$space-10` inside its 800px pane, putting its cards 64px off the window
+edge. `.installer-body` now carries `$space-6` inside its 600px pane for the same reason — measured
+after: 47px from the card to the sidebar and to the rim, against 23 before.
+
+⚠️ **`ROW_HEIGHT` in tokens.ts mirrors `.veltrix-row--single/--double` in `_components.scss`**, with
+`scripts/ci/row-height-check.mjs` holding the two together — the rows get their height from CSS and
+the code that reasons about them (a list asking for six WHOLE rows) cannot ask CSS anything. Same
+shape and same silence as the blur thresholds.
+
+**What it replaced, and why none of it was noticeable one page at a time** (all measured live
+2026-08-11, `veltrix-ipc queryUI` × 18 pages × window widths):
+
+- the collapse breakpoint was DERIVED from the active page's natural width, every 200 ms. At a
+  850 px window, 16 pages kept the sidebar docked and **Appearance and Region** — the two carrying
+  a 320 px preview — collapsed it. Navigating Display → Appearance made the sidebar vanish and the
+  page jump 518 → 720 px. A breakpoint is a property of the WINDOW, never of what is inside it.
+- content width was **not monotonic** in window width: 900 → 568, 800 → 468, 700 → **618**,
+  600 → 518. Narrowing the window made the page wider at the breakpoint, because collapsing hands
+  the sidebar's 250 px to the content.
+- the clamp had a ceiling and no floor, and `VeltrixSplitView`'s ZeroMinOverlay deliberately severs
+  the content's minimum from the window — so nothing stopped a drag. The window went to **250 px**
+  with the page stuck at 403 and CLIPPED.
+
+**Why 800 is the number**: it is what the widest ROW needs. Across all 18 pages the widest trailing
+control is 388 px (Appearance → Accent color), then 324 (Region) and 315 (a slider row). At C = 800
+the page inside its `$space-10` padding is 720 and a row's content box 688, leaving the widest row
+~347 px of text column — about 40 characters. Below ~720 that budget starts breaking titles
+(Appearance at 518, most pages by 418). Which is also the argument against an elastic band: between
+640 and 800 there is nothing to gain and a text column to lose. A constant buys the row contract ONE
+width to be correct at, forever. (Prior art: macOS System Settings has a hard minimum window and
+never reflows its content pane.)
+
+**Check it with the instrument, not by opening the window**: `node scripts/dev/settings-geometry.mjs`
+sweeps every page at several window widths and asserts the three invariants (same pane width across
+pages, same pane width across window widths, floor holds). The failure mode here is invisible one
+page at a time — that is the whole reason it exists.
+
+## Scrollable boxed list — card on the ScrolledWindow, not the list
+
+When a boxed list must scroll INSIDE a fixed card (App Icons' installed-apps list), the card
+chrome (`@include material-card` — bg/border/radius) goes on the **`ScrolledWindow`**, not on the
+`ListBox`. If `.veltrix-list` sits on the scrolling `ListBox`, its own rounded top/bottom + border
+scroll out of the viewport → you see a **cut-off rectangle** (bug fixed 2026-07-04). Pattern:
+`scrolledwindow.<foo>-scroll { @include material-card; padding: 3px; > viewport, list { @include
+veltrix-reset; background: transparent; } }` and a transparent `ListBox`. Also set
+**`overlay_scrolling: false`** so the scrollbar takes its own gutter instead of floating over the
+rows' trailing controls (buttons). The shell scrollbar is already themed (`_reset.scss`, scoped to
+`.veltrix-settings-window` etc.) as a thin pill.
+
+## Any ScrolledWindow: use `VeltrixScrolled` — windows included
+
+**What was wrong with GTK's scrollbar was not that it was interactive. It was that it GREW.**
+GTK expands the overlay slider on pointer *proximity* — it sets `.hovering`/`.dragging` on the
+node itself, which is not the CSS `:hover` — so the bar reaches out toward whatever the pointer
+is approaching. When a list's rows carry a control at their right edge (a close ✕, a chevron),
+the bar gets there first and eats the click. This recurred three times (Settings lists → the
+Assistant transcript 2026-07-21 → the clipboard rows 2026-08-03) and **CSS cannot win it**:
+Adwaita's `scrollbar.overlay-indicator.hovering slider` beats any specificity we can write
+in-process, its base slider rule also carries `border: 4px solid transparent` (8px of invisible
+real width) that takes over exactly when hovered, and `set_can_target(false)` does nothing
+because proximity expansion is independent of event targeting.
+
+So the answer is **a bar of fixed width in a reserved lane** — not a bar you cannot touch.
+(A first pass dropped dragging entirely; the user rejected it as a regression, correctly: the
+drag was never the problem.)
+
+**`VeltrixScrolled`** (`lib/veltrix-kit/scrolled.ts`) is the one scroll view for the whole DE,
+overlay surfaces and windows alike. `vscrollbar_policy: EXTERNAL` keeps the scrolling (wheel,
+touchpad, kinetic, keyboard) while GTK never creates a scrollbar widget — no node left to grow,
+no Adwaita rule left to fight. The bar is ours: a `Gtk.Box` in a `Gtk.Overlay`, sized from the
+adjustment, dragged by a `Gtk.GestureDrag`.
+
+- **One stationary `Gtk.DrawingArea`, full height.** The whole lane is the hit area and the thin
+  pill is *painted* inside it. Its colour comes from the widget's CSS `color` read back via
+  `get_style_context().get_color()` — the same trick as `common/WorkspaceSchematic.ts`, and the
+  only way to stay token-driven from veltrix-kit, which cannot import ThemeManager.
+
+### The settled spec (2026-08-03 — decided with the user, do not re-litigate)
+
+| | Rule |
+|---|---|
+| **Alignment** | The bar sits at the **trailing edge of the scroll viewport**, and every surface's viewport must reach its own **visible inner edge**. One rule for panels and windows. Before this was written down there were three: the clipboard bar sat 14px in (it inherited `expansionInner`'s margin), Settings sat at 0, the NC/Assistant somewhere else again — which is exactly what the user noticed.  ⚠️ **Padding on the CARD is outside the scroll** — it pushes the viewport in and takes the bar with it. The Settings dropdown had `padding: 6px` on `popover > contents`, so its pill sat 10px from the wall (6 + `EDGE_CLEAR`) against 4 on every flush surface, and the whole list read as roomier than the menus it sits among. The row inset belongs on the ROWS (`listview { margin: 0 6px }`), the card keeps nothing (`contents { padding: 0 }`), and the bar then needs the card's radius as `cornerRadius` because flush means it runs into the corner. Splitting the inset across two boxes is how you end up with a card padding and a list margin **both** live, which measures 13px at the top against 7 at the sides.  🔑 **Sides only, and on purpose** — see "A vertical inset on a scrollable list is viewport, not air" below. |
+| **Content inset** | **What has to clear the lane is a row's trailing CONTROL, not its fill.** The lane may be wider than the content's inset — the pill then floats over the fill's last pixels, which is what an overlay scrollbar does everywhere. It must never reach a ✕ or a switch, and it does not have to: those sit inside the row's own trailing padding, so on the clipboard the ✕ lands 18px in (6 halo + 12 row padding) against a 12px lane. This replaces the earlier rule "content inset ≥ lane", which was true of the insets of the day (12–14) and became a trap when the halo dropped to 6: it made a scrolling list look airier than a static one for no reason the eye could name. `reserveLane` (default true) pads the child by `lane` on BOTH sides and is the fallback for content with no inset of its own; pass `false` whenever the content has one, or it pays twice (the CC detail panel sat at 18 that way). |
+| **Widths** | Pill **4px at rest → 8px hovered/dragging** = `$space-1`/`$space-2` on the project's 4px scale. Not free-hand numbers — the earlier 5/9 were, and the user caught it. Lane **12px** (`$space-3`), and it must stay ≥ 8 so an expanded pill never leaves the lane. |
+| **Hover** | The pill grows; **the hit lane never does.** That distinction IS tech-debt #15 — GTK grew the *hit area*, which is why it could eat a neighbouring button. Growth is safe on every surface precisely because the lane is measured from the viewport wall and a row's trailing control clears it — see Content inset. |
+| **Persistence** | Auto-hides everywhere, windows included: reveal on scroll or on pointer motion in the view, fade after 1.1s. One behaviour across the DE. |
+| **Corners** | The pill keeps `CORNER_CLEAR` (4px) from the curve exactly as it keeps `EDGE_CLEAR` (4px) from the wall — **one rule, every boundary** — and how far that is comes from the arc, not from a table: `⌈r - √(r² - (r - 4)²)⌉ + 4`. So `radius-md` 16 → 10, `radius-lg` 24 → **15**. Pass `cornerRadius` with the surface's own token wherever the view runs flush into it, and `cornerInset` with however far the view already starts inside that corner (else the allowance double-counts and the pill floats in dead space). ⚠️ **The bare arc expression is TANGENCY, not clearance** — it was the formula until 2026-08-03 and looked fine only because a *window's* visible corner is Hyprland's `rounding_power 3.2` **squircle**, which is squarer than a circle and leaves slack the maths never promised. A Cairo capsule drawn `perfect: true` is real circular arcs and has none: moving the bar-expansion panel from radius 20 to 24 in the token audit left the clipboard pill 1.27px off the curve, and the user saw it immediately. |
+
+**`barExpandedFlush`** (`AtomicWidget`) is how a bar-expansion panel opts out of the 14px
+horizontal inset `Bar.tsx` gives every panel, so its scroll can reach the edge; the widget then
+owes its own content that inset (`PANEL_PAD` in `widgets/clipboard.ts` — keep the two in step).
+- 🔑 **A scroll position is not a layout property.** The first version built the bar from boxes
+  and moved it with `margin_top`/`height_request`, which produced three bugs from one mistake:
+  the **drag lagged** (`Gtk.GestureDrag` reports offsets in the coordinate space of the widget
+  it is attached to — and that widget was being moved *by the drag*, so the origin moved every
+  frame), and the view **flickered with ghosted content** (changing a size request from an
+  adjustment notify, which fires *during* allocation, queues another resize on every scroll
+  step). Scrolling must only `queue_draw()`. Put the gesture on something that never moves.
+- **`reserveLane`** (default true) pads the child by `lane` so content never sits under the
+  bar. Pass `false` where the caller's CSS already reserves it (`.nc-content-box` 8px,
+  `.agent-transcript` 16px) or where nothing lives at the right edge (a clamped Settings page,
+  the app grid's centred flowbox).
+- Geometry never depends on allocation: `page_size` IS the viewport height in a ScrolledWindow,
+  so the thumb is right on the first notify, before being mapped and measured.
+- The lane is targetable **only while visible** — a faded-out lane that still took clicks would
+  swallow them invisibly, which is the very bug this replaces.
+- `alwaysVisible` for content where the bar doubles as a position readout.
+
+Migrated: clipboard panel + CC detail (`IslandGrid`), notification centre, Assistant transcript,
+every Settings page (`wrapPage`) plus the app/autostart lists and search results, app grid, and
+in the kit itself the **`VeltrixWindow` sidebar** (the `VeltrixSelect` list was migrated too, then
+deleted with the component in the token audit — Settings uses `VeltrixDropDown`).
+
+**`new Gtk.ScrolledWindow` now appears exactly twice in the tree** and that is the invariant to
+check when this claim is made again: `scrolled.ts` itself, and `IslandGrid`'s `gridClamp`, which
+is a width clamp with `NEVER` on both axes (`propagate_natural_width: false` reports a width
+independent of its child) and therefore has no scrollbar node at all. Anything else is a miss —
+the kit's two were missed on the first pass precisely because the surfaces looked done.
+A window's sidebar is not an exception; it sat two panes from ours looking like another component.
+
+`_reset.scss`'s native-`scrollbar` fallback stays, but it now covers only GTK internals we do not
+construct (`Gtk.DropDown`'s popup list is the live one — Settings uses it for blur, see the
+dropdown tradeoff). Its existence is not a licence to leave a Veltrix-built view unmigrated.
+
+⚠️ `VeltrixScrolled` returns an **overlay wrapping the view**, so anything positional belongs on
+the wrapper, not on the `scrolled`: margins (the sidebar's 4px gap to the search slot moved from
+CSS into `window.ts` for this — a margin on the view alone leaves the lane taller than the
+viewport it maps to, and the thumb drifts from the content) and any `width_request`/`measure`
+that positions a popup around it.
+
+**Do not add `scrollbar` rules for any of them** — there is no such node. `overlay_scrolling:
+false` is no longer needed anywhere and should not come back: its gutter appears WITH the bar,
+so content resizes the moment a view starts overflowing.
+
+The user's ask that settled the lane part (2026-07-21, Assistant transcript): *thin, as far
+right as possible, and it must not affect the chat's content or size*.
+
+## Search field — `.settings-search` box, never `Gtk.SearchEntry`
+
+A search input on a shell/Settings surface is a **`Gtk.Box.settings-search`** holding an
+`Icons.search` (`nd-icon`) + a `Gtk.Text` — NOT a `Gtk.SearchEntry`, which forces the icon theme's
+magnifier glyph (off-brand, wrong on the opposite mode). Wire filtering off the `Gtk.Text`'s
+`changed`. The Settings sidebar search (`Settings.tsx`) is the reference; App Icons repeated the
+`SearchEntry` mistake and was corrected (2026-07-04).
+
+⚠️ **If a surface types INTO that `Gtk.Text` from its own key handler, move the caret yourself.** The
+app grid takes keys at the window level (the focus grab routes them there so the same keystroke can
+also drive grid navigation) and pushes characters into the **buffer**:
+`buf.insert_text(buf.get_length(), ch, 1)`. A `GtkEntryBuffer` has no cursor, and `Gtk.Text` only
+advances its position from its own editing path — so the letters land correctly and the caret sits at
+column 0 forever. Nothing warns. Follow every buffer mutation with `entry.set_position(-1)`
+(GtkEditable: "after the last character"), ideally by routing all of them through one helper, as
+`AppGrid.tsx`'s `searchInsert`/`searchBackspace` now do. Shipped broken; user-caught 2026-08-10.
+
+⚠️ **Do not tint the magnifier on focus.** The original reason was mechanical — `color` could not
+reach an `nd-icon`, which was `-gtk-icon-filter: invert(1)`, a black/white toggle — and that reason is
+**gone since #587**: the glyphs are symbolic and take `color`. The rule stands on taste instead, so
+keep it: the focus signal belongs on the BOX, border and fill. An accent rule on the app grid's
+search icon was written, was dead for other reasons, and was deleted rather than repaired
+(2026-08-10).
+
+## Ghost descenders on filter — FIXED AT THE ROOT 2026-08-11, not by a line height
+
+Historical, because the workaround is gone and the reasoning is worth keeping: list subtitles
+used to leave the tails of `y/g/j/p` behind on a filter re-layout, and the shipped fix grew the
+line box of one list (`.apps-list .veltrix-row-subtitle { line-height: 1.35 }`) so the ink lived
+inside the label's text node. It read as a GskGL damage bug for a month.
+
+It was not. The line box itself was wrong — unrounded font metrics meant the box the toolkit
+reported did not contain the ink it drew, so any re-layout repainted the box and left the rest
+on screen. The same defect shaved the tops of flat glyphs (T E F H I L) everywhere else. See
+"Text is only crisp when the line box lands on WHOLE PIXELS" (at the end of this file) for the
+fix and the measurements; tech-debt §29 for why the wrong diagnosis held for a month.
+
+## The corner — ONE curve, continuous, for every shape (owner, 2026-11-02)
+
+> "Tiene que ser de forma que no haya un salto entre la recta y la curva" · "el diseño
+> unificado, no hacer una cosa de una forma y otra de otra" — the owner, on a 2×2 tile that
+> read as a square with a radius.
+
+Every rounded shape of the desktop — a capsule, a tile, a menu, the dock, a window, a toolkit
+widget — has the same corner, defined ONCE in `crates/veltrix-corner`. A shape states only its
+**radius**; nobody picks a curve.
+
+- **Continuous.** A circular arc meets a straight edge with a jump in curvature, and the eye
+  sees the joint. Our corner ramps the curvature up from the edge and back down (clothoid ramps
+  around a circular arc, smoothing 0.6 — `reference.rs`, the exact construction). It leaves the
+  edge about 1.5 radii from the box's corner and reads as a circle of radius `r` from a
+  distance. The 0.6 is chosen, not measured.
+- **Drawn as** a two-exponent superellipse quadrant fitted to that reference (within 0.2 % of the
+  radius): cheap enough for every shader, which matters — the exact curve unrolled in GLSL hung
+  llvmpipe's compiler (the headless harness).
+- **A pill** (radius = half the short side: bar capsules, 2×1 tiles, buttons) keeps a ROUND tip:
+  exponent 2 at the tip, flat-meeting where it leaves the long edge. A single exponent above 2
+  flattens the tip — the old dock squircle, rejected for capsules.
+- **Containers are concentric**: radius = what is inside's radius + the padding between. The
+  dock: icon corner (14/64 of the icon, not measured) + its air `PAD` 10 → 24 at icon 64
+  (`capsule_radius` in `toolkit/shell/src/geometry.rs`, option "C" chosen by the owner).
+- **Circles** are a square with `r ≥ half its side` — exact.
+- **Radii read 1.5× larger than the same number on a circular arc.** Windows and menus are 16,
+  which covers what 24 did before (owner, 2026-11-02: "16, as before"); a radius carried over
+  from the old curve must be checked the same way. Checked and KEPT: the Control Center's 2×2 at 38
+  (half a cell, the 1×1's corner) — the owner prefers those tiles rounder (2026-11-02).
+
+Who draws it: Hyalo's glass, window corners, title bars and the line/shadow (`corner_sdf`,
+injected by `glass_gl::with_corner`); the toolkit's CPU paint (`nk-render`, every
+`rounded_rect`/`rounded_ring`/`clip_rounded_rect`). The protocol's `exponent` stays in
+`veltrix-material-v1` (protocols stay v1) and Hyalo ignores it: send 2. Hyalo's
+`[windows] rounding_power` is parsed and ignored the same way.
+
+⚠️ **A corner reaches PAST its radius** — up to `MAX_REACH` (1.52) radii along each edge. Anything
+that treats "the corner" as an r×r square (opaque regions, skipped interiors, damage) must use
+`veltrix_corner::reach`, or the last half radius of the curve is drawn as if it were square.
+
+Not done, by decision: the TS fallback painters (`DrawingUtils`'s `createSquirclePath`, CSS
+`border-radius`) keep their old curves — TS gets no new work (owner, 2026-10-26), and on Hyalo
+the TS shell's glass is Hyalo's, so it already wears the new corner; only its GTK content clip
+and the Hyprland fallback do not.
+
+## Radii — ONE ladder, in `ui/lib/veltrix-kit/platform/tokens.ts` (audited 2026-08-03)
+
+`RADIUS` in `ui/lib/veltrix-kit/platform/tokens.ts` is the source; `--veltrix-radius-*` in `_base.scss` is a
+**mirror**, and both files say so. The ladder governs **container corners**; rounding *art* is a
+separate job (a ratio of the bitmap's own size, painted by `squircleThumb()`), and those numbers
+are not rungs — see `tech-debt.md` #48 for the three that currently disagree. Cairo cannot read a CSS var — a corner that clips has
+to be known in px — so the duplication is deliberate and labelled. **There are no radius
+literals left in TS/TSX, nor in `ui/shell/styles/*.scss`** (use `$veltrix-radius-*`, the SCSS
+alias of the same vars); that is the invariant to re-check when adding a surface. **Since
+2026-08-09 the greeter and lockscreen are covered too** — see "The design system reaches the
+greeter and the lockscreen" below.
+
+| Token | px | What wears it |
+|---|---|---|
+| `xs` | 6 | chip, badge, segmented button |
+| `sm` | 10 | button, input, dropdown, list row |
+| `md` | 16 | card inside a window (settings group, sidebar capsule) |
+| `lg` | 24 | window chrome, and any floating popup of the shell — system menu, **bar expansion panel**, CC context menu |
+| `xl` | 32 | island / overlay directly on the wallpaper: all five island modes, app grid, Prism, NC cards, CC islands |
+| pill | 9999 | capsules |
+
+There is no percentage rung. `--veltrix-radius-squircle: 28%` was documented here as "only for
+app-icon plates" and **had zero consumers in any bundle** — the plates wear `lg` like everything
+else. It could not have had one either: it was meant for rounding *art*, and **GTK4's
+`border-radius` does not clip a child's rendering** (that is why `squircleThumb()` exists).
+Deleted 2026-08-03. The same rule retired `.prism-result-icon`, a rule whose entire body was
+`border-radius: 8px` on a background-less `Gtk.Image` — it had been rounding nothing since it
+was written. **A radius on a node with no background of its own is decoration in the
+stylesheet, not on screen.**
+
+Three things this ladder is not, all of which came up in the audit:
+
+- **It is not the 4px spacing scale, and must not be "corrected" onto it.** Spacing is
+  additive (gaps sum down a column, so a shared divisor matters); a radius ladder is
+  multiplicative — what matters is the ratio between rungs. Material 3 ends its ladder on
+  28, Tailwind's has a 6. Ours runs ×1.67 ×1.60 ×1.50 ×1.33, decreasing and smooth.
+- **`sm` is derived, not chosen.** A `.veltrix-row` sits 5px inside a `.veltrix-list`
+  (1px border + 3px padding + 1px margin) and the concentric radius for a 16px card at
+  that inset is 11 — the 10 is that, rounded to the rung. Nested corners only stay
+  parallel while `inner = outer − inset` roughly holds, so **if you change the card's
+  padding you have to re-derive `sm`**, and vice versa.
+- **Radius does NOT scale with the surface.** The Workspace Overview is ~1684px wide, the
+  widest thing in the shell, and it sits at `xl` like a 200px recording island. It was 64
+  until the audit; it is also one of five modes morphing out of the same capsule through
+  `MorphRevealer`, which interpolates the radius, so an odd one out is visible in motion.
+
+- **A radius past half the box's short side is a STADIUM, not a rung — say `pill`.** The SCSS
+  sweep found two numbers hiding as ladder values: the active workspace dot (`4` on a box 6px
+  tall) and the NC header badge (`12` on ~17px). Both were already clamped by GTK to the same
+  capsule they would draw at `pill`, so writing `pill` changed no pixels and removed two
+  off-ladder literals. Check the height before you read a corner value as a radius.
+
+⚠️ **Changing a rung has a second-order cost: it moves the scroll-pill corner clearance**
+(`⌈r − √(r² − (r−4)²)⌉ + 4`, see the VeltrixScrolled spec above). Going 20 → 24 on the bar
+expansion panel is what put the clipboard pill on the curve. Whenever a radius moves, check
+who passes it as `cornerRadius`.
+
+## Spacing is TWO layers — only one of them is the 4px scale
+
+The 4px ladder (`$space-1..10`) governs **gaps between elements** — margins, box spacing,
+page padding. Those must be on it.
+
+It does **not** govern **a control's internal padding**, which is arithmetic toward a target
+box height. `button.veltrix-btn` is `padding: 5px 14px` because 5 + 1px border + the line box
+lands on ~32px, and the `Gtk.DropDown` trigger next to it uses `padding: 4px 14px` because it
+carries a 2px border instead — both comments say so in `_components.scss`. The switch's
+`slider { margin: 3px }` is (24px trough − 18px slider) / 2. **The number that belongs on the
+scale is the resulting HEIGHT (24 compact / 32 control / ~48 row), not the padding.** Snapping
+those paddings to `$space-1` does not tidy anything; it resizes every control in the shell.
+
+Two more categories that are legitimately off-scale, both easy to "fix" wrongly:
+
+- **Optical nudges on text** — `valign: CENTER` centres against a label's allocation, not its
+  ink. These carry a comment and were settled against pixels; `design-system`'s own rule is
+  *measure, don't reason* (see "Optical vs geometric centring"). Leave them.
+- **Derived sizes** — a control whose size is the sum of its parts (the accent
+  swatch button was the example: 24px swatch plus a 3px ring on each side = 30px
+  `min-width`; the picker went with the cyan-only decision, 2026-11-12, and
+  came back in Studio with the accent, 2026-11-15).
+
+When you add a control and reach for a padding value: pick the height first, then solve for the
+padding, and say so in a comment. (Audit state and what is still off-scale: tech-debt #47.)
+
+### Container padding — three tiers, by what the surface IS
+
+Swept 2026-08-03. Each step is +4, and horizontal is always +4 over vertical:
+
+| Surface | v / h | Who |
+|---|---|---|
+| **A list of rows on a shell surface** | **`rowInsetFor(R, n)`**, uniform, from the GLASS — radius **and exponent**. Every floating popup of the shell is a squircle at `lg`, so in practice they all land on **6** | bar expansion panels + clipboard, the **system menu**, the CC context menu, the **CC detail panel** (squircle `lg` → 6); the three `GlassBubble` menus (`lg` squircle body + arrow → 6); the Settings dropdown (circular `md` → 6, **sides only** — see below) |
+| **Window row** | **12 / 16** | `VeltrixRow` / `VeltrixEmptyRow` — inside Settings that is now every row but the five documented opt-outs in tech-debt #65 |
+| **Island** | **16 / 20** | all five island modes |
+
+**That first row is not a tier — it is a formula, `rowInsetFor()` in `ui/lib/veltrix-kit/platform/tokens.ts`.** A row's
+hover fill spans its container, so the container's padding IS the fill's margin, and the goal is
+ONE gap: the fill should stand as far from the corner's curve as it does from the straight edge.
+
+```
+d = (k(n)·R − k(2)·rowRadius) / k(2)        k(n) = √2·(1 − 2^(−1/n))
+```
+
+`k(n)·R` is how far a `drawSquircle` corner reaches along its 45° diagonal (its path is
+`|x/R|ⁿ + |y/R|ⁿ = 1`, so the diagonal point sits `R·2^(−1/n)` from the corner centre). For a real
+circle it collapses to plain concentricity, `d = R − r` — the same rule that derives `sm` from the
+`.veltrix-list` inset, one level up.
+
+⚠️ **The exponent moves the answer more than the radius does, and that is not a footnote.** At `lg`
+24: a circular corner asks for **14**, an `n: 3.2` squircle for **6**. Two surfaces of the *same
+radius* legitimately take insets that differ by 8px, because a squircle is nearly square and simply
+does not intrude. Getting this wrong is what the user caught twice — first a flat `12` that was
+double what a `md` bubble wants, then the circular answer applied to every `lg` surface, which left
+the system menu and the CC panels reading airy while the bubbles next to them looked right. Pass
+the `n` the surface is actually painted with: `SquircleContainer` defaults to **3.2**,
+`perfect: true` means **2**, a CSS `border-radius` is **2**, and `paintGlassBubble` takes an `n`
+(default 2 for the tooltip, 3.2 for the menus — see the bubble section below).
+
+**`perfect: true` belongs to CAPSULES, not to panels — and that is why every popup now lands on the
+same 6.** In `Bar.tsx` the only `perfect` left is the island's capsule (32px tall, in a 36px strip), where it is what clamps the
+corner to `min(w,h)/2` and produces the stadium — the bar's own glass is one full-width strip since 2026-11-12, radius 0, no `perfect`. The bar expansion panel had inherited it from the
+file it shares with them, and at `lg` it bought nothing but a *circular* corner — a different shape
+from the system menu, the CC context menu and the CC detail island, which are the same family
+(`lg` is literally defined as "any floating popup of the shell"). The user asked the right question
+— *"shouldn't they all be squircles like the system menu?"* — and the answer was yes: one shape for
+the family, and the halo falls out of it (14 → 6). **If a large surface reads airy next to a menu
+right under it, check whether it is circular by accident before touching its padding.**
+
+**The row's radius is the fixed side of the equation.** Varying a row's corner per container would
+make the same menu row look different in the dock and in the system menu — a worse inconsistency
+than any halo. Rows stay at `sm`; the container yields. Consumers write
+`rowInsetFor(R)` from the container's box, which is its glass (until #762 they added `GLASS_INSET`,
+the 2 px the glass was painted inside the box).
+
+Uniform on all four sides, too. The +4 horizontal of the other two tiers is right while the padding
+is a **text** inset; once the fill spans the box it is a margin, and it ran `12 / 6` until the user
+caught the halo being twice as wide at the sides as at the ends. No menu system runs 2:1 (AppKit's
+highlight is ~5/4pt, Windows 11 flyouts 4/4). The text's own breathing room lives on the row —
+`.veltrix-menu-row` is `7px 12px`.
+
+**⚠️ The formula covers children that paint a FILL. Bare ink is not covered, and it looks wrong
+at the same number.** `rowInsetFor` derives from concentricity — outer radius minus the child's
+own radius — which presumes the child HAS a radius, i.e. a hover pill or a background of its own.
+A child that paints none has nothing between its glyph and the cap's curve, so the identical inset
+reads as "stuck to the edge". The greeter's locale-bar capsule is the case that made it explicit
+(2026-08-16, user-caught): `padding: 4px` is exactly right for the two dropdowns inside it (32/2
+outer − 24/2 clamped inner = 4) and left the bare keyboard glyph's ink 4px from the cap, while the
+dropdowns' own `padding: 3px 8px` put THEIR glyphs at 12. Three times the clearance on one end.
+
+The correction goes **on the ink**, not on the container's padding — the container's number is
+derived and correct, and putting the difference on the bare child means reordering the row cannot
+lose it. The number to aim at is **the clearance the ink already has from the straight edges**: a
+12px glyph in a 32px capsule sits 10px off the top and bottom, so 12px from the cap is right —
+marginally more at the curve, which is what a cap wants.
+
+🔑 **What NOT to aim at is the opposite end's measured clearance.** Photometry said the ▾ on the
+right cleared its cap by 17px, not 12, because GTK's arrow glyph does not fill the padding it
+sits in. That 17 is an accident of a glyph, not a chosen number; matching it would have pushed a
+dense square icon out to where a light triangle happens to land. Measure both, then align to the
+DERIVED number and record why the other one was ignored.
+
+Prism is the check that the formula is honest: its panel is `xl` 32 but `n: 4.5`, and the formula
+gives **5.6** — which is why its long-standing 8 never looked wrong, while the 22 a circular 32
+would have demanded would have been absurd. This is `cornerClearFor`'s lesson one level up: the
+corner's squareness is a real quantity, not a hedge.
+
+**A panel's header is a row too.** In the CC detail panel the back-button header sat at 10 from
+the glass while the rows under it sat at 6 — two axes inside one card. The header's fill now keeps
+its inset like any row, and its *content* takes the same 12 the detail rows use, so the title
+and every row title share one left edge. The island is a fixed 356px, so this inset is paid out of
+the row (340 → 328 usable) — a fixed-width surface is a reason to know the cost, not to keep two
+axes.
+
+**A bubble is not a different kind of menu — and by the end of the audit it is not a different
+shape either.** The dock item menu, the app-grid item menu and the media source menu are
+`GlassBubble` popovers rather than squircle cards, and they had their own `PAD = 5`, a *fifth*
+halo. They go through `rowInsetFor()` like everything else. Then the user asked the obvious
+follow-up — *"shouldn't the dock menus be the same too?"* — and the answer was the same as for the
+bar panel: `lg` means **any floating popup of the shell**, so the three menu bubbles are now
+painted at `radiusMax: RADIUS.lg` with `n: 3.2`, the shell's squircle. **The arrow is the only
+thing that distinguishes a bubble menu; the box it hangs off is the same card as the system
+menu's.** `paintGlassBubble` grew an `n` for this and defaults it to **2** — the tooltip is a
+near-pill whose ends genuinely are stadium arcs, and it stays exact `cr.arc`. (At `n = 3.2` the
+bubble's body corners are `squircleCorner`, the same four Béziers the capsules use; until #84 they
+were a 48-chord polyline of their own, which was 2.6× closer to the ideal superellipse and 11.6×
+slower to build.) (`radiusMax` is a CAP, not a ladder rung — `paintGlassBubble` computes a near-pill
+`min(w,h)/2` first — but it *is* the surface radius `rowInsetFor` derives from, so the two come
+from one token.) (`radiusMax` in those calls is **not** a ladder rung and must not
+be swept onto one.)
+
+**The Settings dropdown popover satisfies both rules at once**, which is the sign the formula is
+right. Concentricity gives 6 (`md` 16 − `sm` 10); the ALIGNMENT AXIS says the list is the trigger
+*opened*, laid out at the trigger's width, so an option must sit on the same left edge as the value
+it replaces — the trigger puts its label at 16 (2px border + 14 padding), so the popover is
+`1 (border) + 6 (contents) + 9
+(row)`. It was landing at 23 against that 16 — a 7px sideways jump on open, which on a narrow
+list reads as "why is this padding so big" (user-caught 2026-08-03). Three numbers, one axis:
+move one and the value appears to slide as the list opens.
+
+⚠️ **Never copy a sibling's margin out of its constructor.** `Bar.tsx` builds `expansionInner`
+with one value and **rewrites it on every open** (flush panels take the horizontal over), so the
+number in the constructor is not the number that ships. The system menu was fixed twice for this:
+the second fix read the constructor's `12`, wrote `12`, and stayed 2px tighter than its siblings
+because theirs was measured after `+ GLASS_INSET` (gone with #762). Import the token.
+
+**Menus are NOT a separate tier** — an earlier version of this section claimed a symmetric `8/8`
+"menu tier" and it was wrong. It was invented to justify a blanket `sed`: `SystemMenu.tsx` held
+`10/10` (not the panel's `10/14`), so sweeping by NUMBER turned it into `8/8`, and the tier got
+written down afterwards to make that look deliberate. The user caught it from the pixels — a menu
+row's hover fill spans that box, so the margin **is** the gap between the hover and the card edge,
+and the system menu's sat **6px from the glass against the window menu's 12** (measured, both
+from the glass). Both are bar surfaces; both take `8 / 12`.
+
+Two rules out of that:
+- **Never sweep a spacing value by its NUMBER; sweep it by its ROLE.** Read what the box is.
+- **A tier you introduce to explain a change you already made is not a tier.** Derive it from what
+  the surfaces are, then check it against pixels.
+
+#### The SCSS side (swept 2026-08-03, second pass)
+
+The TSX sweep left SCSS *padding* untouched on the theory that it is all height arithmetic. That
+holds for controls and **not** for a container's section padding, so the stylesheets got their own
+pass. The finding is the useful part: of 58 literal paddings in `ui/shell/styles/`, only a handful
+were spacing at all — one genuinely off-scale gap (a `18px` breathing room) and the rest either on
+the scale already or arithmetic. **They are now written as `$space-*` where they are gaps, so the
+scale is enforced and not merely declared, and left as literals *with a comment* where they are
+not.** Prefer the token; a bare number in a padding is now a claim that it is derived.
+
+Two shapes of derived padding worth recognising, both of which a "tidy" sweep would break:
+
+- **A gap measured from a rect, when the glass was painted inside it** (until #762:
+  `.prism-results-list` was `10px` on the sides because the glass sat 2 px in from the box, so 10
+  from the rect *was* `$space-2` from the visible edge). Since #762 the box is the glass and the
+  list is `$space-2`.
+- **An ALIGNMENT AXIS wearing spacing's clothes.** Prism's search field is `padding: 14px 20px`
+  and 20 is not a spacing value at all — a result row's text lands at 8 (list) + 12 (row) = 20, so
+  the field and the results share one left edge. Before you correct a number, find out what it
+  lines up with; if something else has to move with it, say so in the comment.
+
+### Some off-scale numbers are an ALIGNMENT AXIS — check before "fixing" them
+
+Prism looks like drift (`.prism-search` `padding: 16px 22px`, `.prism-results-list` `6px 10px 10px`)
+and is not: a result row's text sits at list-padding `10` + row-padding `12` = **22**, and the search
+field's `22` puts its text on that same axis. The one genuinely wrong value there was a section
+label at `10 + 14 = 24`, 2px off its own rows — invisible as a number, visible as a ragged column.
+Before snapping a value, find out what it lines up with.
+
+⚠️ **`@mixin veltrix-reset` does NOT clear `padding`** (it does background/border/shadow/outline),
+and Adwaita gives every `list > row` 2px of it. That 2px silently offsets a row's whole text
+column — measured 2026-08-03, a `.veltrix-row-title` sat 18px inside a row whose content margin is
+16, which is why the group header above the card could never be aligned to it with any round
+number. `.veltrix-row` now sets `padding: 0` explicitly. Suspect this on any Adwaita-derived node
+whose geometry is 2px off what the code says.
+
+⚠️ **It does not clear `margin` either, and the theme uses margin on list internals.** GTK ships
+`dropdown popover listview { margin: 8px }` and `… > row.activatable { padding: 8px }` — our
+provider (810) outranks the theme (600) on the row padding *because we declare it*, but nothing
+overrode that 8px margin, so the Settings dropdown list carried an inset nobody in this repo had
+chosen. **Read the theme instead of guessing at it:**
+
+```bash
+gresource extract /usr/lib/libgtk-4.so.1 /org/gtk/libgtk/theme/Default/Default-dark.css > /tmp/adwaita.css
+```
+
+That is the actual cascade you are fighting; grep it before theorising about a widget whose
+spacing does not match its source.
+
+### Who wins: the theme is not the enemy, our own blanket rules are
+
+Measured 2026-08-03 with `scripts/dev/gtk-probe.js`, both directions, because the answer had
+been guessed at twice:
+
+- **Against the THEME, provider priority decides, per property, whatever the specificity.**
+  A theme rule at 600 setting `outline-color` + `outline-width` as longhands is fully
+  neutralised by our `outline: none` shorthand at 810 (`LOW_CSS='… row:selected { outline-color:
+  red; outline-width: 4px }'` → zero red pixels). So `@mixin veltrix-reset` really does kill
+  Adwaita's focus rings; that hypothesis is closed, don't re-open it.
+- **Within style.css, ordinary CSS specificity decides — and a window-scoped blanket rule
+  out-specifies a component's own opt-out.** `window.veltrix-settings-window button:focus-visible`
+  (0,2,2) beats `dropdown > button:focus-visible` (0,1,2), so the dropdown trigger wore the
+  blanket's accent OUTLINE *on top of* its own accent BORDER: **two concentric accent rings on
+  one control**, which is what tabbing through Settings showed. The exception lives next to the
+  blanket (`window.veltrix-settings-window dropdown > button:focus-visible { outline: none }`),
+  not in the component — the component already said `outline: none` and lost.
+
+🔑 **A blanket `window.X <element>:state` reaches inside every composed widget in that window.**
+Before writing one, ask which components style that element themselves; when one of them opts
+out on purpose, the exception belongs beside the blanket.
+
+🔑 **Focus is not one affordance.** A control styled as an INPUT (the dropdown trigger, the text
+inputs) shows keyboard focus as its 2px border going accent — no ring. A BUTTON shows a ring
+(`veltrix-focus-ring`, now in `ui/lib/veltrix-kit/styles/_tokens.scss` so all three bundles share it). One
+control must never show both.
+
+⚠️ **`outline` follows the widget's OWN `border-radius`, so declare the radius on the BASE
+rule — not only on the states that paint something.** A widget whose box is painted behind it
+(the greeter/lock capsules) draws nothing at rest, which makes it natural to put the radius
+under `:hover`/`:active` where a fill actually appears. Then the focus ring comes out a
+rounded RECTANGLE around a pill (user-caught 2026-08-09 on the unlock button, reproduced
+offscreen). **The hover fill and the focus ring are two consumers of one number.** When
+sweeping, the check is: every `@include veltrix-focus-ring` consumer must have a
+`border-radius` outside its state blocks.
+
+🔑 **A painted (Cairo) control still wears GTK's ring — a CSS `outline` — not one of its own.**
+(Owner's call, 2026-09-27, after a first version painted rings in Cairo.) The outline follows the
+widget's `border-radius`, and that is enough for most painted shapes: a PILL radius draws a circle
+or a capsule EXACTLY. Give the painted widget its shape's radius on the base rule and
+`:focus-visible { @include veltrix-focus-ring(...) }`; `SquircleContainer({ keyboardStop: true })`
+only makes the container focusable. Why not Cairo: a DrawingArea's cairo node is clipped to its
+allocation, so a painted ring can never sit OUTSIDE the glass with the 2px gap — it landed on the
+glass edge and melted into the volume tile's accent fill — while an outline is drawn outside the
+widget. The CC tiles: pill radius (1×1, 2×1, 1×2, 4×1), the 2×2 gets half a cell (`UNIT / 2`,
+restated in the SCSS because CSS cannot read it) — the same circular corner its glass draws. The one ring still painted is the slider THUMB's: the thumb
+is ours, drawn in Cairo, and GTK knows nothing of where it is.
+
+⚠️ **`@include veltrix-reset` clears `outline` too.** A state that resets and then paints its own
+fill (`button.veltrix-seg-btn.suggested-action`) loses the focus ring unless it declares
+`&:focus-visible` again after the reset — and the SELECTED segment is exactly where the focus
+lands when its panel opens.
+
+⚠️ **A focusable control with NO focus rule does not get "no ring" — it gets GTK's own.**
+GTK4's built-in fallback CSS draws a blue `outline`, which ignores the user's accent entirely.
+That is why the greeter/lock sheet says `outline: none` on every control before declaring its
+own state, and why the user chip and the dropdown triggers were quietly showing a second ring
+vocabulary until 2026-08-09. Adding a control to these surfaces means adding both halves.
+
+The greeter and lockscreen broke this in both directions until 2026-08-09 and the symptom the
+user reported was neither rule: the focus just looked **dull**. The unlock button drew an
+accent border AND a halo (both affordances), and every ring on those two surfaces was
+`rgba(accent, 0.35)` rather than solid — a 35 % ring reads as "something is slightly different
+here" instead of "your keystrokes go here". **A tinted focus ring is not a softer focus ring,
+it is a weaker signal**; if it looks too loud at full strength, the control is wrong, not the
+alpha. On the lock the input's accent edge is the painted rim (`followFocus: true`), which is
+also why only the entry passes that flag — a container reports `FOCUS_WITHIN` for any child,
+so passing it on the power bar paints the whole bar accent when one button inside has focus.
+
+### A vertical inset on a SCROLLABLE list is viewport, not air
+
+`GtkListView`, `GtkGridView` and `GtkColumnView` implement `GtkScrollable`, so a
+`Gtk.ScrolledWindow` hands them the whole surface with **no `GtkViewport` in between** and they
+scroll inside their own allocation. A vertical `margin` on such a list — **or a `padding`, they
+measure identically** — therefore takes it out of the PAGE: 6px each side turned a 400px card
+into a 388px viewport, and the rows were then clipped 6px inside the card instead of at its
+edge. A dead band, and it reads as the top and bottom being more separated than the sides
+(user-reported, 2026-08-03; measured with `scripts/dev/gtk-probe.js`, which prints the page size
+for exactly this reason).
+
+Every other list in the shell sits inside a viewport (its child is an ordinary box), where
+padding is part of the scrollable content and **scrolls away** — air at rest, content to the
+edge once you scroll. That is the behaviour to match, and a native list cannot: wrapping it in a
+viewport to force one costs the list's recycling and GTK's open-at-the-selected-item scroll,
+both of which need the list to own the adjustments.
+
+**So: a scrollable list insets its SIDES and not its ends.** The Settings dropdown is
+`listview { margin: 0 6px }`. Where the ends need air and the list is short enough never to
+scroll, the air belongs to a box around it, not to the list.
+
+⚠️ The consumer of `cornerRadius`/`cornerInset` has to follow: with the ends flush, the scroll
+pill starts at the corner and must keep the whole arc's clearance (`cornerInset: 0`), not an
+indent the list no longer has.
+
+## Tokens
+
+Tokens live in `styles/_base.scss`. Dark/light values are injected at runtime by `VeltrixTheme.ts → generateTokensCss()`. **Never invent hex values.** Use:
+
+- `--veltrix-accent`
+- `--veltrix-text*`
+- `--veltrix-surface*`
+- `--veltrix-border`
+- `--veltrix-radius-*`
+- `--veltrix-shadow-*`
+- `--veltrix-material-{thin,regular,thick,chrome}`
+- `--veltrix-danger`, `--veltrix-success`, `--veltrix-warning`
+
+The only legitimate hex literals are the one cyan accent (`#00E5FF`, in
+`ui/lib/veltrix-kit/platform/accent.ts` — the only accent; the picker and its
+swatches were removed 2026-11-12) and the danger/success/warning seeds defined
+inside `VeltrixTheme.ts`.
+
+### `--veltrix-surface*` alphas are ADDITIVE — a level picked while nested is wrong once unnested
+
+The surface ramp is translucent white over the glass (`surface-back` 0.04 · `surface` 0.08 ·
+`surface-raised` 0.20), so **a widget's apparent level is the sum of everything under it**, not the
+token it names. A chip at `surface-back` inside a `surface` bubble reads at ~0.12; lift that same
+chip out onto the bare panel and it reads at 0.04 and all but vanishes — which is exactly what
+happened to `.agent-tool-chip` when the assistant's tool chips were unbubbled (2026-07-29).
+
+**So when you re-parent a widget to a shallower background, re-pick its surface token.** Nothing
+warns you: it typechecks, the SCSS compiles, and the boot smoke passes. And do not settle it from a
+screenshot — near-threshold alpha over blurred glass is precisely what a capture flatters (see
+`tech-debt.md` on screenshot fidelity). It takes a look at the live panel.
+
+Corollary for hierarchy: when two elements have to share an alpha for legibility, carry the
+difference in **shape** instead — a small hugging pill against a wide filled block reads as two
+levels at the same 0.08.
+
+### ⛔ A CSS margin and `set_size_request` on the SAME widget fight — the margin wins
+
+**In GTK4 a CSS margin is drawn INSIDE the widget's allocation, and `width_request`/`height_request`
+set the minimum of that allocation** — so a request plus a margin does not offset the widget, it
+**shrinks** it. Measured off rendered pixels (2026-07-29): `.agent-tool-dot` requested 6×6 with
+`margin-bottom: 2px` and painted **6×4**, a horizontal oval instead of a circle. The same pattern had
+already shipped in `.agent-error-dot` — 6×6 requested against `margin-top: 5px`, painting **6×1**, a
+hairline where a dot was intended, unnoticed because only an abnormal turn end draws it.
+
+**Rule: if a widget needs a nudge, its size must come from CSS `min-width`/`min-height`, not from a
+size request.** `min-*` applies to the content box and survives the margin. A sweep of every
+`*_request:` in the shell found exactly these two (`cc-status-banner` pairs a WIDTH request with a
+vertical margin — different axes, harmless), but the trap is silent: nothing errors, nothing fails
+typecheck, and the widget just draws the wrong shape.
+
+### Optical vs geometric centring next to text — and MEASURE the direction
+
+`valign: Gtk.Align.CENTER` beside a label centres against the label's **allocation**, which is not
+where the ink looks centred, so a nudge with a comment saying `optical` is the house pattern
+(`.agent-error-dot`: `margin-top: 5px` to meet the first line of wrapped text; `.agent-tool-dot`:
+`margin-top: 2px`).
+
+**Do not reason about which way to nudge — measure it.** The plausible theory here (the line box's
+lower third is descender space most strings never use, so a centred dot reads *low*) was applied
+first and was **backwards**: the pixels showed the dot's centre at y13.5 against a cap-height band
+centring at y14.5, i.e. already 1px HIGH, and the "fix" moved it 2px further up. Crop the widget out
+of a screenshot and read the rows — `magick <png> -crop WxH+X+Y txt:-` piped through a brightness
+threshold prints an ASCII map that settles it in one shot, and it costs less than a second round of
+asking the user whether it looks right yet.
+
+### Semantic colour goes in a MARK or a FILL — never in the copy
+
+**Do not tint text `--veltrix-danger`/`--veltrix-warning`.** Red type on glass reads badly (thin
+weights over a translucent, blurred backdrop), and it shouts where a mark suffices. The signal
+belongs to a small dedicated element next to the neutral text, or to a filled background:
+
+| Signal | Where the colour lives | Text |
+|---|---|---|
+| Tool call rejected (`.agent-tool-fail`) | the 6px dot | `--veltrix-text-dim` |
+| Turn ended abnormally (`.agent-error-row`) | the 6px dot | `--veltrix-text-dim` |
+| Battery critical | the battery glyph's fill | plain white `%` |
+| Recording active (island compact) | the 8px dot | `--veltrix-text` |
+
+Rejected four times now (battery `%` 2026-07-20, assistant errors 2026-07-21, the capture card's
+and detail page's clock 2026-08-02, the greeter's caps warning 2026-08-09 — all four caught by the
+user's eye), which is why it is a rule and not a preference.
+
+⚠️ **"Not in the copy" does NOT mean "therefore a dot" — a mark has to EARN its place, and
+there are exactly two ways.** Settled with the user 2026-08-09, after a warning dot on the
+greeter's caps message shipped for an hour and was removed:
+
+1. **It SUBSTITUTES for text there is no room for.** `.island-rec-dot`: a compact island
+   capsule cannot say "recording". The dot is the only thing that fits, so it carries the whole
+   message. (`.bar-cc-badge` was the second example — a bar icon button cannot say "the AI has
+   permissions" — until the owner removed it on 2026-09-27; see state-and-ipc.md.)
+2. **It DISCRIMINATES between items that otherwise look identical.** `.agent-tool-dot` /
+   `.agent-error-dot`: the assistant's transcript is a list of steps rendered the same way, and
+   the dot is what separates the ones that failed from the ones that worked. Remove it and you
+   cannot tell them apart at a glance. This is the case the "no room" reading misses — there IS
+   room next to a tool name; the dot is not there for space, it is there for contrast within a
+   set.
+
+**A single self-describing sentence is neither.** The greeter's caps warning says what it
+means, in words, and appears alone; a dot beside it repeats the sentence. That is decoration.
+**When the copy already carries the meaning, removing the colour is the entire change** — what
+makes the message noticeable is the capsule it sits on.
+
+The user's own framing, worth keeping because it is the test that scales: *"in the agent it
+makes sense because it marks errors and tells them apart from the correct steps. Here the text
+is enough."* Before adding a mark, name which of the two jobs it is doing. If the answer is
+"it makes it stand out", it is decoration.
+
+✅ **And the sequel, same day: the icon already existed and the message was deleted.**
+`Gtk.PasswordEntry` builds its OWN caps-lock warning — an `image.caps-lock-indicator` inside
+the field, driven from the real keyboard, with no property to turn it off. So the greeter was
+showing TWO warnings for one state (that icon plus our text) while the lockscreen, which never
+had ours, showed one. Ours is gone; the field's is the only one on both screens, which is what
+macOS and iOS do and what the user had already reached for when they said "if anything, an
+icon". **Before adding an indicator to a composed GTK widget, check whether the widget already
+ships one.**
+
+🔑 **On a composed GTK widget, DUMP THE NODE TREE — do not assume the node.** Walking
+`entry.password` to confirm the indicator turned up a second, older mistake: the peek icon is
+an `image`, and this sheet had been styling `> button`, so that rule had never matched and the
+eye was inheriting the entry's full `--veltrix-text`. It matters more than it sounds, because
+the fix above depends on a hierarchy — the caps indicator is a STATE and must sit above the eye,
+a passive affordance — and that hierarchy did not exist. (`entry.password` has exactly three
+children: `text` and two `image`s.) Same family as the `margin-start` that GTK4 does not have;
+both were invisible because CSS that matches nothing fails silently.
+
+⚠️ **Rendering a GTK-owned state needs its own frame.** `lock-probe.js`'s `CAPS=1` force-shows
+that indicator, and the timing has exactly one valid slot: not at construction (GTK re-syncs the
+node from the real keyboard when the entry is mapped) and not immediately before the snapshot
+(showing a child queues a resize, and the snapshot comes back EMPTY — "nothing drawn", every
+crop missing). It goes in a timeout of its own, after the map, well before the render.
+
+🔑 **The fourth rejection adds a reason the first three did not have: on an arbitrary backdrop a
+mid-tone hue is WORSE than plain white, not merely louder.** The greeter's caps warning was
+`--veltrix-warning` type sitting directly on the wallpaper, and on a light one it read worse
+than the neutral text beside it — a saturated mid-tone has nowhere to go when the background
+can be anything, which is exactly the argument that had already talked `.greeter-error` out of
+red on the same screen. Where the shell's version of this rule is about *taste* (red type on
+glass shouts), the greeter's is about *legibility*. Same conclusion, and on the surfaces that
+sit on the user's own photograph it is the stronger of the two arguments. Corollary already documented below: once a capsule fills with a semantic
+colour, do NOT tint the label on top of it as well.
+
+### And the red BUDGET is smaller than that (2026-08-02, user call: "se tiende a abusar del rojo")
+
+Passing the mark-not-copy test does not earn a colour the right to be red. Red is for exactly two
+things:
+
+1. **A status MARK** — a small dot saying "this is happening whether or not you are looking"
+   (`.island-rec-dot`, the tool-failure dots). Small, steady, never a whole shape.
+2. **The destructive edge of an ACTION** — deletion, and revocation like the AI kill switch.
+
+Everything else that is merely *on* uses the ordinary accent-fill vocabulary, because that is what
+"on" already means in this shell. Screenrecord had drifted into the opposite: a whole capsule filled
+`DANGER_HEX` while recording, a red clock in the detail page, and a `destructive-action` Stop button.
+All three are gone — the tile fills with the plain accent like `dark_mode`/`night_light`/`focus`, the
+clocks are `--veltrix-text`, and **Stop is `suggested-action`**: stopping a capture you started on
+purpose is how the flow FINISHES (it writes the file), not something that destroys work. Reserve
+`destructive-action` for a click the user could regret.
+
+## Shell skin & opacity (the mode, the shell's glass, the glass sliders)
+
+### Which skin each shell surface wears (2026-09-30: DARK, whatever the mode)
+
+**Every shell surface wears the dark skin — dark glass, white ink — whatever the system mode, and
+whatever is behind it** (owner, 2026-09-30). The bar, the island, the dock, the CC and the NC, the
+menus, the banners, the tooltips, the app grid: `Theme.chromeIsDark` is `SHELL_SKIN_IS_DARK`
+(`core/VeltrixTheme.ts`), a constant. The system mode is the APPLICATIONS' — Settings and About
+included, which are app windows — and the "Appearance" tile still switches it, for them.
+
+| surface | its skin |
+|---|---|
+| **every shell surface** | dark, fixed — except the dock and the app grid, which follow the system mode (`skinFromMode`), and Hyalo's ink |
+| **Settings, About** | the system mode, like any app (they are not shell skin) |
+
+🔑 **Why** (the owner, in his words: "we are not going to change the colour of the text every time
+the wallpaper changes a little"): the shell used to follow the mode, and from 2026-09-29 the bar
+row took its skin from its backdrop (#676) — so the bar's ink changed with the wallpaper, and every
+panel's with the mode, for no reason the person could see. The numbers say it is not needed: dark
+glass at the ceiling (0.60) keeps PRIMARY text at 4.69:1 over pure white; the secondary tier holds
+4.5:1 up to a grey of 0.84 and falls to 3.66:1 over pure white, the dim tier to 2.78. Over the
+default wallpaper, at the thinnest glass (0.24), primary is 6.3 and secondary 4.6.
+- **Tokens:** the global `*` block is the MODE's (Settings and About wear it); the shell's windows get
+  their own full set over it, `generateChromeTokenScope` — the pin's scope, brought back for this:
+  `window#<w>, window#<w> *` for every window in `CHROME_SCOPE_WINDOWS`, emitted only while the two
+  differ. Verified live 2026-09-30: system switched to light, bar, dock and CC stayed dark with white
+  ink (the Appearance tile read "Claro").
+- **Not decided yet, and deliberately not built:** a LIGHT skin as a Setting (the owner wants the
+  possibility, "as a separate setting", its form undefined). The skin-flip classes
+  (`generateSkinFlipScope`) are what it would use; today they carry the surfaces that follow the
+  mode. (The adaptive glass's rule B and the bar row's backdrop skin went with it, #762.)
+- ⚠️ This reverses TWO recorded calls of 2026-09-29, both by the owner: #676 ("the bar reads its skin
+  from the wallpaper") and "no appearance pin — do not bring it back". The pin is not back: there is
+  still no setting. What came back is its token scope, for a skin that is now fixed.
+
+What the pin's machinery taught, and what still uses it:
+- **CSS side:** `VeltrixTheme.generateSkinFlipScope()` re-emits the full `--veltrix-*` block
+  (factored into `veltrixVars()`) under a scoped selector — per SKIN now, keyed by a class
+  `common/ShellGlass.ts` puts on the root of a surface whose skin differs from the shell's. (`generateChromeTokenScope` — the pin's, back since 2026-09-30 for the fixed dark skin — does the same per WINDOW; the lessons below were learnt on it.)
+  - **Scope = every toplevel in `CHROME_SCOPE_WINDOWS`** (each window + its descendants):
+    `veltrix-bar`, `veltrix-dock`. The bar window's `Gtk.Overlay` hosts every panel — CC, NC,
+    Prism, the system menu, the island and the app grid (#708 point 3) — so scoping that window
+    covers them all. A panel ever given a toplevel of its own must be listed by name.
+    Settings/About are separate toplevels too, and are excluded on purpose.
+  - 🔑 **THAT LIST IS A COUPLING TO WHICH SURFACES EXIST, AND IT WAS WRONG FOR A MONTH.** It
+    said "bar and dock" from the days when the island and the app grid were children of the
+    bar's window. The island moved out on 2026-07-26 and the app grid on 2026-08-09; neither
+    was added, so pinning the shell to Dark on a Light system (or the reverse) gave a bar and
+    a dock that obeyed and an island and an app grid that did not — wrong tokens **and**
+    uninverted icons. Owner-caught 2026-08-24 on the island's icons.
+    ⚠️ The same move cost the island its `blur_popups` flag in `hyprland.lua`, which is the
+    identical failure in a different file: **a surface leaving the bar's window silently leaves
+    everything that was scoped to the bar's window**. `scripts/ci/chrome-scope-check.mjs` is
+    now the gate — it compares the list against the namespaces that actually exist, requires
+    each window's GTK `name:` to equal its Wayland namespace (the selector is `window#<name>`),
+    and rejects a list entry no surface declares. The agent pointer is the one exemption, with
+    its reason recorded in the check: it paints from `chromeIsDark` in Cairo and carries no
+    CSS tokens.
+  - **GOTCHA:** the selector must hit every **descendant** directly — GTK4 custom properties
+    don't inherit reliably and the global `* { --veltrix-* }` matches every node directly, so a
+    bare `window#veltrix-bar { --veltrix-* }` only overrides the container. An id-qualified
+    universal beats `*` on specificity. It mirrors the `.nd-icon` `-gtk-icon-filter` too.
+- **Cairo side:** shell painters read the chrome skin — `chromeIsDarkFor(widget)` from
+  `common/ShellGlass.ts`, asked with the painter's OWN widget, which is `Theme.chromeIsDark`
+  unless the surface it sits in follows the mode or Hyalo turned its ink (see "The shell's glass,
+  as a painter asks for it" below). Never `Theme.isDark`:
+  `SquircleContainer` (**`chrome` defaults to `true`** = shell skin; pass `chrome: false` ONLY
+  for app-mode windows like About), the dock (`DockAxis`/`DockItem`), the bar CPU/RAM ring +
+  battery glyph, and the CC/NC/app-grid Cairo. Non-shell (Settings/About) keep `Theme.isDark`.
+  - **Shared Cairo widget drawn into BOTH** (the slider, in CC/system-menu AND Settings) can't
+    pick a global flag — it calls **`Theme.surfaceIsDark(widget)`**, which resolves by the
+    widget's ROOT window name against the SAME `CHROME_SCOPE_WINDOWS` list (in it →
+    `chromeIsDark`, else → `isDark`), so a Cairo widget and the tokens around it cannot
+    disagree about which mode a surface is in. It used to hardcode `veltrix-bar`/`veltrix-dock`
+    and went stale with the pin, for the same reason.
+    The slider uses it for the neutral track colour. Use this for any future shared painter.
+    🔑 The kit's hook is wired in `app.ts` as
+    `Theme.isChromeSurface(w) ? chromeIsDarkFor(w) : Theme.isDark` — a slider, tooltip or menu
+    inside a surface that wears the other skin must follow that surface, which a per-WINDOW answer
+    cannot. The kit's `chromeIsDark(widget?)` takes the widget for the same reason (`paintGlassBubble`
+    passes it as `opts.widget`).
+    ⚠️ Since the slider moved to the kit (2026-08-15) it reaches that method through
+    **`kitAppearance().surfaceIsDark(widget)`**, not by importing `Theme` — a kit component may
+    not import from `ui/shell/`. Same method, injected. A shared painter that stays in
+    `ui/shell/common/` still calls `Theme.surfaceIsDark` directly.
+- **Glass base color is unified via `GLASS_TINT` in `tokens.ts`**:
+  All Cairo painters (`SquircleContainer`, `DockAxis`, `GlassBubble`, `NotificationCenter`, `ActivityIsland`)
+  and CSS tokens (`--veltrix-bg`, `--veltrix-popover-bg`, `--veltrix-material-*` in `VeltrixTheme.ts`)
+  read from `GLASS_TINT` in `ui/lib/veltrix-kit/platform/tokens.ts`. In dark mode, it is an Apple HIG / macOS Vibrancy-inspired
+  **Deep Slate (`#161622` / RGB `22, 22, 34`)** rather than pure black `#000000` — providing material
+  body and preventing muddy/dirty desaturation over warm/complex wallpapers while maintaining
+  pixel-perfect coherence between windows and shell overlays.
+  ⚠️ Each entry carries the SAME colour twice — floats for Cairo, `rgb`/`hex` strings for the CSS
+  engine — and **nothing checks that the two halves agree**. `light` disagreed with itself from the
+  day the token was born until 2026-08-23 (`{1,1,1}` painted, `#fafafa` written), so light glass was
+  pure white in the shell and `#fafafa` in Settings while every comment cited "#fafafa". `#fafafa`
+  won: it is what the CSS half had always shipped, and light vibrancy is off-white in the prior art
+  we follow. Measure a retint with `scripts/dev/glass-probe.ts` rather than reasoning about it.
+- **Light-mode text ramp is nudged up:** `--veltrix-text-secondary`/`-dim` are `rgba(fg, 0.85/0.72)`
+  in light vs `0.8/0.6` in dark. Black ink over translucent light glass (on an arbitrary
+  wallpaper) reads washed-out at the dark-mode alphas; white-on-dark needs less ink. The alphas
+  live in **`TEXT_INK`** (`ui/lib/veltrix-kit/platform/glass-legibility.ts`), which `veltrixVars`
+  emits from — the tooltips' floors are held to exactly those tiers, so they are one value, not
+  two copies. The ramp is ALPHA on purpose, and that was measured, not assumed
+  (2026-09-29, #673): a solid grey equal to `dim` over black measures 1.19:1 over a white backdrop
+  against 2.13:1 for the alpha ink, because alpha ink always lands brighter than what it sits on
+  and a fixed grey sinks into a bright backdrop. Apple's `secondaryLabelColor` & co. are alpha too.
+
+**Adwaita colour leak (tech-debt #9):** libadwaita is force-loaded in-process and colours
+`button` / `calendar` labels by the PROCESS mode — wrong for a pinned shell. Fixed ONCE in
+`_reset.scss`: `button, calendar { color: var(--veltrix-text); }` (low specificity, high provider
+priority → beats Adwaita, loses to our classes). **Don't** patch `color` per menu/button — new
+shell text follows the pin automatically.
+
+### Opacity — one glass material of three, a window switch, reduce transparency (#674)
+
+⚠️ **The glass opacities are the PANE. A neutral mark painted ON the glass takes its alpha from
+`INK` in `ui/lib/veltrix-kit/platform/tokens.ts`, never from a glass opacity and never from a literal.** Two different
+quantities that both get called "opacity": `SquircleContainer` fills a CC island at
+`Theme.overlayOpacity`, `GlassBubble` at `max(overlayOpacity, 0.38)`, the notification cards at
+`overlayOpacity * depth` — that is the material. The battery outline, the dock's running dot, a
+resource ring, the cover art's empty slot are drawn on top of it, and they must NOT scale with it:
+the two would compound, so the more transparent a user made a surface the harder its own contents
+would be to read. Three tones, all painted as `chromeIsDarkFor(area) ? 1 : 0` (a painter that hardcodes
+a colour is a painter that vanishes in one appearance, and one that reads the global
+`Theme.chromeIsDark` is one that stays white on a surface that wears the other skin):
+
+| token | for |
+|---|---|
+| `INK.solid` 0.9 | the mark itself — battery outline, dock running dot, a ring's filled arc, the island player's EQ bars. Just under the icon set, never half of it: the Lucide icons beside it stroke at FULL opacity, so a half-alpha stroke at true icon scale reads as a washed-out hairline. |
+| `INK.track` 0.12 | the track a solid mark runs on — a ring's unfilled remainder. A thin stroke takes a much lower alpha than a filled area to read the same. |
+| `INK.wash` 0.1 | a filled AREA standing in for absent content — the cover art's empty slot. Lower than `track` although it reads stronger, because area beats stroke. |
+
+🔑 They are tokens because there was nowhere for them to live and nothing could compare them:
+`widgets/cpu-memory.ts` drew **the same resource ring** at 0.12/0.8 in the bar and 0.14/0.88 in the
+Control Centre — one file, one element, two sets of numbers, from a redesign that wrote a second
+drawer and never looked at the first. Deliberately NOT a token: `PulseDots`'s idle dot (0.22) has no twin
+anywhere, and a single-use number in a shared file advertises a sharing that does not exist. Nor is
+`WorkspaceSchematic`'s `WP_SCRIM`/`NO_WP_FILL`: a scrim over a wallpaper IMAGE is not ink on glass,
+and both are already named where they are used.
+
+
+**What the user picks: two switches, and no glass style** (#674, then owner 2026-10-11). Five
+opacity sliders became, on 2026-09-30, a choice of three materials (Clear / Standard / Frosted,
+`glass-material`). 🔑 **That choice is GONE since 2026-10-11** (owner): it predated measuring the
+reference, and its names collided with the reference's own (its default setting, its Regular and
+Clear variants), so it only confused what we were matching. What stayed is its factory position, the
+one every measurement against the reference was made on. How the glass's STYLE becomes configurable
+is to be decided anew — do not bring the three back. The key stays in the schema, retired, only for
+`migrations/2026-09-30-glass-material-from-opacities.sh`; nothing reads it, the portal does not serve it.
+
+| control | key (`org.veltrix.appearance`) | what it sets |
+|---|---|---|
+| Appearance → Windows: **Window style** | `window-background` (`opaque`) | Veltrix's WINDOWS: opaque, tinted or translucent — one opacity + one blur each (`WINDOW_BACKGROUNDS`, drawn by Hyalo, toolkit/PHASE1.md D6) |
+| Accessibility → Vision: **Reduce transparency** | `reduce-transparency` (off) | every glass surface SOLID (`SOLID_GLASS`), no haze |
+
+The glass itself is one set of values in `ui/lib/veltrix-kit/platform/theme-tokens.ts`: per-surface
+floors (`GLASS_FLOORS`), a white haze (`GLASS_FROST`), the launcher's floor (`GLASS_ROLE_FLOORS`) and
+the compositor blur (`GLASS_BLUR`). **The four opacities every painter reads — `barOpacity` /
+`overlayOpacity` / `dockOpacity` / `windowOpacity` — are DERIVED, stored nowhere**: `glassOpacities()`
+is the one place the values are read, and `withGlass()` re-derives them after either switch moves.
+The portal serves the two KEYS, not the numbers, and every process (the shell, Settings, the
+installer, the lock screen, the greeter through the mirror) derives the numbers itself.
+
+⚠️ **Windows are NOT part of the interface's glass** (owner, 2026-09-30). The glass is for the
+interface's surfaces and controls — bar, panels, dock, menus, tooltips. Veltrix's windows are only
+translucent or solid. And the switch says TRANSPARENCY, deliberately not macOS's "wallpaper tinting":
+what shows through a window is shaped by the compositor's blur. A tint of our own would be a promise
+we cannot keep on Hyprland (ONE blur for everything); a compositor of our own could
+(`project_own_compositor_vision` in the owner's notes, and the inventory issue it leads to).
+
+**The blur is the compositor's own.** `GLASS_BLUR` (2:2) is what `config/hypr/hyprland.lua` ships and
+what Hyalo gives a surface (a large pane one pass further — `references/hyalo.md` → "A large pane's
+blur"); the shell pushes no blur to either. `settings.blurBaseline()` reads Hyprland's live value (a
+`hyprland-user.lua` override included), re-read after `config-reloaded`. Reduce transparency leaves
+the blur on: switching it off would reach every other app's translucent window.
+
+**The haze — why the glass needs more than opacity.** Our dark tint only DARKENS, so over a
+near-black wallpaper more of it shows nothing: measured 2026-09-30 behind the bar (19,1,61), the
+old clear and frosted were identical. The glass lays a white haze over its tint (`GLASS_FROST`,
+0.04) — macOS's dark glass lightens too. The haze costs white text contrast, so it is IN
+the legibility model (`glassOver` → `frostAt`) and it gives way as the glass thickens: full
+up to `FROST_FULL_UNTIL` (0.48, the thickest floor), none from `FROST_GONE_AT` (0.58) — under the
+tooltips' floor, so every guarantee measured without a haze still holds. Painters do
+not paint a second layer: `frostedFill(tint, alpha)` gives the ONE fill equivalent to tint + haze
+(`over(over(B,T,a),W,f) ≡ over(B,T′,a′)`), and `glassAlphaFor`/`glassTintFor` already return it — so
+a shell painter gets the frost by asking what it always asked. The kit's `GlassBubble` (menus,
+tooltips) folds it through the `glassFrost` seam. `setGlassFrost()` is process-global like the
+ceiling: the shell sets it from `Theme.glassFrost`; 0 (no haze) anywhere else, which is why the pure
+probes are unchanged. `scripts/dev/glass-legibility-probe.ts` §10 holds it.
+
+**Reduce transparency reaches everything that paints glass**: the four derived opacities go to 1,
+the edge light stops clearing a solid body (`drawGlassEdgeLight`: `bodyAlpha >= 1` → no clear), the
+notification stack's ghost cards stop fading (fainter would be see-through again), the login/lock
+capsules paint their fill solid and the lock skips its own blur pass (`glass-capsule.ts`, through the
+kit seam's `reduceTransparency`).
+
+Glass a client paints itself is painted at **the floor** (the shell's own panes are Hyalo's: their
+glass is the measured tone, references/hyalo.md). The range every floor lies in lives in ONE place: **`GLASS_RANGE`** in the
+kit's `theme-tokens.ts` (`scripts/ci/blur-threshold-check.mjs` reads its `min`).
+
+⚠️ **The lowest floor is `0.24`, and it was `0.05` with "no floor" until 2026-08-23.** That is not a
+reversal of WYSIWYG: 5% glass was never 5% of anything. Hyprland's `decoration:blur:brightness`
+was `0.8`, so the blurred backdrop under every surface was being dimmed 20% — body the material
+had and no token accounted for. That brightness had to go (it draws a hard dark step along every
+antialiased edge — resolved debt #81), and `0.2 + 0.8·α` is the arithmetic of what it was worth, so
+`0.2 + 0.8 × 0.05 = 0.24` **is the old default, honestly named**.
+
+⚠️ **A floor is not a legibility guarantee — never document it as one.** White text on 24% glass
+over a pure-white wallpaper measures 1.69:1; nothing under **0.59** clears 4.5:1 there. For the
+SHELL on Hyalo, legibility is the compositor's glass — its tone, and its ink where the whole
+backdrop under the text is white (references/hyalo.md → "The ink").
+
+The four derived opacities, and who paints with each:
+- `barOpacity` → the bar strip (Cairo) — `SquircleContainer({ opacityRole: "bar" })`.
+- `overlayOpacity` → overlays CC/NC/Prism/app-grid (Cairo) — `opacityRole: "overlay"` (default).
+- `dockOpacity` → dock (Cairo, `DockAxis`).
+- `windowOpacity` → Settings/About windows = the **CSS token path** (`--veltrix-bg`/materials/
+  popovers in `veltrixVars`). Those windows are CSS-painted, not Cairo — hence a separate axis, and
+  the one the Windows switch sets.
+
+When adding a shell capsule, `SquircleContainer` already defaults to shell skin — pass
+`opacityRole: "bar"` if it's a bar capsule (else it tracks overlay).
+
+⚠️ **The old keys** (`bar-opacity`, `overlay-opacity`, `dock-opacity`, `window-opacity`) stay in the
+schema, marked retired, only so `migrations/2026-09-30-glass-material-from-opacities.sh` (and
+2026-09-14c before it, on an install upgrading from before then) can read and write them: the mean
+of the bar and the panels picks the nearest material once, then the four are reset. Nothing else
+reads them.
+
+### Tray icons recolour conditionally (not "never", not "always")
+
+A common misconception (it bit a past explanation): system-tray icons are NOT uniformly
+"app pixmaps that can't recolour". `Tray.tsx` resolves each item like this:
+- If the app exposes its icon by **name** AND the active icon theme has a **`-symbolic`**
+  variant of it → load the symbolic icon; CSS `-gtk-icon-style: symbolic` + `.bar-tray-icon
+  { color: var(--veltrix-text) }` recolour it, so it **follows the theme and the chrome pin**
+  (this is why e.g. Telegram's tray icon flips — its symbolic exists in the icon theme, no
+  app-specific code).
+- Otherwise → fall back to the app's composited `gicon` **pixmap**, which **can't** recolour.
+
+- **A one-colour pixmap is a TEMPLATE** (2026-09-29, macOS's term and its answer): an app that
+  sends only pixels picks their colour from the SYSTEM mode (Claude Desktop: white in dark, black in
+  light) and cannot know that the bar reads its skin from its backdrop (#676) — so a white icon sat
+  on light glass. `isTemplatePixbuf` (every visible pixel the same colour, ±24) routes it to
+  `templateIcon()`, a DrawingArea that paints the pixmap as a MASK in the bar's ink
+  (`chromeIsDarkFor`), repainted with the bar like every Cairo mark. A second colour
+  anywhere (a red badge, a two-tone keyboard label, a logo) → shown untouched, and that is the
+  decision, not a gap (owner, 2026-09-29): a two-colour icon carries its own contrast — ChatGPT's
+  black logo on a white tile, Fcitx's white label with a black outline — and reads on any bar, like
+  the dock's full-colour icons. Do not add an "invert grey icons" pass.
+  🔑 An SNI Id of `chrome_status_icon_N` is NOT Chrome: it is what Chromium names every tray
+  icon, so every Electron app has one (it was ChatGPT). Resolve the process before naming the app.
+  ⛔ "Make the APP believe it is in the other mode" does not work: the portal's colour scheme is
+  one answer per app, and Electron uses the same value for its windows.
+- **The symbolic palette keeps its meaning:** `-gtk-icon-palette: success var(--veltrix-text),
+  warning var(--veltrix-warning), error var(--veltrix-danger)` on the bar's images and on
+  `.veltrix-menu` — orange warning, red error, as GNOME and macOS (owner, 2026-09-29: a warning in
+  red reads as a failure); success follows the ink because the bar is monochrome and colour is for
+  what asks for attention. `--veltrix-warning` = `WARNING_HEX` (status-colors.ts), new that day. It
+  was `… white` for all three from when the bar was always dark: Telegram's unread dot stayed white
+  on light glass. That dot is `warning` only because Papirus classed it so (`ColorScheme-Highlight
+  warning` — KDE's convention and GTK's in one element); Telegram itself asks for no colour, it
+  swaps its IconName to `…-attention-symbolic` rather than using SNI's NeedsAttention status.
+
+Consequence: a single bar can show some tray icons themed and others full-colour, depending
+purely on what the icon theme provides. That's inherent to SNI (apps supply what they
+supply); making it coherent is a policy decision, deferred — see tech-debt #24.
+
+**Per-icon capsules (2026-07-15)**: each tray item sits in its OWN glass capsule (identical
+`SquircleContainer` params to the search/CC/clock capsules), NOT one grouped pill — so tray
+icons match every other bar icon. The click→window-focus wiring (PID-first match, `is_menu`,
+`activate` fallback) lives in architecture.md under `bar/Tray.tsx`.
+
+## The glass material: one base per kind, then the exceptions (owner, 2026-10-21)
+
+🔑 **This is the ONE definition of how the glass behaves.** Everything else — the kit, the
+toolkit (`toolkit/CONTRACT.md`), Hyalo (`references/hyalo.md`) — implements it and points here;
+none of them defines a behaviour of its own. Owner: "a common behaviour, then the exceptions,
+if any — never different paths; the bases may not differ." It may change (the top bar's
+behaviour is the first candidate); when it does, it changes HERE first.
+
+**What is glass.** The topmost layer of the interface — the bar and its capsules, the panels,
+menus and popovers, the dock, the Control Center, the notifications — and the elements of a
+window that float over its content: buttons, control capsules, sidebars. **A window is not
+glass**: its shadow and its backdrop blur are the window's decoration (`references/hyalo.md`,
+the window's look), outside this section.
+
+**The mechanics are the same for every piece** (Hyalo paints them all): its kind's tone over
+the blurred backdrop; its shadow, if its kind casts one, outside its shape and cut out of it,
+and never seen by its own glass (#908); a veil behind it where its kind has one; hover and press
+as a wash inside the glass, faded; it materializes rather than fades (#764). A piece takes the
+values of its KIND, never values of its own.
+
+**The kinds** (`GlassPiece`; values in `glass-material.ts`, exported to `tokens/glass.json`):
+
+| kind | what | tone | shadow | veil behind |
+|---|---|---|---|---|
+| `control` | bar capsules, island, window buttons, toolkit controls | measured, by size | measured law, by size (2026-10-12) | none |
+| `panel` | menus, popovers, Prism, system menu, app grid, toolkit sidebars | measured, by size | measured law, by size (2026-10-12) | none |
+| `dock` | the dock | measured | none — measured (2026-10-08: a 1 px outline only) | none |
+| `controlCenter` | the CC's tiles and the notifications, in their panel and as they come up (owner 2026-10-21) | measured | none — measured (2026-10-08) | ≈10 % black, measured (2026-10-11) |
+
+A value with no source does not exist: "none" means measured none, never "not measured". The
+2026-10-08 run's "no shadow at rest" for an app's glass was wrong — that window was inactive
+(corrected 2026-10-12, the `control`/`panel` law); the Dock and the CC are the system's own
+surfaces, not an app's window, so that cause does not apply to them. They were not re-measured.
+
+**The base of `control`** — every control, whoever draws it:
+1. **Tone**: the control's, mixed towards its ink tone by its answer to the backdrop it stands on
+   (r from the measured luminance, c from its deviation: `set_response`).
+2. **Ink** (glyphs and text): mixed by the same answer.
+3. **Shadow**: the measured law by size, its opacity growing with the same answer
+   (`shadow_white`, `shadow_text`).
+4. **States**: hover and press as washes in the glass, faded over the export's duration; the
+   destructive button its own colours.
+
+**There is no older path** (owner, 2026-10-21): a piece that behaves differently does so as a
+declared case below, through the same mechanism — never on code left over from before the base.
+
+**Special case: the bar's capsules** (owner, 2026-10-21). By design they are a case of their own
+— their grouping, their separation, their behaviour — and how the top bar behaves is still to be
+redefined. Until it is, what they do is what is listed under the exceptions; whatever it becomes
+is written here, and it goes through the base's mechanism.
+
+**Exceptions — the owner's, dated; nothing else departs from the base:**
+- The bar's capsules take their ink from the system MODE, not from the backdrop (2026-10-09).
+  Provisional: how the top bar behaves may change.
+- The Control Center and the notifications keep white text always (2026-10-08).
+- The dock follows the system mode (`trackModeGlass`, `skinFromMode`).
+
+**Where the code still departs (to be removed, not new exceptions):**
+- The bar's capsules (TypeScript kit) run the older path — the binary ink and a fixed shadow.
+  It goes when their special case above is defined; the kit is frozen (#818), and the owner has
+  ruled that no older path may stay.
+
+**Settled sources:** menus and large panels are glass (owner, 2026-10-10: the large ones are the
+same glass, thicker — not a solid panel), so they take the reference's glass law (2026-10-12).
+The 2026-10-08 run's menu (`0 4 15`, α .23/.27) and large-panel (`0 18 38`, α .39/.68) shadows
+are of the reference's OPAQUE menus and panels (98–100 % fill): a different object, which
+Veltrix does not have.
+
+### Who draws what on glass: the compositor, never an imitation (owner, 2026-10-26)
+
+🔑 Owner: "we cannot have some buttons drawn by the compositor one way and others drawn by the
+app as an imitation. We built our own compositor to control these things." Hyalo exists so that
+the glass and how it behaves are ONE thing across the desktop; a client copy always drifts (seen
+in #952: the toolkit's window glyphs 3–9 % off Hyalo's, with another hover).
+
+- **Hyalo draws the glass AND the states of anything whose body is glass** — a capsule, a
+  header button, a control: rest, hover, press, the destructive red, and the ink that answers
+  the backdrop. The app *declares* them through `veltrix-material-v1` (its shapes,
+  `add_state_region` per button id, `add_ink_coverage`) and never paints a wash, tint, blur,
+  rim or shadow over glass itself.
+- **The window controls are Hyalo's entirely** — glyphs, clicks, which buttons show and on
+  which side (`veltrix-window-controls-v1`). An app with its own header reserves the room the
+  layout gives it and says where; it draws none of them.
+- **The app draws its content on the glass** — icons, text, rows and lists and their
+  selection, menus' rows, the scroll bar, the keyboard focus ring — and owns input, focus and
+  accessibility. A highlighted row in a list on glass is content, as in any toolkit; the glass
+  under it is not.
+- **Without the protocol** (another compositor: PHASE1 D5) the app paints its own fallback.
+  That is the ONLY case of client-painted glass or washes, and it never runs where the protocol
+  is offered. On Hyprland that fallback is plain normal buttons
+  (`normalWindowControls`, `ui/lib/veltrix-kit/platform/window-controls.ts`): close, minimize,
+  maximize — the standard symbolic icons, always visible, no colours, no circles, on the side
+  the user's `button-layout` says (re-read live when the key changes). Their actions are the
+  standard ones: close runs the close policy, minimize hides the window (the app keeps
+  running; reopening it presents the hidden window), maximize is standard maximize — the
+  window fills the working area WITHOUT covering the bar, so its header stays reachable.
+  Fullscreen is NOT the maximize button's job: it is entered deliberately (Super+Shift+F,
+  the app's own F11, the bar's window menu) and left through the bar's Exit fullscreen
+  button, because a fullscreen window's own header sits under the bar when the bar is
+  revealed over it (2026-11-13). The macOS traffic-light circles (red/yellow/green, glyphs
+  on hover) were removed 2026-11-13: they did not work, and Adnan asked for normal buttons.
+- **Third-party apps' window controls are neither the compositor's nor an imitation.**
+  A GTK app (Nautilus/Files, GNOME apps) draws its own title-bar buttons from
+  `org.gnome.desktop.wm.preferences button-layout` — the same key Hyalo follows — so the side
+  and order are the system's, and the look is GTK's default: no CSS of ours paints them.
+  That is the app's own controls, not drawing the compositor's controls for it — and not
+  rewiring them: a GTK app's buttons keep GTK's built-in actions (close / minimize /
+  maximize). Qt, Electron and Firefox draw their own controls and are out of scope. (The
+  old `defaults/gtk/traffic-lights-*.css`, installed into the user's gtk.css by
+  `bin/veltrix-setup`, is deleted; `veltrix-setup` now REMOVES a previously-installed copy,
+  verified by hash, and never installs one.)
+- **Before painting over glass, ask which it is.** The glass or its state → Hyalo. Content →
+  the app. Something Hyalo cannot express yet → extend the protocol (inside v1, the library and
+  Hyalo together), never imitate it in the client.
+
+**Where the code still departs (2026-10-26 audit; to be removed, not new exceptions):**
+- The native Settings draw their own window controls: Hyalo's glass and washes under them, but
+  the glyphs, the clicks and the layout are the app's (#934). Moving to Hyalo's: #936 / #952.
+- The TypeScript shell never declares state regions: every hover over its glass (the bar's icon
+  circles, the Control Center's tiles, the dock…) is a CSS background GTK paints. Frozen kit
+  (#818): it goes when the shell moves to the native toolkit; nothing new is built on it.
+
+## The shell's glass, as a painter asks for it (`common/ShellGlass.ts`)
+
+On Hyalo the shell's panes are the compositor's glass (references/hyalo.md). What a Cairo painter on
+the shell still asks — for the glass it paints itself (a control on a pane, `nested`) and for its
+ink — comes from `common/ShellGlass.ts`, asked with the painter's OWN widget:
+
+- `chromeIsDarkFor(widget)`: the skin of the surface it sits in — the shell's (dark), the system
+  mode's on a surface registered with `skinFromMode` (the dock, the app grid: the root then carries
+  `veltrix-skin-light`/`-dark` while the mode differs from the shell's), and light where Hyalo said
+  the content of the pane is dark (`darkInkFor`, the ink).
+- `glassAlphaFor(widget, role)` / `glassTintFor(widget)`: the slider of the surface's role
+  (`bar`, `overlay`, `launcher`, `dock`) and `GLASS_TINT` of its skin, with the material's haze
+  folded in (`frostedFill`).
+- Each surface is registered once (`registerGlassSurface`: `Bar.tsx` for the bar, its panels, the
+  island and its modes and the app grid; `DockCore.tsx` for the dock); `dumpState.glass` lists them.
+
+⛔ **Until 2026-10-13 this was the ADAPTIVE glass (#673)**: each surface captured the screen behind
+it (`BackdropProbe`, zwlr_screencopy), subtracted an offscreen render of itself, and thickened its
+tint (rule A) or flipped its skin (rule B, off since 2026-09-30) to hold its text to 4.5:1 — with
+the backdrop's colour in its tint and a model of Hyprland's blur. On Hyalo the capture was never
+taken (`caps.backdropCapture` was false there): the compositor paints the glass and measures under
+it itself. It went with #762, with `glassRemeasure`, `VELTRIX_BACKDROP_DEBUG` and the rule's probe;
+`glass-legibility.ts` keeps the model a client's own glass is painted with and the tooltips' floors
+(`TOOLTIP_GLASS_FLOOR`, held to 4.5:1 over any grey backdrop by `glass-legibility-probe.ts`).
+Its measurements (#82: 1.69:1 for white text on 0.24 glass over white; the 0.59 that clears it)
+still hold for any glass a client paints.
+
+### The glass's edge and its tint (2026-09-30)
+
+The owner asked how macOS 27's "Glass" capsule gets its look — light glass with white text on it.
+Measured on its image: it does not. The body behind the letters is the wallpaper's own saturated
+blue at ~4.6:1; what reads as "light" is the EDGE, where the lens shows a brighter, displaced piece
+of the backdrop. Apple's kit (Figma, `reference_macos27_glass_recipe` in the owner's memory) makes
+dark glass by LIGHTENING the backdrop (a lighten fill + plus-lighter), so white text on it is 2.3:1
+over mid grey and 1:1 over white — Apple does not solve bright backdrops; we must, since our ink is
+fixed white. So we split the two: the look at the edge, the contrast in the middle. Chosen on a
+side-by-side sheet (a probe since deleted: variants × real backdrops, printing the contrast behind
+each label, which must not move) and then live. On Hyalo the shell's edge is the compositor's;
+what follows is the glass a CLIENT paints (the greeter on Hyprland, a control on a pane).
+
+- **The transparent edge** (`drawGlassEdgeLight` + `EDGE_LIGHT` in `glass-paint.ts`, called by
+  `drawSquircle` for glossed glass): within 10 px of the silhouette the body's tint is taken away
+  (up to 70 % at the edge, DEST_OUT, quadratic fall-off) so the backdrop shows through in its own
+  colour, plus a white light band (0.12, key light on top, least on the flanks). Nested
+  NON-OVERLAPPING rings, like the shadow (`drawShadowFromPath`), never concentric strokes.
+  ⛔ **It never clears below `EDGE_MIN_ALPHA` (= `LAYER_IGNORE_ALPHA` + 0.01, 0.24).** Below the
+  layer's `ignore_alpha` Hyprland stops blurring behind the pixel and shows the backdrop raw — a
+  sharp ring with a seam where the alpha crosses the threshold, which an offscreen sheet cannot
+  show. Consequence, intended: a surface at its 0.24 floor gets the light only; a thickened one
+  (a bright backdrop, where grey was the complaint) clears the most. The greeter (its own
+  threshold, 0.3) and the lock (no compositor blur: it blurs its own copy) are not wired yet.
+- **The dark tint took the backdrop's colour** (`tintFromBackdrop`) and **the dock did not thicken**
+  while the adaptive glass existed; both went with it (#762). A client's glass is `GLASS_TINT`.
+
+Not done here, on purpose: the explicit accessibility modes (Reduce transparency, Increase
+contrast) are #674 — including the CC's solid panel, the only container it gets (the halo was
+tried and removed, see "The Control Center is a PANEL").
+
+## Accent palette (10 preset colors + any hex)
+
+The accent is a real setting again (owner, 2026-11-15 — reversing the
+cyan-only decision of 2026-11-12). Ten presets, plus any `#RRGGBB` the
+user picks in Studio; the exact hex is stored as
+`org.veltrix.appearance accent-hex` (default `#00E5FF`), and
+`appearance.accent` is the nearest preset NAME to the hex. Cyan stays
+the default; custom is opt-in per theme. When hex and name disagree,
+the hex wins for painting (`effectiveAccentHex`).
+
+| Name | Hex |
+|---|---|
+| cyan | `#00E5FF` |
+| blue | `#0088FF` |
+| teal | `#2190A4` |
+| green | `#79B757` |
+| yellow | `#F3BA4B` |
+| orange | `#E9873A` |
+| red | `#ED5F5D` |
+| pink | `#E55E9C` |
+| purple | `#9A57A3` |
+| slate | `#6F8396` |
+
+## Real blur = compositor, not widget
+
+GTK has no true `backdrop-filter`. CSS only sets the translucent background, sheen, and border. Real blur comes from Hyprland `layerrule blur, <namespace>`. Don't try to "fix" the absent blur from inside CSS — it's not a CSS problem, and no amount of CSS will make it one. There are **no `backdrop-filter` declarations left in the tree** (the last went with #53 on 2026-07-26; this paragraph described them as web-preview-only leftovers "ignored by AGS" long after both the declarations and AGS were gone) — so if you find yourself adding one back, that is the mistake this paragraph exists to stop.
+
+### Blur is per SURFACE, and it can only ever reach DOWNWARD
+
+⚠️ **`ignore_alpha` sits in the gap between the glass and what you want it to cut, and it is now a
+CI GATE.** It decides where the compositor blurs at all: below it, the backdrop stays sharp. Above,
+`GLASS_RANGE.min` = 0.24 → **61/255**. Below, the thing worth cutting: a MAGNIFIED dock icon is
+taller than its own capsule (`maxIconSize` 128 vs `PILL_HEIGHT` 92), so its soft edge falls on bare
+wallpaper — and measured on the shipped icons, half of firefox's 1544 semi-transparent pixels are
+under alpha 12 and three quarters under 43. The dock's **0.23** (58.7/255) is as high as it goes
+while staying under the glass.
+⚠️ **Crossing it does not degrade a surface, it stops blurring it outright** — and silently: the
+config parses, the shell boots, the smoke passes. The two numbers live in different files in
+different languages, so `scripts/ci/blur-threshold-check.mjs` compares them, each layer against the
+glass IT paints — `GLASS_RANGE.min` for the shell, `LOCK_GLASS.fill.a` for the GREETER, which is a
+separate bundle with a fixed glass and no slider. It reported a false failure on its first run by
+measuring the login surfaces against the shell's floor, which is how that distinction got encoded.
+⚠️ **There is no `veltrix-lock` rule any more, and adding one back would be wrong.** The lockscreen
+people actually run is an ext-session-lock-v1 surface, not a layer surface, so no `layer_rule`
+reaches it — that is precisely why it blurs its own copy of the wallpaper. The namespace exists only
+on `LockOverlay()`, the fallback, which paints the wallpaper itself too. The rule was inert on both
+paths, predated the rename, and read as evidence that the lock gets compositor blur; it was removed
+2026-08-23. The gate still names `veltrix-lock` explicitly, so a re-add is caught rather than
+silently measured against a floor that means nothing to it.
+⚠️ **The threshold cuts BOTH ways, and the second way shipped a bug.** Everything above asks
+whether our glass is thick enough to still be blurred. The opposite question — is everything we
+paint over BARE wallpaper thin enough to stay under the line? — has exactly one place it matters,
+the login surfaces, because they are the only ones that put translucent paint straight onto the
+wallpaper with no glass body: `.greeter-scrim` (a full-screen gradient) and the hero's
+`text-shadow` on date/clock/username, which is painted **over** the scrim and therefore composites
+with it:
+
+```
+a_total = 1 − Π(1 − aᵢ)     must stay < ignore_alpha (0.23)
+```
+
+Above that line Hyprland blurs the wallpaper behind the paint — and because a gradient crosses the
+number somewhere down the screen, what you get is a frosted BAND ending in a hard edge, plus a
+frosted halo the shape of the clock's shadow. That is not hypothetical: the block was written
+against `ignore_alpha = 0.3` and capped at 0.28, the threshold later moved to 0.23 (chasing the
+glass down to `LOCK_GLASS` 0.24) and the cap did not follow. Measured in a VM 2026-08-25 the
+boundary sat at 85.8 % of screen height — exactly where 0.16 → 0.28 crosses 0.23. Now: scrim
+0.13/0.08, hero shadow 0.05 + 0.04, composite **0.207**, and `blur-threshold-check.mjs` computes
+that sum and fails on it.
+🔑 **The consequence to accept before raising any of them again:** this ceiling is what protects the
+hero on a LIGHT wallpaper, and it is now much thinner than the 0.28 that was measured as necessary
+in 2026-08-09. More protection means a different mechanism — a glass body for the hero (it
+deliberately has none) or frosting the whole wallpaper uniformly — not a bigger number.
+
+⚠️ **Only the dock can take a high value, and the reason is animation.** The surface alpha during a
+`ScaleRevealer` close is `glass × widget-opacity`, so the blur pops off at `threshold / glass` — 4%
+opacity at 0.01, but 96% at 0.23, i.e. in the first frames of every close. The bar (which hosts
+CC/NC/Prism/system menu/overview) and the app grid all fade. The dock never does: it slides.
+
+The corollary that costs people hours: Hyprland blurs what was composited **behind
+a surface**, once, at composite time. Everything painted inside one GTK window
+lands in **one buffer**, so **nothing can blur its siblings** — two widgets in the
+same window composite in Cairo, which has no backdrop filter. Symptom when you hit
+it: a translucent panel sits visibly on top of another widget, and that widget
+shows through **sharp**, which reads as "the blur isn't applied" or "that widget is
+on top". Neither is true. This is what forced the Activity Island onto its own
+layer surface from 2026-07-26 to #708 point 3 — it is the only overlay that covers the bar
+row, and at the default `overlayOpacity` (0.05 then, `GLASS_RANGE.min` now) the bar capsules read
+straight through it. A surface on a HIGHER layer level is composited after, so its blur samples
+the one below. ⚠️ **On Hyalo the answer is the opposite one** (owner, 2026-10-06): glass on glass
+is the reference material's own anti-pattern, so the island is a panel of the bar again and a
+mode wide enough to cover the row's groups FADES them (`ActivityIsland.coveredBy`) instead of
+blurring them. **Verified live, 2026-07-25** (Hyprland 0.55.4): an OVERLAY-level layer
+with `ignore_alpha = 0.01` blurred the TOP-level bar underneath at glass alphas
+0.05 / 0.20 / 0.38 alike — `new_optimizations` does not restrict sampling to the
+background, and `xray` is off.
+
+**Three different alpha thresholds, don't mix them up:**
+
+| Surface kind | Knob | Value here | Practical floor for the glass |
+|---|---|---|---|
+| Layer (bar, dock) | `ignore_alpha` per `layer_rule` | **0.23** on all three (bar, dock, greeter) | gated by `blur-threshold-check` from BOTH sides; there is deliberately no lock rule |
+| Popup of a layer (tooltip, dock menu) | `popups_ignorealpha` (global) | 0.30 | ≈0.38 (`VeltrixTheme.popoverAlpha`) |
+| Popup of a window (Settings dropdown) | `decoration:blur:popups` + same 0.30 | 0.30 | ≈0.38 |
+
+So "make it a popover to get blur" is a real technique (it's why Settings uses the
+native `Gtk.DropDown` — see the dropdown note below), but it **costs the 0.38
+floor** and therefore stops honouring a low user opacity setting. A layer surface
+gets blur with no floor. Pick accordingly; `popups_ignorealpha` cannot be lowered
+without Hyprland blurring the popup's own drop shadow into a halo.
+
+**Row 2 needs `blur_popups = true` on that layer's own `layer_rule`, and it is the
+easy one to forget**, because `decoration:blur:popups` is already on globally and
+covers row 3 — so a popover of a WINDOW blurs and the identical popover of a LAYER
+does not. Being a `Gtk.Popover` is not enough on its own. `veltrix-island` shipped
+without the flag and its player-panel source menu (and every tooltip inside an
+island mode) came out flat, while the same menu blurred fine in the Control Center
+— which lives in the bar's window, where `veltrix-bar` already had it (user-caught
+2026-08-03). **Any layer that can open a `Gtk.Popover` needs the flag**; check it
+whenever a surface moves to a layer of its own.
+
+## Glass capsule edge = AA, NOT none (don't flip it back)
+
+`drawSquircle` fills the glass body with **antialias GRAY (AA)** so the capsule
+curves are smooth. It was **NONE** (hard 1-bit edge) until 2026-06-24 to dodge a
+feared "halo": Hyprland blurs any pixel with alpha > `ignore_alpha` (0.01), so AA
+edge pixels (alpha = glass × coverage) show the blurred backdrop and were thought
+to glow at the curved ends. **Re-measured** with offline renders + live grim
+captures over a real *light* wallpaper through Hyprland's actual blur: the halo is
+**negligible** (the soft edge just blends into its surroundings), while NONE's
+stair-stepped curves were clearly visible. So AA wins. **Don't
+"fix" this back to NONE** thinking AA causes a halo — it was checked on real pixels.
+(This paragraph used to add that "the border/rim strokes still clip to the path so their inner
+AA can't spill outward". No rim clips any more — `drawSquircle` stopped in #230 and `GlassBubble`
+followed when #84 closed; see the next section for what replaced it. `GlassBubble` still clips its
+top bevel bloom, which is a *fill* that has to stop at the silhouette.)
+
+## The squircle path is analytical Béziers, and the rim is ONE Fresnel ramp
+
+Both halves of the glass recipe were rewritten on 2026-08-22 (#225 then #230). The visual result
+is meant to be a refinement, not a redesign — but the *mechanism* underneath changed enough that
+older notes describing either one will mislead you.
+
+### The corner: two cubic Béziers, not a chord loop
+
+`createSquirclePath` (`ui/lib/veltrix-kit/platform/glass-paint.ts`) used to walk the superellipse and emit a run of
+straight `lineTo` chords. It now emits **two `curveTo` segments per corner**, meeting at the
+corner's 45° point:
+
+```
+mid = 0.5 ** (1 / n)          // where the superellipse crosses its own diagonal
+mx = my = (1 - mid) * r       // that crossing, as an offset from the corner box
+a = 0.3100, b = 0.1950        // the two control-point weights, in units of r
+```
+
+so a corner is `curveTo(→ the 45° joint)` + `curveTo(→ the next edge)`. The code's own claim is
+**99.96% agreement with the true n=3.2 superellipse (< 0.012 px deviation)** — which is well under
+a pixel, so the point of the change is not accuracy, it is that Cairo now rasterizes a *curve*
+instead of a polygon and can therefore antialias it subpixel-smoothly at any size or scale.
+Chords looked fine at dock-icon size and faceted on a large panel.
+
+⚠️ `n` did NOT go away — it still selects the superellipse (default 3.2), it just parameterizes
+`mid` now instead of a sampling loop. ⚠️ But the two Bézier tangent lengths (`a`, `b`) are fitted
+for **n = 3.2 and only 3.2** — 0.011px there, 0.322px at n=4.5 (radius 32). Every Bézier silhouette
+in the shell is 3.2 since Prism joined its siblings on 2026-08-23 (it had carried 4.5 in through a
+refactor, 2.35px off the shape it was asking for); `n = 2` never reaches this code because it comes
+with `perfect`, which is four real arcs. Pass a different `n` and refit them — the numbers are in
+`glass-paint.ts`. Everything built on the exponent still holds: `cornerReach`,
+`rowInsetFor`, the `k(n)·R` diagonal reach documented elsewhere in this file. And the `perfect`
+branch is untouched — a pill is still four real `arc()` calls, because a pill is a circle-capped
+rectangle and there is no superellipse to approximate.
+
+### The rim: one continuous gradient, in tokens, unclipped
+
+The 1px glass edge used to be **four stacked strokes** — a flat white base, a top zenith
+highlight, a bottom shelf reflection, and a lateral dark contour, each its own gradient and its
+own `strokePreserve()`. It is now a **single stroke** through one vertical `LinearGradient` with
+seven stops:
+
+| stop | 0.0 | `t·0.55` | **`t`** | **`1−t`** | `1−t+t·0.45` | 1.0 |
+|---|---|---|---|---|---|---|
+| colour | white | white | **`GLASS_TINT.dark`** | **`GLASS_TINT.dark`** | white¹ | white¹ |
+| alpha | .42 | .16 | **`FLANK_DEPTH`** | **`FLANK_DEPTH`** | .14 | .24 |
+
+Read it as **Fresnel**: an edge reflects most where you meet it at a grazing angle — the top rim
+(key light, .42) and the bottom rim (ground bounce, .24). Along the SIDES you are not looking at
+the edge, you are looking **through** it, so what belongs there is the thickness of the material:
+dark, held as a plateau rather than a single stop.
+
+⚠️ **ONE ramp serves both modes, and it does not take a mode argument** (2026-08-23). There used
+to be two: this seven-stop one for dark and a four-stop one for light, disagreeing in four places
+— key light (.42 vs .55), second stop (.16 vs .25), flank (this radius-tied plateau vs
+`GLASS_TINT.dark` at .10 pinned to a single stop at 50 %), and the bottom (white bounce vs dark
+lower edge). None was derived; they were two tables written months apart, and the light one still
+carried — in light mode only — exactly the "very small darker bit" defect #239 fixed for dark.
+`GlassBubble` was a third table again: a FLAT `GLASS_TINT.dark` at .12, no gradient at all.
+
+The unification was **measured, not argued**. Over real blurred wallpapers, comparing the same
+pixel with the rim against without it (`scripts/dev/rim-backdrop-probe.ts`):
+
+| | dark glass | light glass |
+|---|---|---|
+| over a bright wallpaper | **−13.7 %** (−13.8 levels) | **−16.2 %** (−36.7 levels) |
+| over a dark wallpaper | +13.8 % (**+1.9 levels**) | −15.1 % (−21.0 levels) |
+| light, before unifying | — | −8.0 % → −11.0 %, drifting; **+3.7 %** at the top of a CC panel |
+
+2.5 points apart on one shared number, less than the spread the wallpaper itself causes. That is
+what says one number is enough. The `+3.7 %` in the last row is the top of a light CC panel having
+had, in practice, an *inverted* edge — brighter than the body it was supposed to define.
+
+⚠️ **Always measure the rim RELATIVE to the body it edges, and against the same pixel with no rim
+on it.** Two traps, both of which produced a confidently wrong answer here first: raw pixel deltas
+across bodies of different brightness invert the conclusion (they briefly "showed" light glass with
+the stronger flank), and sampling the body a few pixels inboard measures the *wallpaper's* own
+gradient, not the rim (that one "showed" the dark flank turning bright over a dark wallpaper, at
++13.8 %).
+
+⚠️ **Over a dark wallpaper the dark-mode flank really does inverts sign** — the tint ends up
+lighter than the composited body — but it is +1.9 levels of 255 on a body sitting at 13.4. Real,
+invisible, and not a reason to reintroduce a branch. If it ever needs fixing, the honest fix is a
+MULTIPLY pass for the flank, not a second table.
+
+⚠️ **The mode-sniffing in `drawSquircle` is gone with it.** It used to infer dark/light from the
+FILL COLOUR (`color.r > 0.8 && …`), with a warning that `GLASS_TINT.light` had to stay above that
+threshold or a light capsule would silently take the dark branch. One ramp deletes the guess and
+the footgun together.
+
+⚠️ **`t` is computed, not a constant, and that is the whole point.** The straight vertical run of
+the silhouette spans `y ∈ [radius, height − radius]`, so as a fraction of the height it is
+`radius/height` — which differs per surface: a dock capsule (92 tall, radius 32) has its side at
+.35–.65, while a CC panel at the same radius has it at .05–.95. `glassRimGradient` therefore takes
+the radius. Pinning the dark to a fixed 0.50 puts it at a POINT in the middle of the side; that
+shipped in #239 and the owner saw it immediately — *"a very small darker bit"*.
+
+⚠️ **`FLANK_SPREAD` (0.35) then carries the dark INTO the corner arcs**, and without it the effect
+still under-delivers on wide short capsules: only 28px of a dock capsule's 92px side is straight,
+the rest is corner. Spreading it leaves the key light on the CAPS — bright top and bottom, dark
+sides — which is the effect. On a pill, where `radius/height` is 0.5 and there is no straight side
+at all, it still leaves a bright cap at each end instead of collapsing to a point.
+
+⚠️ **The flank was white `.08` until 2026-08-23, which made it LIGHTER than the body it edges** —
+measured over a bright wallpaper, flank `27,149,182` against a body of `7,139,175`. The capsule had
+no dark side at all, which is why it read flat over pale wallpapers: on those the contrast has to
+come from the edge, because the fill cannot supply it without going opaque. `FLANK_DEPTH` in
+`glass-paint.ts` is the one number to move if the sides read as too much or too little.
+
+⚠️ **This reopened a decision, deliberately.** #230 removed a lateral dark contour because it "read
+as a drawn outline rather than as material" — but that judgement was made while `blur:brightness`
+was still painting a hard dark step along every antialiased edge (resolved debt #81), so the
+outline it rejected was partly the artefact. The owner reopened it once that was fixed. If you are
+about to remove the dark flank again, know that you are re-deciding this, and say why.
+
+Three things about it that are easy to undo by accident:
+
+- **There is ONE copy of those stops: `glassRimGradient` in `ui/lib/veltrix-kit/platform/glass-paint.ts`.** No mode
+  argument at all since 2026-08-23; `GlassBubble` makes the same call, and since 2026-08-24 so do
+  the greeter and the lockscreen. #230 unified the *shape* and left copies of the *numbers*; every
+  round of this has been a divergence found after the fact, never one anybody proposed. If you are
+  about to write a branch here, that is the signal to add a PARAMETER instead — which is exactly
+  what the login surfaces got: a `scale` that multiplies every alpha, so their two rim WEIGHTS
+  (`LOCK_GLASS.rimStrong` on the primary control, `rimSubtle` on everything else) survive as a
+  ratio of the tokens they already had, without a second table of stops.
+- ⚠️ **It lives in `ui/lib/`, not in the shell, and that is load-bearing.** It sat in
+  `ui/shell/common/DrawingUtils.ts` until 2026-08-24, and `ui/lib/` may not import from `ui/shell/`
+  — so for as long as it did, `ui/lib/veltrix-kit/platform/glass-capsule.ts` (the greeter's and the lockscreen's only
+  capsule) *could not reach it* and painted a flat rim with no shadow instead. Nothing said so; the
+  #234–#248 wave simply stopped at a directory boundary and the login screen kept the old glass.
+  `DrawingUtils.ts` re-exports every name, so the shell's import paths are unchanged. **If you add
+  a primitive that defines what glass looks like, it goes in `glass-paint.ts` — putting it in the
+  shell is how a surface silently gets left behind.**
+- **The white is `GLASS_SPECULAR`, not `GLASS_TINT.light`.** Both are pure white and for two months
+  they were the same token, which is the trap: they are the colour of the *light* and the colour of
+  the *surface*, and tying them together means a retint of light-mode glass silently dims the
+  highlight on every dark capsule in the desktop. The dark tint still comes from `GLASS_TINT.dark`
+  (commandment 10 reaching the Cairo rim — the Deep Slate pass moves the glass *and* its lower edge
+  together); what left is only the misuse of the light one.
+- **No rim clips itself any more — capsule and bubble share ONE idiom.** Offset the path inward by
+  half the line width and stroke it once (`drawSquircle`'s `strokeOffset = -borderWidth * 0.5`;
+  `bubblePath`'s trailing `offset` parameter, added when #84 closed), so the stroke lands entirely
+  inside the silhouette by construction. The bubble used to clip to its own silhouette and stroke
+  at `BORDER_W * 2`, letting the clip discard the outer half, because `bubblePath` took no offset.
+  An antialiased clip MULTIPLIES coverages (clip × stroke), so the two idioms agree to the byte on
+  straight runs and disagree on every curve — 130 pixels at r=18, 299 at r=40, all of them in a
+  corner. ⚠️ **What that difference is NOT is a weaker rim**, which is how #84 read it and how this
+  file said it. Measured directly — mean |pixel − the same fill with no rim| over the pixels the rim
+  touches — the corners move **15.34 → 15.36, +0.1 %**, and the straight runs do not move at all.
+  The idioms disagree about where the coverage lands, not about how much rim there is. Reach for
+  this idiom for coherence and for the path being 11.6× cheaper to build, never to make a rim read
+  stronger. `scripts/dev/bubble-probe.ts` is the instrument for all of it.
+
+### The rim is a HIGHLIGHT, not a delimiter — that is what the shadow is for (2026-08-23)
+
+Against a flat white backdrop — a maximised white window under the control centre — a glass
+surface nearly disappears, and the way it disappears is specific: the ramp's top and bottom stops
+are **white**, so they vanish, and the only thing left is the dark flank. The surface reads as two
+vertical lines. That is not a bug in the ramp. The rim describes a material; **delimiting is not
+its job**, which is also how macOS treats it — a menu over a white document is separated by its
+drop shadow, and its own hairline is just as invisible there.
+
+`drawGlassShadow` is the missing piece. It self-scales to the problem: over a busy colourful
+wallpaper it reads as depth and is nearly invisible, over flat white it becomes the only separator
+left. Three things about it are load-bearing:
+
+- **Nested FILLS, never concentric strokes.** The first version stroked N rings of decreasing
+  offset and increasing alpha. That looks like a falloff and is not one — neighbouring strokes
+  overlap, the overlaps composite, and the accumulated alpha stops being monotonic: measured across
+  a flank, `254 248 235 217 230 211`, rising where it had to keep falling, which reads as a lighter
+  gap between the shadow and the rim. Filling nested shapes largest-first cannot do that.
+- **Clip the silhouette OUT (EVEN_ODD) before filling.** Nested fills cover the interior too, and
+  the glass on top is translucent, so without the clip the shadow shows through and tints the whole
+  surface — the body of a CC tile went 253 to 233 while the shadow was doing its job outside. A
+  drop shadow must not darken the thing it is under.
+- **`drop` is subtracted from the top edge, and the top is where the rim already gives up.** On a
+  small `spread` it costs more than it buys. Measured on a CC tile at `spread 2` — darkest contour
+  pixel, 255 meaning nothing is there — sides 211, and the top going 218 / 227 / 239 / 244 at drop
+  0 / 0.5 / 1 / 2. Round the corner arc it is the 60-90 degree band that dies. So keep `drop` near
+  zero on tight shadows and only spend it once `spread` can spare it.
+
+**One recipe, `GLASS_SHADOW` in `ui/lib/veltrix-kit/platform/glass-paint.ts`** — `{ spread: 2, alpha: 0.18, drop: 0 }`,
+chosen because `spread 2` was what `GLASS_INSET` already reserved, so no surface's glass shrank and
+nothing moved. Since #762 only a container that paints its own glass carries it (the CC's context
+menu), and its box reserves the spread. (It lived in `SquircleContainer.tsx` until 2026-08-24 and moved down with the
+primitives it parameterises, for the reason in the rim section above; that file re-exports it.) It
+goes on the OUTERMOST glass of a surface and nowhere else: a shadow on a control that sits inside
+another glass panel is a shadow inside a window, and reads as dirt rather than as depth. Currently:
+**everything the CC and the NC paint** (neither has a panel — their tiles and cards ARE the outer
+glass, and so is everything that floats beside them: the islands, the detail island the grid swaps
+itself for, the status banner, the tile context menu, the notification cards, the calendar, the
+group headers, and the `Editar` / `Borrar notificaciones` / empty-state pills), Prism's wrapper, the
+system menu's wrapper, the overview's panel, the bar's expansion panel, the app grid's panel,
+**every bar capsule** (all eight of them, discriminated by `opacityRole: "bar"` — each sits directly
+on the bar, none inside another panel), and since 2026-08-24 **every greeter/lockscreen capsule**
+(there is no card behind them either — each one floats on the wallpaper). The one deliberate
+exclusion inside those two surfaces is a notification banner's ACTION buttons: those genuinely sit
+inside a card.
+
+⚠️ **None of it is drawn on the compositor's glass (Hyalo).** There the edge belongs to Hyalo — its
+rim, now a 2 logical px band of light (#1028, owner, 2026-11-05). The 2 px dark ring
+right outside it read as a drawn frame; the owner compared both in the glass lab and dropped
+it (2026-10-06: "3.2 without the halo looks best"). That older choice was narrowed from
+3.2 to 2 px on 2026-11-05.
+Every painter skips the shadow while `compositorPaintsGlass` is true: `SquircleContainer`, the
+dock on both axes (`DockAxis.ts`), `GlassCapsule` and `paintGlassBubble`. Since #762 the shell's panes
+carry no `shadow` at all (Hyalo casts each pane's own, `set_shadow`) and their box is their glass.
+
+🔑 **The pills were missed for six days because the rollout enumerated SURFACES and the pills are
+CONTROLS.** #244's list reads "the NC's notification cards and calendar island, Prism's wrapper,
+…" — nobody writing it thought of the `Editar` button as glass that floats, and it does: it hangs
+under the grid with nothing behind it but the wallpaper. Owner-reported 2026-08-24. When you apply
+a surface-level recipe, walk the widget TREE of each surface for `SquircleContainer` calls and ask
+of each one "what is behind this?", instead of listing the surfaces you can name. `grep -n
+'SquircleContainer({'` over `ui/shell` is the whole audit; today exactly one call site still passes
+no shadow — a notification banner's action buttons, and that one is correct: they sit inside a card.
+
+🔑 **The app grid was the last one in, and the blocker was its LAYER, not its widget tree.**
+`veltrix-app-grid` was its own surface then (unmapped when closed; a panel of the bar since #708
+point 3) and it ran at
+`ignore_alpha 0.04`, under the shadow's `alpha 0.18` = 45.9/255 — so Hyprland blurred *behind* the
+shadow band and would have smeared a halo along the silhouette. **A shadow is a band of low alpha
+outside the glass, so adding one to a surface is a decision about that surface's threshold, and you
+have to make it in the same change.** It moved to 0.23 on 2026-08-24, joining the other three, on
+two facts rather than on precedent: its close is `OVERLAY_POP.durationOut` = 150 ms (the bar's
+number, the one #244 actually watched — not the island's 220 ms, which was flagged as the surface a
+pop would surface on first), and its layer carries nothing but the panel, so raising the threshold
+takes blur away from nothing except the band itself. `scripts/ci/blur-threshold-check.mjs` still
+guards the other end: 0.23 stays 2.5 levels under `GLASS_RANGE.min`.
+
+⚠️ **On the login surfaces the shadow needs no `inset`, and that is a real difference.** In the
+shell the falloff has to be bought out of the surface's own `inset`; `GlassCapsule` instead sizes
+its Cairo node bigger than the widget, and GTK4 does not clip a widget to its allocation — so the
+shadow costs no painted glass and **nothing in the layout moves** (verified: card 280×257 and power
+bar 339×32 before and after, to the pixel). Only reach for this where the widget genuinely has no
+clipping ancestor.
+
+⚠️ **Check the layer's `ignore_alpha` before shadowing a NEW surface, and there is still no gate
+for it.** A shadow is a band of low alpha *outside* the glass, so if it clears the threshold
+Hyprland blurs behind it — a smeared halo tracking the silhouette, which is debt #237. For the
+greeter the numbers are: shadow `alpha 0.18` = 45.9/255 against the layer's `ignore_alpha 0.23` =
+58.7/255, **12.8 levels of margin** — it was 30.6 until the greeter layer was put on the shell's
+numbers (2026-08-24), so this is now the same tight configuration the dock has lived on since #237,
+not a roomy one. The lockscreen cannot be affected at all (no compositor blur;
+it paints its own). `scripts/ci/blur-threshold-check.mjs` guards the *other* end of that coupling —
+a threshold reaching the glass FLOOR, which kills the blur — and, since 2026-08-25, the login
+surfaces' un-blurred paint as well (below). It still knows nothing about a WIDGET's drop shadow.
+
+🔑 **The bar capsules turned out to be the strongest case, not the marginal one, and the reason is
+geometric.** They are PILLS, so `radius = height/2`, so `t` collapses to `0.5 × FLANK_SPREAD` and
+the dark flank spans only .175–.825 of the height — everything outside that is the white caps.
+Against a white window a bar capsule therefore renders as **two disconnected side arcs with no top
+or bottom at all**: measured, darkest contour pixel with 255 meaning nothing is there, sides 213 and
+top/bottom **254**. With the shared recipe: 213 and 218. A tile degrades on white; a pill breaks.
+
+The **Activity Island** has it on all six of its outer glasses — the compact capsule, the chip, and
+the four expanded modes — and its layer went to 0.23 with them. ⚠️ Its morph ramps opacity over
+300 ms in / **220 ms out**, half again as long as the bar's 150 ms close, so it is the surface where
+a threshold pop would show first if it ever shows at all.
+
+The **dock capsule** had it too, through `DOCK_SHADOW_PAD` (its gloss widget grown by the pad and
+its margins shrunk by it, so the capsule did not move); both went with #762, and the gloss widget is
+the capsule again.
+
+The **glass bubble** was the last one, and the only one whose shadow had to wrap a POINTER. It
+could be written at all because `bubblePath` already knew how to grow its own outline: the `offset`
+argument the rim got in #242 offsets the body box AND the pointer's three corners, so the shadow is
+the same outline at six sizes. What that needed on the shadow's side was splitting the algorithm
+from the shape — **`drawShadowFromPath`** in `ui/lib/veltrix-kit/platform/glass-paint.ts` now owns the nested fills and the
+punch-out, and `drawGlassShadow` is a caller that happens to hand it a squircle. There is still one
+recipe and one falloff.
+
+🔑 **The pointer fits in the room the bubble already had, and the arithmetic says it should not.**
+`BUF` is 2 px and so is `spread`, which is the same deal `GLASS_INSET` gave the capsule until #762 — but an
+offset outline moves each vertex along its bisector by `offset / sin θ`, so the ~90° apex should
+reach 1.41 × spread = 2.83 px into 2 px. It does not, because **the tip is an arc, not a vertex**:
+`bubblePath` grows `tipR` by the offset too, and a fatter arc sits further back from the vertex it
+rounds, which cancels most of the excess. Measured across four pointer sides, three body sizes and a
+slid pointer (`scripts/dev/bubble-probe.ts`, specimen E): **0 px clipped anywhere, 1 px of slack on
+the pointer's side, 0 px on the flat runs** — with a positive control that loses 12 px the moment the
+widget rect is shrunk by 3. ⚠️ So `tipR + offset` in `bubblePath` is not cosmetic; deleting it puts
+the shadow's apex outside the widget. Nothing about the popover changed: same size, same body rect,
+same anchor separation.
+
+⚠️ **A bubble is a POPUP, so it is not the layer's threshold that applies to it** — it is
+`popups_ignorealpha` (**0.30**). The shadow's total at the silhouette is 0.18 and the bubble floors
+its glass at 0.38, so one number separates both, deliberately: the glass stays blurred and the
+shadow cannot drag a halo behind it.
+
+⚠️ **A shadow interacts with compositor blur, and that decides WHERE it can exist.** Hyprland
+decides where to blur by an alpha threshold per layer (`ignore_alpha`), and a shadow is by
+definition a band of low alpha OUTSIDE the glass. If it clears the threshold, Hyprland blurs the
+backdrop behind it — a smeared halo tracking the silhouette, which is debt #237 exactly. `spread`
+is also **room**: the shadow lives in the surface's `inset`, so anything wider than what is already
+reserved comes out of the painted glass.
+
+| surface | layer | `ignore_alpha` | what it can take |
+|---|---|---|---|
+| dock capsule | its own `veltrix-dock` | **0.23** | an outer shadow, with room to spare |
+| CC / NC / Prism / system menu / the Activity Island / the app grid | guests on `veltrix-bar` | **0.23** | an outer shadow — the bar was raised from 0.01 for it (#243); the island and the grid had layers of their own at 0.23 until #708 point 3 |
+| the tooltip / dock menu bubble | a POPUP, not a layer | `popups_ignorealpha` **0.30** | an outer shadow; 0.18 is under it and the 0.38 glass floor is over it |
+
+🔑 **All of the above is HYPRLAND's.** Hyalo blurs only the shapes a surface declares, whatever
+their opacity, so no threshold limits a shadow or a fade there — and a limit that exists only for
+Hyprland must never constrain what the desktop does on Hyalo (owner, 2026-10-07). The shell's
+limits of this kind went with #762 (the `layerAlphaThreshold` caps flag with them): the panels'
+glass materializes, and the dock's icons cast the elevation shadow (`ELEVATION_SHADOW`, `DockIcon`)
+on both compositors, Hyprland's halo accepted. What is left is the greeter's (still on Hyprland).
+
+⚠️ **Raising a threshold has a cost that is temporal, so no screenshot shows it — and it turned out
+not to be visible either.** The overlays fade on close (`ScaleRevealer` animates opacity) and a
+glass pixel's alpha is `glassOpacity x widgetOpacity`, so the blur switches off the moment that
+product drops under the threshold. At the glass floor (`GLASS_RANGE.min` = 0.24) that is
+`widgetOpacity = threshold / 0.24`: **4.2 % at 0.01, 21 % at 0.05, 96 % at 0.23** — i.e. at the
+dock's value the backdrop blur leaves in the first frames of every close, with the panel still
+fully on screen. That reasoning is why the bar had been walked back from 0.05 to 0.01 once before,
+and why `veltrix-bar` at 0.23 shipped as an experiment.
+
+🔑 **Watched on a real close over a detailed window, the pop is not perceptible** (owner, 2026-08-23).
+The close is 150 ms and the blur leaves while the eye is still tracking a panel that is scaling and
+fading; **a computed threshold crossing is not the same thing as a seen one**. Keep the number — do
+not re-derive it from the formula and "fix" it back. What the formula is still good for is
+predicting *where* the crossing lands, which is what makes 0.23 safe on a fast fade and would not
+make it safe on a slow one.
+
+`scripts/ci/blur-threshold-check.mjs` guards the *other* end of the coupling (a threshold reaching
+the glass floor kills the blur entirely) and knows nothing about shadows or about this.
+
+## A CSS pill at `--veltrix-radius-pill` seams at the middle of each cap
+
+`--veltrix-radius-pill` is `9999px`, and GTK clamps it to **exactly half the
+height**. That makes the two corner arcs of each side meet at a single tangent
+point with no straight segment between them, and GTK's border rendering leaves
+**one brighter pixel right in the middle of each cap** — a "dot" on the left and
+right edges of the capsule. Only bites CSS-drawn pills with a visible hairline
+border (Cairo capsules draw their own path and are unaffected).
+
+Reproduced offscreen 2026-08-09 (user-caught on the lockscreen): **visible at an
+odd height, clean at an even one**, because half of an odd height lands
+mid-pixel. Parity is not something we can guarantee — fractional display scaling
+turns any logical height into whatever it likes — and `box-shadow: inset` instead
+of `border` seams identically (tried).
+
+The fix, applied to the greeter/lock pills in `ui/greeter/style.scss`: an
+explicit **even `min-height`** (vertical padding zero, so the shape comes from a
+number we control rather than font metrics) and a **radius one pixel under
+half**. The arcs are then joined by a 2px straight edge and never become tangent,
+at any scale. Any widget painting a backdrop inside such a pill
+(`ui/lockscreen/widget/GlassBackdrop.ts`) must clip to the SAME radius, or its
+fill spills past the border at the caps.
+
+✅ **CLOSED 2026-08-09 — both surfaces PAINT their capsules** (`ui/lib/veltrix-kit/platform/glass-capsule.ts`,
+lifted out of the lockscreen bundle). Everything below is the record of why CSS could not do
+it, because the number was argued from both sides twice.
+
+⚠️ **"Still a pill to the eye" was wishful — the straight edge IS visible, and
+the trade is not free.** Rendered and magnified 2026-08-09 with
+`scripts/dev/lock-probe.js` after the user reported a flat run on the caps and
+the note went down as "does not add up": on the 42px password field and unlock
+button, a 20px radius shows an unmistakable vertical run in the middle of each
+cap. Both readings were right, of different surfaces — **the LOCKSCREEN paints
+its capsules** (`GlassBackdrop` uses `min(w,h)/2`, a true pill, and its rim is a
+FILL rather than a border primitive, so it has neither defect), **the GREETER is
+still CSS** and wears the flat. So the honest state is: the CSS route has two
+failure modes and no good setting between them — a dot at exactly half, a flat
+segment one under — and the only shape that is actually a capsule is a painted
+one. Painting the greeter's capsules the way the lockscreen already paints its
+own is the open fix; do NOT relitigate the radius number, it has been tried from
+both sides.
+
+## The design system reaches the greeter and the lockscreen (2026-08-09)
+
+Before this, `ui/greeter/style.scss` — the sheet **shared** by the greeter and the
+lockscreen — opened with its own `* { }` block re-typing the radii and the palette, and
+carried eleven freehand `font-size` values with no ramp behind them. Nothing was broken; it
+had simply stopped moving. Every design-system decision taken in the shell had to be
+re-typed here to arrive, and none ever was, so the surfaces drifted one generation at a
+time. The tell was arithmetic: the date sat at **13px under an 88px clock**, a 1:6.8 ratio
+outside every system that ships a lock screen (macOS 1:4.8, iOS 1:4.4, Win11 1:3.7, GNOME
+1:3.4) — two numbers nobody had ever chosen together.
+
+**`ui/lib/veltrix-kit/styles/_tokens.scss` is now the mode-independent half of the system**, `@use`d by
+both `ui/shell/styles/_base.scss` (which `@forward`s it, so every `@use 'base' as *` keeps
+seeing the same names) and `ui/greeter/style.scss`. It holds the type ramp, the weights, the
+line heights, the spacing scale, the motion curves and the radius ladder — and since
+2026-08-10 the relative **`$fse-*` em ramp** too.
+
+⚠️ **`$fse-*` was labelled "Settings-only" and that was already false in two places**: the
+kit's own row typography wears it (`.veltrix-list-title`, `.veltrix-row-title`,
+`.veltrix-row-subtitle`, `.veltrix-list-footer`) and so does the alert dialog, which is its own
+toplevel window. The anchor is not a Settings-local font-size — it is `gtk-font-name`
+(ThemeManager), which is display-wide, which is exactly why the dialog keeps scaling right as
+a separate window. The rule that has not changed: **shell CHROME uses the fixed `$fs-*` px
+ramp**, because a bar or dock label that reflows with the font picker breaks the layout it
+sits in. Body copy in a window is supposed to grow.
+
+⛔ **Do not retune the `$fse-*` ratios to land on whole pixels.** It was tried twice (#123, #124)
+and reverted both times: the anchor is `gtk-font-name`, deliberately a POINT size so the
+accessibility text scale can reach it through the dpi, and 11pt is 14.667px — no set of ratios
+lands a fractional anchor on integers. It buys nothing either; crispness comes from
+`gtk-hint-font-metrics`. Full story under "the tops of letters were being shaved" below.
+
+### The installer is the FOURTH bundle wearing the system, and it found four holes (2026-08-26)
+
+`ui/installer/` is the first surface built mostly by an outside agent, which makes it the
+first honest test of whether the kit is *usable* from a bundle that is not the shell. It is —
+`VeltrixList`, `VeltrixRow`, `VeltrixStackedRow`, `VeltrixButton`, `VeltrixClamp` and the
+appearance seam all came across untouched. What did not come across is the **system around**
+the components, and every one of the four holes has the same shape: a kit widget whose rule
+names something the borrowing bundle's sheet never defined.
+
+✅ **Holes 1 and 4 are CLOSED (2026-08-26) by `initAppearance()`** (named `installAppearance()`
+until #533) — see architecture.md, "The appearance contract". The installer no longer has a colour ramp of its own at all: the engine
+generates the whole thing from the user's real accent, mode and opacity, and
+`scripts/ci/token-contract-check.mjs` now fails the build if any bundle paints with a token
+nothing defines — and since 2026-09-20 `scripts/ci/token-orphan-check.mjs` fails it for the
+mirror image, a token that is defined, emitted and read by nobody. Both directions are silent
+in GTK4, and the second one is worse to debug because everything renders: the value is simply
+not the one on screen, so the next person to retune it changes nothing and believes they did
+(tech-debt #106). The orphan check matches `var(--x)` AND `var(--x, fallback)` across `.scss`,
+`.ts` and `.tsx`, and strips comments first — this repo names tokens in prose constantly, and a
+token mentioned in a sentence must not count as a reader. Holes 2 and 3 stay as written — they are rules about writing a bundle's sheet,
+not about where the values come from. The four are kept in full because each one is a different
+way for GTK4 to fail without saying anything.
+
+1. **`--veltrix-surface-strong` did not exist in the installer's ramp.** It is the hover of
+   anything whose resting fill is `--veltrix-surface-raised` — which is every round icon
+   button. The rule was there, the token was not, so the button's hover resolved to nothing
+   and the control looked inert. A missing custom property is not an error in GTK4; it is a
+   declaration that quietly does not apply.
+2. **No `.nd-icon` rule at all.** The installer had no such rule, so its close glyph was
+   black-on-dark-glass. **Any bundle that shows a shipped icon owes this rule**, which is now
+   `color: var(--veltrix-text)` in all three sheets. Before #587 it was
+   `-gtk-icon-filter: invert(1)` plus a light-mode counterpart, because the drawings were
+   non-symbolic and rendered black — a bundle with a light mode owed both halves, so the
+   greeter's unconditional invert could not simply be copied. A colour needs no such pair.
+3. **`window.<class> *` silently kills the glass.** `.veltrix-window-glass` is one class,
+   (0,1,0). `window.veltrix-installer-window *` is a type plus a class, (0,1,1). So a blanket
+   `background-color: transparent` written to reach the children out-ranks the glass and the
+   card stops painting: an installer whose prose floats on the wallpaper with the file manager
+   readable through it. Seen on screen. **Put `background-color`/`color` on the WINDOW node
+   only** — `color` inherits by itself, and the descendant form is needed exclusively for the
+   `--veltrix-*` block, where it is load-bearing (custom properties do NOT inherit reliably; the
+   token engine's `* { }` and `generateChromeTokenScope` exist for that reason alone).
+4. **The live half of the ramp has to be computed, not written.** Accent and window opacity
+   are the user's, so `style.scss` can only hold fallbacks; `app.ts` emits the rest into a
+   `Gtk.CssProvider` at `PRIORITY_USER + 20` — above the base sheet, because in GTK4 provider
+   priority is settled before specificity is looked at — and reloads it from a `Gio.FileMonitor`
+   on whichever `appearance.json` actually answered. Keep the monitor in a variable that
+   outlives the call: an unreferenced one is collected and its signal stops arriving silently.
+
+**`.veltrix-circle-btn` moved to the kit in the same change**, with its widget: the shell's
+`common/IconButton.ts` is now a wrapper that adds only what the kit cannot reach (the glass
+tooltip, the capture-phase click). A fourth bundle asking for a close button is exactly the
+moment a shell-local "single source of truth" stops being one — and copying it instead would
+have given one process two definitions of one class, since the shell compiles both sheets.
+
+⛔ **Its `&.is-danger:hover` red stays OFF — decided 2026-08-26, do not restore it.** Both
+variants hover the same neutral grey; the class is still emitted, so the intent is recorded and
+one rule would turn it on. Reason: a red wash on the control you use to LEAVE a window spends
+the red budget (see "the red BUDGET is smaller than that") on the most routine click in the
+DE. It was proposed in that same move and declined on the merits, which makes it a decision
+rather than an oversight — and `IconButton`'s doc comment, which promised red for two years,
+was corrected to match.
+
+⚠️ The rule's history is still worth carrying, because it is a warning about orphan sweeps: it
+was deleted on 2026-06-23 (`d87e5e0a`) for having "no consumer", because the sweep grepped the
+literal `is-danger` while the consumer builds the class by interpolation — `is-${variant}` —
+the exact dynamic-class trap that same commit lists for `.accent-*`. So for two months the
+shell documented a hover it did not have, and nobody could tell whether that was a decision or
+a bug. **Grep a class before deleting it, then grep the fragments a template could assemble it
+from** — and when the answer is "we don't want it", say so in the sheet instead of deleting the
+rule silently.
+
+**Its sibling `ui/lib/veltrix-kit/styles/_mixins.scss` (2026-08-10) holds the mixins the KIT needs** —
+`veltrix-reset`, `glass`, `material-card`, `veltrix-row-states`, `veltrix-tile-states` — for the
+same reason and with the same `@forward` from `_base.scss`. `material-control`,
+`material-popover` and the `material($level)` vibrancy ladder stayed in the shell on the
+grounds that they described full-window layer-shell surfaces — and on 2026-09-20 all three
+were deleted instead (tech-debt #106): those surfaces are painted in Cairo, the mixins had
+no call sites at all, and the tokens they spent had no reader but them.
+
+Three rules for extending it:
+
+- **Nothing in that file may emit CSS at import time**, and every comment is `//`, not
+  `/* */` (sass copies loud comments into the output). The radius custom properties go
+  through a **`@mixin radius-vars`** so each bundle includes them inside its OWN `*` block
+  instead of getting a second one. That is what let the extraction be verified the way a
+  pure refactor should be: compile `style.css` before and after and diff — the shell's came
+  back **identical but for comments**, zero declarations moved.
+- **What stays per-bundle is the PALETTE**, and for a real reason: the shell rewrites its
+  colour tokens at runtime per light/dark mode (`VeltrixTheme.generateTokensCss`), while the
+  greeter and lockscreen wear ONE palette, fixed. So they take the shell's **dark set** as
+  literal values and nothing else.
+  ⚠️ Between 2026-08-25 and 2026-09-21 there was a second, light palette here, chosen by
+  measuring the wallpaper (#82's login half); the owner removed it (#613 — see "The login
+  screens wear ONE skin"). Their ink is also PINNED now, `initAppearance({ fixedDarkInk: true })`,
+  because the session's ramp is installed above this sheet and a light-mode desktop was
+  painting these two surfaces' text black (#612). They had been a near-miss copy of it — `0.70/0.45`
+  against the shell's `0.80/0.55`, and a local name (`--veltrix-text-muted`) for what the
+  shell calls `-dim` — which made secondary text a step darker on the one surface with no
+  card behind it.
+- **A token with two representations gets labelled as a mirror, on both sides.** The glass
+  palette now lives as numbers in `ui/lib/veltrix-kit/platform/tokens.ts` (`LOCK_GLASS`) because the lockscreen
+  PAINTS its capsules and Cairo/GSK cannot read a custom property — the same constraint that
+  produced the radius ladder's double life. What was wrong before was not the duplication,
+  it was that one half was three literals at the top of a painter with only a comment tying
+  them to the sheet.
+
+**The hero clock is the DISPLAY register, not a rung.** `$fs-display: 88px` / `$fw-display:
+200` are named and documented as having exactly one consumer in the DE. This is not the ramp
+continued — macOS, GNOME and Windows all set their lock clock outside the UI type scale too —
+and `$fw-display` is the single exception to the four weights. **If a second consumer ever
+appears, that is when it becomes a ramp; not before.** Everything else on these two surfaces
+lands on `$fs-*` exactly: eight of the eleven freehand sizes were already 12/13/14 and simply
+needed the token; only the hero block was genuinely off-system (date 13→`$fs-title-3`,
+username 20→`$fs-title-3`, both `$fw-semibold`).
+
+**Icons too.** The power bar asked the icon THEME for `system-shutdown-symbolic` /
+`system-reboot-symbolic` / `media-playback-pause-symbolic` — the same three actions the
+shell's system menu draws with `Icons.power` / `rotateCcw` / `moon`. On a clean Arch box that
+is Adwaita's art, so Veltrix's own login and lock screens were the one place in the DE not
+using Veltrix's icons (commandment 10). **`ui/lib/veltrix-kit/platform/icons.ts`** resolves the shipped set for
+bundles that have no `core/`, by the same route `avatar.ts` already used
+(`VELTRIX_SHELL_ROOT ?? /usr/share/veltrix/ui/shell`), and falls back to the theme name rather
+than throwing — a missing icon must cost an icon, never the login screen. They are Lucide
+SVGs, not symbolic, so the consumer **must** add `nd-icon`; the sheet now carries that rule
+once instead of stapled to the avatar fallback.
+
+### A generic font alias is a value fontconfig chooses, not one we chose (2026-08-31)
+
+`font-family: monospace` — the alias alone, with no family in front of it — is not a decision.
+It is a question handed to fontconfig, answered by whatever that machine's substitution rules
+resolve first, and the answer is not the same on two machines.
+
+**Measured on the live medium**: the installer's log view asked for `monospace` and got
+**NotoSansCJK-Regular** — a CJK face rendering a column of pacman output — on a system where
+JetBrains Mono was installed, declared by the desktop and one string away. Nothing errored.
+Compare the greeter, which has named `"Inter", sans-serif` since it was written: a real family
+first, the generic kept behind it as a genuine last resort.
+
+So: **name the family, keep the generic as the fallback**. The canonical strings are
+`"Inter"` and `"JetBrains Mono"` — ⚠️ *not* `JetBrainsMono Nerd Font`, which was the patched
+232 MiB build and is not what any Veltrix install carries (see `ThemeManager`'s seed of
+`monospace-font-name`, which carries the same warning for the same reason).
+
+The reason a bundle can rely on the family being there is packaging, and it is worth checking
+rather than assuming: `veltrix-installer` depends on `veltrix`, whose `depends=()` names
+`ttf-jetbrains-mono` — and the live medium installs `veltrix`, which is also why the
+substitute it landed on was a CJK face at all (`noto-fonts-cjk` arrives by the same route).
+
+### The capsule is PAINTED, on both surfaces — and the rim has to be a RING
+
+`ui/lib/veltrix-kit/platform/glass-capsule.ts` (`withGlassCapsule`) is the one capsule of the greeter and the
+lockscreen. It draws the body inside a rounded clip at radius exactly `min(w,h)/2` — a true
+pill, which CSS cannot deliver (see the tangency section above: a dot at half, a flat run one
+under, no third setting) — and the rim as a **1px ring, filled through an even-odd Cairo path**,
+never stroked and never a border primitive.
+
+Since 2026-08-24 that ring is filled with the shell's **`glassRimGradient`** (scaled by rim weight)
+and the pill gets the shared **`GLASS_SHADOW`**, so these two screens wear the same glass as the
+desktop. Before that they had a FLAT white rim (`.22` / `.14`) and no shadow — not by decision, but
+because the primitives lived in `ui/shell/` and `ui/lib/` may not import from there. Measured on the
+login button over a pale backdrop, grey levels at the contour: top rim **133 → 159** (the key light
+arriving), flank **150 → 91** (now darker than the body it edges, which is what makes it read as
+thickness), bottom **120 → 135**, and outside the silhouette a shadow of **−27 levels** decaying
+monotonically over ~3px where there had been nothing at all.
+
+🔑 **FOCUS stays a flat accent — it is not run through the ramp.** The Fresnel ramp describes a
+physical edge lit from above; focus is a STATE and has to read as one crisp bright ring at a glance.
+Sending the accent through the ramp dims it at exactly the mid-height the eye lands on.
+
+**The only difference between the two surfaces is where the pixels behind the glass come
+from, and that is a property of the compositor rather than a design decision.** The greeter is
+a transparent layer whose `layer_rule` blurs whatever is below, so it passes no backdrop and
+its body is fill-only. The lockscreen gets no compositor blur at all (`ext-session-lock-v1`
+blanks everything behind the lock surface), so it calls `setCapsuleBackdrop(wallpaper)` and the
+painter renders the blurred copy itself, once, into a texture.
+
+🔑 **The bug that asymmetry hid, and the reason the ring matters.** The first version filled
+the *whole* outer pill with the rim colour and painted the body over it. That is invisible for
+as long as the body is opaque — and on the lock it is, because the blurred texture covers the
+rim. The greeter paints no texture, so its body is a 55 % tint, and the rim came straight
+through: **the entire capsule rendered accent blue the moment it took focus.** It could not
+have been found by reading the code, and it was not in the lock's own rendering either. It
+appeared on the first offscreen render of the textureless case. When one consumer of a painter
+is opaque and another is not, render the transparent one.
+
+### Bare text on the wallpaper: the scrim, and the threshold that governs it
+
+The hero date, the clock and the username are the only text on either screen with **no glass
+behind them**, and on a light wallpaper they do not dim — they vanish. Rendered on an
+87 %-luminance backdrop (2026-08-09), the entire hero block was gone.
+
+**The obvious fix was the weakest of five candidates.** A text shadow outlines the glyph
+without raising the contrast underneath it, so the hero went from invisible to *ghostly*. What
+works is a **scrim** lifting the background contrast plus a shadow doing the edge — which is
+also what the field does: GNOME, Windows 11 and iOS all scrim their lock wallpaper, macOS
+leans on a shadow with a slight dim, and none of the four leaves the text bare. The gradient
+is stronger at the ends (where the clock and the power bar live) and lighter through the
+middle, so the wallpaper survives where nothing has to be read over it.
+
+🔑 **The peak is not a taste value — it is the blur threshold, and it MOVED.** The greeter is a
+*transparent* layer over awww's wallpaper (`config/greetd/hyprland-greeter.lua`); the lockscreen
+paints its *own* wallpaper and gets no compositor blur at all. **So any pixel of ours at or above
+that layer's `ignore_alpha` has blurred wallpaper behind it on the login screen and sharp
+wallpaper on the lock screen.** Two surfaces, one stylesheet, same declaration, different result
+— and nothing warned you until 2026-08-25.
+
+⚠️ **This paragraph said 0.3 and 0.28 for two months after the threshold became 0.23**, and the
+sheet believed it: the login screen shipped with a frosted band across its top and bottom third,
+edged where the gradient crossed the line, and a halo around the clock. The live numbers, the
+compositing rule that governs them (the scrim and the shadow COMPOUND), and the CI gate that now
+computes the sum are under "Blur is per SURFACE" above — **read them there, they are not repeated
+here on purpose**. What belongs here is the design consequence: this ceiling is why the shadow
+cannot simply be made stronger (a convincing one wants 0.5–0.6), it is now thinner than the 0.28
+this section was written around, and it is the first thing to check before adding any translucent
+element to this sheet.
+
+⚠️ A full-size child of a `Gtk.Overlay` **takes input by default**. The scrim sets
+`can_target: false` in both bundles; without it, it swallows every click meant for the card.
+
+### The login screens wear ONE skin, and the wallpaper no longer votes (2026-09-21)
+
+**Removed by the owner's decision (#613).** For four weeks the greeter and the lock
+measured the wallpaper they were about to be painted over and chose between two
+palettes — `ui/lib/backdrop-skin.ts`, `ui/lib/login-skin.ts`, and a light half under
+`window.skin-light` in `ui/greeter/style.scss`. All of that is gone. The two surfaces
+are what their stylesheet always said they were: **permanently dark glass, white ink**,
+over whatever the wallpaper is.
+
+**Why it went, and none of the three reasons is "the measurement was wrong".** It
+wasn't: on the greeter's own wallpaper it scored `dark` at 9.3:1 against 4.0:1, which
+is the right answer.
+
+1. **It was already being overridden in production and nobody could tell.** The
+   appearance ramp this repo installs at `PRIORITY_USER + 20` carries `--veltrix-text`,
+   so on a light-mode desktop the session painted every login label black while the
+   skin kept the material dark (#612). A mechanism whose output can be silently
+   replaced is not a mechanism.
+2. **Its decision could not be read.** The line it logs — *"the line to read when
+   someone reports the login screen changed colour"* — never reached any machine:
+   `veltrix-greeter-session` sends the greeter's whole output to `/dev/null` (#614).
+3. **No comparable system ships one.** macOS, GNOME and Windows all draw this screen
+   with fixed light ink over a veil. Systems that flip material and glyphs by
+   backdrop do it for in-app material, not for the login screen. ⚠️ This file
+   used to cite that prior art as support for the mechanism — read it as what it is:
+   support for *adaptive material*, not for a login screen that analyses a photograph.
+
+**The numbers are kept because they still bound the problem.** Sweeping the RGB cube
+(140,608 backdrops) at `LOCK_GLASS.fill.a`: white-on-dark fails AA on **42.9 %** of all
+backdrops, black-on-light on 14.9 %, and no backdrop defeats both. So a single skin
+*does* leave a real gap, and the veil is what has to close it — see the owed
+measurement below. #82's other table still stands too: nothing under α 0.59 clears
+4.5:1 on a white wallpaper, and 0.59 has stopped being glass, so **do not answer this
+by thickening the material**.
+
+▶️ **OWED, and it is the other half of #613: the veil is not strong enough yet.**
+Measured 2026-09-21 on the live lock screen over the shipped default wallpaper, after
+the removal: the hero reads **2.27:1** behind the username and 2.88:1 behind the clock
+where the wallpaper is pale (6.0–10.7:1 where it is dark). AA needs a uniform veil of
+**0.32** on that wallpaper and **0.54** on a pure white one; the scrim's top stop is
+0.13 today. And it cannot simply be raised: un-blurred paint on these surfaces is
+capped by `ignore_alpha` (0.23) — above it the compositor blurs the veiled region and
+draws a hard edge where the gradient crosses. Three ways out, all design decisions for
+the owner: frost the whole wallpaper uniformly (a veil above the threshold, full
+screen — no edge because there is no gradient), give the hero a glass body of its own
+(it deliberately has none), or accept sub-AA hero text on pale wallpapers and say so.
+
+⚠️ **What the removal did NOT change.** The painted rim is still a specular and still
+does not flip. `--veltrix-glass-border(-sm)` no longer has a light variant to flip to —
+tech-debt #87(b) (a translucent white ring on light glass) is moot on these two
+surfaces now. `BACKDROP_TRIM` stays exported from `glass-capsule.ts`: whatever next
+needs to model what a viewer actually sees through the glass must read those numbers
+rather than copy them.
+
+⚠️ **The shell was never part of this.** A wallpaper-based choice had a real blind spot there —
+behind the bar there can be a window, which no wallpaper measurement can see. The shell's answer
+came later and differently: on Hyalo the compositor measures under each pane while it draws it
+(references/hyalo.md → "The ink").
+
+### Looking at these two surfaces: `scripts/dev/lock-probe.js`
+
+They are the only surfaces in the DE you cannot see while working on them — the shell
+reloads with `Super+Shift+R`, but seeing the lockscreen means locking the session you are
+editing from. That is why they drifted, and why a 2026-08-09 session ended with the *user*
+acting as the render loop and finding four defects by eye.
+
+`lock-probe.js` builds the real widget tree with the real stylesheet and writes a PNG, plus
+the bounds of the hero block, the measured date:clock ratio and — since 2026-08-16 — a
+**LOCALE BAR** block: the capsule and each child's box, plus where the ink actually starts and
+ends. It also crops the capsule to `<out>-locale.png`, which is what makes photometry on it
+honest: measuring the locale bar out of the full-surface PNG has the SCRIM's gradient underneath
+and every luminance threshold lies. Crop the widget, then measure. Point `CSS=` at two builds
+for a before/after pair, and run it at least twice with different `BG=` — **legibility here
+is a question about the WALLPAPER**, and that is exactly what it caught: on a light backdrop
+the date, the clock and the username all wash out, because they are the only text on the
+screen with no glass behind it. Read its header before trusting a number: it does not show
+blur or `:focus-visible`, and on a tiling compositor the window size is a request, so **crop
+from the bounds it prints, never from a remembered offset**. (It DOES show the painted rim and
+shadow, given `PAINTER=`; that stopped being a gap on 2026-08-24.)
+
+⚠️ **It is a REIMPLEMENTATION of the two cards, not an import of them, and that is where its
+lies come from.** It cannot import the real widgets — they are TypeScript and they talk to
+greetd — so every defect it has is a divergence between its copy and the product. Two were found
+on 2026-08-24 and fixed (tech-debt #87d): the power-bar glyphs were OFF by default, which drew
+the exact symptom of a greeter that had lost its icons; and the primary button said the
+LOCKSCREEN's word under `SCOPE=greeter`, so every width verdict it had ever given for the login
+button was measuring the wrong string. The rules those left:
+
+- **Its strings now come from `ui/greeter/lib/i18n.ts`, parsed at run time** — never typed into
+  the probe. `LOCALE=xx` renders any of the thirteen, and sweeping them is the only way to see that
+  the power bar runs 278px (zh-CN) to 441px (nl). If you add a label to these screens, take it
+  from the catalog the same way.
+- **The honest full render is the DEFAULT, and every degraded mode announces itself in the PNG**
+  (a warning band across the top-left), not only on stdout. The image is what travels.
+- **It renders with the SAME NO-THEME the real surfaces use** (`GTK_THEME=Empty`), since
+  2026-08-24. It did not before, and that hid a shipped bug: an `arrow` is a builtin-icon node
+  whose `-gtk-icon-source` comes from the platform theme, so with no theme all three of the
+  greeter's dropdown chevrons kept their 10px box and drew NOTHING — while the probe, borrowing
+  the developer's Adwaita, drew them perfectly. The sheet now names the source itself — and
+  names it as a **PATH to our own shipped Lucide `chevron-down.svg`**, not as
+  `-gtk-icontheme("pan-down-symbolic")`. That distinction is commandment 10: an icon NAME
+  resolves against the ICON theme (a different thing from the blank GTK theme, and not ours —
+  ~40 installed themes provide that name on one dev box), so it would make the login screen's
+  chevron take whatever shape the `greeter` system user's icon theme happened to supply. Exactly
+  the defect `ui/lib/veltrix-kit/platform/icons.ts` was written to end for the power glyphs. The path is relative so it
+  holds both installed and from source; the `-gtk-icon-filter` beside it is not optional, because
+  `-gtk-icon-source` loads the file as a plain image rather than looking it up as an icon. Whether
+  that path honours the `-symbolic` suffix could not be measured off-screen (every harness rendered
+  the `arrow` node empty), so since #587 the filter is `brightness(0) invert(1)` — white whichever
+  way it goes — rather than a bare invert that would turn a recoloured glyph black.
+  ⚠️ **Every other icon on that screen renders**, because
+  the peek eye and the Lucide glyphs are `icon-name`/`gicon` set in CODE and owe the theme nothing
+  — only the CSS-sourced node goes blank, which is why the screen looks like it has icons and one
+  specific kind is missing. `PLATFORM_THEME=1` restores the old behaviour for the A/B that tells
+  you whether something is theme-supplied.
+- **The avatar and the switcher chips are still plain boxes.** Nothing it renders can answer a
+  question about the avatar GLYPH or the multi-user row — those need the VM. (Swept 2026-08-24:
+  the glyph renders correctly on a real install.)
+
+## The greeter wears the kit (2026-08-10)
+
+`ui/greeter/style.scss` — the sheet both login surfaces compile — now `@use`s
+**`ui/lib/veltrix-kit/styles/_components.scss`**, so the kit's look reaches the greeter and the
+lockscreen and not only the shell. The thing that earned it: the three selectors on those
+screens were raw `Gtk.DropDown`s and are now **`VeltrixDropDown`**, so their popup is the
+shell's list rather than a frozen copy of the pre-#86 one (GTK's checkmark in every row,
+accent flashing down the list on hover-select because GTK moves `:selected` with the
+pointer, and GTK's proximity-grown scroll bar on the 12-item language list — the only list
+on either screen long enough to scroll).
+
+**Four things to know before adding the next bundle, or the next kit component:**
+
+- **Source order is the whole safety mechanism.** Sass emits a module's CSS *before* the
+  file that loads it, so everything in `style.scss` out-ranks the kit at equal specificity.
+  That is what makes the two bare-element collisions (`dropdown > button`, `dropdown
+  popover`) safe rather than a coin flip. **If that `@use` ever moves below the rules, the
+  login screens silently become Settings.**
+- **The trigger deliberately does NOT take the kit's look, and that is geometry, not taste.**
+  The kit styles a dropdown trigger as an *input* (surface-back fill, 2px border, radius-sm,
+  20px content floor) because in Settings it sits on a card beside text fields. Two of the
+  greeter's sit *inside* a painted capsule next to an icon and a separator, clamped to 18px
+  so they match `.greeter-power-btn` exactly. **The kit is not all-or-nothing: take the
+  popup, keep the trigger.**
+- **The token contract is the silent half.** The kit's rules read `--veltrix-*` custom
+  properties; an undefined one does not warn, GTK drops the declaration. The greeter defined
+  6 of 22 and got the other 16 in the same change (the shell's dark set verbatim, except
+  `--veltrix-popover-bg`, which stays this sheet's near-opaque value because these popups get
+  no compositor blur). **The list is what the sheet ACTUALLY READS, measured against the
+  compiled CSS — two greps, both written in the block's comment. `--veltrix-shadow-md` was in
+  the first draft and came out: `glass()` names it, no kit rule calls `glass()`.**
+- 🔑 **Verify by rendering the surface and diffing PIXELS, not by reading the cascade.** Two
+  properties leaked through and only one was predictable. Reading found the kit's
+  `> box > label { margin-left: 8px }` — the exact gap the greeter had just refused as a
+  dead `margin-start`. Reading MISSED `font-weight: $fw-medium`, which the greeter's
+  per-variant rules override the size of but never the weight: heavier glyphs are wider, so
+  the language pill grew ~2px and shifted its own label and chevron. With both guarded, the
+  greeter and the lockscreen render **0 different pixels out of 3,686,400** against the
+  sheet before them. That is the acceptance test for every later step of this migration:
+
+```bash
+# closed surface — must be pixel-identical unless a change is intended.
+# KIT= is not optional here: lock-probe REBUILDS the tree, it does not import
+# LoginCard, so without it the kit's construction-time work (list factory,
+# adoptGtkScrolled) never runs and a sheet can pass while the shipping code path
+# was never executed. That hook was added for this change, for that reason.
+CSS=…/style.css PAINTER=/tmp/glass.js KIT=/tmp/kit.js SCOPE=greeter|lock \
+  BG='#1b2430' gjs -m scripts/dev/lock-probe.js /tmp/after
+magick compare -metric AE /tmp/before.png /tmp/after.png /dev/null
+
+# the popup, which no eye can hold open — must match the shell node for node
+CSS=ui/greeter/style.css SCOPE=greeter CLASS=greeter-session-dropdown ITEMS=12 \
+  gjs -m scripts/dev/gtk-probe.js /tmp/popup
+```
+
+`gtk-probe.js` gained `CSS=` and `CLASS=` and a `greeter` scope for exactly this — it already
+built this specimen for Settings, it just could not read another bundle's sheet. Both
+surfaces now measure identical to the shell: `contents` pad 0 / border 1, `listview`
+`margin: 0 6px`, `row` stripped to nothing, `.veltrix-dropdown-item` pad 6/9, row origin 7 left
+/ 1 top. The one honest difference is row height, 28 here against 29 in Settings — Settings
+re-anchors to the `$fse-*` em ramp and the login screens stay on fixed px, which is the rule.
+
+⚠️ **The greeter/lock sheet was compiled by nothing in CI until this change**, on the two
+surfaces that can least afford it (no dev mode, fixed `/usr/share` path — a break shows up
+only when someone boots a VM). The `styles` job now compiles it too.
+
+## Cairo vs CSS
+
+- **CSS** for anything with states (hover/active/focus/drag).
+- **Cairo** for complex static shapes (squircles, dots with halo, ring charts).
+- **Important:** if Cairo paints a node's background, CSS must **not** also declare `background-color`. You'll get double-paint artifacts.
+- **A CHOICE, a FACT and an EXPLANATION must not wear the same clothes.** The wizard's vocabulary,
+  settled 2026-09-20 after a pass over all six pages side by side: a choice is a row inside a card
+  — `VeltrixList(..., { pick: true })` for "pick one of these", `VeltrixToggleRow` for "turn this on";
+  a fact is a row in a card with no `pick` (the detected GPU, every row of the summary); and an
+  explanation is **prose under the thing it explains**, never a row. Two pages had drifted: the
+  disk page's LUKS option was a hand-rolled `Gtk.CheckButton` floating beside the cards it should
+  have been one of, and the system page put "the free Mesa drivers will be used" in a
+  `VeltrixRow` titled "Graphics hardware", so a sentence, a detected adapter and the kernel choices
+  above all looked like the same kind of item. ⚠️ The per-partition "format" box in manual mode
+  stays a `CheckButton` on purpose — a cell in a table is not a standalone decision.
+- **A real window's chrome is CSS fill only, never a Cairo `SquircleContainer` or CSS border.**
+  Hyprland already draws the 1px window border (`border_size = 1`), `rounding` (squircle,
+  `rounding_power 3.2`), and compositor drop shadows around the window rect. The CSS route
+  (`.veltrix-window-glass` → `glass(floating)`: `--veltrix-bg` fill, `border: none`, `border-radius: 0`,
+  `box-shadow: none`) fills the window allocation cleanly and lets Hyprland own the window's
+  border, rounding, and compositor shadow in both floating and tiled modes. Drawing an inner
+  CSS border produces a redundant double border and light-mode white rims, while an inner
+  circular `border-radius` (p=2.0) mismatches Hyprland's squircle (p=3.2) and visibly desyncs
+  from the compositor border during window animations. Settings, About, and the installer all
+  rely on Hyprland to frame and round the window.
+  ⚠️ **There is no CSS rim token to reach for, and that is deliberate.** `--veltrix-edge` — the rim
+  of light — was buried on 2026-09-20 (tech-debt #106) together with the whole `material*` vocabulary
+  of `_base.scss`. The rim is a SPECULAR, it is painted in Cairo (`ui/lib/veltrix-kit/platform/glass-paint.ts`, mirrored
+  as numbers in `LOCK_GLASS`), and the window card was the last CSS surface still painting it —
+  which is exactly what #600 removed when it gave window chrome back to Hyprland. So: **window chrome
+  is fixed in the window's own rules** (`glass(floating)`, `window.veltrix-app-window`), never in a
+  shared token, and a layer-shell surface gets its material from the painter, not from CSS. #600 also
+  retuned that token's light value to ink while fixing the double border; it changed no pixel,
+  because by then nothing read it. If you find yourself adjusting a token to fix something you can
+  see on one surface, that is the signal you are on the wrong lever.
+- **A kit COMPONENT whose rules live in the shell's sheet is a component with no clothes
+  anywhere else.** `ui/lib/veltrix-kit/styles/_components.scss` is the kit's half and every bundle compiles
+  it; `ui/shell/styles/_components.scss` is the shell's and only the shell does. So a widget
+  exported from `ui/lib/veltrix-kit/` whose appearance is written in the second one renders
+  UNSTYLED in the installer, the greeter and the lock screen — and what that costs depends on
+  which, which is worth getting right because the first version of this paragraph did not.
+  ⚠️ **Every bundle runs with no GTK theme** (`useNoGtkTheme()` — `ui/lib/veltrix-kit/platform/gtk-theme.ts`); the
+  shell was the last to stop wearing the user's gsettings theme, on 2026-09-23. So an unstyled
+  widget is INVISIBLE everywhere, unless the base layer draws its node. `VeltrixToggleRow` was in that state until 2026-09-20: the switch's rules were the
+  shell's, so the installer's NVIDIA toggle drew nothing at all.
+  ⚠️ **Which bundle is which has now been got wrong twice on this page, in opposite directions,
+  and the second time was written as a correction of the first.** The claim "the installer runs on
+  Adwaita, so its toggle wore Adwaita's switch, not nothing" was published on 2026-09-20 and is
+  false: `ui/installer/app.ts` has selected a themeless GTK since #268 created the bundle. Nobody
+  opened the file. The lesson that survives both mistakes is the one about instruments — a probe
+  that forces a substrate its surface does not use is measuring a machine nobody has — and it
+  applies to reading code as much as to rendering it. Same shape as the hole
+  `token-contract-check` was born from, one level up — the TOKENS were checked, the RULES were
+  not.
+  ✅ **`scripts/ci/style-ownership-check.mjs` is the gate** (2026-09-20, two controls): every class the
+  kit adds and every widget node it builds must be drawn by the kit's own sheet, or be listed in
+  that file WITH a reason. It found `.veltrix-menu` / `.veltrix-menu-popover` in the same state as
+  the switch and they moved with it. ⚠️ `veltrix-tooltip` is NOT in that state and an earlier
+  version of this paragraph said it was: the kit's sheet has had `.veltrix-tooltip` all along
+  (the shell keeps its own copy on top).
+  Moving a block is not free — it changes cascade order. Verify it the way #59 did: compile the
+  shell's sheet before and after and compare selector→body pairs (identical set, 584 both times
+  for the menu move), then confirm each moved selector appears EXACTLY ONCE, so nothing can
+  compete with it at equal specificity and the reorder cannot change an outcome. And move the
+  tokens the rules spend with them — `--veltrix-thumb` went from the shell's static block to the
+  engine in the same change, because the rules that read it now run in three processes.
+- **Until #762 (2026-10-13) a capsule's VISIBLE edge was `GLASS_INSET` (2px) inside its
+  allocation**, which meant **a child laid out flush to the rect overhung the shape**. Since #762
+  the box is the glass; what follows is why that mattered. Nothing warns
+  you: it typechecks, it renders, and the overhang is invisible until something has to line up
+  with the curve. Two things bit at once here (2026-08-03, both user-caught): the bar's
+  `barExpandedFlush` set the content margin to `0` — flush to the rect, 2px outside the glass,
+  violating the written rule that a viewport reaches its *visible* inner edge — and that put the
+  clipboard's scroll pill 2px nearer the curve than its corner clearance assumed. At 2px from
+  the wall a radius-24 arc eats **14.4px**, not the 10.7px the 4px-distance maths predicts; the
+  pill was left with 0.6px and the user saw the curve under it on hover. A child that must meet
+  the curve measures from the box now — except inside a container that paints its own shadow,
+  whose glass is the shadow's spread in.
+- **Icon glyphs are CSS-recolorable — but only because the FILENAME says so.** GTK4 recolours a
+  `Gio.FileIcon` if, and only if, its filename ends in `-symbolic` — that's the WHOLE mechanism,
+  filename-gated, nothing to do with the SVG's own `fill="currentColor"`. Since #587 our own set
+  (`core/Icons.ts` → `wifi-symbolic.svg`, `check-symbolic.svg`, …) carries the suffix and the
+  symbolic classes, so `color: var(--veltrix-accent)` on a `Gtk.Image` showing one now works.
+  ⚠️ **Drop the suffix and the icon silently goes black again** — no error, anywhere; that is what
+  `icon-registry-check.mjs` guards. It was the other way round until #587: the drawings had no
+  suffix, `color` did nothing, and the only lever was `.nd-icon`'s `-gtk-icon-filter: invert(1)`,
+  a black/white toggle rather than a recolor — found dead on Settings → Power's profile checkmark
+  (`accent-icon`, deleted 2026-07-01). Verify empirically (screenshot + crop, don't trust the CSS
+  alone) before relying on `color:`. A glyph that needs to be live-coloured may still draw in Cairo —
+  `buildSelectionCheck` in `Power.tsx` (a 3-point path matching Lucide's "check") is the reference.
+  **Don't reach for accent by default, though:** that checkmark sits on a `.veltrix-row:selected`
+  row, whose background is *already* an accent tint (`--veltrix-state-selected`, itself derived
+  from the live accent) — an accent-coloured check on an accent-tinted row nearly disappears
+  (found live, corrected same day). Cairo-drawing a glyph means picking its colour is now on you;
+  default to mode-aware white/black (`Theme.isDark`) like `--veltrix-text`, and only reach for
+  live accent when the glyph sits on the shell's own neutral glass, not on another accent fill.
+- **Interface icons are asked for by `nd-` NAME, the Veltrix icon spec's — and only by it (#587).**
+  `uiIcon("nd-network-wireless")` looks for that name in the user's interface icon theme (GSettings
+  `org.veltrix.appearance interface-icon-theme`, empty by default — chosen in Settings →
+  Appearance → *Interface icons*, config key `appearance.interfaceIconTheme`, where the empty
+  value is spelled `veltrix` — our own theme, so it is listed once, first, and filtered out of
+  what the scan finds) and then in our own
+  `assets/icons/veltrix/scalable/actions/nd-network-wireless-symbolic.svg` — the same name, two
+  places. `core/Icons.ts` holds `ICON_NAMES`, a flat LIST that exists so the compiler can refuse a
+  name we do not ship. **Adding an icon is three things: the name there, the drawing beside it,
+  and its row in `ui/shell/assets/icons/veltrix/SPEC.md`** — CI (`icon-registry-check.mjs`) fails on any
+  one missing.
+  - **why our own names (owner decision, 2026-09-17).** Until then these were freedesktop names,
+    asked of whatever theme the user picked, and a name kept drawing a different THING in
+    different themes: dark mode asked `system-suspend` (a moon in Adwaita, the suspend button in
+    Papirus/Qogir/Colloid), the bar's bell `preferences-system-notifications` (a speech bubble with
+    "!"), the Control Centre `preferences-system` (tools) — eight fixed one by one in #591, each
+    found by the owner. The Icon Naming Spec is frozen since 2007 and GNOME calls Adwaita's UI
+    icons a private set with no API; there was nothing stable to target. **Do not go back to
+    freedesktop names for interface icons**, and do not "help" a user's Papirus reach the bar:
+    only a theme made for the spec changes these icons. APP icons (dock, grid, tray,
+    notifications) keep freedesktop names — there each app's `.desktop` names its icon, and it works.
+  - **a theme opts in by DECLARING it:** `X-Veltrix-Icon-Spec=<version>` in `[Icon Theme]` of its
+    `index.theme`, read from the FIRST `index.theme` on the search path (the one GTK uses).
+    Settings lists only those themes (`specIconThemes()`), and the row stays visible with "Veltrix"
+    alone — owner's call: it is how a user learns their own theme can go there. Not detected by
+    counting `nd-` files: a partial theme is legitimate, so any threshold would be invented. A theme
+    chosen by hand without the key is ignored with a log line saying so. The version lives in
+    three places that CI keeps equal — `ICON_SPEC_VERSION` in `Icons.ts`, `**Version N.**` in
+    `SPEC.md`, `VELTRIX_ICON_SPEC` in the theme generator; bump all three when the spec gains names
+    (an older theme keeps working, the new names fall back to ours).
+  - **name by MEANING, one meaning per name.** Every theme made for the spec draws a name once, so
+    two uses sharing a name become the same glyph everywhere. The rename split three that did
+    double duty (`nd-window-tiling` from the Apps page's `nd-view-grid`, `nd-conversation-reset`
+    from Restart, `nd-power-profile-balanced` from the battery). Some still share — see
+    tech-debt — and SPEC.md's *Where* column says so honestly. Before changing a name or a drawing,
+    `gjs -m scripts/dev/icon-theme-audit.js [themes…] > a.tsv` +
+    `python3 scripts/dev/icon-theme-sheet.py a.tsv /tmp/sheet` draws every name in every spec theme
+    beside ours — look at it.
+  - **the THEME FALLBACK is the other half of `ndImageProps`, and it needs measuring too.**
+    `ndImageProps(name, themeFallback, size)` (`ui/lib/veltrix-kit/platform/icons.ts`) draws the shipped `nd-` icon, or
+    the freedesktop `themeFallback` when the asset tree is not found at all. Commandment 10 governs
+    the PRIMARY ask, not this last resort — but a fallback naming something no theme draws is worse
+    than none: the row goes blank and nothing is logged (icon failures never log). #603 shipped
+    three transliterated straight from their `nd-` names — `hand-symbolic`,
+    `clipboard-list-symbolic`, `cpu-symbolic` — and the first two exist in **no icon theme at all**,
+    while the third reaches Papirus and Tela but not Adwaita, which is what a clean Arch install
+    has. `gjs -m scripts/dev/icon-fallback-audit.js` measures every fallback the tree ships (it
+    knows all three shapes: `themeFallback:`, `icon_name:` and `Gio.ThemedIcon.new("…")`), and with
+    names as arguments it prices candidates before you write one in.
+    ⚠️ **Coverage is necessary, not sufficient — then LOOK at the survivors**, same rule as our own
+    names: `help-about-symbolic` is an ⓘ in Adwaita and a four-pointed STAR in Colloid, MacTahoe and
+    Qogir; `user-available-symbolic` is a speech bubble in every family. The three replacements
+    (`go-home-symbolic`, `view-list-symbolic`, `computer-symbolic`) were picked by rendering them.
+  - **the lookup asks for size 512, on purpose.** A `Gio.FileIcon` is one file, so the size decides
+    WHICH of a theme's variants we get, and fixed-size directories are often drawn with padding —
+    Colloid's `status/24` icons fill 63% of their box against 97% for its scalable ones. Asking for
+    24 hit that directory exactly, and was the only size that did (16/32/48/128/512 all give the
+    scalable drawing); the owner saw it as "the ethernet icon is smaller". Ask big, get scalable.
+  - **a theme's answer only counts when it is a symbolic SVG, and when it draws ink.** Only
+    `<name>-symbolic` is asked, but GTK falls back along `Inherits`, and Adwaita used to answer from
+    `legacy/` with full-colour PNGs that neither recolour nor follow the mode — the resolver checks
+    the resolved FILE ends in `-symbolic.svg`. And a valid symbolic file can render EMPTY
+    (GTK drops a group transform on some files without a `viewBox` — Suru++ and La Capitaine lost
+    17 icons that way), so each candidate is rendered off-screen once and used only if it leaves ink.
+  - **a theme name is a case-sensitive DIRECTORY name.** `adwaita` is not `Adwaita`, and
+    `set_theme_name` accepts anything without looking, so a mistyped name silently resolves
+    NOTHING and looks exactly like the setting never having been touched. The name is checked
+    against `index.theme` on the search path before use, and a near-miss is named in the log.
+  - **a theme change reaches icons already on screen through `common/IconThemeRefresh.ts`,
+    not through the cache.** A `Gio.FileIcon` is one file; clearing the cache re-asks nobody, so
+    the first version of the Settings selector changed nothing until a restart. On change it
+    walks every toplevel (hidden ones too — Settings keeps its tree) and swaps each `Gtk.Image`
+    holding a file `uiIcon` ever handed out (`uiIconNameForFile`). An icon stored at MODULE
+    LOAD and turned into a widget later (a widget's catalogue `icon`, a config entry's slider
+    `icons`) is not in any tree yet — its consumer wraps it in `currentUiIcon(…)`. Store names,
+    not `uiIcon(…)` results, in anything new that outlives a theme change.
+  Two more things that are easy to get wrong:
+  - the interface theme is a **private `Gtk.IconTheme`**, never
+    `Gtk.IconTheme.get_for_display()`. The display's theme belongs to APPLICATION icons (the dock,
+    the tray, the app grid) and it **refuses `set_theme_name` outright** — it is a singleton
+    (`assertion '!self->is_display_singleton' failed`). GTK gives one theme per process and these
+    are the two the shell needs at once. Route A of the #587 prototype — putting the interface
+    theme on the display — was measured to change the art of 57 of 72 real app icons.
+  - **do not check a theme's coverage by looking for files in its directory.** GTK resolves through
+    `Inherits`, so it finds names the directory does not hold, and misses some it does. Ask the
+    resolver: `scripts/dev/icon-registry-probe.sh [spec theme dir]` runs the real module
+    off-screen under `cage` — no theme, the theme, a misspelled name, and the same theme with the
+    `X-Veltrix-Icon-Spec` line removed — and fails unless those runs disagree the way they must,
+    including what Settings would list.
+- **The Veltrix icon theme is COMMITTED, and it is the only copy.** `ui/shell/assets/icons/veltrix/`
+  is a complete theme directory — `index.theme` (declaring `X-Veltrix-Icon-Spec`), `scalable/actions`,
+  `16x16/actions`, `SPEC.md`, Lucide's `LICENSE` — and it is at once what the shell draws, what the
+  greeter/lock/installer read, and the spec's reference theme that authors copy. Installed, it is
+  linked as `/usr/share/icons/veltrix` (install.sh and the PKGBUILD both make the symlink), so it sits
+  where themes are found with no second copy. **Do not reintroduce a generated theme.** Until
+  2026-09-17 a `veltrix-symbolic` theme was rebuilt from the whole of `lucide-static` at install
+  (1839 drawings, ~15 MB, its own `veltrix-icon-theme` package), and 9 of the 83 drawings had
+  silently drifted from the committed ones — owner: one copy. The name is plain `veltrix`, not
+  `-symbolic`, to leave room for app icons of our own later; note `~/.local/share/icons/veltrix/`
+  already exists as the per-user APP icon override dir (`AppService`), with no `index.theme` of its
+  own, so GTK and `specIconThemes()` read the system one. The drawings are Lucide's, so the package
+  licence is `GPL-3.0-only ISC MIT`.
+  `scripts/icons/veltrix-icons.py` maintains it: **`add <lucide.svg> <nd-name>`** converts a stroke SVG
+  into both sizes; **`sync`** rewrites `16x16/actions` from `scalable/actions` (the scalable file is
+  THE drawing — edit that, then sync); CI runs **`sync --check`** plus `icon-registry-check.mjs --theme
+  ui/shell/assets/icons/veltrix`. What the conversion exists to get right:
+  - **symbolic classes, from the EFFECTIVE fill.** A shape's own `fill`, else the root's.
+    `foreground-stroke` only when the stroke is `currentColor`, so a filled dot carrying
+    `stroke="none"` does not get GTK's forced 2-unit stroke laid over it. Without classes, a
+    stroke-only icon renders as a filled blob. **A shape that already has symbolic classes keeps
+    them** — in a converted file the class is the only place the intent survives: re-deriving
+    `nd-media-playback-stop` from its `fill="none"` root turned the filled square hollow.
+  - **the 16-unit variant, for a real 2px stroke in the bar.** GTK forces symbolic strokes to 2 SVG
+    *user units*, so a 24-unit drawing at 16px strokes 1.33px. A `<g transform="scale(…)">` does
+    NOT fix it — the stroke scales too; the coordinates have to be rewritten.
+    ⚠️ Measured: that variant only wins at **12–16px, scale 1**. At 18px, and at every size on a
+    scale-2 display, GTK takes the scalable one. `Type=Threshold` does not widen the band (tried,
+    no effect). ⚠️ And the shell's own path never uses it today: `uiIcon` reads the scalable file
+    straight from disk (see `ICON_SIZE` in `Icons.ts`).
+- **NEVER put `nd-icon` on a third-party APP icon** — only on our own monochrome UI glyphs.
+  `.nd-icon` is `color: var(--veltrix-text)`; on full-colour app artwork a symbolic recolour flattens
+  every colour to one. It was `-gtk-icon-filter: invert(1)` before #587, which handed back a photo
+  negative — a louder symptom for the same mistake. This has now been found three separate times (the notification
+  centre's app icon, Settings → Audio's per-app row, and the CC audio detail's per-app row — the
+  last one fixed 2026-08-02, reported by the user as "los iconos salen invertidos"). The pattern to
+  copy when an image is *sometimes* ours and sometimes the app's: decide per icon, like
+  `MenuRow`'s `appIcon?: boolean` opt-out or `widgets/media.ts`'s `remove_css_class("nd-icon")`
+  once a real app icon resolves. Fallback art of ours that lands in the same slot still gets it.
+- **Any bitmap that lands in a rounded slot goes through `squircleThumb(pixbuf, w, h, radius,
+  cssClass)`** (`common/DrawingUtils.ts`) — a `Gtk.DrawingArea` that cover-fits (scale so the
+  SHORTER side fills, then centre-crop) inside a squircle clip. **GTK4 CSS `border-radius` does
+  NOT clip a child's rendering**, so rounding an image is Cairo's job, never the stylesheet's;
+  and cover-fit rather than contain, because a thumbnail column only reads as a column when
+  every cell is the same rectangle — letterboxing a 2560×1440 screenshot beside a square avatar
+  makes the list look broken. It was born inside `NotificationCenter.tsx` (`heroDrawingArea`)
+  and moved out the moment the clipboard history needed the same thing. `scale_simple`
+  allocates, so the cover-fit copy is cached and only recomputed when the allocation changes —
+  **never call `scale_simple` from inside a draw func without that guard.** Decode with
+  `GdkPixbuf.Pixbuf.new_from_stream_at_scale_async` and scale against the shorter side (`-1` on
+  the other axis): a bounding box gives a 2560×100 panorama a 2px-tall thumb, and a synchronous
+  decode of twenty screenshots visibly stalls the panel as it opens.
+- **Any Cairo draw call that needs a colour defined as a hex string elsewhere goes through
+  `hexToFloatRgb(hex)`** — since 2026-08-15 it is defined in **`lib/veltrix-kit/platform/accent.ts`**, beside the
+  palette it parses, so the kit's slider can reach it; `common/DrawingUtils.ts` re-exports it and
+  the shell's painters keep their import path. `"#rrggbb"` → `{r,g,b}` as 0..1 floats,
+  never a hand-rolled `parseInt(hex.slice(...), 16) / 255` triplet. Before this existed, that
+  three-liner was independently copy-pasted into `SquircleContainer` (×2), the CC drag ghost,
+  and — worse — `veltrix-kit/slider.ts` and `widgets/battery.ts` had drifted into hardcoding their
+  OWN *pre-computed float copies* of a color instead of parsing the real hex live. Found because
+  the slider's fill and battery's low/charging colors turned out to be silently duplicating (and
+  in battery's case, duplicating the WRONG source — see below), not just visually similar by
+  coincidence. **Two canonical hex sources, both plain string constants, no Gtk/Cairo import:**
+  `lib/veltrix-kit/platform/accent.ts`'s `ACCENT_HEX` (10 preset accent colors
+  plus any hex the user picks in Studio — decorative, changes with the theme)
+  and `lib/veltrix-kit/platform/status-colors.ts`'s `DANGER_HEX`/`SUCCESS_HEX` (fixed
+  "needs attention"/"good" colors — used by the recording indicator, battery critical/charging;
+  must NOT move with the user's accent choice, since accent has its own selectable "red"/"green"
+  entries that mean something different). `battery.ts`'s old `RED`/`GREEN` were a comment lying
+  to itself: it claimed to match the danger/success seeds but the actual float values matched
+  `ACCENT_HEX.red`/`.green` instead — battery would have quietly wrestled the user's accent
+  palette's arbitrary "red" swatch in a semantic slot for the wrong reason. Corrected to
+  `hexToFloatRgb(DANGER_HEX)`/`hexToFloatRgb(SUCCESS_HEX)`. For the *live* accent specifically
+  (not a fixed status color), read it off `Theme.accentHex` (or
+  `effectiveAccentHex(config)` for a config) first, same as everywhere else, then pass that hex
+  through `hexToFloatRgb` — don't read `ACCENT_HEX` directly for anything that should track
+  live theme state.
+
+## Adwaita vs pure GTK4 — the central rule
+
+This is the table that decides almost every "which widget should I use?" question:
+
+| Surface | Use | Why |
+|---|---|---|
+| Dock, Bar, workspace dots, resource circles, schematic | **Pure GTK4 + Cairo** (`Gtk.DrawingArea` / `Gtk.Snapshot`) — ⚠️ always `set_draw_func(cairoDraw(…))`, and `cr.$dispose()` after `snapshot.append_cairo` (#100: an undisposed context per frame took the shell's native heap 140 → 874 MB in 90 s of dock hover; CI `cairo-dispose-check`). ⚠️ **An IMAGE that animates its size is not Cairo's job**: dock app icons are `surfaces/dock/DockIcon.ts` — GPU textures (`append_scaled_texture`; a HYPER-prescaled copy drawn 1:1 at rest, the 128 px source TRILINEAR in motion). As a `DrawingArea` each frame re-converted the pixbuf and convolution-scaled it on the CPU: 34 % of the shell's main thread in `perf`, 23.1 % → 1.7 % of a core in `scripts/dev/dock-icon-probe.ts`. ⚠️ **A Cairo SHAPE that animates only its LENGTH is not repainted either**: `ui/lib/sliced-cairo.ts` (`SlicedCairoArea`) paints it once with the same painter and composes start cap + a 1 px middle stretched NEAREST + end cap as GPU textures — the horizontal dock capsule, 5.9 % → 1.5 % of a core, pixel-identical (`scripts/dev/sliced-capsule-probe.ts`). Contract: nothing may vary along the stretch axis between the caps, which is why the VERTICAL dock stays a DrawingArea (its rim gradient runs along it). 🔑 **Never `append_scaled_texture` in logical coordinates — use `ui/lib/device-texture.ts`.** GTK's GPU renderer draws a texture-SCALE node through an offscreen created at scale 1 whenever the screen is not at scale 1 (`gsk_gpu_node_processor_add_texture_scale_node`), so on a scale-2 screen both of the above came out at half resolution — the whole dock soft, at rest and magnified, next to a sharp Gtk.Image (owner-caught 2026-09-26, A/B'd live). The helper undoes the surface scale on the snapshot and gives the rect in device pixels; `surfaceScale()` is the FRACTIONAL scale (`get_scale_factor()` rounds 1.25 to 2). A plain `append_texture` is not affected | Adwaita adds nothing here; painting direct = zero defensive CSS. |
+| Floating overlays (CC, NotifCenter, Prism (search), SystemMenu, Overview) | **`Gtk.Box` + gtk4-layer-shell + custom CSS** | Adwaita would only add chrome you'd have to undo. |
+| Toggles / switches / buttons inside overlays | **`Gtk.Switch`, `Gtk.Button`** (NOT `Adw.*Row`) | Base widgets style cleanly; `Adw.*Row` brings padding/focus-ring/separators that have to be killed one by one. |
+| Sliders (any) | **`makeSlider`** from `veltrix-kit/slider.ts` (NOT `Gtk.Scale`) | See "Sliders" below — one Cairo component for the whole shell. |
+| A preference row (label + subtitle + its control) | **`VeltrixToggleRow` / `VeltrixDropDownRow` / `VeltrixSliderRow`** from `veltrix-kit/rows.ts` | Inside Settings, reach them through `SettingsHelpers`' `toggleRow`/`dropdownRow`/`sliderRow`, which hand in `createRow` so the row also lands in the search index. Anywhere else, call the kit directly. |
+| A validated form field (label + subtitle + control + error line) | **`VeltrixFieldRow`** from `veltrix-kit/row.ts` | Stacked row with inline `.veltrix-field-error` caption underneath the control and `setError()` / `setValidationState()`. See "A form's faults belong to its fields". |
+| Settings window | **`ui/lib/veltrix-kit`** (`VeltrixSplitView`, `VeltrixClamp`, `VeltrixButton`, `VeltrixDropDown`) | Custom split view. **Do NOT use `Adw.OverlaySplitView`** — it breaks capsule margins. |
+| A table (several values per line, each named) | **`VeltrixTable`** from `veltrix-kit/table.ts` | The list card with column headings; columns aligned by one `Gtk.SizeGroup` each. See "A table is the same rows, in columns". |
+| Modal dialogs | **`showVeltrixAlert`** from `veltrix-kit` | Clean, themeable. |
+
+**Rule of thumb:** everything is **pure GTK4** — libadwaita has been fully removed. Dark/light is set via `Gtk.Settings.gtk_application_prefer_dark_theme` (no `Adw.init()`); the About window is a plain `Gtk.Window` (no `Adw.AboutWindow`). Don't reintroduce any `Adw.*`.
+
+### Custom container widgets — a JS `vfunc_dispose` is a landmine
+
+GJS blocks JS callbacks during garbage collection. A GJS `Gtk.Widget` subclass that
+unparents its children in `vfunc_dispose` works on explicit destroy but NOT when the
+widget is finalized from GC (a dropped subtree, e.g. a replaced Settings subpage): the
+override is blocked (`Gjs-CRITICAL: Attempting to run a JS callback during garbage
+collection`), the chain-up never runs, and GTK warns `Finalizing …, but it still has
+children left` (the child subtree leaks). GTK4's own `gtk_widget_dispose` does NOT
+unparent children either, so a subclass *without* the override warns just the same —
+there is no safe GJS-subclass variant of a container.
+
+**Pattern:** host children in a plain **C container** (`Gtk.Box`) and get custom layout
+by replacing its layout manager (`box.set_layout_manager(new MyLayout())`) — GtkBox
+releases its children in C, which is GC-safe. `VeltrixClamp` (`veltrix-kit/clamp.ts`) does
+exactly this. When subclassing is unavoidable (`ScaleRevealer` needs snapshot-time
+scaling), expose an explicit teardown (`dismantle()`) and require callers to invoke it.
+
+## Entry vs dropdown in Settings — the CLOSED SET decides, not the list's length
+
+A `Gtk.Entry` in Settings is a claim that the valid values are open-ended. Where they are
+not, the entry is just a dropdown that can be typed wrong — `Gtk.EntryCompletion` does not
+fix that, because completion is a suggestion and the widget still commits whatever is in
+the buffer. Audit of every writable field (2026-08-16), with the option counts **measured
+on a stock install** rather than guessed from the catalogue:
+
+| Field | Closed set? | Options | Verdict |
+|---|---|---|---|
+| Language & region → Language (LANG) | `localectl list-locales` | **13** — the GENERATED locales, not glibc's ~800; **12 offerable**, see below | → `VeltrixDropDown` |
+| Language & region → Timezone | `timedatectl list-timezones` | **598** | entry stays (see below) |
+| Users → full name / username | no | — | entry |
+| Autostart → command | no | — | entry |
+| AI → model | no (local Ollama catalog) | — | entry |
+
+⚠️ **`C.UTF-8` is not a language, and `localectl list-locales` lists it FIRST.** It is the
+POSIX "no localization" locale — untranslated messages (which read as English because the
+msgids are), byte-order collation, C date format, no currency — and `detectLanguage()`
+(`core/i18n/index.ts`) matches no prefix for it and falls through to `en`, so Veltrix's own
+UI looks fine while everything else in the session goes unlocalized. Left unfiltered it was
+the top entry of a control labelled "Language". Regional format had always filtered the
+C/POSIX family out of `locale -a`; the Language list shipped without that filter for one
+commit. Both filter it now. Filtering the list is **not** the same as hiding an active
+value: a LANG absent from the list is appended to the model, so a machine really running
+`C.UTF-8` still shows the truth rather than snapping to a neighbouring row.
+
+🔑 **Measure the set on the machine before choosing.** `localectl list-locales` returns only
+what `locale.gen` generated — 13 rows, a trivially browsable dropdown. Sized from the glibc
+catalogue instead, the same field looks like an 800-row list that "obviously" needs a search
+box. The count that decides the control is the runtime one.
+
+**Timezone stays an entry for now** because 598 rows need `Gtk.DropDown`'s `enable_search`,
+and that is not a free flag: it requires `expression` (a `Gtk.PropertyExpression` on
+`GtkStringObject:string`), its `search_match_mode` defaults to **`PREFIX`** — so "Madrid"
+would not find "Europe/Madrid" and the whole feature reads as broken — and, crucially,
+`VeltrixDropDownRow` (`veltrix-kit/rows.ts`) reads and writes the selection **by index**,
+which stops meaning a stable thing the moment a search filter is active. Converting it means
+moving that row to `selected_item` first. `search_match_mode` is GTK 4.12+; the repo targets
+4.22, so availability is not the blocker.
+
+### A row that names a CATEGORY must enumerate AND write the whole category
+
+Settings → Apps → Default apps, fixed 2026-08-16. Every row there is a category — the
+labels say "Image viewer", "Web browser", and the subtitles promise "Opens photos and
+images", "Opens links and web pages" — but each was built from **one** content type, which
+broke it at both ends at once:
+
+- **What it wrote.** "Image viewer" wrote only `image/jpeg`, so a PNG still opened in the
+  previous app. The browser row was worse than partial: it wrote `text/html`, while
+  `xdg-settings get default-web-browser` and every app that opens a link read
+  `x-scheme-handler/http` — the choice never left the page.
+- **What it offered.** The same single type enumerated the dropdown, and a text editor
+  legitimately registers for `text/html`: on a stock Arch install the "Web browser" list
+  offered **micro, nvim and GNOME Text Editor** (measured, not guessed).
+
+The shape that holds: a row carries a LIST of types whose **first element defines the
+category** — it is what the app list and the current default are read from — and picking an
+app writes every type in the list **that the app is already registered for**. That support
+filter is not optional: `set_as_default_for_type` will happily make an app the default for
+a type it cannot open (it just appends an association), so writing the list blind trades a
+partial setting for a broken one.
+
+⚠️ **The types left OUT are a decision too, and belong in a comment.** `image/svg+xml` is
+not in the image list because "view" and "edit" genuinely diverge there; source-code types
+are not in the text-editor list because an editor claiming `text/x-csrc` is not a reason to
+take that association from an IDE the user chose deliberately.
+
+🔑 **The A/B that proves it** (and proves it could fail): run the write against a throwaway
+`XDG_CONFIG_HOME` — GIO writes `mimeapps.list` there — picking an app that is *not* already
+the default, then read `Gio.AppInfo.get_default_for_type("x-scheme-handler/http")` back. The
+pre-fix path prints `DID NOT REACH`. No display and no risk to the real config needed.
+
+### A row that costs ROOT keeps its Apply button — even as a dropdown
+
+Asked and settled 2026-08-16 ("¿el Apply de Language no sobra, si Regional format no lo
+lleva?"). It does not, and the reason is not cosmetic. Settings → Language & region holds
+all three cases side by side and is the reference for the split:
+
+| Row | What it actually writes | Cost | Control |
+|---|---|---|---|
+| Regional format | `~/.config/environment.d/veltrix-locale.conf` — 7 `LC_*` vars, as the user | none | dropdown, **instant** |
+| Change timezone | `timedatectl set-timezone` → `org.freedesktop.timedate1.set-timezone` | admin password | entry + **Apply** |
+| Language (LANG) | `pkexec localectl set-locale` → `/etc/locale.conf` | admin password | dropdown + **Apply** |
+
+⚠️ **"System-wide" does not mean "the login screen too."** The greeter has its own
+language picker (`ui/greeter/widget/LocaleBar.ts`, persisted to `greeter-prefs.json` in
+the greeter user's config dir), and `detectLocale()` in `ui/greeter/lib/i18n.ts` reads
+that **first** — `$LANG` next (usually absent: greetd starts the greeter with an empty
+env) and `/etc/locale.conf` only as the **fallback**. So Settings → Language governs the
+greeter on a machine nobody has picked on, and stops governing it the moment someone
+uses that picker. The reverse holds too, by design: the greeter's pick re-strings the
+greeter only and never touches the session. A subtitle claiming "login screen included"
+shipped in the first draft of this work and was wrong for every machine whose greeter
+had been used once — user-caught the same day.
+
+Both system actions are `auth_admin_keep` on **all three** polkit levels (`allow_any`,
+`allow_inactive`, `allow_active` — checked in `/usr/share/polkit-1/actions/`), so every
+change raises a real password dialog. The rule: **root → Apply; our own user config →
+instant.** A dropdown that raises a polkit prompt on `notify::selected` is a trap, not a
+convenience — merely browsing the options starts asking for the root password.
+
+⚠️ And it is not a one-line removal even if you wanted it: the page sets `langDrp.selected`
+inside an `idle_add` once the model has loaded, so an instant-apply handler would fire
+`pkexec` **on page open**. Any move to instant-apply must guard the sync exactly the way
+`VeltrixDropDownRow` does.
+
+🔑 The tempting counter-argument — "Regional format proves we can do it per-user, so put
+`LANG` in `environment.d` too and drop the button" — is a **product** change, not a cleanup:
+it demotes the row from the SYSTEM language (greeter, TTY, other users) to this session's
+language, and the group is titled "System language" for that reason. Considered and
+declined; reopen it as a product decision, not as a refactor.
+
+### A value that is the CONTEXT for other rows must re-derive the GROUP, not just itself
+
+Some controls do not hold a value so much as decide what the rows around them mean. Settings →
+AI's **provider** is the case: the model, whether the endpoint row exists at all, whether the key
+row exists, and every placeholder in it are derived from it. In-page that was handled (its callback
+calls `refreshSensitivity`), but its **external-sync hook moved the dropdown and nothing else** —
+so with one Settings window per monitor, switching provider on one screen left the other showing
+the previous provider's model and a key field still describing it, while "Save key" reads the LIVE
+provider and would have filed the secret under the new one.
+
+🔑 The mechanical question is *what else on this page is derived from this value?* If the answer is
+"other rows", the hook must call the same re-derivation the local callback does — track the value
+the widgets were last built around (`shownProvider`) so a change can be recognised as a change of
+CONTEXT rather than of value. ⚠️ And when it is not the context that moved, a sync must not steal
+text someone is typing: reconcile a free-text entry only while it does not have focus.
+
+## Buttons — one component + a variant convention
+
+All action buttons go through **`VeltrixButton`** (`ui/lib/veltrix-kit/button.ts`) — never
+`new Gtk.Button({ css_classes: ["veltrix-btn", …] })` by hand, and never per-surface classes
+(`settings-row-action` was a dead class that left its button rendering as raw Adwaita). CSS
+lives once under `button.veltrix-btn` — in **`ui/lib/veltrix-kit/styles/_components.scss`** since
+2026-08-10, because `VeltrixButton` is built in `ui/lib/` (see "The kit's stylesheet" below).
+
+Variants carry **intent**, applied consistently across pages (Network/Bluetooth were unified
+to this in 2026-06):
+
+| Action | `variant` | `pill` | Shape |
+|---|---|---|---|
+| Connect / Pair / Apply / the affirmative CTA | `primary` | `true` | label |
+| Disconnect / neutral secondary action | `secondary` (default) | `true` | label |
+| **Destructive** (Forget network, Remove device) | `danger` | `true` | trash icon |
+| Scan / Search / other plain actions | `secondary` | `true` | label |
+
+- **`danger` is for destructive only.** Disconnect is reversible → `secondary`, NOT danger.
+### A label class inside a capsule must carry its OWN colour (2026-08-24)
+
+`.bar-left / .bar-center / .bar-right { label, image { color: var(--veltrix-text) } }` in
+`_bar.scss` colours capsule content by ANCESTRY, and that is enough right up until a
+**morph ghost** exists. `MorphRevealer` paints twins of the capsule's content as its own
+direct children — the whole point being that they travel OUTSIDE the box they belong to —
+so a ghost matches no `.bar-*` ancestor, falls back to the GTK theme's own label colour,
+and renders **white**.
+
+🔑 **In dark mode that is accidentally correct, so the bug only exists in light mode**, which
+is exactly how it was reported: the media title flashed white for the first third of every
+island open and close, and nowhere else. A defect that is invisible in one theme is a defect
+nobody finds by looking at the theme they use.
+
+⚠️ It also produced a misleading first measurement. Sampling the title band during the LATE
+frames showed dark text ramping in and no pixel ever brighter than the glass — a clean,
+wrong answer, because the ghost lives in `[0, SOURCE_FADE_END]` = the first 35 % and the
+sampling started past 50 %. The user's own observation (*"only in light mode, opening AND
+closing"*) is what said the mechanism had to be a colour and not an opacity ramp: a fade
+looks the same in both modes.
+
+The split that made it diagnosable: the same ghost's **Cairo** parts stayed correct
+throughout, because they read `Theme.chromeIsDark` directly. Text wrong, EQ bars right ⇒ the
+fault is in CSS inheritance, not in the theme.
+
+🔑 **Second instance, same family, found the same way (2026-08-25): the About window.** It was
+the one surface of the shell that declared no text colour at all, so every label fell back to
+GTK's default — white — and in LIGHT mode the card rendered white-on-near-white: the whole strip
+measured **2.68:1** of dynamic range, i.e. below the 4.5:1 minimum even between its most extreme
+pixels. Fixed with `color: var(--veltrix-text)` + `label { color: inherit }` on the window scope
+(`_about.scss`), which reads 20:1 after.
+
+⚠️ **The tell to remember, because it is what makes this class findable:** the LOGO flipped to
+black correctly while the text stayed white. `.about-logo` was the only node in the sheet naming
+`var(--veltrix-text)` — so the token was right, the mode was right, and the labels simply were not
+asking. When one element of a surface follows the mode and its neighbours do not, suspect an
+un-declared colour before suspecting the theme. Settings and the alert dialogs were never exposed
+(they colour every string they draw), which is also why the two windows side by side did not read
+as a difference in the STYLESHEET.
+
+So: **any label class used inside a capsule declares its own `color`** — `.bar-widget-label`
+does now. Do not rely on an ancestor rule for anything a ghost can clone.
+
+- **`ghost`** (transparent, dim text) reads as *text with a hover*, not a button — use it only
+  for subtle nav affordances (e.g. a row "details" chevron), never for a real action like Scan.
+- For a button whose intent toggles at runtime (e.g. connect⇄disconnect), build it with
+  `VeltrixButton({ pill: true })` and `add/remove_css_class("veltrix-btn--primary")` in your
+  state setter (the base `--secondary` class is a no-op, so removing `--primary` = neutral).
+- **Icon-only buttons:** pass `icon: true` (adds `veltrix-btn--icon` — compact uniform padding)
+  and `set_child(new Gtk.Image({ … css_classes: ["nd-icon"] }))`. This keeps an icon button the
+  same height as a labelled one in a cluster (e.g. details/forget sitting next to Connect),
+  instead of looking smaller/odd. Don't hand-roll icon buttons with ad-hoc sizing.
+
+**Size is a separate axis from intent and from shape** (added 2026-08-02, tech-debt 16b). There
+are exactly two steps and `size` composes with every variant, `pill` and `icon`:
+
+| `size` | Metrics | Use for |
+|---|---|---|
+| `"default"` (omit) | `$fs-small`, `padding 5px 14px`, ~32px tall | every normal action |
+| `"compact"` | `$fs-caption`, `padding 3px 10px`, ~24px tall | a control inside a **dense row** that must not out-weigh the row's own text |
+
+Two rules that keep the axis from rotting into a free-for-all:
+
+- **Compact is not a fitting tool.** If a default-size button doesn't fit, the layout is wrong —
+  fix the layout. Compact is for the *editorial* case: the row's own label is the subject and the
+  button is an aside (the CC audio detail's "set as default" = `ghost` + `compact`; the same
+  control in Settings → Audio stays default-size, because that row is roomier and the button is
+  the row's point). The same action legitimately takes different sizes in different surfaces.
+- **In `_components.scss`, `--compact` is declared LAST inside `button.veltrix-btn`** so its
+  padding beats `--pill`/`--icon` while leaving their `border-radius`/`min-width` intact (it
+  re-specifies padding for both combinations). Anything you add below it must not re-set padding
+  unconditionally.
+
+There is no `"large"`. Don't add one speculatively — one was never needed, and a size ramp nobody
+uses is just three ways to be inconsistent.
+
+**Icon buttons inside a list row use `settings-icon-btn`, and their tints are NEUTRAL** (mute
+buttons in CC/Settings audio, the Settings → Widgets configure chevron). This is the *second*
+icon-button class next to `VeltrixButton({ icon: true })` and it survives for one reason: it is
+28×28 with 4px padding, sized to sit in a dense row. Not folded into the kit (2026-08-02, user
+call) because the merge changes the box on five rows for no behavioural gain.
+
+The load-bearing detail is the **tint ladder**: the button sits inside a `.veltrix-row`, which is
+already wearing `--veltrix-surface-hover` (0.12) by the time the pointer is on the button. An equal
+tint reads as a dead control. So the row is 0.12, the button's hover is `--veltrix-surface-active`
+(0.16) and its press is `--veltrix-surface-raised` (0.20) — each one rung deeper than its parent.
+Until 2026-08-02 it reached for `--veltrix-accent-10` to win that contrast, which is the
+active/selected tint spent on a hover; the neutral rung buys the same visibility without
+overloading the accent. **If you add a control inside a row and it looks dead on hover, go one rung
+down the neutral ladder — do not reach for the accent.** Watch out for `--veltrix-state-selected`:
+despite the neutral-sounding name it is accent-tinted (`rgba(accent, 0.22)`), so it is not a rung
+of this ladder.
+
+**Never `suggested-action` / `destructive-action` — and know WHY they seem to work.** Those are
+Adwaita classes, and the shell restyles them in exactly two class scopes: `.bar-expansion-panel`
+(`_bar.scss`) and `.veltrix-detail-panel` (`_control-center.scss`). Inside those two, an Adwaita class
+looks native; **one pixel outside, it renders as raw GTK — Adwaita blue and Adwaita red, colours
+the user never picked.** That is not theoretical: it shipped twice on 2026-08-02, in the island's
+capture card (blue Stop) and in the CC status banner row (red revoke button), both caught on sight
+by the user. `button.veltrix-btn` is deliberately UNSCOPED, so `VeltrixButton` is the only button
+vocabulary that is correct in every window — bar, island, CC, Settings.
+The ONE legitimate remaining use is `.veltrix-seg-btn.suggested-action`, where the class is not a
+button style at all but the SELECTED marker of a segmented control, and `_components.scss` owns
+that rule (screenshot/screenrecord mode rows). Every real button in `widgets/` was converted on
+2026-08-02 (vpn, bluetooth, screenshot; volume lost a vestigial `flat`), and the last holdout —
+volume's caption-sized "set as default" text link — went with it once the kit grew a compact size
+(same day, see the size table above). **`widgets/` and `surfaces/` now carry zero author-written
+Adwaita button classes.** The `button.flat` rule still in `_control-center.scss` has no author-side
+consumers left; it survives only as a defensive normalizer for GTK composite widgets that carry
+`.flat` internally (night-light's `SpinButton`). Don't read it as permission to write `flat`.
+
+For an icon that belongs **next to a row's title** rather than as a trailing control (e.g. a
+lock on a secured Wi-Fi row), pass it as `VeltrixRow`'s `titleIcon` arg (threaded through
+`createRow(label, subtitle, widget, titleIcon)`) — don't park it in the trailing control box.
+For an icon that **leads the row** (an identity icon before the title, e.g. each control's icon
+in Settings → Control Center, or an app icon), pass `VeltrixRow`'s `leadingIcon` arg (also threaded
+through `createRow(label, subtitle, widget, titleIcon, leadingIcon)`) — it sits as the row's
+first child, before the title column.
+
+**A row has three zones — `[leadingIcon] [text (expands)] [control]` — and the trailing slot is
+for ONE control.** The moment you find yourself building a `Gtk.Box` of unrelated things to pass
+as `widget`, the row is telling you something belongs in another zone. A preview thumbnail is a
+leading icon, not the first item in a button box: cramming it trailing reads as one dense clump
+shoved against the right edge with the text stranded far left, and it looks like the layout is
+saving space. This is a RECURRING slip, not a one-off — Settings → Top bar (launcher icon) and
+Settings → Apps → app detail (icon override) both did it, with byte-identical copies of the
+preview box, the two buttons and the `Gtk.FileDialog` (user-caught 2026-08-02: *"está todo
+apretado en la misma fila"*). Both now build on **`imagePickerRow`** (`SettingsHelpers.ts`), the
+shared "pick an image for this" row: preview leading, text middle, `[Choose image…] [reset]`
+trailing, dialog and SVG/PNG filters included; callers supply only `renderPreview` / `isCustom` /
+`onPick` / `onReset`. Use it for any new image-picking setting rather than a fourth copy.
+
+Three legitimate escapes when one control genuinely will not fit the trailing slot:
+**`createStackedRow`** (control on its own full-width line beneath the text — for entries and
+button pairs), a dedicated preview row of its own (Settings → Gaming's wallpaper, Users' avatar,
+where the image is large enough to be the row), and **`VeltrixRow`'s `footer` arg** (below).
+
+**An OPTIONAL control in the trailing slot misaligns the whole column — "it fits" is not the
+test.** Settings → Widgets put a "Configure" chevron beside each configurable widget's
+Bar/Center switches; since only *some* widgets have settings, the chevron pushed just those rows'
+switches left and the switch columns stopped lining up down the page (user-caught 2026-08-02:
+*"se desalinean del resto"*). A control that is not present in EVERY row of a group cannot share
+that group's trailing slot. The fix is **`VeltrixRow`'s `footer`** (threaded through
+`createRow(label, subtitle, widget, titleIcon, leadingIcon, footer)`): a second line INSIDE the
+row, under the text column, while line 1 keeps its title and trailing control untouched — so a
+column of trailing controls stays aligned even though only some rows carry a footer. The caller
+owns the footer's `halign` and its `margin_start` (leading-icon width + the row's 16px spacing —
+34 for an 18px icon; `VeltrixRow` cannot know the icon's size), and keeps it visually lighter than
+the title: **ghost + compact** is the house style for this slot.
+
+Align the footer's **text**, not its box. A `.veltrix-btn--compact` carries `padding: 3px 10px`
+(`_components.scss`) and a ghost button has no visible edge, so that 10px is pure optical offset:
+`margin_start: 34` lands the button flush under the leading icon's gutter but the LABEL a visible
+step right of the title (caught live 2026-08-02 — the code said "line the label up with the name"
+and did not). Subtract the variant's horizontal padding — `34 - 10` — and verify by comparing the
+label's `bounds.x` from `query_ui .veltrix-row-title` against the row titles above it, which is
+the measurement the eye is actually making.
+
+Do NOT reach for a sibling row instead. That was the intermediate fix here and it read as another
+ITEM in the list — *"como si fuese otro widget"* — because an indent alone cannot say "this
+belongs to the row above" when every row in a list looks alike. Inside the row, the two lines
+share one cell and one hover, so ownership is structural rather than a hint. (A sibling row is
+still right when the thing genuinely IS a peer item — that is what the Apps page's `navRow`s are.)
+
+**Inside a stacked row, keep going: one control per line, actions last.** Moving to
+`createStackedRow` buys a whole card's width — spending it on a field and its buttons side by side
+just reproduces the squeeze one level down, with the entry pinned to a `width_chars` stub and the
+three reading as one clump. Use **`fieldWithActions(field, ...buttons)`** (`SettingsHelpers.ts`):
+the field takes the full width, the buttons sit on their own line beneath, right-aligned with the
+primary LAST. `actionRow(...buttons)` is that button line on its own, for stacks with extra parts.
+This bit Settings → AI twice over (user-caught 2026-08-02): the API-key row had entry + Save +
+Forget on one line, and the model row had an entry, a dropdown AND "Find models" competing for a
+single line once a fetch succeeded. Note what the model row teaches about ORDER — the catalog
+dropdown writes into the entry above it, so it is a picker for that field and belongs directly
+under it, while the button that *populates* the dropdown is an action and goes in the action line.
+Group by what a control DOES to the field, not by what it looks like.
+
+**A picker is not a second place the value lives.** When a control's job is to write into another
+control, it must not also display the result — one value shown in two widgets stacked on top of
+each other reads as a duplicate, and the user asks why it appears twice (2026-08-02, the model
+row). Park the picker on its placeholder permanently: the catalog dropdown rests on
+"Choose a model…" forever, the entry above is the single display, and the id landing there IS the
+confirmation the pick registered. Two things fall out for free — the bare-id matching needed to
+preselect the configured model disappears along with the preselect, and re-picking the model you
+are already on starts working (`notify::selected` never fires when the chosen row is already
+selected, so a sticky selection silently made straying from a model a one-way trip). Snapping back
+to row 0 re-enters the handler, so it needs the same `suppressDropCb` guard as the rebuild.
+
+⚠️ The AI page was cited as prior art for this shape while it was itself wrong, and Settings →
+Users' name row was converted to match it before anyone noticed. When you copy a layout from
+another page, check it against the rule rather than assuming the older page earned it.
+
+## CC capsule tiles: stateful vs action (no fake status line)
+
+The 2×1 (WIDE) CC tile built by `makeCapsuleInner(getIcon, getTitle, getSubTitle)` (in
+`common/widget-kit/tile.ts`) adapts to whether the widget has a **status**:
+- **Stateful** (wifi, bluetooth, focus, ethernet, vpn, battery): `getSubTitle()` returns the
+  live state ("Connected", "Off", an SSID, "Do not disturb"…) → single-line title + dim
+  subtitle.
+- **Action / stateless** (screenshot, screen recording, clipboard — they *do* something, they
+  aren't *on/off*): `getSubTitle()` returns `""`. The sub line is hidden and the title is
+  allowed to **wrap to two lines, vertically centred**, so the name reads in full ("Screen
+  Recording") instead of being padded with a redundant descriptor ("Screen Record / Record
+  screen"). The shape is **derived from the subtitle being empty**, so a dynamic widget (focus
+  *off* → empty sub) gets it for free. When adding a CC widget: return a real state subtitle or
+  return `""` — never invent a description-as-subtitle. (`applySub()` runs at build time too, so
+  plain detail-opening tiles that never call `update()` still hide the empty line.)
+
+⚠️ **The second line is conditional since 2026-09-07 (#428), and the reason generalises to every
+fixed box in the DE.** A wrapping `GtkLabel`'s MINIMUM width is its longest unbreakable run, and a
+minimum cannot be squeezed — GTK grows the parent instead, and the CC's visible region clips what
+sticks out. So the wrap branch is taken **only when the longest word fits the column**; a word too
+wide reads on one line and ellipsizes, the way every other desktop's quick toggle does. What the
+branch was written for ("Screen Recording" reading in full) is untouched: a name that breaks at a
+space still gets its two lines.
+
+The column is **96px** — the 2×1 span (2·UNIT + GAP = 172, on the glass since #762: it was 176 on
+the boxes) minus the island's padding (2·10; 2·12 from the box) minus
+the capsule's own chrome (`CAPSULE_CHROME` = margin 4 + `CAPSULE_ICON_SIZE` 44 + `CAPSULE_ICON_GAP`
+8; macOS 27's proportions, 2026-09-30 — it was 48 + 12). It was 84 with the old 12px gap and 48/12
+chrome, confirmed then against a live session, not derived on paper: `queryUI` put the island at
+x=2380 w=172, the icon at x=2396 w=48 and the label at x=2456. The column is what the title's size
+is held to: 14px bold (since 2026-09-30) fits every title measured at 96 — "Luz nocturna" 91, "Luce
+notturna" 96 — but pl "Oszczędzanie" is 97, one pixel over.
+The SUBTITLE under it (a tile's state: "Activo", "Sin conexión") is `.veltrix-atomic-label-sub`: the
+title's size (14), regular weight, and the SECONDARY ink tier (80 %, held to 4.5:1 by the adaptive
+glass) — owner, 2026-09-30, over 12 px / 400 / dim, which read "very thin next to the title". It is
+information, not metadata, so it is not `dim`. `.veltrix-atomic-label-dim` (12, 400, dim) is kept for
+real metadata — the CC context menu's "full row" note. The player's artist
+(`.veltrix-media-artist`, the CC tile, its detail and the island's player) follows the same rule
+against ITS title: 14 px, regular, secondary (was 12, dim) under a 14 px bold title (was 13 — the
+one title left behind when the tiles' went to 14). It shares the 96 px column: "VeltrixTest" is
+71 px, so a network name of ~13 letters reads whole and a longer one ellipsizes.
+
+🔑 **A tile learns that number the only legal way — it is HANDED the `ContentBudget`.** The capsule
+makers take it as a trailing optional argument and the widget forwards what `buildContent(size,
+budget)` already gives it; the kit subtracts the chrome it owns and nothing derives the host's
+geometry (the zero-layout contract, `widget-kit/contract.ts`). A maker called without a budget keeps
+the old unconditional wrap, so nothing outside the CC changed. And because CSS — hence the real font
+— needs a root, the verdict is re-taken on `map`: at construction the tile is not in a window yet
+and the first measurement would be against GTK's default font.
+
+⚠️ At the default text size **no shipped string should ever reach the ellipsis**: `text-budget.js`
+gates all thirteen locales on this column (see dev-workflow.md), and the answer to a name that does
+not fit is a shorter name or a soft hyphen, not a smaller font.
+
+⛔ **A `set_size_request` is a FLOOR, not a ceiling — and the CC's status banner is the case that
+proves it.** The card carries `set_size_request(GRID_WIDTH)` so it shares the grid's right edge, and
+its labels wrap so their minimum collapses. Both were true and the card still came out **412px wide
+against a 356px grid** in Spanish (v0.12.0, seen on screen by the owner). Nothing above it
+constrains a width — `cc-window-root` is `hexpand: false, halign: END` — so it was allocated its
+NATURAL width, and a wrapping label only wraps when it is given less than it asked for. Wrapping
+fixes a MINIMUM; it is not a maximum.
+
+**The ceiling is `VeltrixClamp`** (GTK4 CSS has no `max-width`), with `min = max` when the box must be
+CONSTANT: the banner clamped its row list to `GRID_WIDTH − 2 × BANNER_PADDING`, which made the card
+exactly the grid's width and finally made the labels wrap. (Since 2026-09-30 it is a one-line PILL
+as wide as its content: the clamp is a ceiling only, `GRID_WIDTH − 2 × PILL_PAD_X`, and the name
+ellipsizes instead of wrapping.) Any surface that must match a fixed
+sibling's width needs the same, and `text-budget.js --verify` is what checks it against a real
+window — the offline sweep cannot.
+
+**Reach for `makeCapsuleTile` first — it is `makeCapsuleInner` + the subscription + the
+wrapper, which is the shape nine widgets were writing out by hand.** Drop to
+`makeCapsuleInner` + `wrapCapsuleTile(inner.box)` only when a tile needs the refs, and never
+write a bespoke wrapper. A WIDE tile is left-anchored by BaseIsland
+(`child.halign = START, hexpand = false`), and `wrapCapsuleTile` adds the exact nesting level
+that survives `SquircleContainer`'s padding so the icon/text land on the same grid as every
+other tile. A tile that built its own wrapper — screen recording once put an idle/recording
+`Gtk.Stack` inside a hand-rolled `outer` box — insets the content a few px off from the column
+(visible once you line the tiles up). If a tile has multiple visual states (e.g. record ⇄
+stop), drive ONE `makeCapsuleInner` via getters + `inner.update()` on a `notify::` (and toggle
+state classes on `inner.iconBox`/`inner.icon`/`inner.label`/`inner.subLabel`) — the same
+dynamic-capsule pattern as wifi/focus — instead of swapping whole subtrees in a stack.
+
+**A widget that needs BOTH a one-tap toggle AND a `buildCCDetail` subpage uses
+`makeSplitCapsuleTile`.** The whole-capsule button form wraps the *entire* capsule in one
+`Gtk.Button` — fine for toggle-only widgets (dark_mode, night_light, focus), but it swallows the
+tile-level click IslandGrid wires up for `buildCCDetail` widgets, so a toggle widget that grows a
+subpage (bluetooth → device list) has no way to open it. That is why it is PRIVATE to `tile.ts`
+and only reachable through `roundToggleSpec`, whose widgets have no detail panel by definition.
+`makeSplitCapsuleTile` makes *only the icon badge* a button (the toggle); the title/subtitle stay plain so the unclaimed
+click area falls through to IslandGrid's detail handler — the same mechanism the plain
+detail-opening tiles (wifi, ethernet) already rely on, just carved out of a smaller region instead
+of the whole tile. CSS gotcha: the icon button's own class (`.cc-split-icon-btn`) must outrank the
+blanket `.cc-island button { reset }` — a single-class selector loses that fight on specificity
+regardless of source order, so it's written as a two-class descendant
+(`.cc-island .cc-split-icon-btn`), which always wins.
+
+**Every `buildCCDetail` tile has THREE routes to its detail panel** (2026-07): (1) primary tap on
+the unclaimed capsule area (the split-capsule M/L story above); (2) the right-click context menu's
+"Show details" row — `CCContextMenu` renders it whenever the widget declares `buildCCDetail`
+(hidden in edit mode via its `detailEnabled` option); (3) press-and-hold anywhere on the tile —
+`Gtk.GestureLongPress` in `IslandGrid.makeIslandWidget` (non-edit only) that CLAIMS the sequence
+at trigger time so the inner toggle's release doesn't also fire. On a 1×1 tile, hold and the
+context menu are the only routes: the round toggle button swallows plain taps by design — a
+compact quick-toggle stays a toggle on every platform, "open detail" is
+never a fallback on tap.
+
+**A "stateful" tile's on-state is WHITE, with its icon in the accent** (owner, 2026-10-12, after
+the reference; until that day the whole capsule filled with the accent). A 1×1 IS its circle, so
+the whole tile turns white (`ON_WHITE`, Cairo); a 2×1/2×2 keeps its glass and only its icon
+circle turns white — `BaseIsland` puts `active` on the island and `_control-center.scss` paints
+the circle (`--veltrix-on`) and the icon. The tile's text stays white on the glass. The gauge
+(below) fills with the same white, and its icon and value take `INK_DARK_CLASS` where the fill
+covers them — decided when the slider gets its size (`resize`), never on a later tick: the CC's
+open animation draws what its first frame had, and a check one tick after map left the icon white
+on the white until the CC reopened (measured). The CC's horizontal sliders (4×1, `makeHSliderTile`)
+fill white too — `makeSlider`'s `fillColor`; every other slider keeps the accent. Wired via `AtomicWidget.getActive`/
+`watchActive` (`common/widget-kit/contract.ts`) → `BaseIsland` → `SquircleContainer`'s `getActive`/`activeAlpha`/
+`watchActive` props: `getActive()` is read live *inside the Cairo draw call*, so it paints through
+the exact same `resolveDrawParams`/`drawSquircle` path a real tile already uses — no separate CSS
+shape to keep in sync, no mismatched corners. `watchActive(cb)` only exists because the container
+can't know the state changed on its own (it's driven by the widget's own domain signal — BT
+power, the Do Not Disturb flag, `Theme` changed, an nmcli poll); it just calls `cb` to trigger
+`da.queue_draw()`. Live on **dark_mode, night_light, focus, bt, vpn** — action/stateless widgets
+(screenshot, clipboard) have nothing to fill and omit both props. `wifi`/`ethernet` don't have this
+either: their WIDE tile has no toggle button at all (see `makeSplitCapsuleTile` above), so
+there's no "this tile is a toggle" moment to fill — only their `buildCCDetail` switch reflects
+state today. VPN is the template for a **polled** (non-signal) state: one shared module-level
+poller + listener `Set` in `vpn.ts` (`watchVpnActive`), lazily started on first subscriber, instead
+of a `GLib.timeout_add` per built tile instance — cheaper and it's what let the 1×1 icon and the
+capsule badge both go live for free, which they weren't before.
+
+**A FIXED (non-accent) fill colour is available as one more optional prop —
+`activeColorHex`, threaded the same way as `getActive`/`getFill` (`lib/veltrix-kit/platform/status-colors.ts` holds the
+seeds). NOTHING IN THE SHELL USES IT.** Screenrecord was its only consumer and lost it 2026-08-02:
+a tile that is on fills with the ACCENT like every other tile, and red belongs to the small status
+marks — see the red-budget rule above before reaching for this. `activeAlpha`
+(`number | (() => number)`) likewise exists for a live-varying alpha, and a getter there is how a
+Cairo tile could pulse — **also unused, also not for new code**: screenrecord's
+`0.75 + 0.25·sin(2π t/1400)` plus its ~15 fps redraw timer went the same day, see the indicator
+rule below.
+
+**INDICATORS DO NOT BLINK (2026-08-01, user call).** A condition that lasts minutes — a capture
+running, AI control granted — is marked with a STEADY danger mark, never an animated one.
+Two reasons, and the second is the one that generalises:
+- It reads wrong. A throbbing red capsule is an alarm demanding action; "you are recording" is a
+  state. Liveness is already proven by the elapsed clock ticking beside the mark.
+- **It is a permanent compositor cost.** Every one of these marks sits on a blurred layer (bar,
+  island, CC), and Hyprland re-blurs the whole surface on any repaint — so a 1.4 s CSS opacity
+  keyframe or a 15 fps Cairo redraw means re-blurring 2560×1440 forever, for a dot. This is the
+  general rule from the glow work: **continuous animation costs ≈40 % GPU; momentary is fine,
+  perpetual is not.**
+  🔑 **And it does not scale down with the effect.** A 1px rotating border gradient measured the
+  same as a 24px glow (2026-08-01), because what costs is the damage the animation causes every
+  tick, not the pixels it paints — a loop dirties the window whatever it draws, and re-compositing
+  means re-blurring the surfaces above it. So the question to ask about a new effect is
+  **"continuous or punctual?"**, never "is this one expensive?" — the second question has no
+  useful answer, and asking it is how a 1px detail gets waved through.
+The marks are `.island-rec-dot` (island compact + its indicator chip) and the screenrecord tile's
+steady `DANGER_HEX` fill (`.bar-cc-badge`, the CC button's AI dot, left on 2026-09-27). The one surviving `@keyframes rec-pulse` user is
+`.cc-status-dot.is-active` (`_control-center.scss`, where the keyframe now lives): a few seconds of
+"the agent just acted", inside a surface that only paints while open — momentary, and invisible
+when the CC is closed.
+
+**Icons with STATES — `common/StatefulIcon.ts` (2026-09-27).** An interface icon can change, and
+animate the change, when what it shows changes: the Control Centre's two switches flip while the CC
+is open. It is GTK's own mechanism, not ours — GTK ≥ 4.22 renders SVG itself (`Gtk.Svg`) and
+understands an extension of it (`xmlns:gpa="https://www.gtk.org/grappa"`): `gpa:state-names` on the
+root, `gpa:states` / `gpa:transition-type` (`fade`, `animate` = the stroke draws itself, `morph`) on
+a shape, and plain SVG `<animate>` with `begin="gpa:states(N).begin"` (offsets allowed:
+`… .begin +60ms`). Symbolic colours are `foreground`/`accent`/`success`/`warning`/`error`, and
+`-gtk-icon-palette: success var(--x)` takes our tokens. `gtk4-icon-editor` edits the format; the
+reference is https://docs.gtk.org/gtk4/icon-format.html. It is SF Symbols' animation set (replace,
+draw on/off, variable colour) without its licence, which is Apple-platforms-only.
+Measured, and each one cost a try:
+- `uiIcon()`'s `Gio.FileIcon` draws the file in its INITIAL state and exposes no state: a stateful
+  icon is loaded into a `Gtk.Svg` and set as the image's `paintable` (what `statefulIcon()` does).
+  Everything else asking for the same name keeps the still drawing, so the initial state must be a
+  complete picture — and it must draw right under GTK's TRADITIONAL symbolic path too, which is
+  NOT the same renderer: a `mask="url(#…)"` there came out as a flat grey block. Cut holes with
+  `fill-rule="evenodd"` in one path and animate its `d` instead; that works in both.
+- no `set_frame_clock` + `play()` → a transition never leaves its first frame;
+- an animation tied to the state the file STARTS in never runs — only a change starts one;
+- `none`/`all` are `gpa:states` keywords: as state names they void the whole list;
+- `Gtk.SvgFeatures.ANIMATIONS` off does NOT stop a state-change animation (same frame 150 ms in,
+  on and off). Reduce motion is honoured by not changing state at all — fine for decoration (the
+  open CC is marked by its pill anyway); an icon whose state carries meaning needs another answer;
+- at rest a stateful icon costs NOTHING: 0 `invalidate-contents` in 2 s, against 127 for a looping
+  control. Keep it that way — transitions, never loops (the rule above).
+`scripts/icons/veltrix-icons.py sync` drops `<animate>` and `gpa:` attributes from the 16-unit
+variant: that file is the still drawing of the initial state. SPEC.md point 6 tells theme authors.
+
+**The "something is happening" pulse — `common/PulseDots.ts`.** The shell's one working
+indicator: `makePulseDots()` (the three-dot typing idiom, Cairo) and `pulseOpacity(widget)`
+for anything that breathes without its own drawing area (the Assistant capsule's glyph, a
+running tool chip's dot). Two rules that are easy to re-implement wrongly:
+**ONE refcounted driver, never a timer per consumer** — a second timer advances the shared
+phase twice as fast, so the animation speed would depend on how many indicators happen to be
+on screen; consumers subscribe/unsubscribe and the single 10 fps timer exists only while at
+least one is active AND mapped. And **gate on `get_mapped()`, not just on "is it busy"** —
+the island hides rather than destroys, so a widget stays "active" while invisible and would
+otherwise tick forever behind a closed panel. Opacity, never `transform: scale` (commandment
+3), and alpha is what reads as breathing anyway.
+
+(Historical, kept for the CSS-bug lesson in it.) Migrating `screenrecord`
+also retired its OWN one-off CSS states (`.rec-active-bg` icon-badge tint + keyframe, same
+badge-only-not-whole-capsule pattern VPN had before), and deleted `.rec-stop-icon { color: danger
+}` outright — dead CSS on a `Gtk.Image`, the exact bug class documented in the icon-tinting entry
+above, just not caught until this pass. The label/subtitle no longer get a manual danger-red
+override either: once the WHOLE capsule fills (with the accent, since 2026-08-02),
+`--veltrix-text`'s default white/black already reads fine on top (same reasoning as the split-target badge, same as every other filled toggle tile) —
+tinting the text AGAIN on top of a filled background is how the Power.tsx checkmark bug happened
+in the first place.
+
+**The CC gauge tiles (volume/brightness's TALL slider) fill fractionally, through the SAME
+mechanism — `getFill?: (size) => number` (0..1), not a separately-drawn inner layer.** The
+original TALL implementation had `makeVerticalFillTile` paint its own accent fill in a nested
+inner `DrawingArea`, inset within `BaseIsland`'s own padding — visually a capsule-inside-a-capsule
+(the island's own border, THEN a gap, THEN the slider's own smaller pill with no border of its
+own). User called it out: it didn't read as the same "material" as an active toggle's fill.
+Fixed by extending `drawSquircle` itself with `fillFrac`/`emptyColor`/`emptyAlpha`: ONE path/clip
+paints the empty (top) portion with the base glass and the filled (bottom) portion with `ON_WHITE`,
+so the border + gloss steps right after wrap BOTH portions as one continuous shape — structurally
+identical to how `getActive` fills the whole thing, just clipped to a fraction.
+`SquircleContainer`'s `getFill` takes priority over `getActive` when given (`frac >= 1` collapses
+to the exact same single-fill path `getActive` uses, `frac === 0` is pure glass, no behaviour
+change for anything that only passes `getActive`). `getFill` is **size-aware**
+(`(size: WidgetSize) => number`) because a slider widget's OTHER sizes aren't gauges — volume's
+SINGLE (1×1 icon) and FULL_WIDTH (its own inline thumbed slider row, unrelated to island fill)
+both return `0` there, only `WidgetSize.TALL` returns the real fraction. `makeSlider` grew a
+matching `paintFill?: boolean` (default true) so `makeVerticalFillTile` can opt OUT of drawing its
+own fill (`paintFill: false`) and become a pure interactive hit-region (drag/scroll/click-to-jump)
+over whatever BaseIsland paints — nothing else calls `paintFill:false` today, so every other
+slider (bar popovers, Settings pages) is unaffected. Brightness has no change signal, so its
+`watchActive` is just a 2s redraw poll (reusing the polling reality `buildVertical`/
+`buildHorizontal` already live with) reading the SAME shared `_cachedPct` those keep fresh.
+
+**Anything that sits IN the Control Center is painted like the Control Center — and spaced on its
+rhythm.** Two rules, both learned by shipping the opposite (2026-08-02, the AI-control banner):
+
+- **Cairo, not a CSS card.** A `@include material-card` box (flat background + 1px CSS border)
+  dropped on top of a grid of Cairo glass reads as a foreign element pasted over the panel, however
+  close the colours are: no inner specular rim, no squircle profile, no shell-opacity tracking. Use
+  a `SquircleContainer` with BaseIsland's numbers (`borderWidth: 1.5`, `inset: 2.0`, `padding: 12`,
+  `useShellOpacity`, `gloss`) and `Shape.CAPSULE` for a single-row full-width card. Put the
+  `GRID_WIDTH` size request on the CAPSULE, never on the inner box — padding is drawn INSIDE the
+  requested width, so a child requesting `GRID_WIDTH` makes the card 24px wider than the grid and
+  breaks the right edge every tile is aligned to.
+- **The panel has TWO spacing scales, and mixing them is visible.** `GAP` (12) is the gap WITHIN a
+  block — between tiles. **24 is the gap BETWEEN blocks**, which is what the Edit pill already uses
+  (`editBtnWrapper.margin_top` in `IslandGrid.tsx`). A card separated from the grid by 12 looks
+  stuck to it — tighter than the panel's own internal spacing, which is the tell that a block gap
+  was set by eye instead of read off the existing rhythm.
+
+`.cc-island` is NOT the class to reach for on such a card: it carries
+`.cc-island button { @include veltrix-reset }` to strip Adwaita defaults out of tile content, and
+that selector matches `button.veltrix-btn` at EQUAL specificity — `_control-center` is imported after
+`_components`, so the reset wins and any `VeltrixButton` inside loses its background and border.
+Give the card its own class with `background-color: transparent`.
+
+**Multi-cell `centerContent` tiles align their items to the grid-cell centres.** A 2×1 tile
+spans two grid cells; its content (e.g. cpu_memory's two metric rings) should sit one grid
+**pitch** (`UNIT + GAP`) apart, centred — so each item lands on its cell centre, exactly where a
+1×1 widget's icon centres and where a 2×1 tile's leading icon sits (the icon inset ≈ `UNIT/2`).
+Spacing the items by their natural gap instead bunches them toward the middle, a few px inside
+the icon columns. `cpu_memory` does this with `spacing: budget.pitch − ring` in a `CenterBox`.
+**The pitch is HANDED to the widget** — `ContentBudget.pitch`, filled in by `IslandGrid` — because
+a widget never does host-geometry math (the zero-layout contract). `UNIT`/`GAP` belong to
+`CCLayoutManager`, the surface that draws the grid, and are unreachable from `widgets/`: importing
+`CCLayoutManager` from a widget pulls in the widget registry and forms a boot-crashing import cycle,
+which is why they used to be parked in the shared leaf in the first place.
+
+**The CC edit-mode drag ghost previews the dragged tile's real silhouette, not a generic rounded
+box.** `BaseIsland.tsx` exports `resolveIslandShape(size, width, height)` — the per-`WidgetSize`
+shape/radius decision (SINGLE→circle, WIDE/TALL→perfect capsule, FULL_WIDTH→dock-pill,
+SQUARE→squircle) that used to live only inline in `BaseIsland()`. `SquircleContainer.tsx` exports
+`resolveDrawParams(shape, radius, n, perfect, w, h)` — the second-stage resolution (CIRCLE/CAPSULE
+always collapse to a perfect arc sized to `min(w,h)/2`, ignoring the requested radius) that used to
+live only inline in its `draw_func`. `IslandGrid.tsx`'s `makeDropGhost` calls both directly and
+paints with `drawSquircle` on a bare `Gtk.DrawingArea` (bypassing `SquircleContainer` itself,
+because the ghost's invalid/valid tint must be driven by a mutable flag + `queue_draw()`, not a CSS
+class — the fill/border colors are baked into the draw call). The result: drag a 1×1 widget → a
+circular ghost; a 2×1 → a perfect capsule; a 2×2 → a squircle — always whatever the *real* tile
+would render, because both draw from the same two resolvers BaseIsland itself uses. `drawSquircle`
+also grew an optional trailing `dash?: number[]` param (only the ghost passes it) so the border
+keeps its dashed "phantom" look without a CSS-only dashed-stroke escape hatch.
+
+🔑 **The CC tiles draw the 1×1's corner: half a cell (owner, 2026-11-01).** `UNIT / 2`
+(38 px), with circular arcs: a 1×1 is that corner all the way round (a circle), a 2×1 or 1×2 a
+capsule of it, a 2×2 a square with it — tiles side by side read as one family. **The 4×1 is the
+exception**: the dock's shape, never a capsule (owner, 2026-11-03), like the reference's
+full-width module. Since the one continuous corner (#1013) that is the dock's corner at icon 64,
+24 (`geometry::capsule_radius`); the TS keeps half its height at exponent 3.2.
+`resolveIslandShape` takes the corner from `IslandGrid` (a widget never reads `UNIT`). Until then the
+2×2 took `RADIUS.xl` (32) at 3.2: a token picked from the radius
+ladder in #86, not derived from the tile, and visibly tighter than the circle next to it. The Rust
+Control Center keeps the rule.
+
+## The dock's measures — a fixed air and gap, whatever the icon size
+
+🔑 **The air round the dock's icons is 10 and the gap between two is 4, at every icon size**
+(owner, 2026-11-01, PR #988). The reference dock keeps both fixed: measured by accessibility on
+2026-10-08, at the same icon size each time, it is 84 tall at icon 64 and its radius stops near
+24. Ours were 22 % and 16 % of the icon until then. That matched at 48, but the dock grew 8 px
+taller at 64 and 20 px at 96. The two docks share the numbers: TS `DockPhysics.deriveConstants`
+(`PILL_PAD`, `GAP_TOTAL`) and Rust `toolkit/shell/src/geometry.rs` (`PAD`, `GAP`). Change them
+together. The capsule (radius half the cross size, exponent 3.2) is still ours, not the
+reference's. That one is left as it is for now.
+
+## The bar launcher mark — plain geometry, no SVG filter
+
+The bar launcher (system-menu) icon is the **Veltrix mark**, `assets/veltrix/assets/veltrix-symbolic.svg`,
+loaded as a `Gio.FileIcon`.
+
+**The mark is a stylised V** (Adnan's logo, 2026-11-14, replacing the Phase 0
+crescent + four-point star): dark navy `#0A1E40` left half, bright-blue right
+half (vertical gradient `#027CFE` → `#0333BB`), a white slit with a small
+circle at the centre, plus the lowercase `veltrix` wordmark in dark navy with
+a blue dot over the i. Two files:
+`veltrix-logo.svg` is the design **source** — the full lockup, tight viewBox —
+and `veltrix-symbolic.svg` is the ICON: the V mark alone in a **square**
+viewBox where the mark takes 79 % of the width. That number is not arbitrary: it is the footprint the previous
+"N" had (measured by trimming both renders: 16×14 at 18 px, 58×51 at 72 px), so swapping the mark
+moved no layout in the bar, About or the installer. An icon slot is square; a non-square SVG gets
+fitted to its width and silently changes the optical size. Replacing the mark again = replace the
+paths in BOTH files and keep the symbolic's box at the same footprint — and regenerate the two
+copies that live in veltrix-repo's `veltrix-system` (Plymouth `watermark.png`, 192 px from the
+symbolic; fastfetch `veltrix.txt`, 24 half-block columns from the source), which is the product
+layer, not this repo. (veltrix-repo does not exist yet — those copies are owed when it is created.)
+
+**The mark is two fixed colours, not `currentColor`.** The old crescent was a
+single `currentColor` path, so GTK recoloured it via `.bar-distro-icon` /
+`.about-logo { color: var(--veltrix-text) }` and it adapted to dark/light.
+The new V is two-tone by design, so those `color` rules no longer recolour
+it — they are harmless dead rules now, kept so a future currentColor mark
+would work again. Consequence to know: on a dark bar the navy half is
+low-contrast (the logo's own colours) and the blue half carries the shape; at
+18 px the mark reads as a blue V. Do NOT "fix" this by recolouring the mark
+to cyan or to a single colour without Adnan's call — the logo keeps its own
+navy/blue, and the OS accent (`#00E5FF`) is a separate thing. The
+transparent PNGs in `~/workspace/veltrix/logo/` (`veltrix-logo.png`,
+`veltrix-logo-dark.png` with the wordmark in white for dark surfaces,
+`veltrix-mark.png`) are the raster versions; `make_assets.py` in the same
+dir regenerates everything from `veltrix-logo.jpg`, the source of truth.
+
+Non-obvious gotcha (cost a wrong first attempt, verified live): **GTK's symbolic recolour does NOT
+render SVG `<filter>`s.** The old "N" got its round terminals from a goo/metaball `feGaussianBlur`;
+loaded as a symbolic icon the filter was dropped and at 18px the bare rects read as **square
+terminals**. So the mark must be **plain geometry, no filter** — the V mark was delivered that way
+(traced with potrace: two paths plus a linearGradient, which is a fill, not a filter),
+and any future mark drawn with a filter has to be flattened into a path before it ships. The same
+`veltrix-symbolic.svg` is reused at **72px** in the About window header
+(`AboutWindow.tsx`) and at **64px** on the installer's welcome page
+(`veltrixLogoIcon()` in the kit) — it replaced a `distributor-logo-<os-id>` theme
+icon that rendered **broken on a clean machine** (no distro logo in the icon pack); our own mark
+always resolves. (Two SVG hygiene gotchas, both real: a `--`
+anywhere in an XML comment — e.g. writing a `var(--token)` name — makes strict librsvg reject the
+file even though GTK tolerates it; and the old `fill="currentColor"` rule (commandment #10) no
+longer applies to the mark itself — it still applies to every other symbolic icon in the repo.)
+The bar icon is configurable (`barSettings.launcherIcon`: preset key or absolute
+path); unknown/stale keys fall back to `DEFAULT_LAUNCHER_ICON`. Arch's logo is deliberately **not
+bundled** (trademark — restricted, not under the OS's free licence; we ship our own mark and let users
+point `launcherIcon` at any file).
+## Naming a control that has no visible label
+
+A control in a table cell has no label of its own: the **column heading is the label**, and a
+heading is not in that row's accessibility tree. So a column of dropdowns reads, to a screen reader
+or to `veltrix-a11y`, as a run of identical controls.
+
+⚠️ **`update_property([LABEL], …)` does nothing on a `Gtk.DropDown`.** It publishes its SELECTED
+ITEM as its accessible name and swallows the label. Measured over AT-SPI, 2026-09-06, with a
+`GtkCheckButton` carrying the same call as the control
+(`scripts/dev/dropdown-a11y-probe.ts` — the window, then `veltrix-a11y dropdown-a11y-probe`):
+
+```
+what was set                  name                  description
+nothing                       "None"                ""
+LABEL                         "None"                ""     ← swallowed whole
+DESCRIPTION                   "None"                "Mount point — /dev/sda2"
+LABEL + DESCRIPTION           "None"                "Mount point — /dev/sda3"
+LABEL, on a CheckButton       "Format — /dev/sda1"  ""     ← the control
+```
+
+So: **`VeltrixDropDown({ accessibleDescription })`**, which sets `DESCRIPTION` — the name stays the
+selected value, which is the right thing for it to be, and the description says which control it
+is. `VeltrixDropDownRow` passes its own row title automatically. Every other control (check boxes,
+entries, buttons) takes `LABEL` as normal.
+
+⚠️ `LABELLED_BY` would be the honest relation — point at the heading widget instead of copying its
+text into every row — and it is **not reachable from GJS**: `update_relation` wants a GList of
+`GtkAccessible`, the nested form throws *"Could not guess unspecified GValue type"* and the flat
+form is accepted and silently sets nothing (`g_value_get_pointer` assertion). A string on the
+control is the only thing this binding can express, not a shortcut somebody took.
+
+`veltrix-a11y` reports `description` on a node when it has one — added with this, because a fix the
+agent surface cannot see is a fix that only half exists (#465).
+
+## Sliders — one component
+
+All sliders are **`makeSlider`** (Cairo) in `veltrix-kit/slider.ts` (`makeHSlider` is just a
+horizontal wrapper). There is **no native `Gtk.Scale`** and no `PillSlider` — don't add them.
+
+⚠️ **It lives in the KIT, not in the shell** (moved 2026-08-15, NTK step 3). That is what forced
+the kit's **appearance seam**: the accent and the surface's mode now arrive from
+`kitAppearance()`, which each BUNDLE registers once in its `app.ts` — see
+`veltrix-kit/appearance.ts` and architecture.md. A bundle that builds a slider without registering
+gets blue-on-light and one warning in the log; it does not crash.
+
+- **Cairo-drawn**: fill + thumb are painted together so they never visually separate (the
+  native `scale` highlight/slider misalignment bug). Accent comes from `kitAppearance().accent()`
+  (the shell wires that to `PALETTE[Theme.accentColor]`).
+- **Custom input** (a `GestureDrag` + scroll + arrow keys, *not* a `Gtk.Scale`): clicking the
+  track jumps to that position; grabbing the thumb never warps it; `drag-begin` claims the
+  sequence so a slider inside a clickable tile (e.g. a CC widget) doesn't trigger the tile.
+  **Gotcha:** that same eager claim-on-press also wins against the CC's edit-mode
+  tile-move `DragSource` on `overlay` — GTK4 delivers bubble-phase events to the deepest
+  widget under the pointer first, so the slider (a descendant) claims before the ancestor
+  `DragSource` ever gets a look, and a slider tile becomes undraggable in edit mode.
+  Fixed in `IslandGrid.tsx`'s `makeIslandWidget`: when `editMode`, `content.set_can_target(false)`
+  — the same "pointer-transparent" idiom already used for `cc-slot-placeholder`/the drag ghost —
+  so `pick()` resolves the press straight to `overlay` and the move-drag always wins. Applies to
+  every tile's content, not just sliders: nothing inside a tile should be independently
+  actionable while rearranging (only the × remove badge and the drag itself stay live).
+- **Options:** `orientation: "horizontal" | "vertical"`, `thumb` (default true). `thumb: false`
+  + a wide `trackH` = the vertical capsule (fill rises, clipped to the capsule so
+  the end follows the rounded cap). Thumb goes translucent while pressed. `paintFill` (default
+  true) = false makes this `DrawingArea` paint NOTHING, a pure interactive hit-region — used by
+  `makeVerticalFillTile` (see the CC gauge tiles entry above), whose fill now lives one level up
+  in `BaseIsland`, not here. Every other caller leaves `paintFill` alone and is unaffected.
+- **Wiring:** `onChange` (committed, optional `debounce` / `commitOnRelease`), `onValueChanged`
+  (live, for the % label), `onExtChange(cb) → cleanup` for external value updates (ignored
+  while the user drags). ⚠️ `onExtChange` is armed through `bindWhileRealized`, so **prime it**
+  (`cb(read())` before connecting) or the slider comes back from a hidden page still on the value
+  it was built with — see the external-sync note in `architecture.md`. `VeltrixFontButton` takes the
+  same optional `onExtChange` (2026-08-16) for the same reason: it is a button whose LABEL is the
+  value, and nothing outside it could refresh that label before.
+- **`snapToStep`** (with `step`) turns the glide into **detents** — the FRACTION is quantized, so
+  thumb, label and committed value are all derived from the same snapped number and cannot
+  disagree. 🔑 Reach for it when the underlying thing is coarser than the thumb's travel, because
+  a free glide then promises precision the screen cannot show and most positions are
+  indistinguishable from their neighbours. The case that added it (2026-08-11) is the
+  accessibility text scale: font rendering hints glyph advances to whole pixels, so measured, only
+  37 of 75 one-hundredth steps over 0.75–1.50 changed the rendered width of a label while all 75
+  moved the number — "the slider only changes in certain positions" was a true report about a real
+  mismatch, not a drawing bug. `sliderRow` exposes it as a plain `step` option (passing `step` opts
+  the row in; omitting it keeps the old free glide with `range/20` for scroll and arrow keys).
+- **`makeVerticalFillTile`'s bottom icon is sized/placed to match a 1×1 tile's icon exactly** —
+  28px glyph, vertical centre `UNIT/2` (40px) above the TALL tile's true bottom edge, not an
+  arbitrary smaller icon of its own. Derivation: `40 − 4 (BaseIsland's TALL padding,
+  `islandPadding()`) − 14 (half the 28px glyph) = margin_bottom: 22`. This works because a
+  SINGLE tile's icon (button `width_request:48` + CENTER align) always resolves to the dead
+  centre of its 80×80 cell regardless of padding magnitude, so `UNIT/2` from either edge is the
+  correct target for both. If `UNIT`/`islandPadding`/the glyph size ever change, recompute this
+  margin too — it's a hand-derived constant (matching the existing `trackH: 72` comment right
+  above it in `veltrix-kit/slider.ts`), not something that re-derives itself.
+- **`makeVerticalFillTile`'s `icon` param accepts a getter** (`Gio.FileIcon | (() =>
+  Gio.FileIcon)`) plus an optional `iconSubscribe?: (sync) => cleanup`, so a level-dependent icon
+  (volume's mute/low/medium/high ladder, via `AudioSvc.targetVolumeIcon`/`watchVolume`) stays
+  live on the TALL tile — the same canonical helper the bar icon and the SINGLE icon already
+  used. Pass a plain `Gio.FileIcon` (no subscribe) for a static icon like brightness's `Icons.sun`.
+
+## Tooltips — one component
+
+All shell tooltips go through **`attachTooltip(widget, text, opts?)`** from `common/Tooltip.ts`.
+`IconButton`'s `tooltip` prop already routes through it (with `tooltipChrome` mapping to the
+`chrome` opt — pass `tooltipChrome: false` from app-mode windows like Settings/About), so
+buttons built with the kit get the glass tooltip for free.
+**Don't use GTK's `tooltip_text` / `tooltip_markup` on shell surfaces** — the native tooltip renders
+in its own `GtkTooltipWindow`, out of reach of our scoped CSS, so it can never be themed (this is why
+the dock "looked like default GTK"). It's a hover-delayed `Gtk.Popover` (`has_arrow: false`); the
+bubble — rounded body **plus the pointer** — is painted in **Cairo as ONE continuous shape**: a
+single glass fill and a single 1px inner-edge stroke that wraps body and arrow together. **That
+bubble painter is shared** — it lives in `common/GlassBubble.ts` (`paintGlassBubble`) and the dock
+context menu paints the same shape (see "The glass bubble" below); the tooltip only adds the label.
+
+- **Why Cairo, not a GTK popover arrow:** GTK always strokes the arrow's *base* where it meets the
+  body. With an opaque popover the body fill hides that seam; our glass is translucent, so it shows
+  through as a line at the junction. There's no CSS way to border only the arrow's slanted sides
+  (the triangle is made by clipping, not by per-side borders). Painting the whole silhouette
+  ourselves is the only way to get a continuous rim on translucent glass — and it's the Veltrix way
+  (all custom shapes are Cairo). The popover is still its own surface, so it keeps Hyprland's blur.
+- **Lives in `common/`, not `lib/veltrix-kit`** — it reads `Theme` (chrome pin + opacity), like the
+  other shared Cairo widgets (`SquircleContainer`, `Slider`, `ScaleRevealer`). `veltrix-kit` stays
+  Theme-free / portable, so a Theme-coupled widget can't live there.
+- **Glass:** fill tint follows `Theme.chromeIsDark` (shell skin) and alpha is `Math.max(Theme.overlayOpacity, 0.38)`, with the glass's haze folded into that one fill (`frostedFill`, via the kit seam's `glassFrost`).
+  **The 0.38 floor is load-bearing:** a tooltip is a *popup*, and Hyprland blurs popups with
+  `popups_ignorealpha = 0.30` (NOT the bar/dock layer's `ignore_alpha` 0.01/0.04). Track the raw
+  overlay slider and at a low setting the bubble drops below 0.30 and **stops blurring** (reads flat).
+  This is the same reason `VeltrixTheme` floors `--veltrix-popover-bg` at `Math.max(bgAlpha, 0.38)` — any
+  popup glass must clear the popup threshold. `chrome:false` (About) is a normal window with no blur →
+  near-opaque fill. Rim is white on dark glass, a subtle dark line on light. Repaints on `Theme "changed"`.
+  🔑 **A TOOLTIP floors higher, at `TOOLTIP_GLASS_FLOOR` (0.59 dark / 0.47 light, owner 2026-09-29)**
+  — the least glass at which its one line of primary text reads 4.5:1 over pure white / pure black,
+  i.e. over any backdrop (at 0.38 it was 2.41:1 over white). A tooltip is NOT measured: it is its own popup over whatever is below it (a bar tooltip hangs over the
+  windows, not over the bar's strip), and measuring it would mean changing it while it is read. The
+  constant lives in `glass-legibility.ts` and the probe holds it to "passes, and is the least that
+  does". The dock MENU still floors at 0.38 — only tooltips were decided.
+  ⚠️ The bubble's top bloom follows the SILHOUETTE (the shape minus itself moved down, in 4
+  stacked bands), not a rectangle along the body's top edge: that rectangle ran straight across the
+  base of a pointer on the "top" side and read as a line there (the bar's tooltips, owner-caught
+  2026-09-29).
+  Geometry consts (`ARROW_W/H`, `PAD_*`, radius clamp so the arrow base fits the straight edge) are at the top.
+- **Text** is `string | (() => string)`. A getter is resolved **lazily, right before show** — so
+  live values (a window title) stay fresh WITHOUT subscribing (a subscription forces a dock redraw +
+  blur pass per title tick; see `DockItem.computeTitle`).
+- **Opts:** `position` (default TOP — just a *preference*, see placement sync below), `delay` (500ms),
+  `markup` (Pango — tray uses it), `chrome`, `suppress: () => boolean` (skip while a context menu is
+  open — the dock passes `() => menu.visible`).
+- **Placement sync (flip + slide):** on Wayland the COMPOSITOR has the final say on where a popup
+  lands (`xdg_positioner`): it FLIPS to the opposite side when the requested one has no room (a tiled
+  window's close button at the screen's top edge) and SLIDES along the edge when the bubble would
+  overflow the monitor. A native popover repositions its arrow after that; ours is Cairo, so
+  `attachTooltip` does it itself — it reads where the popup surface actually went (`GdkPopup`
+  position, parent-surface-relative, re-checked on the surface's `layout` signal) and repaints the
+  arrow on the side facing the widget with its base shifted (`arrowOffset`) to keep aiming at it.
+  Swapping the two `ARROW_H` margins keeps the popover size identical → no repositioning feedback
+  loop. So callers just pick the side they'd *like*; wrong-side arrows can't happen.
+- **Insensitive widgets get no motion events, so a tooltip attached to one never shows** (unlike the
+  native mechanism, which picks insensitive widgets too). If the tooltip must explain WHY a control
+  is disabled, attach it to an always-sensitive parent — see `controlGroup` in
+  `settings/pages/Widgets.tsx`.
+- **Lifecycle:** self-cleans on the host widget's `destroy` (drops the Theme handler, unparents);
+  returns `{ popover, setText, destroy }`.
+- **Adopted everywhere — there are ZERO native `tooltip_text` on shell surfaces** (2026-07-03 sweep):
+  dock (replaced the bespoke `dock-tooltip` popover), bar tray (position BOTTOM), app grid, and ALL
+  of Settings + About (`chrome:false` — app-mode windows). `veltrix-kit` deliberately has **no tooltip
+  props** (`VeltrixButton` / `VeltrixWindow`): the kit is Theme-free so it can't paint the glass bubble;
+  callers attach the tooltip to the returned widget instead. `.veltrix-tooltip` CSS in
+  `_components.scss` only resets the popover chrome to transparent (the bubble is Cairo) + sets the
+  label colour/size.
+- **In the bar, EVERY capsule has one** (owner, 2026-09-26) — "name, optional state": widgets
+  (`barTooltipState`), tray items (their own SNI text), the system menu, the `»` (show / hide again), search,
+  the CC (just "Control Center" — owner's words), and the clock (the FULL date with the year,
+  `formatFullDate` in `ui/lib/date-names.ts`, whatever the clock's own date format, plus the
+  pending-notification count when there is one). **One exception: the app name (AppTitle) has none**
+  (owner, 2026-10-05) — its tooltip was the window's whole title, there because the label showed a
+  title cut to fit; the label is now the app's name and the title is in the window's own title bar,
+  so a tooltip could only repeat one of the two. All go through `barTooltip`
+  (`surfaces/bar/capsule.ts`), never `attachTooltip` directly: that is where the panel rule lives
+  and where the dwell is set. The island's compact capsule has none yet.
+- **The bar's dwell is `BAR_TOOLTIP_DELAY` = 1000 ms counted from REST, the kit's default is 500
+  counted from arrival** (dock, app grid, Settings). Same 500 from arrival in both until 2026-09-26,
+  and the owner found the bar's "too little" and the dock's fine: the bar is a row the pointer
+  CROSSES on its way to something, so bubbles popped over capsules merely passed. `restToShow`
+  (kit option) restarts the dwell on any movement beyond `REST_TOLERANCE` (3 px — a hand is never
+  perfectly still; with zero a trackpad tremor keeps it from ever showing). Once a bubble is up,
+  movement inside the capsule does not hide it. Change these in `barTooltip`, not per call.
+
+## The glass bubble — `common/GlassBubble.ts` (tooltip + context menus)
+
+The Cairo glass bubble — a rounded capsule with a **pointer spliced into one side as one continuous
+silhouette** (single fill, single 1px inner edge wrapping body AND arrow, no seam) — lives in
+`common/GlassBubble.ts` and is **shared by the tooltip and the three menu bubbles (dock item,
+app-grid item, media source)** so they all speak the same glass language. Don't re-implement it;
+every consumer paints via `paintGlassBubble`.
+
+⚠️ **Two consumers, two body profiles, one painter.** `paintGlassBubble` takes `n` (the superellipse
+exponent of `drawSquircle`'s path) and `radiusMax`:
+
+| Consumer | `radiusMax` | `n` | why |
+|---|---|---|---|
+| Tooltip | 13 | **2** (default) | a near-pill: `min(w,h)/2` already rounds it to a stadium, and stadium ends genuinely ARE circular arcs. Kept on `cr.arc`, not a polyline. |
+| The three menu bubbles | **`RADIUS.lg`** | **3.2** | a menu bubble is one of the shell's floating popups, so its body is the same `lg` squircle as the system menu and the CC context menu. The arrow is the only thing that distinguishes it. |
+
+The pointer's own three corners stay circular in both cases — they are features of the pointer, not
+of the box.
+
+- **The pointer is a downward TRIANGLE with ONLY the tip filleted** — a TRUE circular arc tangent to
+  both diagonal sides, so the sides stay perfectly straight (no kink, no bowing). **The arc must stay
+  SMALL relative to the triangle** (`TIP_R` ≪ side length): a big arc eats the straight sides and the
+  whole thing reads as a *bell*, not a triangle — that's the failure mode to avoid. The `arrowTip`
+  helper caps the fillet so it can't reach the base, and `paintGlassBubble` **clamps the base width**
+  to the edge's straight portion so a short bubble's arrow never overruns its corners.
+- **ONE size for tooltip AND menu** (consts `ARROW_W`/`ARROW_H`/`TIP_R`). Keep `ARROW_H` modest — a
+  tall pointer separates the body too far from its anchor (and on the menu looks detached). Both
+  surfaces reserve `ARROW_H` in their content margins (`Tooltip.ts` label margins, `DockItem.tsx`
+  `menuRows` margins). Don't reintroduce per-surface arrow sizes — they were tried and looked
+  inconsistent.
+
+- **`paintGlassBubble(cr, w, h, side, { chrome?, radiusMax? })`** — fills the bubble + strokes the
+  inner rim. `chrome` (default true) = shell skin (`Theme.chromeIsDark`) vs app-mode; `radiusMax`
+  (default 13) caps the corner radius (tooltip 13, the roomier menu passes 16). **Alpha is floored at
+  0.38 inside the painter** — a popover is a *popup*, blurred by Hyprland's `popups_ignorealpha`
+  (0.30), NOT the dock/bar layer's `ignore_alpha`; below 0.38 it stops blurring and reads flat (the
+  same load-bearing floor as `--veltrix-popover-bg`). The dock/bar layerrules carry `blur_popups = true`,
+  so the popover blurs on its own surface.
+- **`sideFor(position)`** maps a `Gtk.PositionType` to the side the pointer is painted on (it points
+  *back* at the anchor: a popover ABOVE the item → arrow on its bottom). The content child clears the
+  arrow strip + AA buffer with margins computed inline from the exported `BUF`/`ARROW_H` consts
+  (`BUF + PAD + (side === thatSide ? ARROW_H : 0)` per edge — see `layoutMenu` in `AppGrid.tsx`).
+- **Structure** (both tooltip and menu): a `Gtk.Grid` overlaying a `Gtk.DrawingArea` (paints the
+  bubble, `halign/valign FILL`) and the content (label / rows box) with the arrow-aware margins.
+  Repaint on `Theme "changed"`; disconnect that handler on `destroy` (the menu is rebuilt per dock
+  layout change, so a leaked handler accumulates).
+
+### Context menus — glass popover, NOT `Gtk.PopoverMenu`
+
+A right-click context menu on a shell surface must be a **plain `Gtk.Popover`** whose body is the
+glass bubble above, **never `Gtk.PopoverMenu`**. `PopoverMenu` renders GTK's native `modelbutton`
+chrome, which (like the native tooltip) can't be themed to glass — exactly why "the dock menu looked
+like default GTK". Two consumers today, same pattern (see `surfaces/dock/DockItem.tsx`
+`ensurePopover`/`updateMenuModel`, and `surfaces/app-grid/AppGrid.tsx` `ensureMenu`/`updateMenu`):
+
+- **`new Gtk.Popover({ autohide: true, has_arrow: false, css_classes: ["veltrix-menu-popover"] })`** —
+  autohide so it grabs focus and dismisses on outside click; no GTK arrow (we paint our own pointer,
+  aimed back at the item, via `paintGlassBubble`).
+- **Rows = `renderMenuModel(model, actionGroup, onClose)`** from `common/VeltrixMenu.ts` — the SAME
+  component as the bar tray menu, so every menu is identical glass rows (`.veltrix-menu-row`,
+  separators, dim section/submenu headers — section labels render as headers too). It activates
+  actions on the passed group directly. The bubble DrawingArea + rows box are built ONCE (stable host,
+  rows rebuilt per show) so the Theme subscription isn't leaked per show.
+- **The row under the pointer takes the ACCENT, at full strength** (owner, 2026-10-06): the
+  accent fill with `--veltrix-accent-fg` on its text and `.nd-icon`s, pressed a little darker;
+  keyboard focus (`:focus-visible`) shows the same fill instead of a ring. The neutral hover
+  (`veltrix-row-states`, white at 12 %) barely read in a menu over glass. It is the ONE place the
+  accent marks a hover rather than a selection, and it is MENUS only — every
+  `.veltrix-menu-row` (system, dock, app grid, tray, window, CC context menu, clipboard, network
+  lists) and, since the Settings review the same day, every **dropdown's list**
+  (`.veltrix-dropdown-item`, kit — so Settings, the installer, the greeter and the lock): an open
+  dropdown is a menu. There the chosen value is a **check at the row's end**
+  (`VeltrixSelectionCheck`, in the row's ink), marked by `VeltrixDropDown` from
+  `drop.get_selected_item()` — never from the list item's `selected`, which GTK's popup moves
+  with the pointer (hover-select).
+- **The Settings sidebar's chosen row is the accent, filled** (owner, 2026-10-06), icon and label
+  in `--veltrix-accent-fg`; in a window that is not active (`:backdrop`) it turns the neutral
+  `--veltrix-surface-active` with the normal ink. It was `--veltrix-state-selected` (accent at
+  22 %), a muddy blue over the dark sidebar. Every other selected row keeps that tint. Rule in the
+  kit (`.veltrix-sidebar`), so any `VeltrixSidebar` gets it.
+- ⚠️ **White on the accent is OWED a decision** (tech-debt #113): `--veltrix-accent-fg` is white
+  for all nine accents, and white on yellow (1.8:1), green (2.4) and orange (2.6) does not read.
+  Measured and laid out for the owner 2026-10-06 (black ink on those three / a deeper accent
+  under text / leave it); undecided — do not pick one silently.
+- **Destructive rows** are `menuRow({ danger: true })` → `.veltrix-menu-row.danger-action`: the
+  NORMAL text colour (no red lettering — owner, 2026-08-03: red text in a flat list reads as an
+  error before anything went wrong) and a red-TINTED hover, **never a filled red row**. The
+  shell's red budget is a small mark or a destructive edge; a solid red bar in a flat menu reads
+  as an alert rather than as one option among several. It beats the accent hover on specificity,
+  focus included. *(Was applied in three places while being defined nowhere — CC context menu "Remove" and
+  the system menu's confirm action had been rendering as ordinary rows.)*
+- **Destructive confirmation in a popover surface is INLINE, never a dialog** — the row swaps in
+  place for a cancel/confirm pair (`.veltrix-confirm-secondary` / `.veltrix-confirm-primary`, both
+  on top of `.veltrix-menu-row` for geometry). A modal over a popover dismisses the very surface
+  it is asking about. Shared by the bar system menu (logout/restart/shutdown) and the clipboard
+  widget's "Clear history"; the classes are `veltrix-*` because they are universal — they were
+  `system-confirm-*` until the second caller appeared.
+- **CSS** is the shared **`.veltrix-menu-popover`** (`_components.scss`) — it only resets the popover
+  chrome to transparent (`@include veltrix-reset` on root + `> contents`), exactly like
+  `.veltrix-tooltip`; the glass is all Cairo. (The old per-surface `.dock-menu` rule is gone.)
+- **Open direction:** the dock is edge-anchored, so its menu always opens inward (fixed `position`).
+  The app-grid item can sit anywhere, so its handler **picks the direction per right-click** — flips
+  the menu up for items low in the launcher (`compute_bounds` vs root height, 0.65 threshold), then
+  sets `menuSide = sideFor(position)` and repaints, so the fixed Cairo arrow stays aimed at the item
+  (GTK's own auto-flip would desync a painted arrow). **No native `Gtk.PopoverMenu` remains in the shell.**
+
+## Show/hide animations — `ScaleRevealer` (THE overlay animation)
+
+CSS `transform: scale` is banned on interactive widgets (see anti-pattern 6 below), but a
+**snapshot-time** scale is fine: **`ScaleRevealer`** (`common/ScaleRevealer.ts`) shows/hides
+its child with a grow/shrink + fade. It scales in `vfunc_snapshot` (paint only, ends at
+identity — hit-testing is correct at rest). API: `reveal(open, onDone?)`; the wrapper
+manages its own visibility (hides itself when the close finishes, *then* fires `onDone` —
+that's where the bar refreshes the layer-shell input region). There is **no CSS overlay
+fade anymore** (`.overlay-fade`/`common/fade.ts` were removed); every animated surface
+goes through this one component. Two modes:
+
+- **`animateLayout: true`** (default — notification banners): the *measured height* follows
+  the scale, so siblings reflow like a `Gtk.Revealer SLIDE_DOWN`. The banners are
+  phone-style (Adnan, 2026-11-13): top-CENTER, sliding DOWN from the top edge —
+  `riseFrom: 28` (upward travel at progress→0, paint-only, ends at identity) with
+  `scaleFrom: 1` (full size the whole way — no grow-from-small) and pivot
+  `top-center`. Bar.tsx's visible-region pad (`BANNER_PAD = 40`) covers the travel.
+- **`animateLayout: false`** (spread as the **`OVERLAY_POP`** preset: CC, NC, Prism, system
+  menu, overview, app grid, bar expansion panel): Gtk.Bin semantics — measure/allocation
+  pass through 1:1, so external `halign`/margins/`height_request` on the wrapper behave
+  exactly as on the child (in `Bar.tsx` the wrapper IS the `cc`/`nc`/... variable), and each
+  frame only repaints. Subtle pop: 0.97→1, in 220ms, out 150ms. Pivot per surface,
+  toward its visual anchor (cc/nc `top-right`, system menu `top-left`, expansion panel
+  `top-center`, centered surfaces `center`).
+
+**Asymmetric easing, on purpose:** ease-OUT opening, ease-IN closing. A decelerating exit
+leaves a long low-opacity tail where only high-contrast content (icons, images, 1px Cairo
+borders) stays perceptible — that tail is what made the old CSS fade look "non-uniform"
+("icons disappear later").
+
+🔑 **The glass does not fade at all** (#764, owner 2026-10-07): it MATERIALIZES — Hyalo grows its
+blur, refraction, tint and rim over the whole reveal — while the content fades in over the second
+half (and out over the first half of a close). `ScaleRevealer` keeps the two apart
+(`glassFormation()`); hyalo.md → "Glass materializes, it never fades". Until #763 the panels
+appeared on Hyalo at 66 % opacity in one step; until #762 a floor (`opacityFloor`,
+`blurSafeOpacity`) kept the whole-widget fade above Hyprland's `ignore_alpha` there.
+
+- **Teardown:** call `dismantle()` right after removing it from its parent. It deliberately
+  has no `vfunc_dispose` override — GJS blocks JS vfuncs during garbage collection, so a
+  dispose override never runs on GC finalization and the child leaks ("still has children
+  left" warnings). Long-lived wrappers (the overlays) never need it; per-notification
+  banners do.
+- **In-place content swap + height morph:** `setChild(next)` replaces the child while the
+  wrapper keeps its progress/opacity/swipe state — banner replacement (same id, new
+  content) updates without replaying the grow-in. `morphFromHeight(h0)` eases the
+  *measured* height from a predecessor's allocated height to the new child's natural
+  (top-anchored, own tick so reveal/swipe don't cancel it) — the NC uses it when a rebuilt
+  row (item chevron toggle) or the group header ⇄ stacked-capsule swap replaces its old
+  widget, so the column glides instead of snapping by the height difference.
+- **Reduce motion lands in `reveal()` and nowhere else** (2026-08-16). Every overlay that
+  pops — CC, NC, Prism, system menu, overview, app grid, bar expansion, notification
+  banners — goes through that one call, so the accessibility accommodation is a single
+  branch instead of a flag threaded through eight surfaces. It jumps to the end state the
+  animation would have reached, **in the same order**: on close the widget is hidden before
+  `onDone`, because callers use `onDone` to refresh the compositor input region and it must
+  see the panel already gone. `morphFromHeight` short-circuits the same way (`morphFrom =
+  null` IS the rest state). The switch is `core/ReduceMotion.ts` — read it before adding a
+  new animation anywhere; if your motion is system-initiated it belongs behind that call,
+  and if it follows the pointer it deliberately does not.
+- **Typing gotcha:** the class merges `export interface ScaleRevealer extends Gtk.Widget`
+  because `Gtk` is `any` in value position for tsc — without the merge, it can't see the
+  inheritance. (That used to be blamed on the ambient `ags/gtk4` shim, which is gone; the merge
+  is still there and still needed, so the shim was not the cause.) Don't add TS `private` members or members whose
+  name collides with a `Gtk.Widget` property (e.g. `scaleFactor`) — both break the merge.
+- **Banner sizing:** the popup column uses `GRID_WIDTH` (356px, from `CCLayoutManager`) so
+  banners match the NC cards exactly — one `NotificationCapsule`, one size. Wrapping labels
+  inside layer-shell windows need `max_width_chars`: a wrapping `Gtk.Label` requests the
+  full *unwrapped* text width as its natural width, and a layer window sizes to natural
+  (the NC's scroll clamps it, a popup window balloons).
+
+### Capsule→island morph — `MorphRevealer`
+
+**`MorphRevealer`** (`common/MorphRevealer.ts`) is the Dynamic-Island variant of the same
+engine: ONE shape that transforms. Instead of scaling a rendered container (which
+stretches the 1px border and the corners), mid-morph the revealer declares a squircle
+**every frame with truly interpolated geometry** — rect, corner radius and superellipse `n`
+lerp from the capsule's pill (perfect pill ≡ `n=2`, `r=h/2`) to the island container's
+recipe — and Hyalo paints its glass (`glassShape`, #684; the Cairo clone it painted for
+Hyprland went with #762). Both ends are boxes that are their glass, so the clone meets both
+real widgets exactly: the source capsule is hard-swapped for the clone on frame 0 (opacity
+only, stays clickable geometry — `SquircleContainer` exposes its paint layer as
+`(grid as any).glassArea` for this) and the island's real glass takes over at rest.
+Three more tracks complete the "same object" illusion — the rule they implement:
+**something must be on the glass at every instant of the flight** (an empty-glass window
+reads as "content disappears and reappears", user-caught 2026-07-19). (a) **Traveling
+pairs** (`MorphPair[]`): ghost twins of compact elements WITH a landing slot in the
+expanded content fly from the live source element's bounds to where the landing element
+is painted THIS frame (resting bounds pushed through the frame's content mapping —
+chasing the resting position instead visibly desynced the ghosts from the still-scaling
+content, as did a per-pair stagger; both tried and rejected, lockstep). Landing elements
+are opacity-0 until rest; a pair whose source is unmapped (the compact mutated to another
+page) is skipped and its landing element rides the content fade. Consumers: the 5
+workspace dots → overview card headers (`makeWorkspaceDot` twins — the one shared dot,
+identical render everywhere), and the media compact's cover art → the player panel's
+96px artwork (ghost built at 96px and scaled DOWN so it stays sharp; the compact's art
+radius is derived as `14*20/96` so pure uniform scaling matches BOTH endpoint swaps).
+(b) The **source dissolve** (`sourceGhosts[]` + `getSourceGhost` + `getSourceContent`):
+compact content WITHOUT a landing slot (media title/EQ; the whole media compact when
+opening the overview) gets a twin that rides the growing shape (uniform scale, anchored
+where the content sits in the pill, vertically centered) and dissolves over progress
+[0, 0.35] — the compact melts INTO the island instead of blinking out on frame 0. The
+compact can show ANY activity's form, so each revealer owns ONE twin per form
+(single-parent rule) and `getSourceGhost` resolves the twin matching what the compact
+shows NOW (latched per `reveal()`, both directions; null = no dissolve — the dots page,
+whose landing pairs ARE the continuity).
+GTK trap for ANY snapshot-painted ghost: `snapshot_child` already applies the child's
+own margin offset, and `compute_bounds` on the real widget EXCLUDES its margins — so a
+ghost twin must carry NO margins or every offset is applied twice (the media twin's
+12px double-shift pushed the EQ past the glass edge mid-morph and made the contraction
+land with a visible re-seat; user-caught 2026-07-19).
+Ghost twins run NO timers — live text/phase is SHARED module state advanced only by the
+real compact (the EQ phase in `PlayerIsland.tsx`; the shared pulse driver in
+`common/PulseDots.ts`; the REC elapsed label in
+`IslandActivities.tsx` syncs every registered label including the twins'), so ghosts
+repaint bit-identical via the morph's own per-frame redraw (an idle ghost never damages
+the bar). A mode with an art pair gets a media twin with a transparent art slot (layout
+intact, the flying ghost owns those pixels — two visible copies would diverge
+mid-flight). (c) The **content**
+(`contentTarget`) fades in over the last stretch (progress 0.45→1) while the child
+paints with the glass rect mapped onto the interpolated rect — content materializes
+inside the already-formed shape; between the dissolve's end (0.35) and the content's
+start (0.45) the flying pairs carry the continuity. (d) The **companions**
+(`companions[]`): widgets that belong to the compact but are NOT the source rect — today
+the island's indicator chips. The source widget itself is switched off outright
+(`opacity = p <= 0 ? 1 : 0`) because the painted clone replaces it; a companion has no
+clone and sits OUTSIDE the growing shape, so it ramps over the same [0, 0.35] window as
+the source dissolve (a hard cut blinks it out while the island is still capsule-sized and
+nowhere near covering it). **This is not optional polish: source and island live in ONE
+surface, so the island's 5% glass does not hide — or blur — anything painted beside it.
+Anything left lit next to the capsule reads straight through the open island** (found the
+moment the chips shipped, 2026-08-01). A press on a chip faded this way is a press on nothing: `Bar.tsx`'s strip
+gesture treats it as the empty strip and dismisses. (On the island's own surface, until #708
+point 3, the chips had to leave its input-region stamp and live inside a 200px blur pad
+instead; inside the bar's constant strip neither is needed.) **Since #708 point 3 the
+companions are a GETTER asked on every open, and the bar's glass groups join them when the
+mode is wide enough to cover them** (`ActivityIsland.coveredBy`): one surface's glass is
+drawn under all of its content, so a group left lit under the overview would read sharp
+through its pane — glass on glass. Asked AFTER `set_visible(true)`: a hidden widget measures 0.
+All bounds are
+`compute_bounds`-re-read every frame so bar relayouts can't leave a stale origin. Same `reveal(open, onDone?)` contract as
+`ScaleRevealer` (self-managed visibility, close-then-`onDone` for the input-region
+refresh) — but easing is cubic **ease-in-out in BOTH directions**, a deliberate deviation
+from the asymmetric rule: that rule serves fade-pops whose decelerating exit leaves a
+low-opacity tail; the morph is a solid object and the transformation must read both
+ways — ease-in on close compressed the whole spatial shrink into the final sprint and
+read as "overview vanishes, capsule appears" (user-caught, 2026-07-19). A module-level
+`SLOWMO` test dial multiplies both durations while the choreography is tuned by eye —
+**ship at 1**. Gtk.Bin measure/allocate pass-through for the child (ghosts
+are extra children allocated at natural size and placed at snapshot time), and the same
+GC/teardown + interface-merge typing gotchas (`dismantle()` unparents ghosts too). Falls
+back to an OVERLAY_POP-equivalent centered pop when the source is unmapped at open
+(`fromSource` latched per open; no ghosts, landing dots ride the content fade).
+**Consumer: the Activity Island** (`surfaces/island/ActivityIsland.tsx`) — the bar-center
+capsule as a multi-purpose surface. The island owns the compact capsule (workspace dots
++ one page per activity, see architecture.md for the ACTIVITY REGISTRY) and a MODE
+registry; `registerMode` builds one MorphRevealer per mode, wiring the
+capsule as source, the mode's glass recipe (`glassFrom`/`glassTo`, read live per frame
+from `Theme.chromeIsDark` + `barOpacity`/`overlayOpacity`; the overview end imports
+`WO_GLASS` from `WorkspaceOverview.tsx`, the player end `PLAYER_GLASS` from
+`PlayerIsland.tsx`, the battery end `BATTERY_GLASS` from `BatteryIsland.tsx` so recipe
+and real paint can't drift), and the
+`morphContent`/`morphGlass`/`morphDots`/`morphArt` handles the mode widget exposes
+(`registerMode` turns morphDots/morphArt into `MorphPair`s — the morphArt pair belongs
+to the mode's OWNER activity (`expandMode === mode.id`) and flies that activity's
+`flyer` element (media art → panel art, battery glyph → alert glyph; ghost built at the
+PANEL slot's size, scaled down; skipped while another activity fronts) — and gives every
+revealer one source-dissolve twin per activity that declares `makeGhost`; only the
+owner's twin gets `hideArt`). `Bar.tsx` stays
+the mount point: it places the capsule, mounts the revealers, and on
+`notify::island-mode` re-pins each revealer's top edge to the capsule's bounds
+(`island.syncAnchor`) so the morph only inflates down/sideways — the capsule never
+travels. Known affordance trade-off: while open, the island's rect overlaps the
+bar-center strip, so re-clicking the capsule to close is off — Esc / outside click /
+selecting a workspace close it. Known cosmetic nit: the capsule's hover lift (`hoverLift`)
+isn't replicated by the clone, so opening from hover snaps the glass to its rest tint on
+frame 0. A future island mode (player, agent) is a
+`registerMode` call plus a new id exported from `Status.ts` — not a new Status field.
+
+### Bar capsule geometry: height and gaps (2026-09-25, redone 2026-10-06)
+
+Every number is on the design system's **4px scale** (`$space-*`), by the owner's rule. The
+2026-10-06 numbers are "B" from a mockup the owner chose them in (measured live first: pills
+touching, a pill 2 px from the visible edge — on Hyalo's then-3.2 px rim, now 2 px — text running into the
+pill's curved ends, icons at three sizes):
+
+| | px | where |
+|---|---|---|
+| above the island capsule's glass (screen edge) | 4 | `.bar-centerbox` `margin-top` — the strip itself starts at 0 |
+| island capsule height | 32 (radius 16) | `BAR_CAPSULE_H` (derived, see below) |
+| strip the bar reserves | 36 — it ends at the glass | `BAR_H` (exclusive zone) |
+| strip's glass → windows below | 4 | Hyalo's `gaps_out` |
+| between two capsules' glass (only the island and its chips, since the groups) | 8 | `BAR_GAP` |
+| hover/open pill ↔ visible glass, every side, AND ↔ the next pill | 4 | `BAR_PILL_EDGE` — the flank's one rhythm |
+| strip's edge → its first/last item (system menu, clock) | 8 | `BAR_END_PAD` (`capsule.ts`) = the old 4 glass margin + 4 group pad, kept so the menu and clock do not move |
+| hover/open pill ↔ item top and bottom | 4 | `BAR_VEIL_INSET` = `BAR_PILL_EDGE` → pill 28 tall, radius 14 |
+| between two items in a group | 4 | `BAR_ITEM_GAP` = `BAR_PILL_EDGE` (the group box's `spacing`) |
+| every icon in the bar AND the island | 18 | `BAR_ICON_SIZE` (the launcher's mark and the island's chips included) |
+| each side of an icon | 7 | `BAR_ITEM_PAD` → icon-only item and its pill 32 wide |
+| each side of text (title, clock, a revealed label) | 12 | `BAR_TEXT_PAD` = the pill's radius |
+| each side of a STANDALONE capsule's content (the island's compact forms) | 14 | `BAR_PILL_PAD` |
+| strip's glass → a panel's glass (menus, banners) · → the CC/NC panel | 12 · 8 | `PANEL_TOP` · `PANEL_HANG` (`Bar.tsx`) |
+| between the island's glass and a flank's | 20 | `ISLAND_GAP` (`Bar.tsx`) |
+
+Counted on the GLASS since #762 (2026-10-13). Until then the capsules' boxes were 36 with the glass
+painted 2 px inside (`GLASS_INSET`), and the table read 4 · 36 · 4 between capsules · 6 · 6 · 16 · 4
+· 16 — on the boxes. Not one pixel moved. Then (owner, 2026-10-13, the 4px rule and the
+windows' `gaps_out`) the glass came to 4 from the top and the ends and 4 above the windows: it had
+been 6 · 6 · 6, hidden behind a written 4.
+
+`BAR_H`, `BAR_CAPSULE_H`, `BAR_GAP`, `BAR_PILL_EDGE`, `BAR_GROUP_PAD`, `BAR_VEIL_INSET`,
+`BAR_ITEM_GAP` live in `surfaces/bar/capsule.ts`; `BAR_ITEM_PAD`, `BAR_TEXT_PAD`, `BAR_ICON_SIZE`
+and `BAR_PILL_PAD` in `common/widget-kit/bar.ts` so widgets can reach them.
+
+**Why these (2026-10-06).** One distance, 4, between a pill and everything round it — the glass
+on every side and the next pill — so the hover is never cramped against either, and the pill
+(28, radius 14, since the strip — 24, radius 12, under the capsules) clears the rim, which now fades in over 2 logical px from the edge
+(3.2 px when this spacing was chosen; #1028 narrows the rim without changing the spacing). The pills stopped
+touching because an open item next to a hovered one, or edit mode lighting every pill, read as
+one bar. Text gets the pill's radius as its air, or its first and last letter sit in the curve.
+None of it fits a 28 px glass with an 18 px icon, so the capsule grew 4 (and with it the strip:
+every window 4 px lower) — the owner's call between this and keeping 32 with the pill on the rim.
+
+**Why the icons are 18 (2026-09-27, owner: "slightly small" at 16).** The reference is macOS with
+OUR STRIP as its whole bar — the air above the capsule has no counterpart there. macOS draws
+16 pt icons in a 24 pt bar; the island capsule's visible glass is 28, and 16 × 28/24 ≈ 18.7. The hover pill gives
+the same answer: Apple's 16 in a ~22 highlight is 73 %, and 73 % of our 24 px pill is 17.5. The
+bar's height does not move (18 in the 28 pill leaves 5 above and below); each icon item is 2 px
+wider. Since 2026-10-06 the island's chips and compact glyphs are 18 too (they were 16, and the
+launcher's mark 20): one icon size across the bar and the island.
+Text already sits at the matching size: macOS's 13 pt is ~15 px here, and the clock inherits the
+system font (Inter 11 pt ≈ 14.7 px) — which also means it is NOT on the fixed `$fs-*` ramp, a
+small debt of its own.
+
+### Bar strip: one piece of glass, a pill inside (2026-09-26; strip 2026-11-12)
+
+The bar is ONE strip of glass, edge to edge, 36 tall (Adnan, 2026-11-12: the strip is the
+true macOS bar; the three floating capsules were Nidara's design, not macOS's): the **left
+flank** (system menu + window title) and the **right flank** (`»`, the widgets, the tray,
+search, the CC, the clock — in that order, no separators) are plain inner boxes inside it,
+and the **island** floats over the strip's centre on its own overlay row (its chips stay
+separate circles). `barStrip()` builds the glass (`SquircleContainer` with the bar params,
+radius 0, NO border, NO `hoverLift`); `barItem({child, onClick?, ...barOpen(…)})` builds an
+item: its content over a Cairo pill painted ONLY on hover or while its panel is open. The
+strip's glass never changes. An island mode big enough to cover a flank fades that flank's
+ITEMS (its inner box), never the strip itself.
+
+- **The widget owns its air, the group owns only the gaps.** Items sit `BAR_ITEM_GAP` (4) apart;
+  each content carries its own air — `BAR_ITEM_PAD` round an icon, `BAR_TEXT_PAD` round text —
+  and the pill is the item's WHOLE width. A widget's `buildBarContent` that forgets the pad gets
+  a pill hugging its glyph. `makeBarExpandable` is an icon item collapsed and a text item
+  revealed: the extra `BAR_TEXT_PAD − BAR_ITEM_PAD` rides on the label, inside the revealer.
+- **Concentric by construction.** The strip is 36 of glass with no radius of its own; the pill sits 4 in from
+  it on the top and bottom (`BAR_VEIL_INSET`), 28 tall, radius 14 — half its own height. A segmented control's thumb, which is the
+  prior art.
+- **The veil is the capsule's old one, moved.** Same ink (`GLASS_SPECULAR` / `GLASS_TINT.dark`)
+  at the same `GLASS_STATE_MIX` alphas, painted OVER the strip's glass instead of folded into a
+  capsule's own fill — the same pixels.
+- **The whole 36px column is the hit target**, not just the 28px pill (the 4px gaps between items
+  are not).
+- **Width arithmetic** (`measureOverflow`, `syncLeftBudget`): an item costs its own width plus the
+  `BAR_ITEM_GAP` before it, and each flank costs its `BAR_END_PAD` (8) at the strip's edge plus
+  `BAR_GROUP_PAD` where the old group arithmetic charged it (its first
+  item has no gap before it). The ordered row (`bar-optional-widgets`) is hidden while empty, or
+  the flank's spacing would put a gap on each side of nothing.
+- **The CC item is an ordinary icon item** since 2026-09-27. It was 36 while a 12px lane held the
+  AI-control dot; the dot left the bar and the lane with it. The privacy mark planned for that
+  button (state-and-ipc.md) brings a second icon back — size it then, not now.
+- `barItem` subscribes (open state, Theme) on `map`, not at build time: the widget items are
+  rebuilt on every layout pass, and a subscription dropped on `unrealize` is never retaken.
+- ⚠️ `barItem`'s veil EXPANDS and its Grid sets `hexpand`/`vexpand` FALSE explicitly — both are
+  load-bearing. A `Gtk.Grid` gives spare room only to expanding rows/columns, so without the veil's
+  expand the cell stays at the content's natural height at the TOP of the item (the icons sat above
+  the glass, caught live 2026-09-26). And an unset expand on the item is computed from that child,
+  so every item — and the group — would fill the flank. `SquircleContainer` has the same pair.
+
+- The island capsule's height is set by NOTHING directly: `.bar-centerbox` is `height_request: BAR_H` and its
+  CSS `margin-top` is taken out of that request, so height = `BAR_H` − margin. `BAR_CAPSULE_H` states
+  the result for what has to MATCH it — the island's indicator chips are that wide so `perfect`
+  makes them circles. Change `BAR_H`, the margin and it together, or the chips turn into pills.
+  (The strip's own row takes no such margin: `.bar-strip-centerbox` is `margin-top: 0`, so the
+  strip is the full `BAR_H`.)
+- `BAR_H` is also the side dock's window height (monitor − `BAR_H`, `DockAxis.ts`) and the base of
+  `PANEL_TOP`: that is why it is exported and not local to `Bar.tsx`.
+- The strip's glass reaches both screen edges (`BAR_MARGIN` 0 since the strip, 2026-11-12); the
+  system menu and the clock keep their old inset from the edge via `BAR_END_PAD` (8 = the old 4
+  glass margin + 4 group pad), and the panels hang at their own 4 px (`SIDE_GAP`, no longer tied
+  to `BAR_MARGIN`). The tiled windows and the dock still sit `gaps_out` (4) from the edge. 8
+  until 2026-09-29, when the owner tried the whole desktop tighter: `gaps_out` 4, `gaps_in` 2 (was
+  4) — verified live: bar row at x 4, a tiled window at `[5,41]` (gap + border), 6 px between two
+  tiled windows (2 + 2 + their borders).
+- `BAR_GAP` was one constant for every row until the groups (2026-09-26); now only the island's
+  capsule and chips stand side by side as separate glass, so it is theirs (`CHIP_GAP`).
+- `BAR_PILL_PAD` is the side air of a STANDALONE capsule — only the island's compact forms since
+  the groups. Every icon item in a group takes `BAR_ITEM_PAD` (7), the distro mark included (it
+  was 20px with ITEM_PAD − 1 until 2026-10-06); text items take `BAR_TEXT_PAD` (12).
+- How it got here, same day (owner): first 36 tall / 6 gap / 18 sides — liked live, but 36, 18, 6
+  and 10 are off the 4px scale, and 8 + 16 + 8 is the capsule. So the capsule went back to 32 and
+  the gain moved OUT of the strip instead: 4px from the screen edge instead of 8, with the strip
+  (and every window) 4px higher. ⚠️ Not measured live when written; the 4px gap between glass
+  capsules was the owner's call to try, the worry being neighbouring `GLASS_SHADOW`s fusing.
+
+### Capsules of icon buttons: a circle each, 4 from everything (2026-10-06)
+
+The bar's rhythm, for a capsule of icon-only buttons (owner, 2026-10-06, chosen on the bar
+mockup): each button's hover is a **24 px circle — the bar pill's height and radius — 4 px
+from the capsule's edge and 4 px from the next circle**, with no rule between buttons (the gap
+does that). So a button takes 28 and a 32-high capsule is `28 × n + 4` wide: **32, 60, 88**, the
+circle concentric with the capsule's ends (radius 12 in 16). Before, the window controls (which
+left this rule with #921) filled a 30 px slot cut by the capsule (a straight side or two), and the back/forward pair had 26 px
+circles 3 from the edge with a hairline between.
+
+| capsule | where | how |
+|---|---|---|
+| window controls (1–3) | Hyalo, `render/controls.rs` + `protocols/window_controls.rs` | NOT this rule since #921 (owner, 2026-10-23): 16 px circles, 4 from the ends, 8 apart, 24 high (24, 48, 72) — the loose window buttons in a capsule as small as it can be; hyalo.md → "The window controls are Hyalo's" |
+| Settings back/forward | `_settings.scss` `.navigation-capsule` + `Settings.tsx` | 1 border + 3 padding, buttons 24 (14 glyph + 5 + 5), `spacing: 4` |
+| CC detail back | `_control-center.scss` `.cc-detail-back-capsule` + `IslandGrid.tsx` | the same, one button |
+
+**One hover across the desktop** (owner, same day): an icon button's hover and press are
+`GLASS_STATE_MIX` (`tokens.ts`) — the bar's pills paint it in Cairo, Hyalo's shader repeats the
+numbers, and CSS reads `--veltrix-state-hover` / `--veltrix-state-pressed`, which the token engine
+emits from it (white ink on dark, the glass's dark tint on light). `button.veltrix-icon-btn`
+uses them. Until then the controls used 14 %, the kit's icon buttons 12 % and the bar 8 %.
+A button with a resting fill of its own (the sidebar toggle) keeps its own hover.
+
+### Bar capsule states: rest, hover, open (2026-09-25)
+
+A bar capsule has three states and **none of them uses the accent** — the accent marks
+what is ON or SELECTED, and a capsule whose panel is down is neither. Until 2026-09-25 the
+hover painted the rim in the accent at 100 % and nothing marked the open capsule; the
+owner's review against macOS (where a menu bar item stays highlighted while its menu is
+down, and shows nothing on hover) turned that round.
+
+| state | paint | where |
+|---|---|---|
+| rest | glass + `CAPSULE_BORDER` | — |
+| hover | a veil OVER the glass at `GLASS_STATE_MIX.hover` — `GLASS_SPECULAR` on dark glass, `GLASS_TINT.dark` on light glass. A FIXED alpha, not a fraction of the pane: the first version scaled with the bar opacity and all but vanished at its minimum. Since 2026-09-26 it is painted as a PILL inside the group, under the one item (`barItem`, see "Bar groups" above); the island's compact capsule keeps it on its whole glass | `barItem` (the island: `hoverLift: true`) |
+| open | the same veil at `GLASS_STATE_MIX.open` — beats hover | `...barOpen(() => …)` from `surfaces/bar/capsule.ts` |
+
+`barOpen(isOpen)` wires `getOpen`/`watchOpen` to every Status prop that opens a bar panel.
+A capsule that opens the SHARED custom expansion (a tray item's menu, the window menu) asks
+`isBarCustomAnchor(w)` with the widget it passed as anchor — `Bar.openCustomExpansion`
+publishes it through `setBarCustomAnchor`. A new capsule that opens something gets both
+props, or it looks dead while its own panel is open.
+
+### The right group's order: one list, the person's (2026-09-26)
+
+Everything in the right group between the `»` and the CC is ONE ordered list —
+`core/BarOrder.ts`, GSettings `org.veltrix.widgets bar-order` — of keys `widget:<id>`,
+`tray:<StatusNotifierItem Id>` and `shell:search`. The CC and the clock are not in it: they stay
+at the right end (the CC and NC panels hang from that edge; macOS pins the same two). A plugin
+(#640) is a widget, so it is not a fourth kind. The owner's rules, all in that module's header:
+
+- **Empty = derived.** Tray icons in the order FIRST SEEN (`tray-known`, not this session's D-Bus
+  arrival — Settings lists them that way and must show the bar's own order), then widgets by
+  category (`sortWidgetsForBar`, shared with `BAR_ORDER` and Settings), then search. The apps sit
+  LEFT of the system's controls as on macOS, the same side a new icon arrives on once the order
+  is personalised (owner, 2026-09-28; until then the tray came after the widgets). Nothing is
+  written until the person reorders.
+- **Personalised: what the list does not name goes to the LEFT end** (`resolveOrder`) — a new
+  tray app, a widget just switched on. It is the first to fold and never pushes aside what the
+  person arranged.
+- **The FULL list is what is saved, the SHOWN list is what is painted.** `fullKeys` in `Bar.tsx`
+  holds every item with a place — enabled widgets active or not, tray icons seen and not hidden,
+  running or not, search — and a move saves all of it. Saving only what was on screen would drop
+  a VPN that is off or an app that is closed, and each would come back at the left end as "new".
+- **Tray icons are keyed by the SNI `Id`**, never the D-Bus name, which changes each launch. Two
+  live instances of one Id get `#2`, `#3`… ⚠️ **Electron apps name themselves badly**: Chromium
+  registers `<app>_status_icon_<n>` with an EMPTY title, and `<app>` is `chrome` when the app sets
+  no name (measured 2026-09-26: ChatGPT desktop = `chrome_status_icon_1`, no title, no icon name —
+  the owner read it as Chrome). So when an item has no title or that generic Id, `Tray.tsx` asks
+  the OWNING PROCESS (PID from the bus name `…StatusNotifierItem-<pid>-<n>`, else
+  `GetConnectionUnixProcessID`; its exe's basename, matched against the installed apps' id / Exec
+  / WM class / name) for the name and icon — and, for the generic Id, the key (`tray:chatgpt`). That
+  lookup runs for EVERY icon: the shell records each Id in `tray-known` as (title, icon, desktop app
+  id), and Settings lists an app's icon only while `Gio.DesktopAppInfo` still finds that app — the
+  owner's rule, instead of a "forget" button (an icon no app matched is listed: nothing says it is
+  gone). The icon recorded is the one the BAR paints (`recordedTrayIcon`): Electron apps send only
+  pixels, so the pixbuf is written to `~/.cache/veltrix/tray-icons/` — not the config dir, a read
+  root of the assistant's file layer. A hidden tray icon, and a hidden search, are in `bar-hidden`
+  (by order key); a widget's own switch is its `placement`.
+- **Tray icons are a SOURCE, not a box** (`Tray.tsx` → `TraySource`): the bar re-parents each
+  icon's widget wherever the order puts it. Widget items are rebuilt on every pass; tray icons and
+  search are built once (they hold an app's menu, PID and subscriptions).
+- **The order is edited IN THE BAR** (`Status.bar_edit_mode`, 2026-09-27, the owner's choice after
+  macOS — Settings lists visibility in two lists, widgets and app icons, which could not express how
+  the two mix). Entered from Settings → Top bar's "Reorder in the bar" (through the catalog seam,
+  `WidgetCatalog.editBarOrder`, since Settings may not import Status). While on: "Done" takes the
+  `»`'s place, the overflow unfolds if anything is hidden, every item shows its pill (hover alpha,
+  the selected one open alpha — `setBarEditSelected` in `capsule.ts`), an item's CONTENT stops
+  taking input, and inactive "When active" widgets show dimmed so they can be placed. ONE drag
+  source, drop target and press gesture sit on the row (`orderedItems`), not on each item — tray
+  icons and search are re-parented on every rebuild and would pile up controllers. ← → move the
+  selected item, Esc / Enter / "Done" / a click outside finish: edit mode counts in `barModal`, so
+  the bar's focus grab gives it the keyboard and an outside press clears it (`onBarGrabCleared`).
+  The selection is remembered by KEY and re-picked after the rebuild a move causes. ⚠️ Not
+  Super+drag: Hyprland binds it to moving windows (`hyprland.lua` l.439).
+
+### Settings → Top bar: the bar's own list, right to left (2026-09-27)
+
+After macOS's Menu Bar pane (`surfaces/settings/custom/bar.ts`, two custom GROUPS on a preference
+page — a new exempt page would break `settings-config-contract`'s shrink-only count). One list in
+the bar's order READ RIGHT TO LEFT: Clock and Control Center (fixed: an invisible check holds the
+column), the right group's widgets and search, the window title, the system menu ("Change icon").
+The user-facing word is **controls** (macOS's; a volume slider is not a "widget"): the group is
+"Top bar controls". Each row: a check, the icon, the name, and at most ONE control on the right —
+"Change icon" for the system menu, "Configure" for the clock (everything about how the clock
+reads — 24/12 hours, the date, seconds — `custom/clock.ts`; Language & Region keeps only
+language, region and formats: owner, 2026-09-29) and for a control with its own settings (it beats the
+mode menu, so such a control must not have a choosable mode — see writing-a-widget.md), else "Always / When active" for one
+whose mode is choosable (`ccFixed` + `barActive` — the three kinds are in writing-a-widget.md). Below: "App icons", a switch per INSTALLED
+app. No explanatory footers (owner: "only installed apps" raised more questions than it
+answered). The "Reorder in the bar" action sits INSIDE the list, at its foot —
+`VeltrixListActions` in the kit, made for this: a button under a card, outside it, read as the
+page's. The Control Center page lists only the CC now. Rules from the owner's first live pass:
+
+- **A checked control has an icon in the bar.** A control whose hardware is missing is not listed
+  at all — Wi-Fi on a machine without a radio no more than a battery on a desktop (2026-09-28;
+  until then Wi-Fi, Bluetooth and Ethernet were listed disabled because their "When active" could
+  wait for a dongle). The saved choice is kept, and plugging the hardware in brings the row back.
+  "When active" and a presence indicator are the checked-without-icon cases.
+- **Toggling a row must not move the page.** The list is rebuilt only when the set of rows or their
+  order changes (a `signature` of both); a check or a menu updates its own row. Rebuilding on every
+  toggle threw the scroll back to the top.
+
+- **"When active"** (`WidgetConfig.barMode`, GSettings `bar-mode` — only values that differ from
+  the widget's `defaultBarMode`, and only for a choosable widget): the bar paints the widget only
+  while `barActive()` holds, and every widget's `watchBarActive` schedules a layout pass. Offered
+  only for widgets fixed in the CC (Do Not Disturb, night light); Wi-Fi, Bluetooth and VPN are
+  plain on/off controls, as in Apple's pane (writing-a-widget.md). An icon appearing moves the
+  others and may fold one behind the `»`, like any other.
+
+### The bar's overflow: unfolded in line, not a menu (2026-09-25)
+
+When the optional widgets do not fit, the bar shows ONE extra capsule, `nd-pan-end`, at the
+LEFT of the widget group — macOS 27's `»`. Clicking it sets `status.bar_overflow_open`: the
+island RISES off the top of the screen and the hidden widgets unfold in line, the row growing
+leftwards over the room the island left; the capsule flips to `nd-pan-start`. It replaced a
+`···` capsule that opened a panel of menu rows (#646, the owner's decision).
+
+- **Hidden from the LEFT end.** `measureOverflow` counts from the clock side, so the items
+  nearest the clock stay. Since 2026-09-26 that is every ORDERED item — widgets, tray icons and
+  search, in the person's order (next section) — so the order IS the priority. The default order
+  ends with the system widgets, the tray and search; the old cut from the other end hid Wi-Fi and
+  volume while CPU and the clipboard stayed on screen.
+- **Two measured cuts**, `fitFolded` (the right flank, minus the `»` capsule when it is needed)
+  and `fitUnfolded` (from the system menu plus `ISLAND_GAP` to the tray). The window title yields
+  with `setMaxWidth(px, immediate = true)` in the frame the row grows, and steps aside entirely
+  below `TITLE_MIN_W` rather than showing an ellipsis.
+- **The island rises with a paint-only transform, and is then hidden.** The rise is
+  `ScaleRevealer`'s `riseFrom` on `islandHost`, the row around the capsule; it ends above the
+  bar strip, which is in both regions anyway, so neither is re-stamped per frame. Hidden at the
+  end of the rise, it is no longer picked, so the unfolded pills under it take their presses.
+- **Folding is Status's.** Any other surface folds it; a press outside folds it through the bar's
+  focus grab; a panel of an unfolded widget does NOT (it hangs from that pill). Fullscreen folds
+  it with the bar. A `bar_expanded_id` for a widget still hidden (IPC) anchors on the `»`
+  capsule (`capsuleRefs[OVERFLOW_ID]`).
+- ⚠️ `rebuildBarWidgets` folds on its own when nothing is hidden any more, but only on a
+  MEASURED answer: the measuring pass rebuilds with nothing cached, which reads as "everything
+  fits", and folding there closed the overflow on every layout sync.
+
+## SCSS conventions and anti-patterns
+
+These are the patterns that bite. Most "the styles look wrong" bugs in this codebase are violations of one of these.
+
+1. **Avoid `background: none; border: none; box-shadow: none` chains** on internal nodes (`decoration`, `contents`, `ripple`, `focus-ring`, `outline`, viewport, list). If you find yourself needing ≥3 of these resets, the widget is probably Adwaita and should be a GTK base widget instead. Use `@mixin veltrix-reset` for the canonical reset.
+2. **Avoid long specificity chains** like `window.x preferencespage preferencesgroup list.boxed-list row`. They're a strong signal you're fighting Adwaita and should switch to base GTK + a flat custom class.
+   - The fix: add `add_css_class("veltrix-foo")` in TSX and style a flat `.veltrix-foo`.
+3. **Avoid color literals.** Resolve against tokens (`--veltrix-danger`, etc.). The legitimate exceptions are the accent swatches and the danger/success/warning seeds inside `VeltrixTheme.ts`.
+4. **Use `@mixin glass($level)`** (surface / raised / floating) instead of repeating ~20 glass blocks. *Currently underused — only 2 call sites; migrating the rest is open work (see `tech-debt.md`).*
+5. **`background-clip: padding-box` + `border: Npx solid transparent`** for "visual thickness ≠ real thickness" (avoids negative margins that break `GtkGizmo`).
+6. **No `transform: scale` or `transform: translate` on interactive widgets.** GTK respects them but they break hit-testing. Use `margin`, scale inside Cairo, or — for transient show/hide animations — a snapshot-time transform that ends at identity (see `ScaleRevealer` above). *(CSS transforms currently clean: 0 occurrences. Don't reintroduce them.)*
+7. **All SURFACE CSS wrapped in its window's selector** — never global unscoped. The exception is
+   deliberate and narrow: `_base.scss` (tokens on `*`, which must inherit into every window and
+   popover) and the TWO `_components.scss` (the shared widget kit — `entry`, `.veltrix-*` — used
+   by all of them) are the design system's GLOBAL layer, plus `_reset.scss`'s neutralization and
+   any `@keyframes` (not scopable in CSS at all).
+
+   📄 **"The kit's stylesheet" — `_components.scss` exists twice since 2026-08-10.**
+   `ui/lib/veltrix-kit/styles/_components.scss` is the kit's own, written so more than one bundle can
+   compile it; `ui/shell/styles/_components.scss` is the half that is still the shell's. **One
+   mechanical test decides which, not a judgement call: a rule goes to `ui/lib/` iff the widget
+   that wears it is built in `ui/lib/`.** Grep the class there and everyone gets the same
+   answer. So `.veltrix-tooltip` and `.veltrix-circle-btn` did NOT move (their `common/Tooltip.ts`
+   and `common/IconButton.ts` are the shell's) while the whole `Gtk.DropDown` block did
+   (`scrolled.ts` exports `VeltrixDropDown`). **A `veltrix-*` class still in the shell's sheet is
+   not a leftover to sweep** — same legitimate mismatch as `veltrix-media-*`: the PREFIX says who
+   owns the class, the SHEET says which bundles compile it. Elsewhere in this document, a bare
+   `_components.scss` means whichever half holds the rule being discussed.
+
+   ⚠️ **The greeter and the lockscreen DO wear it, since 2026-08-10** (compiled in until
+   2026-09-23; loaded at runtime as `kit.css`, ahead of their own sheet in the same provider,
+   since — same source order, so everything below about order still holds) — what earned the
+   import was migrating their three raw `Gtk.DropDown`s to `VeltrixDropDown` (PR #114, see "The
+   greeter wears the kit" above). Two things stay sharp on that side. The file carries
+   BARE-ELEMENT selectors (`entry`, `selection`, `dropdown > button`, `dropdown popover`) that
+   match without a class and collide with what those two already declare; source order saves
+   them (Sass emits a module BEFORE the file that `@use`s it, so the login sheet out-ranks the
+   kit at equal specificity) and nothing here may rely on being last. And there is a TOKEN
+   CONTRACT: the kit's rules read 22 `--veltrix-*` custom properties (15 in the sheet itself,
+   the rest via `_mixins.scss`; re-measure with a grep over BOTH, that is where the number comes
+   from), an undefined one does not
+   warn — the declaration is simply dropped — so **adding a `var(--veltrix-…)` to the kit's sheet
+   is a change to every consumer's palette block**, verified by grepping the compiled sheet, on
+   two surfaces with no dev mode. (The slider's move on 2026-08-15 brought exactly one rule,
+   `.slider-fill-value`, and the slider ROW's move on 2026-08-16 brought one more,
+   `.slider-value-label`; neither added a token — they read `--veltrix-text` and
+   `--veltrix-text-dim`, both already in the contract. ⚠️ `.slider-value-label` is now worn on
+   BOTH sides, since the shell still builds six readouts by hand. That is not a mistake to
+   sweep: when a class ends up built in `ui/lib/` AND in the shell, the kit's sheet is where it
+   must live, because the shell compiles both and a lone bundle does not.) Everything else names a window. Both spellings are in
+   use because both are set in TSX — id **and** class, and they differ:
+
+   | Window | Scope selector |
+   |---|---|
+   | Bar (+ every panel: CC, NC, Prism, system menu, the Activity Island and its overview, the app grid — commandment 5) | `#veltrix-bar, .veltrix-bar-window` |
+   | Dock | `#veltrix-dock, .veltrix-dock-window` |
+   | Settings | `window.veltrix-settings-window` |
+   | About | `window#veltrix-about, .about-floating-window` |
+   | Alert dialog (`showVeltrixAlert`) | `window.veltrix-alert-dialog` |
+
+   ⚠️ **The window a class lands in is NOT the directory its TSX lives in.** `_bar.scss` was the last
+   unscoped surface sheet (closed 2026-08-10) and the mapping was not what the filenames said: while
+   the island had a window of its own (until #708 point 3), `.bar-center` — declared in
+   `surfaces/bar/` — rendered inside `#veltrix-island` and nowhere else, and `.workspace-dot` never
+   appeared in the bar's window at all. Scoping either one by its filename would have silently
+   unstyled the capsule and every workspace dot. **Follow the mount site, not the folder:**
+   grep the class, then grep where the widget holding it is `append`ed / `mount`ed.
+
+   ⚠️ **Parent-referencing `&` and a scope wrapper do not mix.** `.app-grid-search-box:focus-within &`
+   written inside `.app-grid-search-icon` was correct while that rule was top-level; once `#102`
+   wrapped the file in the window scope, `&` expanded to `#veltrix-app-grid .app-grid-search-icon` and
+   the rule compiled to `.app-grid-search-box:focus-within #veltrix-app-grid .app-grid-search-icon` — a
+   window nested inside a search box, unmatchable. The search icon stopped turning accent and nothing
+   reported it (found and fixed 2026-08-10). **When a rule needs an ancestor's state, nest it under
+   that ancestor** (`&:focus-within .app-grid-search-icon`), never reach back up with `&`. After
+   adding a scope wrapper, grep the compiled `style.css` for `#veltrix-` appearing anywhere other than
+   the START of a selector — every hit is a rule that can never match.
+
+   ⚠️ **A transient is a SIBLING root, not a child — the caller's window is not the widget's
+   window.** `showVeltrixAlert` builds `new Gtk.Window` and sets `transient_for`; a `Gtk.Window` is
+   always a `GtkRoot`, so nothing rooted at another window can ever reach it. Its rules sat at
+   column 0 in `_settings.scss` and worked from 2026-05-24; scoping that sheet (#97, 2026-08-07)
+   swept them inside, they compiled to `window.veltrix-settings-window window.veltrix-alert-dialog`
+   — a window inside a window — and the whole `.veltrix-alert-*` family died. Bluetooth pairing, the
+   Display resolution confirm and Delete user rendered as raw GTK for three days: measured on the
+   real tree, the footer buttons came back `4 9` padding against their declared `14 16` (a 48px row
+   collapsed to ~28) and the heading at weight 400 instead of 600. Fixed 2026-08-10 by giving it
+   `_alert.scss` with its own root, exactly like `.about-*` got `_about.scss` in the same sweep.
+
+   ⚠️ **And then the same rules failed a second time, for the other reason, until 2026-09-05
+   (#440): the sheet was the SHELL's, and the installer calls `showVeltrixAlert` too.** Its quit
+   dialog (#405) and its install confirmation (#436) both rendered as raw GTK — the response
+   buttons plain text at 19px instead of 48px rows, and the destructive one not red. The block now
+   lives in `ui/lib/veltrix-kit/styles/_components.scss` under that file's mechanical test (a rule belongs
+   there iff `ui/lib/` builds the widget). 🔑 Two failures, two different questions, and the pair
+   is the lesson: **which window the widget IS decides the SELECTOR; which bundles build it decide
+   the SHEET.** Getting the first right in 2026-08 left the second one wrong for a month.
+
+   🔑 **The trap was that it looked legitimate.** `.about-*` was in `_bar.scss` "only by position"
+   and read as obviously misfiled; the alert dialog is *called only from Settings*, so filing it
+   with Settings looked right. Ask which window the widget IS, never which window opens it.
+   `scope-audit.mjs`'s pass 2 now catches this shape without needing to know the window exists.
+
+   ⚠️ **An atomic widget has no surface, so its CSS belongs to the kit.** Anything under `widgets/`
+   is placed by the USER (bar, CC grid, wherever the plugin system lands it next), so its classes go
+   in `_components.scss`, not in the sheet of whichever surface happens to host it today. That is why
+   `.bar-popover-key/-val/-value/-icon-btn` all live there despite the `bar-` prefix in the name.
+
+   🔑 **A class prefix names its OWNER, not the window it happens to render in — and a prefix that
+   lies is a bug waiting to be written.** Settled 2026-08-10 by renaming the last three families that
+   claimed the Control Center owned them: `cc-atomic-*` → **`veltrix-atomic-*`** (the vocabulary every
+   `widgets/` atomic wears — also worn by `AvatarCropper` and three Settings pages, another window
+   entirely), `cc-media-*` → **`veltrix-media-*`** (`widgets/media.ts`'s one panel, shown by three
+   surfaces across two windows), and `cc-detail-panel`/`-section-label` → **`veltrix-detail-*`** (worn
+   by `MenuRow` and four widgets). The `-atomic` SUFFIX went too where the `veltrix-atomic-`/`-media-`
+   prefix already carried it (`cc-media-btn-atomic` → `veltrix-media-btn`).
+
+   The `cc-*` names that SURVIVED are the test of the rule, not an exception to it: `cc-open`,
+   `cc-edit-mode`, `cc-edit-pill`, `cc-drag-source`, `cc-drop-ghost`, `cc-slot-placeholder`,
+   `cc-resize-btn`, `cc-context-menu`, `cc-island`, `cc-capsule-btn` and the `cc-status-*` family are
+   the Control Center's own chrome — its grid, its edit mode, its tiles. **Do not sweep a prefix
+   because it is a prefix**; sweep the names whose owner is somewhere else. (`cc-detail-id` is not a
+   class at all — it is a `Status.ts` `ParamSpec`. Leave it.)
+
+   ⚠️ **Renaming is NOT relocating, and the two must not ride together.** `veltrix-media-*` still
+   lives in `_control-center.scss` under BOTH window scopes, deliberately: dropping it into
+   `_components.scss` would make it global and change which rules outrank it (see the media block's
+   own comment). A `veltrix-*` class in a surface sheet is the one legitimate mismatch — the prefix
+   answers *who owns this*, the sheet answers *at what specificity*. Verify a rename with a compiled
+   diff: normalise the new names back to the old ones in `style.css` and it must come out **byte
+   identical**. Anything else is a behaviour change wearing a rename's clothes.
+
+   ⚠️ **A shared widget spans scopes and must list them all.** `common/WorkspaceSchematic.ts` renders
+   into the island (overview) *and* the app grid (workspace strip), so `_workspace.scss` carries two
+   blocks. Put a `.wo-schematic-*` rule in the island-only block and it silently stops painting in
+   the app grid — nothing errors, the strip just goes flat.
+
+   The one that actually shipped broken: `widgets/media.ts` builds ONE panel
+   (`buildMediaDetailPanel`) and three surfaces show it — the bar pill expansion and the CC detail
+   page, both inside the bar's window, **and the island's PLAYER mode** (`PlayerIsland.tsx`). Its
+   `.veltrix-media-*` rules were inside `_control-center.scss`'s `#veltrix-bar` block, so from the day the
+   island got its own window (2026-07-26) the transport buttons and the source selector rendered with
+   raw GTK defaults there. Nobody noticed until 2026-08-10. They now carry both scopes — and
+   deliberately stay **window-scoped rather than global**, so that whatever outranks them in the bar
+   outranks them identically in the island; dropping to a bare `.veltrix-media-*` would have changed that
+   balance in one window only (`.cc-island button` and `.bar-center button` are both (1,1,1)).
+
+   **The detector is committed: `scripts/dev/scope-audit.mjs`** (`node ../../scripts/dev/scope-audit.mjs`
+   from `ui/shell`, after a build). It collects every class used by code that renders into each
+   window and checks the compiled `style.css` for at least one selector that is either unscoped or
+   scoped to that window. Classes with no CSS at all are Cairo-painted and fine; classes whose only
+   selectors name a *different* window are the bug. **Re-run it whenever a surface moves windows** —
+   it found the media panel, the "Default" badge and the slider readout in one pass. Details and its
+   limits in `dev-workflow.md`.
+
+   ⚠️ **A window's scope can MOVE, and nothing tells you.** The app grid's was `#veltrix-dock` until
+   2026-08-09, because the panel lived inside the dock's window; giving it a surface of its own
+   changed the scope of `_app-grid.scss` **and** of `_workspace.scss`'s shared block **and** of the
+   app grid's entries in `_reset.scss`'s two neutralization lists — and #708 point 3 moved it (and
+   the island) once more, into `#veltrix-bar`. That last move was checked by comparing the compiled
+   sheet rule by rule before and after (every declaration the same, only the window prefix moved). Miss any one
+   of the three and the rules stop matching in silence — no SCSS error, no GTK warning, just
+   unstyled widgets. When a surface changes windows, `grep` the OLD scope selector across
+   `styles/` before you call the move done.
+
+   ⚠️ **Scoping changes what an unrooted widget resolves.** A probe that builds a widget outside a
+   matching window gets NO styling and reads 0 for everything, with no error. That is why
+   `scripts/dev/gtk-probe.js` takes `SCOPE=settings|bar|dock|greeter` (the island and the app grid are `bar`) — measured proof it matters: the
+   same dropdown row is 29px in the Settings window (which re-anchors control text to the relative
+   `$fse-*` ramp) and 28px in any other.
+
+## When you're tempted to invent a new pattern
+
+Before adding a new mixin, new token, or new class convention: check whether `_base.scss` already has it, and whether `@mixin glass` / `@mixin veltrix-reset` cover the case. Migrating to existing mixins is a stated direction of the project (`@mixin glass` underuse is item #5 in the tech-debt list); adding a parallel pattern makes the future migration worse.
+
+## The login card: a message that cannot move it, and an entrance (2026-08-10)
+
+Two changes to `.greeter-card`, both on the shared sheet so the greeter and the lockscreen
+get them together.
+
+### The failure message no longer shifts the card
+
+The card is `valign: CENTER`, so anything that changes its height moves its whole contents.
+Showing "Wrong password" added 30px and lifted the avatar, the name, the field and the
+button by **15px each** — half of it, because centring splits growth in two. Failing a
+password moved the field you were about to retype in.
+
+🔑 **The fix is toggling `opacity`, not `visible`, and the reason is a GTK fact worth
+keeping: an EMPTY `Gtk.Label` still measures one line.** So the error capsule is 24px tall
+whether it holds a message or nothing, and leaving it ALLOCATED (opacity 0) reserves exactly
+the right space with no number involved. `visible = false` is what breaks it — a hidden
+widget gets no allocation at all.
+
+⚠️ **A `min-height: 30px` on the slot shipped in the first draft, looked like the mechanism,
+and was not.** It only made the slot 6px taller than the capsule inside it; the mutation test
+(set it to 0) changed nothing. Reserving by NUMBER would also have been the fragile version,
+because the right number is the user's UI font rather than a constant. It was removed.
+
+One line is the true worst case, measured rather than assumed: all 36 real messages
+(12 locales × `wrongPassword`/`noSession`/`loginError`) are 24px tall, none wraps, and the
+widest is 216px against the card's 280.
+
+**The cost, stated:** the strip is always reserved, so with no error on screen the card sits
+15px higher than it used to. Same 15px — paid once, statically, instead of on every failure.
+
+**The slot sits directly under the primary button, and nothing goes between them.** The message
+is about the password, so it belongs under the field and button it refers to. The greeter's
+session selector and user switcher both go BELOW it (`card.append`); an earlier
+`insertBeforeError` put the selector in between and pushed the failure two rows down, reading
+as if it belonged to the selector. Reserving the slot is what keeps the layout still — WHERE it
+sits was always a free choice, and this is the lockscreen's order, which had it right by having
+nothing else to place.
+
+### The card rises as it fades in — driven by the frame clock, NOT by CSS
+
+Both blocks fade in while rising ~21px over 450ms on `$ease-emphasized`. The animation lives
+in **`ui/lib/entrance.ts`** and is written in JS. It was CSS first, and the story of why it
+is not any more is the useful part.
+
+🔑 **A CSS transition SNAPS on a session-lock surface.** Measured on a real lock, with the
+class added on a genuine frame and frames flowing:
+
+```
++0ms    hero y=93.0   card y=614.0   frames=1     ← FROM state
+        (class added 2ms later)
++60ms   hero y=72.0   card y=594.0   frames=3     ← already final, 8ms on
++700ms  hero y=72.0   card y=594.0   frames=67
+```
+
+The whole 21px in under 8ms. The same stylesheet interpolates correctly in an ordinary
+`Gtk.Window` on the same machine (538→533→522→518→517), so this is not the CSS being wrong.
+
+The likely cause: under `ext-session-lock-v1` the surface gets **no frames for ~60ms** after
+`map`, and then the first two ticks arrive in one catch-up burst about 2ms apart — so the FROM
+state is laid out but never PAINTED, and a transition with nothing painted to interpolate from
+is skipped. "Likely" is deliberate: what is measured is that it snaps, not why GTK decided to.
+
+Two earlier attempts at keeping CSS both failed on the same precondition, and are worth not
+repeating: a `GLib.timeout_add(…, 16, …)` "next frame" (it is wall clock — it fired 44ms
+before any frame existed), and revealing on the second frame-clock tick (the ticks are the
+catch-up burst). **The frame clock is the one thing that surface does reliably provide**, so
+the animation now uses it directly and sets its own FROM state in `map`, before the first
+draw.
+
+🔑 **POSITION AND ALPHA DO NOT SHARE A CURVE.** They did at first, and the user's report was
+"I'm not sure the opacity changes at all". It did — measured straight off the pixels, mean
+alpha 0.060 / 0.161 / 0.222 for widget opacity 0.27 / 0.73 / 1.00, exactly proportional, so it
+was never a rendering question. The fault was the ramp: `$ease-emphasized` is a strong
+decelerate, so on the real lock the card hit 0.73 by 150ms and 0.95 by 300, and the last 300ms
+crawled across a difference the eye cannot resolve. **Motion decelerates; alpha is LINEAR.**
+The same trace now reads 0.13 / 0.33 / 0.65 / 1.00, which is a fade you can actually see.
+
+⚠️ **Numbers, and they differ per block to produce the same movement.** `.greeter-hero` is
+`valign: START` and keeps all its rise (21); the card is `valign: CENTER`, where centring
+hands half back (40 → ~21px). Both measured.
+
+⚠️ **CAPTURE THE BASE MARGIN AT `map`, NOT AT BUILD.** `VeltrixClock` starts its own entrance
+from its constructor, and its HOST sets the real position afterwards
+(`clockWidget.margin_top = 72` in `Lock.ts`/`Greeter.ts`). Reading it early captures 0 and the
+block lands 72px too high — a permanent layout bug wearing an animation's clothes. Caught by
+mutation, not by eye.
+
+⚠️ **The animation is an enhancement, never a gate.** The widget starts at `opacity: 0`, so a
+frame clock that never ticks would mean an invisible login card. A timeout lands the end state
+regardless; only the movement is lost. Verified by killing the tick callback: the card still
+arrives.
+
+⚠️ **THE CLOCK STARTS AT THE FIRST FRAME, NOT AT `map`.** Same failure as the CSS version, one
+level down: in a VM the lock's main loop can be busy for >300ms after `map` (cold and warm
+alike), and a clock anchored there hands the first tick a budget that is already spent — so it
+settles immediately and the animation snaps, exactly what this file exists to prevent. Wall
+time between `map` and the first frame is startup cost, not animation. The FROM state still
+goes in `map` (that precondition is untouched); only the counting moves. The watchdog is armed
+from `map` for "no frames ever" and re-armed by the first tick, or a late start would have it
+fire mid-animation. Measured in the VM, before → after:
+
+```
+before:  93 93 93 93 → 72     (four samples of the FROM state, then the end)
+after:   93 … 73 72 72        (0 → 0.65 → 0.98 → 1.00 opacity)
+```
+
+`VELTRIX_ENTRANCE_TRACE=1 veltrix-lock` prints the interpolation — distinct positions mean it
+ran, one value repeated means it snapped. Keep it: this animation was diagnosed three times
+from the log alone, and it is what confirmed the fix on the real surface:
+
+```
++0ms    hero y=93.0 op=0.00 margin=93     card y=614.0 op=0.00 margin=40
++60ms   hero y=87.0 op=0.27               card y=608.0 op=0.27 margin=29
++150ms  hero y=78.0 op=0.73               card y=599.0 op=0.73 margin=11
++450ms  hero y=72.0 op=1.00               card y=594.0 op=1.00 margin=0
+```
+
+21px and 20px of travel, identical opacity at every sample — in lockstep on hardware, not
+just in the compiled sheet. The card's margin running 40→29→11→2→0 against 20px of movement is
+the centring halving, visible in one line.
+
+⚠️ **DO NOT restore `opacity`/`transition` rules for `.greeter-card` or `.greeter-hero` in the
+stylesheet.** They would fight the JS that owns both properties, and on the one surface that
+matters they never worked.
+
+<!-- Rescued 2026-08-11 from the duplicate copy of this file (see the commit that removed it):
+     these rules existed ONLY in the stale copy. The first two are moved verbatim; the
+     never-a-gate one is rewritten against `ui/lib/entrance.ts` as it stands, because the
+     version in the stale copy still described the CSS mechanism that was replaced. -->
+
+⚠️ **The general lesson beyond this file: on a session-lock surface, `map` is not "the screen
+is showing this".** Anything timed from `map` with a wall clock is racing a compositor handshake
+it cannot see.
+
+⚠️ **And an entrance must never be a GATE.** The FROM state hides the card, so a frame clock that
+never ticks would mean an invisible login screen — locked out by a flourish. `ui/lib/entrance.ts`
+carries a watchdog timeout that lands the end state regardless, and calls it a contract rather
+than a fallback for that reason. Any future entrance animation owes the same.
+
+🔑 **Not staggered, and that is a rule rather than a preference: staggering says "these are
+independent peers".** It is right for a list of rows arriving and wrong for the parts of one
+object — a login card that assembles itself out of avatar, name, field and button reads as
+machinery. The whole composition is ONE movement. (Apple's platforms stagger collections, not
+the components of a single control; that part is design reasoning and recollection, not
+something measurable from this repo — unlike every number above it.)
+
+⚠️ **DO NOT MEASURE THESE ANIMATIONS BY SAMPLING FRAMES.** A throwaway probe window only
+advances CSS transitions while the compositor grants it frames, and on a tiling WM it may not:
+a timed probe read **0px of travel and reported it as a pass**, twice, because the transition
+was frozen rather than finished. Measure the TWO STATES instead — add and remove the `-shown`
+class with `transition: none` layered on top, and diff the positions. Frame-independent, and
+it is what determines the travel anyway. See `feedback_prove_the_test_can_fail` in memory.
+
+### The exit is a DELAY, not a transition
+
+🔑 **There is no moment in which an unlock transition could be seen.** The instant
+`Gtk4SessionLock.unlock()` is called the compositor takes the surface down and the session is
+simply there. macOS, iOS and GNOME all cross-fade lock→desktop because they ARE the
+compositor; under `ext-session-lock-v1` we are a client and own only the half that leaves. So
+an exit animation is latency, deliberately spent, and it has to be priced as such.
+
+What makes 150ms worth it is a fact about the wallpaper: **the lockscreen paints the same
+image as the desktop.** Not "unless overridden" — `ui/lib/wallpaper.ts` RESERVES a `surfaces`
+block and `resolveWallpaper` reads it, but nothing writes one and Settings does not expose it,
+so as of 2026-08-10 the two are always identical. ⚠️ **Whoever implements per-surface
+wallpapers has to revisit this exit**: a different lock image makes the held wallpaper
+discontinuous with the desktop and the final cut becomes the thing the fade was bought to
+avoid. Do not add a check before it can happen — there is nothing to detect today.
+
+So `playExit` fades the UI — card, hero, power bar — and HOLDS the wallpaper
+and the scrim. The final cut is then a change of what is *on* the wallpaper rather than a
+change of everything. The bar, the dock and the user's windows still pop in; that half is not
+ours.
+
+⚠️ **The exit covers EVERY monitor.** `buildWindow` runs once per monitor, so the fade targets
+are collected module-wide in `Lock.ts` (`exitTargets`) and one `requestUnlock` dissolves all of
+them. Per-window, a two-screen setup would dissolve the active monitor and hard-cut the other.
+
+⚠️ **`playExit`'s callback is a CONTRACT, not a nicety: it is what unlocks the session.** A
+dropped callback is a user locked out of their own machine, so a timeout fires it regardless of
+the frame clock. Verified by killing the tick callback in the bundle — unlock still runs
+exactly once, at the timeout instead of at 157ms.
+
+**Not done, deliberately:** a spring curve — Apple's real signature is spring physics rather
+than bezier, and `stepSpring` in `DockPhysics.ts` already exists and substeps correctly, so it
+would be its second consumer and the trigger to promote it to `ui/lib/`. Now that the
+animation is a tick loop, it is a drop-in swap for the easing function.
+
+### ⚠️ Text is only crisp when the line box lands on WHOLE PIXELS
+
+Two independent things have to hold, and both are set in `ThemeManager`. The symptom when
+either fails is not "blurry text" — it reads as **the tops of some letters being shaved**,
+which is why it went unfixed for so long: flat-topped glyphs (T E F H I L) put a full-width
+bar on their top row, so losing half its coverage is obvious, while round ones (G O C S) put
+three or four pixels up there and look fine. "In GTK the T is cut but the G isn't" is the
+signature of this bug, not of a clipping one.
+
+🔑 **The cure is ONE global switch, and it is not a font size.** `ui/lib/veltrix-kit/platform/font-rendering.ts` →
+`applyCrispFontRendering()`, called once per bundle before any window exists (shell via
+`ThemeManager.syncFontMetrics`, greeter and lockscreen in their `main()`). It sets
+**`gtk-font-rendering = MANUAL`** *and* `gtk-hint-font-metrics = true`.
+
+⚠️ **`gtk-hint-font-metrics` alone does nothing.** GTK 4.16 added `gtk-font-rendering`, whose
+default `AUTOMATIC` means "GTK decides" — and that includes ignoring the low-level font
+settings, the metric hint among them. Veltrix set the hint from #123 onwards with **zero
+effect**; the fix only landed when the mode went to MANUAL (2026-08-11). Measured, one process
+per configuration, flag set before any widget exists:
+
+| `gtk-font-rendering` | `hint-font-metrics` | Inter 15px | JetBrainsMono 15px |
+|---|---|---|---|
+| AUTOMATIC (the default, what #123 shipped) | true | baseline 14.531 ✗ | 15.300 ✗ |
+| **MANUAL** | **true** | **15.000 ✓** | **16.000 ✓** |
+| MANUAL | false | 14.531 ✗ | 15.300 ✗ |
+
+The third row is the control: MANUAL is only the gate, the hint does the work. Logical heights
+go integral too (mono 15px: 19.80 → 21.00), which is why row geometry stops jittering.
+
+⚠️ **A whole-pixel font size was never the cure**, and believing it was cost three rounds of
+patches. The baseline is `size × ascender/upem`, fractional for essentially every size: a clean
+15px puts JetBrainsMono's baseline at 15.300, while the old 11pt/14.667px was actually CLOSER
+to the grid at 14.209 — exactly why the user reported monospace looking *worse* after the size
+was "fixed". The whole-pixel snap has since been **removed** (it also broke the accessibility
+text scale); see "the font SIZE is not part of this" below.
+
+⚠️ MANUAL also hands `gtk-xft-antialias/hinting/hintstyle/rgba` back to fontconfig, so a machine
+configured for subpixel rendering now gets it instead of AUTOMATIC's grayscale. That is what
+the mode means, but it is a visible change.
+
+🔧 Two GJS limits found on the way, worth knowing before re-investigating: `cairo.FontOptions`
+has **no foreign-type marshaller** (`PangoCairo.context_get_font_options` throws, and it cannot
+be constructed), so font options can only be driven through GtkSettings; and flipping a font
+setting at runtime does not update an existing Pango context — a probe that toggles in-process
+prints two identical tables that look like a result. One process per configuration.
+
+**`gtk-hint-font-metrics = true`** (`syncFontMetrics`, gated by the MANUAL mode above) rounds the
+font's ascent/descent to whole pixels, so the baseline lands ON a row. Measured with the same
+font at the same 14.667px: metrics OFF → ascent `14.208984375`, the T's crossbar smeared across
+two rows (`#######+` over `+++##++.`); metrics ON → ascent `15.0`, one crisp row (`.########`).
+GTK turns this off by default to serve fractional display scaling.
+
+### ⛔ The font SIZE is not part of this, and the DE stores POINTS
+
+This is the trap that ate #123, #124 and most of a third branch, so it is written as a rule:
+**never reach for the font size to fix rendering, and never store an absolute pixel size.**
+
+The reasoning that looked right: the font dialog returns POINTS, at 96dpi `Inter 11` is 14.667px,
+the `$fse-*` ramp is relative so every rung inherits that fraction — therefore snap the anchor to
+a whole pixel (`Inter 14px`, then `Inter 15px`) and the ramp lands on the grid. Two things were
+wrong with it.
+
+1. **It does nothing for crispness.** The hint rounds the ASCENT, and it does that just as well
+   at a fractional size. Measured 2026-08-11, one process per configuration, ascent from a
+   realized widget's own Pango context:
+
+   | config | Inter 11pt (14.667px) | Inter 15px | Mono 11pt | Mono 15px |
+   |---|---|---|---|---|
+   | AUTOMATIC + hint | 14.209 ✗ | 14.531 ✗ | 14.960 ✗ | 15.300 ✗ |
+   | **MANUAL + hint** | **15.000 ✓** | **15.000 ✓** | **15.000 ✓** | **16.000 ✓** |
+   | MANUAL, no hint | 14.209 ✗ | 14.531 ✗ | 14.960 ✗ | 15.300 ✗ |
+
+   The fractional point size is on the grid exactly as much as the whole-pixel one. (Row 3 is the
+   control that makes row 2 mean something — see `feedback_prove_the_test_can_fail`.)
+
+2. **An absolute pixel size breaks accessibility, and no workaround makes it whole.** GTK applies
+   `text-scaling-factor` by multiplying `gtk-xft-dpi` (measured: factor 1.0 → dpi 96, 1.25 → 120,
+   1.5 → 144), and a pixel size is immune to dpi by definition. So `Inter 14px` killed the
+   Accessibility text slider outright. Rescaling the fonts ourselves from an unscaled base —
+   which is what the branch did next — was worse than dead: the effective size was
+   `round(basePx × factor)`, so the whole 0.75–2.0 range held **20 distinct sizes and ~5 of every
+   6 thumb positions changed nothing**, and a mono base of a different size stepped at different
+   positions than the UI. A pixel is the coarsest possible step for a continuous control.
+
+So: **`gtk-font-name` holds a POINT size** (seeded `Inter 11` / `JetBrains Mono 11`, the
+same 11 every install has shipped since PR #6), `ThemeManager.fontToPoints` converts any pick —
+and any px font left by a previous version or by nwg-look/Tweaks — to whole points on the way in,
+and the shell's `core/AppearanceSync.ts` runs it once at start (the px→pt repair) so an upgraded install is repaired. Nothing in
+`ThemeManager` touches the size when the text scale moves: GTK does it, through the dpi,
+continuously (measured: 1.10 → 16.13px, 1.13 → 16.57px, 1.17 → 17.16px).
+
+🔑 **The lesson worth more than the fix**: the anchor is a product decision, the ramp is
+arithmetic, and *the rendering is a toolkit switch*. Three rounds of patches moved the first two
+looking for a result that only ever came from the third. See `feedback_mechanical_over_logic`.
+
+The chrome's fixed `$fs-*` px ramp does NOT follow the factor and never has (macOS behaviour —
+window content scales, the bar and dock do not); `_reset.scss` pins `font-size` on the bar, dock,
+island and app-grid windows, and CC/NC/Prism inherit it by living inside the bar's window.
+
+🔧 To check a suspicion, dump the pixels rather than squinting:
+`magick shot.png -crop WxH+X+Y +repage -colorspace Gray txt:-` and print `#`/`+`/`.` by
+threshold. A crisp horizontal stroke is ONE full-intensity row; a smeared one is two partial
+rows. That is also how the same investigation ruled out the font family, the VM, transparent
+backgrounds and `queue_draw`.
+
+### Naming a place, a language, a keyboard or a timezone — `ui/lib/locale-names.ts`
+
+Three surfaces were answering the same question three ways, and each was locally reasonable:
+the greeter had 12 endonyms by hand and keyboards as CODES (`US`, `ES`, `LATAM`), Settings showed
+`localectl list-locales` raw (`es_ES.UTF-8`), the installer showed 328 endonyms via ICU and
+keyboards as xkb's ENGLISH description. The installer's region page is what made it visible: it
+said "Spanish" to somebody using it in Spanish, and its country list could not find "España".
+
+The vocabulary now lives in `ui/lib/locale-names.ts`. It decides HOW a thing is named; it never
+decides WHICH things exist — that stays each surface's own data.
+
+| | rule |
+|---|---|
+| country | the READER's language (`Intl.DisplayNames`, type `region`) — "España" in a Spanish UI |
+| language / locale | its OWN language, always — the endonym, never translated |
+| keyboard | the endonym of the language it serves, plus the layout code after a `·` |
+| timezone | the IANA name unchanged, `Europe/Madrid` — the same thing Settings lists |
+
+🔑 **Nothing here is a hand-written table.** ICU ships in GJS, so every name is derived — a table
+of country names in twelve languages is a table that goes stale in twelve languages.
+
+⚠️ **A "pick your language" list names the LANGUAGE, not the locale — `languageMenuLabels()`.**
+`Intl.DisplayNames` defaults to its *dialect* naming, which produced three shapes among thirteen rows
+("American English", "español de España", "português europeu" against "français (France)"), and
+every one of those shapes names a TERRITORY that the installer has not asked about yet: the country
+comes on the NEXT page, and `localeFor()` then turns `es_ES` into `es_AR`. So the label is the bare
+endonym, with an initial capital, and the territory appears only where two rows would otherwise read
+the same — Portuguese, and that is computed from the list, not from a table. The capital is against
+the orthography of half of them ("español" is lowercase in running text) and it is deliberate: they
+are entries in an index, GNOME's chooser capitalises them, and **the greeter's list draws from the
+same function**, so the two screens of one product cannot drift apart again. Sorted by that label in
+the READER's collation — alphabetical, like GNOME Initial Setup and Calamares, with no curated
+ranking to defend. `languageHaystack()` is the search twin: endonym + the reader's name + the
+English one, so "aleman" and "german" both find Deutsch.
+
+⚠️ **Whatever answer a page pre-seeds must come from the SAME source as the UI's own language.**
+The installer's welcome page seeds a language on entry so Continue is live from the first frame, and
+it used to seed the literal `en_US.UTF-8` ("what the medium generated") while the UI language came
+from `LANG`/`/etc/locale.conf`. On the ISO the two agree by accident, because the ISO generates no
+other locale; in preview on a Spanish desktop the window came up in Spanish with the tick on American
+English. One question, two sources — the same defect the naming rewrite removed.
+
+⚠️ `countryName()` takes the display locale as an ARGUMENT rather than reading the environment:
+the installer changes its own language at runtime without touching `LANG`, so a function that
+consulted the process locale would keep saying "Spain" after the user switched to Spanish.
+
+⚠️ **A search box must match more than what it displays.** A Spanish list that shows "España" and
+matches only "Spain" is as broken as the English one that could not be found by typing "España" —
+`countryHaystack()` returns the reader's name, the English one and the code.
+
+⚠️ **And it must match what people TYPE, which has no accents.** `searchFold()` is the one
+normalisation both sides go through: NFD, drop the combining marks, lowercase, then a nine-letter
+`FUSED` map for the letters whose diacritic is welded into the glyph and therefore survives NFD —
+`æ œ ø ł đ ð þ ß ı`. Measured over the twelve languages' country names (2026-09-03), only `æ`, `ø`
+("Isole Fær Øer") and `ł` ("Bułgaria") actually occur; the rest are the same class and cost
+nothing. Nothing outside Latin is touched — there is no unaccented way to type Greek or kana. It
+is the one hand-written table in a file whose whole point is not having tables, and it is a fact
+about writing rather than a list of names, so it cannot go stale in any language.
+
+🔑 **A long pick-one list needs three things, and `searchableList()` in
+`ui/installer/steps/common.ts` now has all three:** the fold above on both sides; a RANK (exact
+hit, then prefix, then anywhere, ties keeping the caller's order) so that a two-letter query, which
+is nearly always an ISO code, does not land unsorted among the countries whose names happen to
+contain those letters; and `set_placeholder(VeltrixEmptyRow(…))`, because a filter that matches
+nothing otherwise shows an empty card that reads as a list which failed to load. The haystack is
+folded ONCE per item at construction, not per keystroke — it used to run 249 ICU lookups per letter
+typed.
+
+⚠️ **Do NOT translate xkb's descriptions with gettext, even though it works.**
+`GLib.dgettext("xkeyboard-config", "Spanish")` really does return "Español". But **measured
+2026-09-03: gettext caches the catalogue at first use and ignores a later change to `LANGUAGE`**,
+so a process that starts in `en_US` — which is every process on the live medium, since the ISO
+generates no other locale — keeps answering in English however the UI language changes. The
+endonym needs no catalogue, no process locale and no cache.
+
+⚠️ Two rows that name the same thing two ways read as a bug. Naming a keyboard purely by its
+language made the keyboard row identical to the locale row above it ("español de España" twice,
+for two different questions) — visible only with the page open. The layout code after a `·`
+is what separates them, and it is also the value that actually gets written.
+

@@ -1,0 +1,534 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="veltrix_material_v1">
+  <copyright>
+    SPDX-License-Identifier: MIT
+  </copyright>
+  <description summary="compositor-side materials for Veltrix's glass">
+    A surface declares the shapes of its glass and how the compositor resolves
+    them against what lies behind: the blur's size and passes, per surface.
+    The shapes are exact (rounded rectangles whose corners are superellipse
+    quadrants, the shell's squircle), so the blur never depends on the alpha
+    of the surface's own pixels: a low-alpha shadow next to the glass is not
+    blurred because it is not in a shape.
+  </description>
+
+  <interface name="veltrix_material_manager_v1" version="1">
+    <request name="destroy" type="destructor"/>
+    <request name="get_material">
+      <description summary="the material object of a surface">
+        One per wl_surface; the state is double-buffered on wl_surface.commit.
+      </description>
+      <arg name="id" type="new_id" interface="veltrix_material_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+
+  <interface name="veltrix_material_v1" version="1">
+    <request name="destroy" type="destructor">
+      <description summary="remove the material on the next commit"/>
+    </request>
+    <request name="clear_shapes">
+      <description summary="pending: no shapes (no material)">
+        The ink boxes (add_ink_box) and veil regions (add_veil_region) go
+        with them, the tones (set_tone, set_ink_tone) are reset to none, and
+        the shapes' blur (set_shape_blur) to the surface's. So do the
+        response (set_response), the state regions (add_state_region), the
+        inks (set_ink_colors) and the ink coverage (add_ink_coverage).
+      </description>
+    </request>
+    <request name="add_shape">
+      <description summary="pending: add one glass shape">
+        Surface-local, logical coordinates. corner_radius and exponent
+        describe each corner: a superellipse quadrant of that radius
+        (exponent 2 is a circular arc). Fixed-point values.
+      </description>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+      <arg name="corner_radius" type="fixed"/>
+      <arg name="exponent" type="fixed"/>
+    </request>
+    <request name="set_blur">
+      <description summary="pending: blur size and passes for this surface">
+        size is the kawase offset in logical pixels, passes the number of
+        downsampling levels. passes 0 = no blur. Where the compositor paints
+        the glass (set_glass) the blur is the glass's own, mixed per shape by
+        its size, and this blurs nothing: it is the blur of a surface whose
+        glass its client paints.
+      </description>
+      <arg name="size" type="fixed"/>
+      <arg name="passes" type="uint"/>
+    </request>
+    <request name="set_glass">
+      <description summary="pending: the compositor paints the glass itself">
+        The compositor resolves the whole glass against the real backdrop,
+        per pixel: the blurred backdrop, refracted near the edge; the tone of
+        each shape (set_tone); and a specular rim. The client then paints
+        only its content and state (active fills, hover), not the glass.
+
+        tint_r, tint_g, tint_b, alpha_min, alpha_max, target_luminance and
+        saturation are inert: they drove a tint that thickened per pixel to
+        keep content legible, which set_tone replaced. A shape with no tone is
+        the blurred, refracted backdrop alone.
+      </description>
+      <arg name="tint_r" type="fixed" summary="inert"/>
+      <arg name="tint_g" type="fixed" summary="inert"/>
+      <arg name="tint_b" type="fixed" summary="inert"/>
+      <arg name="alpha_min" type="fixed" summary="inert"/>
+      <arg name="alpha_max" type="fixed" summary="inert"/>
+      <arg name="target_luminance" type="fixed" summary="inert"/>
+      <arg name="refraction" type="fixed" summary="edge displacement, logical px"/>
+      <arg name="rim" type="fixed" summary="specular rim strength, 0..1"/>
+      <arg name="saturation" type="fixed" summary="inert (set_tone's saturation)"/>
+    </request>
+    <request name="clear_glass">
+      <description summary="pending: back to blur only; the client paints its glass"/>
+    </request>
+    <request name="add_shape_clipped">
+      <description summary="pending: add one glass shape, faded and clipped">
+        As add_shape, plus what a toolkit does to the widget that paints
+        the glass. opacity is how FORMED the glass is in this shape, 0..1 —
+        not a coverage: glass appearing materializes. The blur's reach, the
+        refraction, the tint, the rim and the shadow under it all grow with
+        it, so a panel appearing or going sends it every frame (add_shape
+        is 1). The clip rectangle, in the same
+        coordinates, is what of the shape may show: a card scrolled half out
+        of its list is cut straight where the list ends, not rounded. A clip
+        of zero width or height means no clip.
+
+        Shapes are drawn in the order they are added, a later one over an
+        earlier one.
+      </description>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+      <arg name="corner_radius" type="fixed"/>
+      <arg name="exponent" type="fixed"/>
+      <arg name="opacity" type="fixed"/>
+      <arg name="clip_x" type="fixed"/>
+      <arg name="clip_y" type="fixed"/>
+      <arg name="clip_width" type="fixed"/>
+      <arg name="clip_height" type="fixed"/>
+    </request>
+    <request name="add_ink_box">
+      <description summary="pending: where content of one ink group sits">
+        Surface-local, logical coordinates: a box where the client draws
+        content (text, symbolic icons) whose colour it can switch, belonging
+        to the ink group id (a number of the client's choosing, one per pane
+        of glass). A group may have several boxes. Cleared by clear_shapes.
+
+        While set_ink is in force, the compositor measures the darkest point
+        of the backdrop under each group's boxes, as the glass treats it
+        (blurred and saturated, before its tint), and tells the client with
+        the ink event when the group's content should turn dark: only when
+        even that darkest point is brighter than dark_above, and back only
+        when it falls below light_below. Never by an area's average.
+      </description>
+      <arg name="id" type="uint"/>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+    </request>
+    <request name="set_ink">
+      <description summary="pending: measure the ink boxes, with these thresholds">
+        Thresholds are WCAG relative (linear) luminances, 0..1, with
+        light_below below dark_above (the gap is the hysteresis). A shape
+        that holds a group whose ink is dark takes its set_ink_tone. The tint
+        is inert (it was the veil laid over such a shape before set_ink_tone).
+      </description>
+      <arg name="dark_above" type="fixed"/>
+      <arg name="light_below" type="fixed"/>
+      <arg name="tint_r" type="fixed" summary="inert"/>
+      <arg name="tint_g" type="fixed" summary="inert"/>
+      <arg name="tint_b" type="fixed" summary="inert"/>
+    </request>
+    <request name="clear_ink">
+      <description summary="pending: no ink measurement; every group is light again"/>
+    </request>
+    <request name="add_shape_pointed">
+      <description summary="pending: add one glass shape with a pointer">
+        As add_shape_clipped, plus a pointer spliced into one side: a
+        triangle from the shape's edge (its base centred on base_x, base_y,
+        pointer_width wide) to the tip at tip_x, tip_y, whose tip is a
+        circular arc of tip_radius and which meets the shape's edge in a
+        concave arc of base_radius. Body and pointer are one glass: one
+        refraction, one rim. The coordinates are the shape's.
+      </description>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+      <arg name="corner_radius" type="fixed"/>
+      <arg name="exponent" type="fixed"/>
+      <arg name="opacity" type="fixed"/>
+      <arg name="clip_x" type="fixed"/>
+      <arg name="clip_y" type="fixed"/>
+      <arg name="clip_width" type="fixed"/>
+      <arg name="clip_height" type="fixed"/>
+      <arg name="base_x" type="fixed"/>
+      <arg name="base_y" type="fixed"/>
+      <arg name="tip_x" type="fixed"/>
+      <arg name="tip_y" type="fixed"/>
+      <arg name="pointer_width" type="fixed"/>
+      <arg name="tip_radius" type="fixed"/>
+      <arg name="base_radius" type="fixed"/>
+    </request>
+    <event name="ink">
+      <description summary="the content of an ink group should be dark, or light">
+        Sent when a group's decision changes; a group starts light (white
+        content), so the first event for a group is always dark = 1. A group
+        no longer declared keeps its last decision, and so does the client.
+      </description>
+      <arg name="id" type="uint"/>
+      <arg name="dark" type="uint" summary="1: dark content; 0: light"/>
+    </event>
+    <request name="set_lensing">
+      <description summary="pending: the refraction grows with the shape">
+        The edge displacement of each shape of the glass becomes the larger
+        of set_glass's refraction and size_fraction times the shape's shorter
+        side, so a large pane bends its backdrop more than a small control.
+        0 (the initial value) gives every shape set_glass's refraction.
+        Meaningful only while the compositor paints the glass (set_glass).
+      </description>
+      <arg name="size_fraction" type="fixed" summary="of the shape's shorter side, 0..1"/>
+    </request>
+    <request name="set_scrim">
+      <description summary="inert: the shadow under the glass is gone">
+        It laid a shadow under the glass with what a per-pixel tint was
+        missing to keep content legible; set_tone replaced that tint, and
+        nothing is missing any more. Accepted and ignored. Fixed veils
+        (add_veil_region) do not need it.
+      </description>
+      <arg name="max_strength" type="fixed"/>
+      <arg name="size_fraction" type="fixed"/>
+      <arg name="tint_limit" type="fixed"/>
+      <arg name="region_edge" type="fixed" summary="a region's shadow at its rim, as a fraction of its centre's (0..1)"/>
+    </request>
+    <request name="add_scrim_region">
+      <description summary="inert: the shadow under the glass is gone">
+        Accepted and ignored, like set_scrim. A shape inside one is claimed by
+        no veil region.
+      </description>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+      <arg name="falloff" type="fixed"/>
+    </request>
+    <request name="set_fusion">
+      <description summary="pending: the shapes added from now on fuse into one silhouette">
+        The shapes added after this request, until the next set_fusion, belong
+        to fusion group `group` (a number of the client's choosing; 0 = none).
+        The shapes of one group are drawn as ONE pane of glass: the smooth
+        union of their outlines. Two of them closer than `spacing` (logical
+        px) are joined by a bridge that grows as they approach and breaks as
+        they part, and one refraction and one rim follow the whole
+        silhouette. A shape fading out (its opacity) also withdraws from the
+        union, so a bridge to it recedes as it goes. A shape with a pointer
+        fuses with nothing. Reset to 0 by clear_shapes.
+      </description>
+      <arg name="group" type="uint"/>
+      <arg name="spacing" type="fixed" summary="logical px: closer than this, two shapes join"/>
+    </request>
+    <request name="set_fusion_merge">
+      <description summary="pending: how far the current fusion group becomes one shape">
+        The fusion group set by the last set_fusion is drawn `merge` of the
+        way (0..1) from the smooth union of its shapes towards their envelope:
+        ONE shape spanning them all — the bounds of its shapes whose opacity is
+        at least a half, with the smallest of their corner radii. At 1 the
+        group is that one shape, refraction and rim included; on the way, the
+        space between the shapes fills from their middle outwards, and the
+        silhouette never goes past the envelope nor inside the union. Holds
+        for the shapes added after it, until the next set_fusion or
+        set_fusion_merge; reset to 0 by set_fusion and clear_shapes.
+        Meaningless outside a fusion group.
+      </description>
+      <arg name="merge" type="fixed" summary="0..1: the union (0) to the envelope (1)"/>
+    </request>
+    <request name="set_drawn_region">
+      <description summary="pending: the part of the surface its content is drawn in">
+        Surface-local, logical coordinates, like wl_surface.set_opaque_region:
+        the compositor draws the surface's content (its buffer and its
+        subsurfaces') only inside this region, and treats the rest as
+        transparent without sampling it. For a surface far larger than what
+        it paints — a layer the size of the monitor that holds a strip and a
+        panel — so that what changes under it is not blended through its
+        empty pixels. Content outside the region is NOT DRAWN. The glass
+        (the shapes) is not affected: it is the compositor's own.
+
+        A null region, the initial state, is the whole surface. Not cleared
+        by clear_shapes; destroying the material clears it. The region is
+        copied when this request is received, so it may be destroyed at once.
+      </description>
+      <arg name="region" type="object" interface="wl_region" allow-null="true"/>
+    </request>
+    <request name="add_veil_region">
+      <description summary="pending: a FIXED veil under the shapes inside it">
+        Like add_scrim_region — surface-local, logical; every shape whose centre
+        lies inside it is claimed by it — but what it casts is not measured: a black veil of opacity strength (0..1), even
+        under the whole rectangle, falling to nothing over falloff logical
+        pixels outside it as (1 − d/falloff)^exponent. It needs no set_scrim
+        and the backdrop's brightness does not change it. It fades with the
+        shapes' opacity. Cleared by clear_shapes; meaningful only while the
+        compositor paints the glass (set_glass).
+
+        The darkening a group of panes lies on, behind them, rather than a
+        shadow that makes up what the glass lacks.
+      </description>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+      <arg name="falloff" type="fixed"/>
+      <arg name="strength" type="fixed"/>
+      <arg name="exponent" type="fixed" summary="the fall-off's shape outside the rectangle: 1 linear, more falls faster near it"/>
+    </request>
+    <request name="set_tone">
+      <description summary="pending: the tone of the shapes added from now on">
+        How the glass treats the blurred backdrop under the shapes added
+        after this request, until the next set_tone, in this order, on the
+        sRGB-encoded colour:
+
+        1. saturation, about the Rec.709 luma (1 = unchanged);
+        2. ceiling: the luma l is brought to l·(1 − (1 − ceiling)·l), so
+           white ends at ceiling and the mid tones bend towards it
+           (1 = unchanged);
+        3. levels: lift + (gain − lift)·v, where black lands and where
+           white would (0 and 1 = unchanged);
+        4. wash: the colour wash_r, wash_g, wash_b laid over at opacity
+           wash_a (0 = none);
+        5. ambient: what surrounds the pane, blurred far wider than the
+           glass (0.35 of the shape's shorter side), mapped by
+           ambient_lift + (ambient_gain − ambient_lift)·w, lightens what
+           is darker than it, at an opacity of ambient times how large the
+           shape is — none for a shorter side up to 64 logical px, all of
+           it from 160 (0 = none).
+
+        All of it grows with how formed the shape is. Reset to none (the
+        backdrop as it is, blurred and refracted) by clear_shapes.
+      </description>
+      <arg name="saturation" type="fixed"/>
+      <arg name="ceiling" type="fixed" summary="0..1, 1 = unchanged"/>
+      <arg name="lift" type="fixed"/>
+      <arg name="gain" type="fixed"/>
+      <arg name="wash_r" type="fixed"/>
+      <arg name="wash_g" type="fixed"/>
+      <arg name="wash_b" type="fixed"/>
+      <arg name="wash_a" type="fixed"/>
+      <arg name="ambient" type="fixed" summary="0..1, its opacity on a large shape"/>
+      <arg name="ambient_lift" type="fixed"/>
+      <arg name="ambient_gain" type="fixed"/>
+    </request>
+    <request name="set_ink_tone">
+      <description summary="pending: the tone of those shapes while their content is dark">
+        The tone (as set_tone) a shape added after this request takes while
+        its ink group's content is dark (set_ink). Until it is set — and
+        after set_tone and clear_shapes, which reset it — a shape keeps its
+        set_tone whatever its ink.
+      </description>
+      <arg name="saturation" type="fixed"/>
+      <arg name="ceiling" type="fixed"/>
+      <arg name="lift" type="fixed"/>
+      <arg name="gain" type="fixed"/>
+      <arg name="wash_r" type="fixed"/>
+      <arg name="wash_g" type="fixed"/>
+      <arg name="wash_b" type="fixed"/>
+      <arg name="wash_a" type="fixed"/>
+      <arg name="ambient" type="fixed"/>
+      <arg name="ambient_lift" type="fixed"/>
+      <arg name="ambient_gain" type="fixed"/>
+    </request>
+    <request name="set_shape_blur">
+      <description summary="pending: the blur of the shapes added from now on">
+        The blur (as set_blur: the kawase offset in logical pixels and the
+        number of passes) of the shapes added after this request, until the
+        next set_shape_blur, in place of the surface's. passes 0 = the
+        surface's blur (set_blur). Reset to it by clear_shapes. Like set_blur,
+        it blurs only a surface whose glass its client paints: where the
+        compositor paints the glass (set_glass), a large pane already blurs
+        further than the small controls beside it, by its size.
+      </description>
+      <arg name="size" type="fixed"/>
+      <arg name="passes" type="uint"/>
+    </request>
+    <request name="set_shadow">
+      <description summary="pending: the shadow of the shapes added from now on">
+        The shadow the shapes added after this request cast, until the next
+        set_shadow: black, blurred (a gaussian of the given deviation, logical
+        pixels), moved offset logical pixels down, and only OUTSIDE the
+        surface's shapes — never under a pane's own glass. Its opacity and
+        blur follow how large each shape is, from the small values for a
+        shorter side up to 64 logical px to the large ones from 160, linearly
+        between (the ramp of set_tone's ambient). Blended on the
+        sRGB-encoded colour. It fades with the shape's opacity. Reset to none
+        by clear_shapes; meaningful only while the compositor paints the
+        glass (set_glass). opacity_large 0 = none.
+      </description>
+      <arg name="opacity_small" type="fixed" summary="0..1"/>
+      <arg name="opacity_large" type="fixed" summary="0..1"/>
+      <arg name="blur_small" type="fixed" summary="the gaussian's deviation, logical px"/>
+      <arg name="blur_large" type="fixed" summary="the gaussian's deviation, logical px"/>
+      <arg name="offset" type="fixed" summary="down, logical px"/>
+    </request>
+    <request name="set_window_background">
+      <description summary="pending: the window's background colour, opaque">
+        On a toplevel's surface: the colour of the window's background,
+        sRGB-encoded, 0..1, opaque — the client paints no background of its
+        own under its content. The compositor draws it behind the window's
+        content with the window's corners, at the opacity the user chose for
+        windows, and blurs what is behind it as it blurs any translucent
+        window. It is not glass: the shapes, tones and glass of this object
+        do not apply to it, and clear_shapes leaves it. Persists until
+        unset_window_background.
+      </description>
+      <arg name="r" type="fixed"/>
+      <arg name="g" type="fixed"/>
+      <arg name="b" type="fixed"/>
+    </request>
+    <request name="unset_window_background">
+      <description summary="pending: no window background (the client paints its own)"/>
+    </request>
+    <enum name="window_background_level">
+      <entry name="follow" value="0" summary="what the user chose for windows (the default)"/>
+      <entry name="opaque" value="1" summary="always opaque"/>
+      <entry name="tinted" value="2" summary="the colour of what is behind comes through, heavily blurred"/>
+      <entry name="translucent" value="3" summary="less opaque, less blurred: what is behind shows"/>
+    </enum>
+    <request name="set_window_background_level">
+      <description summary="pending: how this window's background shows">
+        By default a window's background (set_window_background) shows as
+        the user chose for windows. An app that wants its own look asks for
+        a level here; the compositor decides the opacity and the blur each
+        level has, and the user's reduce transparency still makes it
+        opaque. Persists until set again (follow to go back).
+      </description>
+      <arg name="level" type="uint" enum="window_background_level"/>
+    </request>
+    <request name="set_shape_grade">
+      <description summary="pending: the blur of the shapes added from now on, graded top to bottom">
+        How strongly the shapes added after this request blur what is
+        behind them, from their top edge to their bottom edge, until the
+        next set_shape_grade: 1 = the shape's whole blur, 0 = what is
+        behind as it is, linear between (a progressive blur — a title bar
+        over content scrolling under it, blurred most at the window's top
+        and not at all at its own bottom edge). Only the blur is graded:
+        the tone, the rim and the refraction are not. top 1 and bottom 1 =
+        the shape's blur everywhere, the default; reset to it by
+        clear_shapes. Values are clamped to 0..1.
+      </description>
+      <arg name="top" type="fixed" summary="the blur's strength at the shape's top edge, 0..1"/>
+      <arg name="bottom" type="fixed" summary="the blur's strength at the shape's bottom edge, 0..1"/>
+    </request>
+    <enum name="error">
+      <entry name="invalid_region" value="0" summary="add_ink_coverage: not finite, empty, or overlapping another"/>
+    </enum>
+    <request name="set_response">
+      <description summary="pending: the shapes added from now on answer their backdrop">
+        Applies to the shapes added after this request, like set_tone, until
+        the next set_response; reset to none by clear_shapes. All 0 = none.
+
+        The compositor measures each such shape's backdrop on the capture it
+        draws the glass from, before the glass's tone: the mean WCAG relative
+        luminance L over the shape's bounds (on the blur the ink is measured
+        on), and its standard deviation sigma on the soft blur — the full one
+        would erase the difference between a white page and text on white.
+        It takes r = smoothstep(luma_low, luma_high, L) and
+        c = smoothstep(contrast_low, contrast_high, sigma), each easing to a
+        new value over settle_ms milliseconds (0: at once).
+
+        The shape's tone is then set_tone's mixed towards set_ink_tone's by
+        r, every stage (none set: set_tone's alone); its shadow's opacity
+        (set_shadow) is multiplied by 1 + shadow_white·r + shadow_text·c;
+        and the ink of the coverage over it (add_ink_coverage) is
+        set_ink_colors' light mixed towards its dark by the same r, in the
+        same frame. A shape that answers its backdrop ignores set_ink's
+        decision; the measurement never waits for the GPU, and the pane's
+        own output is never part of it.
+      </description>
+      <arg name="luma_low" type="fixed" summary="WCAG luminance where r starts rising from 0"/>
+      <arg name="luma_high" type="fixed" summary="where r reaches 1"/>
+      <arg name="contrast_low" type="fixed" summary="the deviation where c starts rising from 0"/>
+      <arg name="contrast_high" type="fixed" summary="where c reaches 1"/>
+      <arg name="shadow_white" type="fixed" summary="the shadow's gain over a light backdrop (r)"/>
+      <arg name="shadow_text" type="fixed" summary="its gain over a busy one (c)"/>
+      <arg name="settle_ms" type="uint" summary="how long r and c take to reach a new value"/>
+    </request>
+    <request name="add_state_region">
+      <description summary="pending: a wash over the toned glass, within a rounded rectangle">
+        Surface-local, logical coordinates: the colour r, g, b (sRGB, 0..1)
+        laid over the glass at opacity a, inside the rectangle with circular
+        corners of corner_radius, and only where there is glass (the shapes).
+        It is what a button's hover or press is over glass: the backdrop
+        still shows through it.
+
+        id is the client's (a button's). When a committed state changes the
+        wash of an id the compositor drew, the wash eases from what was shown
+        to the new one over fade_ms milliseconds (0: at once) — so an id the
+        client keeps declaring at alpha 0 fades its wash out. An id absent
+        from the committed state is gone at once. Cleared by clear_shapes,
+        so it is declared again with the shapes; meaningful only while the
+        compositor paints the glass (set_glass).
+      </description>
+      <arg name="id" type="uint"/>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+      <arg name="corner_radius" type="fixed"/>
+      <arg name="r" type="fixed"/>
+      <arg name="g" type="fixed"/>
+      <arg name="b" type="fixed"/>
+      <arg name="a" type="fixed"/>
+      <arg name="fade_ms" type="uint"/>
+    </request>
+    <request name="set_ink_colors">
+      <description summary="pending: the two inks the coverage is drawn in">
+        sRGB, 0..1: the ink over a dark backdrop (light) and over a light one
+        (dark). The coverage (add_ink_coverage) is drawn in light mixed
+        towards dark by the r of the shape under it (set_response). Until it
+        is set, and after clear_shapes, there is no ink: the coverage is
+        drawn as the client painted it.
+      </description>
+      <arg name="light_r" type="fixed"/>
+      <arg name="light_g" type="fixed"/>
+      <arg name="light_b" type="fixed"/>
+      <arg name="light_a" type="fixed"/>
+      <arg name="dark_r" type="fixed"/>
+      <arg name="dark_g" type="fixed"/>
+      <arg name="dark_b" type="fixed"/>
+      <arg name="dark_a" type="fixed"/>
+    </request>
+    <request name="add_ink_coverage">
+      <description summary="pending: where the surface's buffer is ink, recoloured by the compositor">
+        Surface-local, logical coordinates: inside this rectangle the
+        surface's own buffer is coverage — glyphs, symbolic icons, a focus
+        ring, painted premultiplied in any opaque colour — and the
+        compositor draws it in the ink (set_ink_colors) instead: each pixel
+        becomes the ink's colour at the ink's alpha times the buffer's
+        alpha. So the glyphs follow the backdrop with the glass under them,
+        in the same frame, with no repaint by the client.
+
+        When override_a is above 0 the rectangle takes the override's colour
+        instead of the mix: the contrasting ink of a destructive button's
+        feedback (the client passes its exported ink there).
+
+        Rectangles must not overlap; outside them the buffer is drawn as it
+        is. A value that is not finite, a width or height at most 0, or a
+        rectangle overlapping one already added is the protocol error
+        invalid_region; rectangles are clipped to the surface. Cleared by
+        clear_shapes.
+      </description>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+      <arg name="width" type="fixed"/>
+      <arg name="height" type="fixed"/>
+      <arg name="override_r" type="fixed"/>
+      <arg name="override_g" type="fixed"/>
+      <arg name="override_b" type="fixed"/>
+      <arg name="override_a" type="fixed"/>
+    </request>
+  </interface>
+</protocol>

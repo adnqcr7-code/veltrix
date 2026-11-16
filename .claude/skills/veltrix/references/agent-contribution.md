@@ -1,0 +1,354 @@
+# Veltrix — Working as a user's agent: where a change belongs, and contributing it back
+
+Veltrix is **AI-native**: it ships this skill so that any user running Claude Code
+(or a similar agent) can extend, customize, fix, and improve their desktop — and, when a
+change helps *everyone*, propose it back upstream so the whole community benefits.
+
+If you are an agent helping someone with their **installed** Veltrix, read this
+before making changes. It answers two questions:
+
+1. **Where does this change belong?** — the user's local config, a new Setting, or the
+   project's shared code.
+2. **Should it go upstream?** — and if so, how to propose it as a PR, with the user's
+   consent and almost none of the git/PR mechanics landing on them.
+
+> The golden rule: **classify every change before you make it.** Don't pick a "mode" for
+> the whole session — route each change to its correct destination.
+
+---
+
+## Step 1 — Classify the change: personal, setting, or global
+
+Three buckets. Decide which one each change is BEFORE writing code.
+
+### 🟦 PERSONAL — stays on this machine, never PR'd
+A choice that reflects *this user's taste, hardware, or workflow*. Belongs in the **config
+layer** (`~/.config/veltrix/` — see `references/dev-workflow.md` for the ownership
+model). Other users would reasonably want it different.
+
+Examples (real):
+- Accent colour / theme tokens tuned to taste (e.g. a pink accent).
+- Dock pinned apps, dock size/position, magnification preference.
+- Keybinds added in `hyprland-user.lua`; autostart entries.
+- Wallpaper; keyboard layout (`veltrix-settings.lua`); monitor mode/scale
+  (`veltrix-monitor.lua`) — these are per-machine by definition.
+- A widget or script only meaningful to one person's setup.
+- **"When X happens, do Y"** — recolour my terminal when dark mode flips, back something up when an
+  update lands, mute the speakers when the battery goes low. That is a **user hook**: an executable
+  in `~/.config/veltrix/hooks/<event>.d/`, no rebuild, nothing to PR. Run `veltrix-hook --list` for the
+  events and see `references/user-hooks.md`. Reach for it before patching shell code for one person —
+  a hook survives every update, and a patch has to be rebased onto each one.
+
+### 🟩 MAKE-IT-A-SETTING — the capability is global, the value is personal
+The user wants *a specific value*, but **other users would want a different value of the
+same knob**. Don't hardcode their value — add the knob to the Settings UI (data in JSON),
+then their choice stays PERSONAL while the **new knob** is a GLOBAL improvement worth a PR.
+
+This is the most important and most missed bucket. Default here whenever you're tempted to
+hardcode a preference.
+
+Examples (real):
+- "Make the dock bigger" → if the desired size is outside the slider's range, *raising the
+  range / adding the size option* is global; the chosen size stays local.
+- "I want this clock format / this icon for app X" → the per-app icon override and format
+  options are already Settings features; use them (local), don't fork code.
+- A new colour palette the user likes → the palette *is data* (local), but a new palette
+  *engine capability* (e.g. a new token slot) is global.
+
+**Two things do NOT deserve to be a Setting, however personal they feel:**
+
+1. **A visibility toggle that strands the user.** If hiding a chrome element removes the
+   only route to a capability with no replacement, it is a footgun, not a preference.
+   Concretely (0.6.0): the bar's `showSystemMenu` toggle hid the launcher capsule, which
+   owns the ONLY GUI path to log out / restart / shut down — and the exit-session keybind
+   is deliberately not shipped (`hyprland.lua`). It was removed. Every DE that is not an
+   explicit panel-builder (Plasma) makes the same call: macOS, GNOME and Windows let you
+   toggle informational items but never the control that governs leaving the session. Test
+   before adding one: *"with this off, is there still a way to do the thing?"* If the honest
+   answer is "the config layer", it belongs there, not in Settings.
+2. **A toggle whose label no longer matches its blast radius.** A setting is a promise about
+   what it does. When the surface under it grows, the promise silently gets bigger too — and
+   nobody re-reads old labels. Same release: `showWorkspaces` ("Show the workspace switcher
+   in the center") kept hiding the bar's centre box after the Activity Island moved in, so it
+   was quietly switching off media, recording and AI indicators — including the shell's ONLY
+   live-capture indicator, letting you screen-record with nothing on screen saying so, which
+   is test 1 all over again. It was removed, not renamed. **When you move a surface into a
+   slot an existing toggle controls, that toggle is part of your change** — re-read its label
+   and its key name in the same PR.
+
+**Renaming a mislabelled toggle is not automatically the fix.** The first attempt at the one
+above was `showWorkspaces` → `showIsland` with honest copy, and it was still wrong twice over:
+the recording hole survived the rename, and the new name over-promised in the other direction
+— the island's expanded modes are separate overlay children (of the island's own surface then,
+of the bar's since #708 point 3), so Super+A, Super+W and the battery alert opened regardless of the
+setting. When a label is wrong, **first ask what the honest setting would do, then ask whether
+anyone should want it.** A truthful name on a setting nobody should have just documents the
+footgun.
+
+### 🟥 GLOBAL — improves the DE for everyone; propose a PR (with consent)
+Correctness, compatibility, performance, accessibility, or a genuinely reusable capability.
+Nothing about it is specific to one user's taste.
+
+Examples (real, straight from this project's history):
+- **Hardware compatibility:** NVIDIA GPU autodetection; a fix for WiFi/Bluetooth widgets
+  when no adapter is present; a per-GPU workaround. *This is the highest-value category —
+  the maintainer often cannot reproduce it without the user's hardware.*
+- **Bug fixes:** the vertical-dock hover/leave jump; Cairo fractional-rect truncation in
+  the input region; the Settings `.desktop` being shadowed by a dangling symlink; a Pixman
+  warning on dark/light toggle.
+- **Missing capability that benefits all:** a portal backend so libadwaita apps follow the
+  accent (done — and the rule it set is that apps read the portal, never a Veltrix-private
+  channel: architecture.md, "The appearance contract"); a new reusable `veltrix-*` component.
+- **Performance / robustness:** reducing redraws, fixing a crash, de-duplicating logic.
+
+### When unsure → ask the user, default to PERSONAL
+Phrase it plainly: *"Is this a personal preference for your setup, or a fix/feature other
+users would want too?"* If still unsure, keep it local. A missed upstream contribution
+costs nothing; a noisy or taste-specific PR costs the maintainer review time and trust.
+
+---
+
+## Step 2 — Route it
+
+- **PERSONAL** → **first try `veltrix-ipc setConfig <key> <value>`** (discover keys with
+  `veltrix-ipc describeConfig`; if your client has the `veltrix` MCP server
+  registered, the same doors are the `describe_config`/`set_config`/`screenshot` tools) —
+  it validates, persists and live-applies through the owning service, no reload needed. If the setting isn't exposed there yet, write to the
+  config layer (`~/.config/veltrix/`, `hyprland-user.lua`, Settings UI) — and
+  consider exposing it in `config-entries.ts` as a small GLOBAL improvement. Never edit
+  shared repo code for a personal preference. See the config ownership model in
+  `references/dev-workflow.md`.
+- **MAKE-IT-A-SETTING** → add the knob (follow the widget-registry / Settings conventions),
+  set the user's value through it, and treat the *new knob* as a GLOBAL change.
+  If what you are adding is a **bar pill or a Control-Centre tile**, that is one file and
+  `references/writing-a-widget.md` is the whole of it — vocabulary, template, and the
+  boundary CI enforces.
+- **GLOBAL** → if you already know this is headed upstream, do the **Step 2½** existing-PR
+  check *first* (it may already be done). Then make the change in repo code following all
+  conventions (the ten commandments, scoped CSS, `Status.ts`/`ShellActions`, no hardcoded
+  colours…), and go to Step 3. If the fix stays on this machine instead (user declines the
+  PR, or it's pending review), see **Carrying a GLOBAL fix locally** below — repo edits do
+  not survive updates unless you carry them.
+
+---
+
+## Step 2½ — Before you build it: check it isn't already proposed upstream
+
+Only when this GLOBAL change is **headed for a PR** — you and the user intend to contribute it
+back. For a GLOBAL fix the user only wants on their own machine, skip this (zero friction). Do
+it **before** investing in the full implementation: someone may already have done the work, and
+finding that out now is the difference between a five-minute check and a wasted afternoon.
+
+Best-effort and read-only. `gh` needs network → run sandbox-off. If `gh` is missing or
+unauthenticated, don't block: note it in one line and proceed to Step 3.
+
+```bash
+# is it already proposed?
+gh pr list --repo adnqcr7-code/veltrix --state open \
+  --search "<keywords from the change>" --json number,title,url,updatedAt,isDraft
+# and glance at recently merged — a fix can be merged but not yet in a release
+# (the update channel is tag-based), in which case the user just needs to update:
+gh pr list --repo adnqcr7-code/veltrix --state merged \
+  --search "<keywords>" --limit 5 --json number,title,url,mergedAt
+```
+
+What you find decides the move — and **the user always decides**; you never act on a match
+silently:
+- **An open PR already covers it** → stop coding. Show the user the PR and offer to 👍, comment,
+  or just track it. Don't open a competing duplicate.
+- **An open PR is partial or stalled** → the user's call: improve on it (a comment naming the
+  gap), or proceed with a cleaner one that *references* the prior PR so the maintainer can
+  consolidate rather than review two.
+- **A match is already merged but unreleased** → the fix exists; advise `veltrix-update`
+  (or waiting for the next tag) instead of re-implementing it.
+- **No match, or `gh` unavailable** → proceed to Step 3 normally; just note that you checked (or
+  couldn't).
+
+---
+
+## Step 3 — Proposing a global change upstream (PR protocol)
+
+The aim: the **user** barely has to know what a PR is, while the **maintainer** receives a
+clean, reviewable, conventions-respecting contribution. You do the mechanics; the user gives
+informed consent.
+
+**Never** open a PR without explicit user confirmation in this session. **Never** assume
+auto-merge — every PR is human-reviewed.
+
+> If the intent to contribute only firmed up now and you skipped **Step 2½**, run that
+> existing-PR check before pushing — don't duplicate a PR that's already open.
+
+1. **Self-review FIRST.** Re-read the ten commandments (SKILL.md) and the relevant reference.
+   Confirm the change violates none. If it touches the dock, edit `DockCore.tsx` / `DockAxis.ts`
+   (not the thin H/V wrappers), and account for any area flagged in `references/tech-debt.md`.
+2. **Make CI-passable.** CI gates the SCSS compile AND the typecheck. Run
+   `cd ui/shell && npm run build` and `npm run typecheck` (regenerate `@girs/` first if
+   missing — `./scripts/gen-types.sh`). A red PR wastes everyone's time.
+3. **Gather evidence.** Run `veltrix-doctor` and attach its Markdown report — it
+   captures versions, hardware (GPU, adapters), monitor state, and recent log errors in one
+   shot. Especially for hardware/compat fixes, add what was broken and what you verified
+   after. The maintainer likely can't reproduce it — your evidence IS the test.
+4. **Ask the user.** Summarize the change, that it's a general improvement, and that you'd
+   like to open a PR to `github.com/adnqcr7-code/veltrix` under their GitHub account.
+   Proceed only on a clear yes.
+5. **Branch, fork, PR.** The user almost certainly cloned the upstream repo directly and has
+   **no push access and no fork** — so you cannot push a branch to `adnqcr7-code/veltrix`.
+   Create the branch locally, then fork explicitly (don't rely on `gh pr create`'s interactive
+   fork prompt — it hangs a non-interactive agent), push to the fork, and open a cross-repo PR.
+   **Every commit must be DCO-signed (`git commit -s`)** — the `Signed-off-by` is the *human
+   user* taking responsibility that the contribution is theirs to submit under the GPL (required;
+   a maintainer won't merge unsigned commits — see `CONTRIBUTING.md`):
+   ```bash
+   git checkout -b fix/nvidia-cursor-glitch
+   git commit -s ...                           # -s = DCO Signed-off-by (REQUIRED, the user's identity); end the body with the Co-Authored-By trailer
+   gh repo fork --remote --remote-name fork    # creates the user's fork + adds it as remote 'fork'
+   git push -u fork HEAD
+   GH_USER=$(gh api user --jq .login)
+   gh pr create --repo adnqcr7-code/veltrix \
+     --head "$GH_USER:fix/nvidia-cursor-glitch" \
+     --title "fix(nvidia): …" --body-file <PR body>
+   ```
+   Fill the PR template fully and **tick its "prepared with an AI coding agent" checkbox** — a
+   GitHub Action applies the `agent-submitted` label from that (or from the `Co-Authored-By`
+   trailer). Do **not** pass `--label agent-submitted`: an external contributor lacks the triage
+   permission to set labels, so it would error. If the user already has a fork, `gh` reuses it.
+
+   **After opening, an automated triage comment appears on the PR** (deterministic — no AI
+   reads it, no PR code runs). React to its labels like this:
+   - `needs-evidence` → the template is incomplete. Fix it by **editing the PR description**
+     (`gh pr edit <n> --repo adnqcr7-code/veltrix --body-file <fixed body>`), completing
+     the missing checkboxes/sections **honestly — never tick a box that isn't true**. The label
+     and the comment clear automatically on the next run.
+   - `guardian-files` → the diff touches protected paths; it means a longer human review, not a
+     rejection. Don't try to work around it.
+   - Do not attempt to remove labels or argue with the bot comment; it's metadata for the human
+     reviewer, who makes every decision.
+6. **Keep personal bits out.** Strip the user's accent, wallpaper, pinned apps, keybinds,
+   layout — anything PERSONAL — from the diff. A global PR contains only the global change.
+7. **Hand back the link.** Give the user the PR URL and tell them a maintainer will review;
+   it is not merged automatically.
+
+---
+
+## Step 4 — When MORE THAN ONE PR is open (the ordering rules)
+
+One PR at a time needs no rules. Two do, and the failure is not conflicts in the ordinary sense
+— it is that **`main` moves and every open branch silently goes stale**. All of the below is
+from a single afternoon (2026-08-11) in which three PRs — fonts, Settings geometry, and a skill
+dedupe — spent longer being untangled than being written.
+
+### The two facts that cause everything else
+
+1. **This repo SQUASH-merges.** A merged PR reaches `main` as ONE new commit with a new hash.
+   Your branch's original commits, whatever they said, no longer exist there.
+2. **`main` requires branches to be UP TO DATE** (branch protection,
+   `required_status_checks.strict = true`). So every merge marks every other open PR `BEHIND`,
+   and GitHub refuses to merge it until you rebase — even when nothing conflicts.
+
+Together: *the merge of PR A invalidates PR B mechanically, regardless of content.* That is not
+GitHub misbehaving and it is not something to fix by clicking harder.
+
+### The rules
+
+- **Branch from FRESH `origin/main`, every time.**
+  `git fetch origin && git switch -c <name> origin/main`. Branching off the branch you were
+  just on drags its commits into the new PR — and after the first one squash-merges, they
+  become unmergeable duplicates of work that is already in `main`.
+- **Prefer to finish one before opening the next** when they touch the same files. Two PRs
+  appending to `tech-debt.md` WILL conflict at the tail; that is a property of the file, not
+  bad luck.
+- **Stacking is allowed, but declare it.** Set the PR's base to the parent BRANCH (not `main`)
+  and say so in the first line of the body, with the reason. A stacked PR based on `main`
+  instead would delete or duplicate work that has not merged yet.
+- ⚠️ **After the parent merges, do NOT fix a stacked branch by resolving conflicts.** The
+  conflicts are its own commits meeting their squashed copy, and resolving them by hand
+  re-applies work that is already in. Replay only your own commit:
+
+  ```bash
+  git fetch origin
+  git rebase --onto origin/main <the-parent-branch-tip-you-branched-from> <your-branch>
+  gh pr edit <n> --base main       # GitHub retargets stacked PRs, but check
+  git push --force-with-lease
+  ```
+
+- **Immediately before merging any PR:** `git fetch origin && git rebase origin/main &&
+  git push --force-with-lease`, then let CI finish. Skipping this is what `BEHIND` means.
+- **Merge order:** anything another PR is stacked on goes first. Among independent PRs, merge
+  the one touching the SHARED documents (`tech-debt.md`, the skill references) LAST — it is the
+  one guaranteed to need a rebase, so make it rebase once instead of making everything else
+  rebase around it.
+- **When two PRs both edit a shared doc, the one merging SECOND owns the reconciliation.** Keep
+  both entries. If your change makes a claim in the other's entry false, strike it through with
+  a pointer to what settled it — never delete it silently, or the record loses why it changed.
+  (Deuda #62's collapse-breakpoint bullet was retired exactly this way by #63.)
+
+### Reading CI: trust the RUN, not the check list
+
+GitHub sometimes leaves a job's record `in_progress` inside a run that has already finished.
+Seen twice in one afternoon, on different jobs each time, with the PR page showing a pending
+check and the merge button blocked. The run is the truth:
+
+```bash
+gh pr view <n> --json statusCheckRollup --jq '.statusCheckRollup[0].detailsUrl'   # → runs/<id>
+gh api repos/<owner>/<repo>/actions/runs/<id> --jq '"\(.status)/\(.conclusion)"'
+```
+
+`completed/success` means green, whatever the checks list says. Do not re-push an empty commit
+to "re-trigger" — that runs the whole suite again to learn what you already know.
+
+---
+
+## Carrying a GLOBAL fix locally (not contributed — yet)
+
+Sometimes a GLOBAL-bucket change stays on this machine: the user declines the PR, it's
+still under review, or it was rejected. Repo-code edits do NOT survive updates on their
+own — the release channel reinstalls pure upstream from the release tarball
+(`veltrix-update`'s GITHUB path re-runs the release's bootstrap), so an uncarried local fix silently vanishes on the next update. If it stays
+local, YOU carry it:
+
+1. **Commit it — never leave it loose.** In a kept clone of the repo, commit the fix on a
+   branch named **`local/patches`**, created from the currently installed release tag
+   (`git checkout -b local/patches vX.Y.Z`). One commit per fix, clear message. Never
+   leave repo edits uncommitted, and never commit them to `main`.
+2. **Register the carry.** Write the clone's absolute path to `~/.config/veltrix/.patches`.
+   That marker makes `veltrix-update` refuse a blind update instead of silently dropping
+   the patches — and lets a future agent session (maybe not you) find the clone.
+3. **Updating a patched install** (the procedure `veltrix-update`'s refusal points at):
+   ```bash
+   cd "$(cat ~/.config/veltrix/.patches)"
+   git fetch origin 'refs/tags/v*:refs/tags/v*'   # release tags only — never --tags
+   git rebase "$(git tag -l 'v*' --sort=-v:refname | head -1)" local/patches
+   ./install.sh --update-apply
+   ```
+   A conflict means the fix needs rework for the new release — resolve it with the user.
+   A patch that was merged upstream in the meantime is dropped by the rebase
+   automatically: the stack shrinks to zero as fixes land.
+   `--update-apply` does not touch `~/.config/veltrix/.release`: after the
+   rebase, write the new tag (without the leading `v`) into it yourself, or
+   the update check will keep announcing a release that is already installed.
+4. **When the stack empties** (all merged upstream or discarded), or the user deliberately
+   reinstalls pure upstream: delete `~/.config/veltrix/.patches` so plain `veltrix-update`
+   works again.
+
+Contributing (Step 3) stays the default: a carried patch is a standing cost the user pays
+on every update; a merged one is free forever.
+
+---
+
+## For maintainers (how this lands on our side)
+
+These PRs arrive from many users' agents, of varying quality and origin. Treat the skill as
+a funnel that *shapes* contributions, never as a merge gate:
+
+- **Branch protection on `main`**; CI required; **no auto-merge, ever.**
+- A deterministic triage workflow (`.github/workflows/triage.yml`) pre-chews every PR:
+  labels (`agent-submitted`, `guardian-files`, `needs-evidence`) plus one sticky summary
+  comment, all computed from metadata only — it never executes PR code and contains no AI.
+  The AI-assisted review itself happens on the maintainer's machine, on demand.
+- Triage via the `agent-submitted` label; require the PR template's hardware/testing evidence.
+- Reward the high-value long tail: hardware/compat fixes the maintainer can't reproduce solo.
+- When a contribution changes behaviour or conventions, the PR must also update the relevant
+  skill reference — the skill is versioned with the code (single source of truth).
+
+See also: `references/dev-workflow.md` (config ownership model — the personal/global seam),
+SKILL.md (the ten commandments), `references/tech-debt.md` (known-issue checks).

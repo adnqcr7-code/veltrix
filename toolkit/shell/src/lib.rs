@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+//! The Rust shell process, starting with the dock (#959 D1). The design is DOCK.md;
+//! the contract it implements is session/design/APPLICATIONS1-DOCK.md.
+pub mod actions;
+pub mod apps;
+pub mod attention;
+pub mod autohide;
+pub mod bar;
+pub mod barmodel;
+pub mod bubble;
+mod capture;
+pub mod cc;
+mod ccauth;
+pub mod ccaux;
+pub mod ccdata;
+pub mod cclayout;
+pub mod chooser;
+pub mod cycle;
+pub mod dock;
+mod dropfiles;
+pub mod drops;
+pub mod geometry;
+pub mod hub;
+pub mod hyalo;
+pub mod keys;
+pub mod launcher;
+pub mod material;
+pub mod menu;
+pub mod model;
+pub mod nc;
+pub mod nc_view;
+pub mod notification_card;
+pub mod notification_wire;
+pub mod notifications;
+pub mod paths;
+pub mod popup;
+pub mod prefs;
+pub mod reorder;
+pub mod resize;
+pub mod semantics;
+pub mod shell1;
+pub mod spring;
+pub mod status;
+pub mod thumbs;
+pub mod tooltip;
+pub mod trash;
+pub mod tray;
+
+pub mod icon_metrics;
+
+pub mod icon_memory;

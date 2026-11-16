@@ -1,0 +1,114 @@
+/* ==========================================================================
+   VELTRIX DESIGN SYSTEM - BASE TOKENS (V3000)
+   ========================================================================== */
+
+// The mode-INDEPENDENT half of the system (type ramp, weights, spacing scale,
+// motion curves, radius ladder) lives in `ui/lib/veltrix-kit/styles/_tokens.scss` so the
+// greeter and lockscreen bundles consume the same decisions instead of their own
+// copies. It is forwarded from here, so every `@use 'base' as *` keeps seeing
+// `$fs-*`, `$space-*`, `$veltrix-radius-*` … exactly as before.
+//
+// What stays in THIS file is what only the shell has: the colour tokens, which
+// VeltrixTheme.ts rewrites at runtime per mode, and the Settings-only em ramp.
+@forward '../../lib/veltrix-kit/styles/tokens';
+@use '../../lib/veltrix-kit/styles/tokens' as *;
+// The mixins the KIT needs moved out with its stylesheet (2026-08-10) — they are
+// compiled by more than the shell now. Forwarded so `@use 'base' as *` keeps
+// seeing `veltrix-reset`, `glass`, `material-card`, `veltrix-row-states` and
+// `veltrix-tile-states` under the same names. What stayed below is shell-only.
+@forward '../../lib/veltrix-kit/styles/mixins';
+@use '../../lib/veltrix-kit/styles/mixins' as *;
+
+* {
+    /* --- Brand Colors (Dynamic) --- */
+    /* Real values are injected by VeltrixTheme.ts generateTokensCss (mode-aware).
+       Fallbacks below are safe defaults for startup/non-fluid mode. */
+    --veltrix-accent: #00E5FF;
+    --veltrix-accent-fg: #ffffff;
+    --veltrix-accent-rgb: 0, 229, 255;
+    --veltrix-accent-30: rgba(0, 229, 255, 0.3);
+    --veltrix-accent-10: rgba(0, 229, 255, 0.1);
+
+    /* --- Surface & Backgrounds --- */
+    --veltrix-bg: rgba(22, 22, 34, 0.5);
+    --veltrix-surface-back: rgba(255, 255, 255, 0.04);   /* very subtle bg */
+    --veltrix-surface: rgba(255, 255, 255, 0.08);
+    --veltrix-surface-hover: rgba(255, 255, 255, 0.12);
+    --veltrix-surface-active: rgba(255, 255, 255, 0.16);
+    --veltrix-surface-raised: rgba(255, 255, 255, 0.20); /* workspace dots, more visible elements */
+    /* An icon button's hover and press (GLASS_STATE_MIX; VeltrixTheme emits the real ones). */
+    --veltrix-state-hover: rgba(255, 255, 255, 0.08);
+    --veltrix-state-pressed: rgba(255, 255, 255, 0.20);
+    /* Accent-tinted persistent selection (VeltrixTheme overrides per mode). */
+    --veltrix-state-selected: rgba(0, 229, 255, 0.22);
+
+    /* --- Typography ---
+       VeltrixTheme.ts overrides these at runtime with dark/light-aware values.
+       (#ffffff for dark, #000000 for light). These are just startup fallbacks. */
+    --veltrix-text: rgba(255, 255, 255, 0.95);
+    --veltrix-text-secondary: rgba(255, 255, 255, 0.8);
+    --veltrix-text-dim: rgba(255, 255, 255, 0.55);
+    --veltrix-text-disabled: rgba(255, 255, 255, 0.3);
+    --veltrix-surface-strong: rgba(255, 255, 255, 0.3);
+
+    /* --- Geometry --- (the ladder + its rationale: ui/lib/veltrix-kit/styles/_tokens.scss) */
+    @include radius-vars;
+
+    /* --- Semantic Colors --- */
+    --veltrix-danger: #ff3b30;
+    --veltrix-danger-rgb: 255, 59, 48;
+    --veltrix-warning: #ff9500;   /* WARNING_HEX (status-colors.ts); VeltrixTheme overrides at runtime */
+
+    /* --- Borders & Shadows ---
+       Recalibrated to a subtle "whisper" range (small blur, low alpha).
+       VeltrixTheme.ts overrides these per mode at runtime (dark = heavier).
+       Fallbacks below are the DARK set (startup default). */
+    --veltrix-border: rgba(127, 127, 127, 0.15);
+    --veltrix-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.20), 0 1px 1px rgba(0, 0, 0, 0.16);
+    --veltrix-shadow-md: 0 2px 8px rgba(0, 0, 0, 0.28), 0 1px 2px rgba(0, 0, 0, 0.18);
+
+    /* --- Popover surfaces ---
+       VeltrixTheme floors the bg alpha (≥0.38) so compositor blur applies.
+       Fallbacks below are the DARK set. */
+    --veltrix-popover-bg: rgba(22, 22, 34, 0.85);
+    --veltrix-popover-border: rgba(255, 255, 255, 0.14);
+
+    /* --- Component-specific --- */
+    --veltrix-thumb: #ffffff;
+    --veltrix-on: #ffffff;
+}
+
+/* SCSS Variable Aliases for easier use in component files */
+$veltrix-accent: var(--veltrix-accent);
+$veltrix-accent-fg: var(--veltrix-accent-fg);
+$veltrix-bg: var(--veltrix-bg);
+$veltrix-surface: var(--veltrix-surface);
+$veltrix-text: var(--veltrix-text);
+$veltrix-text-dim: var(--veltrix-text-dim);
+/* ($veltrix-radius-* and the whole $fs-/$fw-/$lh-/$space-/motion set are
+   forwarded from ui/lib/veltrix-kit/styles/_tokens.scss — same names, same values.) */
+
+/* (The relative $fse-* em ramp moved to ui/lib/veltrix-kit/styles/_tokens.scss on
+   2026-08-10 — same names, same values, forwarded above. It was labelled
+   "Settings-only" and was not: the kit's row typography and the alert dialog
+   both use it, and the kit's sheet is compiled by more than the shell now.) */
+
+/* ==========================================================================
+   MIXINS
+   ========================================================================== */
+
+// ⚠️ `veltrix-reset`, `glass`, `material-card`, `veltrix-row-states` and
+// `veltrix-tile-states` are NOT here anymore — they moved to
+// `ui/lib/veltrix-kit/styles/_mixins.scss` with the kit's stylesheet on 2026-08-10 and are
+// @forwarded at the top of this file, so `@use 'base' as *` still resolves them.
+//
+// ⚠️ There is NOTHING shell-only left here. The vibrancy vocabulary that used to
+// live below — `material($level)` (thin/regular/thick/chrome), `material-control`
+// and `material-popover` — was buried on 2026-09-20 (tech-debt #106) because Cairo
+// had taken the job these comments still gave to CSS: a bar or an overlay paints
+// `background: transparent` and the glass, the rim and the shadow come from
+// `ui/lib/veltrix-kit/platform/glass-paint.ts`. The mixins had no call sites at all, and the tokens they
+// spent (`--veltrix-material-*`, `--veltrix-edge`, `--veltrix-shadow-popover`) had no
+// reader but them. Do not reintroduce a CSS material for a layer-shell surface
+// without moving the PAINTER too — two vocabularies for one surface is how the last
+// one died.

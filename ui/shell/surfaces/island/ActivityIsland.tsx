@@ -1,0 +1,620 @@
+import Gtk from "gi://Gtk?version=4.0"
+import Gdk from "gi://Gdk?version=4.0"
+import GLib from "gi://GLib"
+import SquircleContainer from "../../common/SquircleContainer"
+import { MorphRevealer, MorphGlass, MorphPair } from "../../common/MorphRevealer"
+import { makeWorkspaceDot, WS_COUNT } from "../../common/WorkspaceDot"
+import { BAR_CAPSULE_H, BAR_GAP, CAPSULE_BORDER } from "../bar/capsule"
+import status, { ISLAND_OVERVIEW, ISLAND_PLAYER, ISLAND_BATTERY, ISLAND_AGENT, ISLAND_RECORDING } from "../../core/Status"
+import WorkspaceOverview, { WO_GLASS } from "../overview/WorkspaceOverview"
+import PlayerIsland, { PLAYER_GLASS } from "./PlayerIsland"
+import BatteryIsland, { BATTERY_GLASS } from "./BatteryIsland"
+import RecordingIsland, { RECORDING_GLASS } from "./RecordingIsland"
+import AgentIsland, { AGENT_GLASS } from "./AgentIsland"
+import { buildActivities, DOTS_ID } from "./IslandActivities"
+import { trackFusionGroup, pulseFusion } from "../../../lib/veltrix-kit/platform/material"
+import { barConfig } from "../bar/barState"
+
+// The Activity Island — the bar-center capsule as a MULTI-PURPOSE morphing
+// surface. The capsule is the island's COMPACT state; each thing it can host
+// (workspace overview, media player, battery alert; the native agent later)
+// is a registered MODE with its own expanded surface and glass recipe, all
+// sharing one morph engine (common/MorphRevealer.ts) and one state field
+// (status.island_mode, mutually exclusive with the other overlays).
+//
+// Design rules (agreed 2026-07-19):
+// - COMPACT MUTATES BY ACTIVITY (full replacement, not a split capsule):
+//   when a live activity exists, the capsule's compact content transforms into
+//   that activity's compact form.
+// - EXPANSION IS EXPLICIT (click/keybind), except HIGH-PRIORITY events
+//   (critical battery, agent needs confirmation) which may auto-expand.
+//   Ambient state changes only ever touch the compact content.
+// - The island hosts LIVE/STATEFUL things; transactional freedesktop
+//   notifications stay in their banners/NC.
+//
+// Phase 3 (this file): the ACTIVITY REGISTRY. Activities are DATA — each one
+// declares its compact form, a priority, a liveness signal and (optionally)
+// an expanded mode + auto-expand policy (see IslandActivity below; the
+// concrete activities live in IslandActivities.tsx). The engine here owns the
+// arbitration: the highest-priority LIVE activity fronts the compact (the
+// capsule's Gtk.Stack crossfades + interpolates size, so the pill reshapes
+// with the swap). The workspace dots are an activity too — priority 0, always
+// live — so "nothing else running" is not a special case, it is just the dots
+// winning. Clicking the capsule expands whatever fronts it. This is the
+// mechanic the agent mode rides (a "working" pill that expands when the agent
+// needs a confirmation).
+//
+// The live activities that DON'T front are published as `background` for the
+// indicator row (the front is the capsule, the rest are icons beside it). Nothing paints them yet — that's the next step.
+
+export interface IslandMode {
+    id: string
+    /** Expanded surface, built once and revealed by the morph. May expose the
+     *  morph handles (`morphContent`/`morphGlass`/`morphDots`/`morphArt`) and
+     *  nav hooks (`onOpen`/`handleKey`) — see MorphRevealer / WorkspaceOverview. */
+    widget: Gtk.Widget
+    /** Glass recipe of the expanded container (the morph's far end). */
+    glass: () => MorphGlass
+    /** Grab the keyboard EXCLUSIVE while this mode is open (keyboard-driven
+     *  modes: overview cursor, future agent chat). */
+    needsKeyboard?: boolean
+}
+
+/** One thing the island can show live status for. Declared as data; the
+ *  engine below arbitrates which live activity fronts the compact. */
+export interface IslandActivity {
+    /** Compact page name in the capsule's stack. */
+    id: string
+    /** Higher wins the compact when several activities are live. Ambient
+     *  media sits lowest; an active capture above it; critical alerts top. */
+    priority: number
+    /** The capsule's compact form while this activity fronts (carries its own
+     *  side margins — 16px is the bar capsule family standard). */
+    compact: Gtk.Widget
+    /** Twin factory for the morph's source-dissolve track — called once per
+     *  registered mode (a widget has ONE parent, so each revealer owns its own
+     *  twin set). hideArt = this activity's flyer element FLIES in that mode
+     *  (the flying ghost owns those pixels; the twin keeps the slot but
+     *  paints it clear). */
+    makeGhost?: (opts: { hideArt: boolean }) => Gtk.Widget
+    /** Continuity pair: an element of this activity's compact FLIES into its
+     *  expanded mode's `morphArt` slot (media's mini art → the panel's 96px
+     *  artwork, battery's glyph → the alert's glyph). The ghost is built at
+     *  the PANEL slot's natural size and scaled down by the morph so it stays
+     *  sharp at both endpoints. */
+    flyer?: {
+        makeGhost: () => Gtk.Widget
+        getSource: () => Gtk.Widget | null
+    }
+    /** Expanded mode opened by clicking the capsule while this activity fronts
+     *  (a chip never opens it: it flows into the capsule first). Omit = there is no island surface for it, and the click
+     *  falls to `onExpand`. It does NOT fall back to the workspace overview:
+     *  that fallback made sense only while the overview was the capsule's
+     *  default identity, and once the dots became an activity with a mode of
+     *  their own it just meant an unrelated surface answering the click
+     *  (user-caught 2026-08-01 on the recording pill). */
+    expandMode?: string
+    /** What a click does when this activity has no island mode of its own —
+     *  the destination where the user can actually act on it. Recording sends
+     *  you to the Control Center, which is where its Stop lives. */
+    onExpand?: () => void
+    /** HIGH-priority only: expand automatically when this activity TAKES the
+     *  front (once per takeover — closing the island while the condition
+     *  persists must not re-open it). */
+    autoExpand?: boolean
+    /** The activity's glyph in the INDICATOR ROW — what it looks like while it
+     *  is live but something else fronts the capsule. Built once by the row.
+     *  Required, not optional: an activity with no glyph would simply vanish
+     *  from the desktop whenever anything outranked it, which is the failure
+     *  the row exists to fix. Keep it ~16px of ink, the icon weight of the bar. */
+    indicator: () => Gtk.Widget
+    /** Wire liveness; call `changed` whenever isLive() may have flipped. */
+    watch: (changed: () => void) => void
+    isLive: () => boolean
+    /** Show a chip WITHOUT competing for the front. Defaults to `isLive` — an
+     *  activity is normally indicated exactly when it is running. The Assistant
+     *  overrides it: once a provider is configured it is always one click away,
+     *  because the filtering already happened (you turned on an experimental
+     *  feature AND entered a key). Liveness cannot express that — an activity
+     *  that claimed to be live while idle would take the capsule from the music
+     *  and never give it back. */
+    isIndicated?: () => boolean
+}
+
+/** How many indicators can show at once. Beyond this the lowest-priority live
+ *  activities are simply not drawn: the row is a glance, and a fourth chip
+ *  pushes the capsule far enough off-centre that the bar stops reading as
+ *  centred at all. */
+const INDICATOR_MAX = 3
+
+/** A chip's width. Its HEIGHT is whatever the bar row gives it — the chips sit
+ *  in the same box as the capsule, so they match it by construction. The width
+ *  has to equal that height, which is what turns `perfect`'s h/2 radius into a
+ *  circle rather than a pill — hence BAR_CAPSULE_H, not a number of its own. */
+const CHIP_W = BAR_CAPSULE_H
+
+/** Gap before each chip — the bar's rhythm between capsules. It lives on the
+ *  chip's margin rather than the box's spacing so it collapses with the chip;
+ *  see the row's comment. */
+const CHIP_GAP = BAR_GAP
+
+/** `gdkmonitor` is the monitor this bar (and therefore this island) lives on.
+ *  Only the overview needs it today — its cards are sized as a fraction of the
+ *  screen rather than to a constant — but it is the island's own monitor, so it
+ *  belongs on the island's signature rather than being fetched from anywhere. */
+export function ActivityIsland(gdkmonitor: Gdk.Monitor) {
+    // ── Compact state: one page per activity, in a morphing stack ────────────
+    // The workspace dots are an activity too (priority 0, always live — see
+    // IslandActivities' dotsActivity), so there is no separate dots page and no
+    // `else` branch in the arbitration below: the dots are simply what fronts
+    // the capsule when nothing outranks them.
+    // halign CENTER on every compact page: during the stack's width
+    // interpolation the incoming page is allocated at the still-resizing pill
+    // width — left-packed content rides the MOVING left edge and visibly
+    // drifts sideways (user-caught 2026-07-20 on media→battery). Centered,
+    // the pill condenses/expands symmetrically around the content. At rest
+    // (allocation = natural width) CENTER and FILL are identical.
+    //
+    // interpolate_size + non-homogeneous: the capsule's pill WIDTH animates
+    // along with the crossfade when the compact mutates — one shape reshaping,
+    // not a jump-cut (same principle as the big morph, GTK-native here).
+    const COMPACT_SWAP_MS = 350
+    // The island's fusion group (#705 step 2): its pieces are one silhouette on Hyalo — see
+    // where the containers join it, below. A swap PULSES it: the pieces sit apart at rest and
+    // join by a bridge while what they show trades places (`pulseFusion`).
+    const fusion = {}
+    const compactStack = new Gtk.Stack({
+        transition_type: Gtk.StackTransitionType.CROSSFADE,
+        transition_duration: COMPACT_SWAP_MS,
+        hhomogeneous: false,
+        vhomogeneous: false,
+        interpolate_size: true,
+    })
+    // buildActivities returns the dots first, so the stack's initial visible
+    // child is the dots page — the capsule's resting form, before the first
+    // arbitration has run.
+    const activities = buildActivities()
+    for (const a of activities) compactStack.add_named(a.compact, a.id)
+    const dotsAct = activities.find(a => a.id === DOTS_ID)!
+
+    // Expansion is EXPLICIT and follows the compact: the capsule opens what it
+    // is currently showing — its own island mode, or, for an activity that has
+    // none, wherever the user can actually act on it (`onExpand`). Nothing at
+    // all if it has neither: answering with an unrelated surface is worse than
+    // not answering. The overview always stays reachable via Super+W, and now
+    // also via the workspaces' own chip.
+    let front: IslandActivity | null = null
+    const openFront = () => {
+        if (front?.expandMode) status.toggleIsland(front.expandMode)
+        else front?.onExpand?.()
+    }
+    const capsule = SquircleContainer({ child: compactStack, gloss: true, useShellOpacity: true, chrome: true, opacityRole: "bar", borderColor: CAPSULE_BORDER, hoverLift: true, perfect: true, onClick: () => openFront() })
+    // Live dot refs for the morph: ghosts lerp FROM these bounds. (While the
+    // compact shows another activity the dots are unmapped and MorphRevealer
+    // lets the overview's landing dots ride the content fade instead.)
+    ;(capsule as any).morphDots = (dotsAct.compact as any).dots as Gtk.Widget[]
+
+    // ── Arbitration: WHICH live activity fronts the compact ──────────────────
+    // Liveness POLICY stays inside each activity (media owns its pause grace,
+    // battery its hysteresis) — the engine only picks the winner and applies
+    // the two cross-activity rules: a dead activity's expanded surface closes,
+    // and an auto-expand activity opens its surface when it takes the front.
+    //
+    // The losers are NOT discarded: they are published as `background` (every
+    // live activity that isn't fronting), which is exactly what the indicator
+    // row paints. Order is by PRIORITY, never by arrival — an arrival-ordered
+    // row would make the icons swap places under the user's cursor.
+    let background: IslandActivity[] = []
+    const backgroundSubs: Array<() => void> = []
+    let autoExpandTimer: number | null = null
+    // A chip click PINS its activity to the front, because priority is a guess
+    // about what matters and a click is not. The pin outlives every ordinary
+    // change and ends only when the user picks something else or the pinned
+    // activity is neither live nor indicated any more — otherwise "put the
+    // workspaces back" would last exactly until the next track change. An
+    // indicated activity can be pinned while idle (the Assistant): its chip is
+    // what put it one click away, and the click brings it to the capsule.
+    let pinned: IslandActivity | null = null
+
+    // Open a mode ONE BEAT after the compact mutation, never in the same tick:
+    // the crossfade, the pill's width interpolation and the new page's first
+    // allocation must LAND before the morph reads the capsule as its source.
+    // Expanding immediately grew the island out of a still-resizing pill and
+    // dissolved a compact form the user never saw settle (a phantom red % —
+    // user-caught 2026-07-20). Two deliberate steps: mutate, then open. Shared
+    // by auto-expand and by a chip click under `chipOpensPanel`, which need
+    // exactly the same beat.
+    // ISLAND MODES ONLY, on purpose. The beat exists because the island cannot
+    // grow out of a pill that is still interpolating its width; jumping to
+    // another surface (`onExpand`) is not a morph and has no such constraint —
+    // and, more to the point, must not happen here at all: taking the front is
+    // "show this in the capsule", and yanking the user to a different surface
+    // because an activity CHANGED is not the same act as asking for it.
+    // Expanding stays an explicit second click (user call, 2026-08-01).
+    const openAfterSwap = (a: IslandActivity) => {
+        if (!a.expandMode) return
+        if (autoExpandTimer !== null) GLib.source_remove(autoExpandTimer)
+        autoExpandTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, COMPACT_SWAP_MS + 80, () => {
+            autoExpandTimer = null
+            // Still the front and still live: the beat is long enough for the
+            // world to have moved on (the turn ended, the battery recovered).
+            if (front === a && (a.isLive() || a.isIndicated?.())) status.island_mode = a.expandMode!
+            return GLib.SOURCE_REMOVE
+        })
+    }
+
+    const arbitrate = () => {
+        const live = activities.filter(a => a.isLive())
+        // The dots activity is always live, so `live` is never empty and the
+        // compact always has a front.
+        const top = live.reduce((m, a) => (a.priority > m.priority ? a : m))
+        if (pinned && !pinned.isLive() && !pinned.isIndicated?.()) pinned = null
+        // The pin holds the front against priority — with ONE exception: an
+        // auto-expanding activity (a critical battery) exists to interrupt, so
+        // it takes the front anyway. It does not CLEAR the pin: when the
+        // interruption passes, what the user chose comes back.
+        const next = pinned && !(top.autoExpand && top !== pinned) ? pinned : top
+        // The row is everything INDICATED that isn't fronting — which is wider
+        // than "live": an activity can earn a chip without being able to take
+        // the capsule (see isIndicated).
+        const back = activities
+            .filter(a => a !== next && (a.isLive() || a.isIndicated?.()))
+            .sort((x, y) => y.priority - x.priority)
+        // The front can hold steady while the background changes (music starts
+        // under a critical battery), so this is computed before the early-out.
+        const backChanged = back.length !== background.length || back.some((a, i) => a !== background[i])
+        background = back
+        if (next === front) {
+            if (backChanged) for (const cb of backgroundSubs) cb()
+            return
+        }
+        const prev = front
+        front = next
+        compactStack.visible_child_name = front.id
+        pulseFusion(fusion, capsule, COMPACT_SWAP_MS)
+        // The thing the open surface was showing is GONE (player left the bus,
+        // battery recovered) — close it; a mere front takeover by a higher
+        // priority leaves a still-live activity's surface open.
+        if (prev?.expandMode && status.island_mode === prev.expandMode && !prev.isLive())
+            status.island_mode = ""
+        if (front.autoExpand) openAfterSwap(front)
+        if (backChanged) for (const cb of backgroundSubs) cb()
+    }
+
+    // A chip click: the chip FLOWS INTO the capsule, which then shows its
+    // activity — never a panel straight from the chip (owner, 2026-10-07: the
+    // chips always flow to the capsule, and the capsule is what becomes the
+    // panel). The capsule as a mere indicator is a use of its own: the dots
+    // without the overview, what is playing without the player. So the panel
+    // waits for a click on the capsule, unless `chipOpensPanel` asks for it to
+    // open once the fusion has landed (island modes only, see openAfterSwap).
+    // A chip whose activity is neither live nor indicated is on its way out:
+    // its click does nothing.
+    const promote = (a: IslandActivity) => {
+        if (!a.isLive() && !a.isIndicated?.()) return
+        pinned = a
+        arbitrate()
+        if (barConfig.get("chipOpensPanel")) openAfterSwap(a)
+    }
+    // ── The indicator row (Dynamic indicator slots) ─────────────────────────
+    // Instead of a fixed revealer per activity (which causes overlapping cross-slides
+    // when activities swap), we use dynamic indicator slots.
+    // Each slot has its own Gtk.Revealer, and inside it a Gtk.Stack that crossfades
+    // between activity indicator glyphs in place.
+    const indicatorRow = new Gtk.Box({ halign: Gtk.Align.CENTER })
+    const chipSettledSubs: (() => void)[] = []
+
+    interface IndicatorSlot {
+        revealer: Gtk.Revealer
+        stack: Gtk.Stack
+        chip: Gtk.Widget
+        currentActivity: IslandActivity | null
+    }
+
+    const slots: IndicatorSlot[] = []
+
+    for (let i = 0; i < INDICATOR_MAX; i++) {
+        const stack = new Gtk.Stack({
+            transition_type: Gtk.StackTransitionType.CROSSFADE,
+            transition_duration: COMPACT_SWAP_MS,
+            halign: Gtk.Align.CENTER,
+            valign: Gtk.Align.CENTER,
+        })
+        for (const a of activities) {
+            const glyph = a.indicator()
+            glyph.halign = Gtk.Align.CENTER
+            glyph.valign = Gtk.Align.CENTER
+            stack.add_named(glyph, a.id)
+        }
+
+        let slotRef: IndicatorSlot
+        const chip = SquircleContainer({
+            child: stack,
+            gloss: true,
+            useShellOpacity: true,
+            chrome: true,
+            opacityRole: "bar",
+            borderColor: CAPSULE_BORDER,
+            hoverLift: true,
+            perfect: true,
+            onClick: () => {
+                if (slotRef.currentActivity) promote(slotRef.currentActivity)
+            },
+        })
+        chip.width_request = CHIP_W
+        chip.margin_start = CHIP_GAP
+
+        const revealer = new Gtk.Revealer({
+            transition_type: Gtk.RevealerTransitionType.SLIDE_RIGHT,
+            transition_duration: COMPACT_SWAP_MS,
+            reveal_child: false,
+        })
+        revealer.set_child(chip)
+
+        revealer.connect("notify::child-revealed", () => {
+            for (const cb of chipSettledSubs) cb()
+        })
+        indicatorRow.append(revealer)
+
+        slotRef = { revealer, stack, chip, currentActivity: null }
+        slots.push(slotRef)
+    }
+
+    const syncIndicators = () => {
+        const shown = background.slice(0, INDICATOR_MAX)
+        const count = shown.length
+        // A chip born, gone or showing something else is the group changing: it buds off the
+        // capsule, or melts back into it, rather than appearing beside it.
+        if (slots.some((slot, i) => (shown[i] ?? null) !== slot.currentActivity))
+            pulseFusion(fusion, capsule, COMPACT_SWAP_MS)
+
+        for (let i = 0; i < INDICATOR_MAX; i++) {
+            const slot = slots[i]
+            if (i < count) {
+                const a = shown[i]
+                slot.currentActivity = a
+                slot.stack.visible_child_name = a.id
+                slot.revealer.reveal_child = true
+            } else {
+                slot.currentActivity = null
+                slot.revealer.reveal_child = false
+            }
+        }
+    }
+    backgroundSubs.push(syncIndicators)
+
+    for (const a of activities) a.watch(arbitrate)
+    // Closing a mode can end a liveness clause (media holds its compact while
+    // its panel is open; a pause grace may have expired underneath).
+    status.connect("notify::island-mode", () => { if (status.island_mode === "") arbitrate() })
+    arbitrate()
+    // The first arbitration runs before the subscription above could fire (and
+    // `backChanged` is false when the session starts idle), so seed the row.
+    syncIndicators()
+
+    // The morph's two ends: the compact capsule's pill (perfect pill ≡ n=2, radius null = h/2)
+    // and each mode's container.
+    const compactGlass = (): MorphGlass => ({ n: 2.0, radius: null })
+    const modeGlass = (g: { n: number, radius: MorphGlass["radius"] }) => (): MorphGlass => ({ n: g.n, radius: g.radius })
+
+    // ── Mode registry ────────────────────────────────────────────────────────
+    const modes = new Map<string, { mode: IslandMode, revealer: MorphRevealer }>()
+
+    // The bar's glass a mode can grow over (the bar hands it over: `setNeighbours`) — its
+    // groups beside the island and the notification banners below them. A mode grows from the
+    // capsule's top edge, i.e. over the bar's own row, and one big enough to reach any of them
+    // would put glass on glass: their panes sharp under the mode's, since one surface's glass is
+    // drawn under ALL of its content. The reference material avoids exactly that (owner, #708
+    // point 3): what it covers gets out of the way, fading with the capsule's content. Today
+    // only the overview is that big.
+    let neighbours: () => Gtk.Widget[] = () => []
+    const coveredBy = (revealer: MorphRevealer): Gtk.Widget[] => {
+        const parent = revealer.get_parent()
+        if (!parent) return []
+        // The mode is not laid out yet when it opens: centred, at its natural size, from its
+        // top margin is where it will land.
+        const [, natW] = revealer.measure(Gtk.Orientation.HORIZONTAL, -1)
+        const [, natH] = revealer.measure(Gtk.Orientation.VERTICAL, natW)
+        const x0 = (parent.get_width() - natW) / 2, x1 = x0 + natW
+        const y0 = revealer.margin_top, y1 = y0 + natH
+        return neighbours().filter(n => {
+            if (!n.get_mapped()) return false
+            const [ok, b] = n.compute_bounds(parent)
+            // Inclusive vertically: the banners' box is 0 tall while it holds none, and a
+            // banner arriving under an open mode must not show through it either.
+            return ok && b.get_x() < x1 && b.get_x() + b.get_width() > x0
+                && b.get_y() <= y1 && b.get_y() + b.get_height() >= y0
+        })
+    }
+
+    const registerMode = (mode: IslandMode) => {
+        const w = mode.widget as any
+        // Traveling twins, one set per revealer (a widget has ONE parent):
+        // capsule dots → the mode's landing dots; compact cover art → the
+        // mode's art slot. Pairs whose source page isn't the live compact are
+        // skipped frame-by-frame inside MorphRevealer (rectOf → unmapped).
+        const pairs: MorphPair[] = []
+        if (w.morphDots) {
+            for (let i = 0; i < WS_COUNT; i++) pairs.push({
+                ghost: makeWorkspaceDot(i + 1),
+                getSource: () => ((capsule as any).morphDots?.[i] as Gtk.Widget) ?? null,
+                getTarget: () => (w.morphDots?.[i] as Gtk.Widget) ?? null,
+            })
+        }
+        // The flyer pair belongs to the mode's OWNER activity (the one whose
+        // expandMode is this mode): its compact element flies into the mode's
+        // morphArt slot. The pair is skipped frame-by-frame while another
+        // activity fronts the compact (source unmapped → landing element
+        // rides the content fade).
+        const owner = activities.find(a => a.expandMode === mode.id && a.flyer)
+        if (w.morphArt && owner) pairs.push({
+            ghost: owner.flyer!.makeGhost(),
+            getSource: () => (front === owner ? owner.flyer!.getSource() : null),
+            getTarget: () => (w.morphArt as Gtk.Widget) ?? null,
+        })
+        // Source-dissolve twins: whatever activity fronts the compact melts
+        // into the growing island for EVERY mode (opening the overview over
+        // playing music must not blink the compact out either). The dots page
+        // needs no twin — its landing pairs ARE the continuity; known gap: a
+        // mode opened via IPC while the compact shows dots still blinks them
+        // out (no landing slot to fly to) — rare, agent path only. hideArt
+        // only for the OWNER's twin: only its element actually flies here.
+        const twins = new Map<string, Gtk.Widget>()
+        for (const a of activities)
+            if (a.makeGhost) twins.set(a.id, a.makeGhost({ hideArt: !!w.morphArt && a === owner }))
+        const revealer = new MorphRevealer(mode.widget, {
+            getSourceWidget: () => capsule,
+            contentTarget: w.morphContent ?? null,
+            glassWidget: w.morphGlass ?? null,
+            glassArea: (w.morphGlass as any)?.glassArea ?? null,
+            pairs,
+            sourceGhosts: [...twins.values()],
+            getSourceGhost: () => (front ? twins.get(front.id) ?? null : null),
+            getSourceContent: () => front?.compact ?? null,
+            glassFrom: compactGlass,
+            glassTo: mode.glass,
+            // The chips leave with the capsule's content, and so do the bar's
+            // groups this mode covers (`coveredBy`). Only one revealer animates at a
+            // time, so they cannot fight over an opacity.
+            companions: () => [indicatorRow, ...coveredBy(revealer)],
+        })
+        // The island is the capsule GROWN, not a separate panel: top-anchored
+        // (top edge pinned to the capsule by syncAnchor), centered like the
+        // capsule — the morph only inflates down/sideways. Both the capsule's row
+        // and this revealer are children of the bar's overlay, which is exactly
+        // the monitor rect, so CENTER here and the row's own CENTER land on the
+        // same axis with no correction.
+        revealer.valign = Gtk.Align.START
+        revealer.halign = Gtk.Align.CENTER
+        modes.set(mode.id, { mode, revealer })
+    }
+
+    const overviewModeWidget = WorkspaceOverview(gdkmonitor)
+    registerMode({
+        id: ISLAND_OVERVIEW,
+        widget: overviewModeWidget,
+        glass: modeGlass(WO_GLASS),
+        needsKeyboard: true,
+    })
+    // No keyboard grab: the player panel is ambient — media keys and app focus
+    // keep working; it closes on outside click / capsule click like CC.
+    const playerModeWidget = PlayerIsland()
+    registerMode({
+        id: ISLAND_PLAYER,
+        widget: playerModeWidget,
+        glass: modeGlass(PLAYER_GLASS),
+    })
+    // No keyboard grab either: the battery alert is dismissed by outside click
+    // / Esc-less design, same ambient contract as the player.
+    const batteryModeWidget = BatteryIsland()
+    registerMode({
+        id: ISLAND_BATTERY,
+        widget: batteryModeWidget,
+        glass: modeGlass(BATTERY_GLASS),
+    })
+    // No keyboard grab: the capture card is a statement + Stop, dismissed by
+    // outside click / capsule click like the player and the battery alert.
+    const recordingModeWidget = RecordingIsland()
+    registerMode({
+        id: ISLAND_RECORDING,
+        widget: recordingModeWidget,
+        glass: modeGlass(RECORDING_GLASS),
+    })
+    // Keyboard grab: the assistant has a text entry (like the overview cursor
+    // needs keys, this needs the entry to receive them — the bar grants EXCLUSIVE
+    // while needsKeyboard). handleKey only claims Escape; the rest reaches the entry.
+    const agentModeWidget = AgentIsland()
+    registerMode({
+        id: ISLAND_AGENT,
+        widget: agentModeWidget,
+        glass: modeGlass(AGENT_GLASS),
+        needsKeyboard: true,
+    })
+
+    // ONE silhouette on Hyalo (#705 step 2): the capsule, its chips and whatever a mode morphs
+    // through are one fusion group — the chips join the capsule by a bridge while a swap pulses
+    // the group, and the capsule growing into a mode takes the fading chips into its shape
+    // instead of passing over them. A mode's glass at rest is in the group too; nothing else
+    // of the island is lit then.
+    trackFusionGroup(capsule, fusion)
+    trackFusionGroup(indicatorRow, fusion)
+    for (const { revealer } of modes.values()) trackFusionGroup(revealer, fusion)
+
+    const active = () => modes.get(status.island_mode) ?? null
+
+    return {
+        /** Compact state — the bar appends this to its center box. */
+        capsule,
+        /** The bar's glass a mode can grow over — its groups, the banners — which a mode
+         *  big enough fades out rather than lay its glass over (see `coveredBy`). */
+        setNeighbours: (get: () => Gtk.Widget[]) => { neighbours = get },
+        /** The indicator chips — appended to the same centre box, right of the
+         *  capsule, so the GROUP is what centres on the monitor. */
+        indicatorRow,
+        /** What of the island's row is on screen to be hit: the capsule always (it
+         *  keeps its geometry while a mode is open, switched off by opacity alone),
+         *  the chips only while they are not faded to nothing. The bar reads it for
+         *  what the island covers (`occupiedRect`); collapsed chips fall out on its
+         *  zero-size guard. */
+        hitTargets: () => indicatorRow.opacity === 0
+            ? [capsule as Gtk.Widget]
+            : [capsule as Gtk.Widget, ...slots.map(s => s.chip)],
+        /** Every LIVE activity that is NOT fronting the capsule, highest
+         *  priority first — the model the indicator row paints. Idle session =
+         *  only the dots are live = empty list, which is why the bar looks
+         *  unchanged until something else runs. */
+        background: () => background,
+        /** Fire when that list changes (membership or order). */
+        onBackgroundChanged: (cb: () => void) => { backgroundSubs.push(cb) },
+        /** Fire when a chip has FINISHED sliding in or out — the frame the row's
+         *  final width exists, which the bar lays its flanks out against. */
+        onChipsSettled: (cb: () => void) => { chipSettledSubs.push(cb) },
+        /** All mode revealers — the bar mounts each on its master overlay and
+         *  includes them in its input-region pass (visibility-gated there). */
+        revealers: [...modes.values()].map(rt => rt.revealer),
+        /** The same revealers with their mode ids — each is a surface of its own for
+         *  its glass (Bar.tsx → registerGlassSurface). */
+        modeRevealers: [...modes.entries()].map(([id, rt]) => ({ id, revealer: rt.revealer })),
+        /** Reveal/hide every mode against status.island_mode. The bar passes
+         *  its popToggle-equivalent so close keeps the input-region refresh. */
+        sync: (reveal: (r: MorphRevealer, open: boolean) => void) => {
+            for (const [id, rt] of modes) reveal(rt.revealer, status.island_mode === id)
+        },
+        /** True while the open mode wants the keyboard EXCLUSIVE. */
+        needsKeyboard: () => active()?.mode.needsKeyboard === true,
+        /** Seed the open mode's keyboard nav (call on open, after sync). */
+        onOpened: () => { (active()?.mode.widget as any)?.onOpen?.() },
+        /** Route a key to the open mode. */
+        handleKey: (keyval: number): boolean => ((active()?.mode.widget as any)?.handleKey?.(keyval)) ?? false,
+        /** The monitor changed shape: any mode that SOLVED a size from it has to
+         *  solve again. Duck-typed like `onOpen`/`handleKey` above, so a mode
+         *  that derives nothing from the monitor implements nothing — today only
+         *  the overview does (its card width comes from the monitor's width, and
+         *  a stale one is a panel wider than the screen it is centred on). The
+         *  bar calls this; a mode must not subscribe to the monitor itself, or we
+         *  are back to the optional subscription that caused the bug
+         *  (common/VisibleRegion.ts). */
+        onMonitorResized: () => {
+            for (const rt of modes.values()) {
+                try { (rt.mode.widget as any)?.onMonitorResized?.() }
+                catch (e) { console.error(`[ActivityIsland] ${rt.mode.id} failed to re-solve its geometry:`, e) }
+            }
+        },
+        /** Pin every revealer's top edge to the capsule's top (both boxes are their
+         *  glass, so aligning the BOXES aligns the drawn edges). Falls back to the panel gap when the capsule is
+         *  hidden or not yet mapped (matches the morph's centered-pop
+         *  fallback). Call per-open, before the reveal.
+         *
+         *  `relativeTo` is the bar's overlay, the revealers' parent. */
+        syncAnchor: (relativeTo: Gtk.Widget, fallbackTop: number) => {
+            let top = fallbackTop
+            if (capsule.get_mapped()) {
+                const [ok, b] = capsule.compute_bounds(relativeTo)
+                if (ok) top = Math.round(b.get_y())
+            }
+            for (const rt of modes.values()) rt.revealer.margin_top = top
+        },
+    }
+}
+
+export type ActivityIslandHandle = ReturnType<typeof ActivityIsland>

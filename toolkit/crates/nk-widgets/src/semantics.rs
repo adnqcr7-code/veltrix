@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+use crate::*;
+use nk_a11y::{Action, Bounds, Node as Semantic, Relation, Role, States, Tree as Semantics};
+impl Tree {
+    pub fn semantics(&self) -> Semantics {
+        let mut ids = vec![];
+        self.ordered(self.root, &mut ids);
+        let mut nodes = BTreeMap::new();
+        for id in ids {
+            let widget = &self.nodes[&id];
+            let role = match widget.kind {
+                Kind::Window if self.dialog_role => Role::Dialog,
+                Kind::Window => Role::Window,
+                Kind::Sidebar | Kind::List { .. } => Role::List,
+                Kind::TitleBar | Kind::Label | Kind::Subtitle | Kind::Footer => Role::Label,
+                Kind::Disclosure { .. } => Role::ToggleButton,
+                Kind::Page { .. } => Role::Option,
+                Kind::Scroll => Role::ScrollPane,
+                Kind::Group
+                | Kind::Row
+                | Kind::Choices { .. }
+                | Kind::Fields
+                | Kind::ControlCapsule => Role::Panel,
+                Kind::Slider { .. } => Role::Slider,
+                Kind::Spin { .. } => Role::SpinButton,
+                Kind::Switch { .. } => Role::ToggleButton,
+                Kind::Button => Role::Button,
+                Kind::Image => Role::Image,
+                Kind::SearchInput if self.suggestion_combos.contains_key(&id) => Role::ComboBox,
+                Kind::SearchInput => Role::TextInput,
+                Kind::Dropdown { .. } => Role::ComboBox,
+                Kind::DropdownOption { .. } | Kind::MenuOption { .. } => Role::Option,
+                Kind::Choice { .. } => Role::RadioButton,
+            };
+            let mut n = Semantic::new(id, role, &widget.name);
+            if let Some(m) = &self.action_menu {
+                if m.scroll == id {
+                    n.role = Role::Menu;
+                }
+                if let Some(row) = m.rows.get(&id) {
+                    n.role = match row.kind {
+                        MenuActionKind::Action | MenuActionKind::Submenu { .. } => Role::MenuItem,
+                        MenuActionKind::Check(_) => Role::CheckMenuItem,
+                        MenuActionKind::Radio(_) => Role::RadioMenuItem,
+                        MenuActionKind::Separator => Role::Separator,
+                    };
+                }
+            }
+            if self.suggestion_combos.values().any(|s| s.list == id) {
+                n.role = Role::ListBox;
+            }
+            if id == self.root {
+                n.attributes
+                    .insert("application-name".into(), widget.name.clone());
+            }
+            n.attributes.insert("veltrix-node-id".into(), id.to_string());
+            n.attributes
+                .insert("veltrix-tree-generation".into(), self.generation.to_string());
+            let mut r = widget.bounds;
+            let mut ancestor = Some(id);
+            let mut sidebar = false;
+            while let Some(p) = ancestor {
+                sidebar |= self.nodes[&p].kind == Kind::Sidebar;
+                ancestor = self.nodes[&p].parent;
+            }
+            if sidebar {
+                // AT-SPI bounds are model values (CONTRACT.md), even on the D5
+                // client timeline. Pointer/paint use the tree's sampled placement.
+                let model = if self.sidebar_open {
+                    0.
+                } else {
+                    -self.metrics.sidebar
+                };
+                r.x += model - self.sidebar_x;
+            }
+            n.bounds = Bounds {
+                x: r.x as f64,
+                y: r.y as f64,
+                width: r.width as f64,
+                height: r.height as f64,
+            };
+            n.states = States {
+                active: id == self.root && self.active,
+                focused: self.focused == Some(id),
+                disabled: !self.available(id),
+                checked: matches!(
+                    widget.kind,
+                    Kind::Switch { checked: true } | Kind::Choice { checked: true }
+                ),
+                selected: matches!(
+                    widget.kind,
+                    Kind::Page { selected: true }
+                        | Kind::DropdownOption { selected: true }
+                        | Kind::MenuOption { selected: true }
+                ),
+                expanded: matches!(
+                    widget.kind,
+                    Kind::Disclosure { expanded: true } | Kind::Dropdown { expanded: true }
+                ),
+                expandable: matches!(widget.kind, Kind::Disclosure { .. } | Kind::Dropdown { .. }),
+                offscreen: !intersects(r, self.visible_clip(id)),
+                ..Default::default()
+            };
+            if let Some(kind) = self.menu_action_kind(id) {
+                n.states.checked = matches!(
+                    kind,
+                    MenuActionKind::Check(true) | MenuActionKind::Radio(true)
+                );
+                n.states.expandable = matches!(kind, MenuActionKind::Submenu { .. });
+                n.states.expanded = matches!(kind, MenuActionKind::Submenu { expanded: true });
+            }
+            if self.action_row(id) && !n.states.offscreen {
+                let clipped = intersect_rect(r, self.visible_clip(id));
+                n.bounds = Bounds {
+                    x: clipped.x as f64,
+                    y: clipped.y as f64,
+                    width: clipped.width as f64,
+                    height: clipped.height as f64,
+                };
+            }
+            n.children = widget
+                .children
+                .iter()
+                .copied()
+                .filter(|id| !self.is_hidden(*id))
+                .collect();
+            if let (Some(range), Some(value)) = (&widget.range, self.value(id)) {
+                n.actions = vec![Action::Focus, Action::SetValue];
+                n.value = Some(nk_a11y::ValueInfo {
+                    min: range.min as f64,
+                    max: range.max as f64,
+                    current: value as f64,
+                    step: range.step as f64,
+                    text: range.text(value),
+                });
+            } else if matches!(widget.kind, Kind::DropdownOption { .. }) {
+                n.actions = vec![Action::Activate];
+            } else if widget.kind.focusable() {
+                n.actions = vec![Action::Focus, Action::Activate];
+            }
+            if matches!(
+                widget.kind,
+                Kind::Group | Kind::Row | Kind::Disclosure { .. }
+            ) && let Some(label) = n
+                .children
+                .iter()
+                .find(|id| self.nodes[id].kind == Kind::Label)
+            {
+                n.relations.push(Relation::LabelledBy(*label));
+                n.name = self.nodes[label].name.clone();
+            }
+            // A menu row is heard by its own label: its siblings' Labels are separators.
+            let menu_row = self
+                .action_menu
+                .as_ref()
+                .is_some_and(|m| m.rows.contains_key(&id));
+            if widget.kind.row_control()
+                && !menu_row
+                && let Some(parent) = widget.parent
+                && let Some(label) = self.nodes[&parent]
+                    .children
+                    .iter()
+                    .find(|id| self.nodes[id].kind == Kind::Label && !self.is_hidden(**id))
+            {
+                n.relations.push(Relation::LabelledBy(*label));
+                n.name = self.nodes[label].name.clone();
+            }
+            // A row's second line describes the row and its control (as a GTK row's subtitle).
+            let row = match widget.kind {
+                Kind::Row => Some(id),
+                k if k.row_control() => widget.parent,
+                _ => None,
+            };
+            if let Some(subtitle) = row.and_then(|r| {
+                self.nodes[&r]
+                    .children
+                    .iter()
+                    .find(|c| self.nodes[c].kind == Kind::Subtitle && !self.is_hidden(**c))
+            }) {
+                n.description = self.nodes[subtitle].name.clone();
+            }
+            if let Some(description) = self.button_descriptions.get(&id) {
+                n.description = description.clone();
+            }
+            if widget.kind == Kind::SearchInput {
+                self.search_semantics(id, &mut n);
+            }
+            if let Some(combo) = self.suggestion_combos.get(&id) {
+                n.states.expandable = true;
+                n.states.expanded = combo.expanded;
+                n.active_descendant = combo.active;
+            }
+            for combo in self.suggestion_combos.values() {
+                if id == combo.list || widget.parent == Some(combo.list) {
+                    n.states.offscreen = !intersects(widget.bounds, self.nodes[&combo.list].bounds);
+                    if widget.parent == Some(combo.list) && !n.states.disabled {
+                        n.actions = vec![Action::Focus, Action::Activate];
+                    }
+                    if let Some(description) = &widget.caption {
+                        n.description = description.clone();
+                    }
+                }
+            }
+            nodes.insert(id, n);
+        }
+        let inverse: Vec<_> = nodes
+            .values()
+            .flat_map(|n| {
+                n.relations.iter().filter_map(|r| {
+                    if let Relation::LabelledBy(label) = r {
+                        Some((*label, n.id))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        for (label, target) in inverse {
+            nodes
+                .get_mut(&label)
+                .unwrap()
+                .relations
+                .push(Relation::LabelFor(target));
+        }
+        Semantics {
+            root: self.root,
+            nodes,
+        }
+    }
+}

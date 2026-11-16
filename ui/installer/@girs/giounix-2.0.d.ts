@@ -1,0 +1,2289 @@
+/// <reference path="./gio-2.0.d.ts" />
+/// <reference path="./gobject-2.0.d.ts" />
+/// <reference path="./glib-2.0.d.ts" />
+/// <reference path="./gmodule-2.0.d.ts" />
+
+/**
+ * Type Definitions for Gjs (https://gjs.guide/)
+ *
+ * These type definitions are automatically generated, do not edit them by hand.
+ * If you found a bug fix it in `ts-for-gir` or create a bug report on https://github.com/gjsify/ts-for-gir
+ *
+ * The based EJS template file is used for the generated .d.ts file of each GIR module like Gtk-4.0, GObject-2.0, ...
+ */
+
+declare module 'gi://GioUnix?version=2.0' {
+
+// Module dependencies
+import type Gio from 'gi://Gio?version=2.0';
+import type GObject from 'gi://GObject?version=2.0';
+import type GLib from 'gi://GLib?version=2.0';
+import type GModule from 'gi://GModule?version=2.0';
+
+export namespace GioUnix {
+
+    /**
+     * GioUnix-2.0
+     */
+
+
+    /**
+     * Extension point for default handler to URI association. See
+     * [Extending GIO][extending-gio].
+     * @deprecated since 2.28: The {@link GioUnix.DesktopAppInfoLookup} interface is deprecated and    unused by GIO.
+     * @default gio-desktop-app-info-lookup
+     */
+    const DESKTOP_APP_INFO_LOOKUP_EXTENSION_POINT_NAME: string;
+
+    /**
+     * Gets the default application for launching applications
+     * using this URI scheme for a particular {@link GioUnix.DesktopAppInfoLookup}
+     * implementation.
+     * 
+     * The {@link GioUnix.DesktopAppInfoLookup} interface and this function is used
+     * to implement `g_app_info_get_default_for_uri_scheme()` backends
+     * in a GIO module. There is no reason for applications to use it
+     * directly. Applications should use `g_app_info_get_default_for_uri_scheme()`.
+     * @param lookup a {@link GioUnix.DesktopAppInfoLookup}
+     * @param uri_scheme a string containing a URI scheme.
+     * @returns {@link Gio.AppInfo} for given `uri_scheme` or    `null` on error.
+     * @deprecated since 2.28: The {@link GioUnix.DesktopAppInfoLookup} interface is deprecated and    unused by GIO.
+     */
+    function desktop_app_info_lookup_get_default_for_uri_scheme(lookup: Gio.DesktopAppInfoLookup, uri_scheme: string): Gio.AppInfo | null;
+
+    /**
+     * Gets the underlying file descriptor.
+     * @param fd_based a {@link GioUnix.FileDescriptorBased}.
+     * @returns The file descriptor
+     * @since 2.24
+     */
+    function file_descriptor_based_get_fd(fd_based: Gio.FileDescriptorBased): number;
+
+    /**
+     * Determines if `mount_path` is considered an implementation of the
+     * OS. This is primarily used for hiding mountable and mounted volumes
+     * that only are used in the OS and has little to no relevance to the
+     * casual user.
+     * @param mount_path a mount path, e.g. `/media/disk` or `/usr`
+     * @returns `true` if `mount_path` is considered an implementation detail     of the OS.
+     */
+    function is_mount_path_system_internal(mount_path: string): boolean;
+
+    /**
+     * Determines if `device_path` is considered a block device path which is only
+     * used in implementation of the OS. This is primarily used for hiding
+     * mounted volumes that are intended as APIs for programs to read, and system
+     * administrators at a shell; rather than something that should, for example,
+     * appear in a GUI. For example, the Linux `/proc` filesystem.
+     * 
+     * The list of device paths considered ‘system’ ones may change over time.
+     * @param device_path a device path, e.g. `/dev/loop0` or `nfsd`
+     * @returns `true` if `device_path` is considered an implementation detail of    the OS.
+     * @since 2.56
+     */
+    function is_system_device_path(device_path: string): boolean;
+
+    /**
+     * Determines if `fs_type` is considered a type of file system which is only
+     * used in implementation of the OS. This is primarily used for hiding
+     * mounted volumes that are intended as APIs for programs to read, and system
+     * administrators at a shell; rather than something that should, for example,
+     * appear in a GUI. For example, the Linux `/proc` filesystem.
+     * 
+     * The list of file system types considered ‘system’ ones may change over time.
+     * @param fs_type a file system type, e.g. `procfs` or `tmpfs`
+     * @returns `true` if `fs_type` is considered an implementation detail of the OS.
+     * @since 2.56
+     */
+    function is_system_fs_type(fs_type: string): boolean;
+
+    /**
+     * Gets a {@link GioUnix.MountEntry} for a given mount path. If `time_read`
+     * is set, it will be filled with a unix timestamp for checking
+     * if the mounts have changed since with `g_unix_mounts_changed_since()`.
+     * 
+     * If more mounts have the same mount path, the last matching mount
+     * is returned.
+     * 
+     * This will return `null` if there is no mount point at `mount_path`.
+     * @param mount_path path for a possible unix mount.
+     * @returns a {@link GioUnix.MountEntry}.
+     */
+    function mount_at(mount_path: string): [Gio.UnixMountEntry | null, number];
+
+    /**
+     * Compares two unix mounts.
+     * @param mount1 first {@link GioUnix.MountEntry} to compare.
+     * @param mount2 second {@link GioUnix.MountEntry} to compare.
+     * @returns 1, 0 or -1 if `mount1` is greater than, equal to, or less than `mount2`, respectively.
+     */
+    function mount_compare(mount1: Gio.UnixMountEntry, mount2: Gio.UnixMountEntry): number;
+
+    /**
+     * Makes a copy of `mount_entry`.
+     * @param mount_entry a {@link GioUnix.MountEntry}.
+     * @returns a new {@link GioUnix.MountEntry}
+     * @since 2.54
+     */
+    function mount_copy(mount_entry: Gio.UnixMountEntry): Gio.UnixMountEntry;
+
+    /**
+     * Gets a {@link GioUnix.MountEntry} for a given file path. If `time_read`
+     * is set, it will be filled with a unix timestamp for checking
+     * if the mounts have changed since with `g_unix_mounts_changed_since()`.
+     * 
+     * If more mounts have the same mount path, the last matching mount
+     * is returned.
+     * 
+     * This will return `null` if looking up the mount entry fails, if
+     * `file_path` doesn’t exist or there is an I/O error.
+     * @param file_path file path on some unix mount.
+     * @returns a {@link GioUnix.MountEntry}.
+     * @since 2.52
+     */
+    function mount_for(file_path: string): [Gio.UnixMountEntry | null, number];
+
+    /**
+     * Frees a unix mount.
+     * @param mount_entry a {@link GioUnix.MountEntry}.
+     */
+    function mount_free(mount_entry: Gio.UnixMountEntry): void;
+
+    /**
+     * Gets the device path for a unix mount.
+     * @param mount_entry a `GUnixMount`.
+     * @returns a string containing the device path.
+     */
+    function mount_get_device_path(mount_entry: Gio.UnixMountEntry): string;
+
+    /**
+     * Gets the filesystem type for the unix mount.
+     * @param mount_entry a `GUnixMount`.
+     * @returns a string containing the file system type.
+     */
+    function mount_get_fs_type(mount_entry: Gio.UnixMountEntry): string;
+
+    /**
+     * Gets the mount path for a unix mount.
+     * @param mount_entry input {@link GioUnix.MountEntry} to get the mount path for.
+     * @returns the mount path for `mount_entry`.
+     */
+    function mount_get_mount_path(mount_entry: Gio.UnixMountEntry): string;
+
+    /**
+     * Gets a comma-separated list of mount options for the unix mount. For example,
+     * `rw,relatime,seclabel,data=ordered`.
+     * 
+     * This is similar to `g_unix_mount_point_get_options()`, but it takes
+     * a {@link GioUnix.MountEntry} as an argument.
+     * @param mount_entry a {@link GioUnix.MountEntry}.
+     * @returns a string containing the options, or `null` if not available.
+     * @since 2.58
+     */
+    function mount_get_options(mount_entry: Gio.UnixMountEntry): string | null;
+
+    /**
+     * Gets the root of the mount within the filesystem. This is useful e.g. for
+     * mounts created by bind operation, or btrfs subvolumes.
+     * 
+     * For example, the root path is equal to "/" for mount created by
+     * "mount /dev/sda1 /mnt/foo" and "/bar" for
+     * "mount --bind /mnt/foo/bar /mnt/bar".
+     * @param mount_entry a {@link GioUnix.MountEntry}.
+     * @returns a string containing the root, or `null` if not supported.
+     * @since 2.60
+     */
+    function mount_get_root_path(mount_entry: Gio.UnixMountEntry): string | null;
+
+    /**
+     * Guesses whether a Unix mount can be ejected.
+     * @param mount_entry a {@link GioUnix.MountEntry}
+     * @returns `true` if `mount_entry` is deemed to be ejectable.
+     */
+    function mount_guess_can_eject(mount_entry: Gio.UnixMountEntry): boolean;
+
+    /**
+     * Guesses the icon of a Unix mount.
+     * @param mount_entry a {@link GioUnix.MountEntry}
+     * @returns a {@link Gio.Icon}
+     */
+    function mount_guess_icon(mount_entry: Gio.UnixMountEntry): Gio.Icon;
+
+    /**
+     * Guesses the name of a Unix mount.
+     * The result is a translated string.
+     * @param mount_entry a {@link GioUnix.MountEntry}
+     * @returns A newly allocated string that must     be freed with `g_free()`
+     */
+    function mount_guess_name(mount_entry: Gio.UnixMountEntry): string;
+
+    /**
+     * Guesses whether a Unix mount should be displayed in the UI.
+     * @param mount_entry a {@link GioUnix.MountEntry}
+     * @returns `true` if `mount_entry` is deemed to be displayable.
+     */
+    function mount_guess_should_display(mount_entry: Gio.UnixMountEntry): boolean;
+
+    /**
+     * Guesses the symbolic icon of a Unix mount.
+     * @param mount_entry a {@link GioUnix.MountEntry}
+     * @returns a {@link Gio.Icon}
+     * @since 2.34
+     */
+    function mount_guess_symbolic_icon(mount_entry: Gio.UnixMountEntry): Gio.Icon;
+
+    /**
+     * Checks if a unix mount is mounted read only.
+     * @param mount_entry a `GUnixMount`.
+     * @returns `true` if `mount_entry` is read only.
+     */
+    function mount_is_readonly(mount_entry: Gio.UnixMountEntry): boolean;
+
+    /**
+     * Checks if a Unix mount is a system mount. This is the Boolean OR of
+     * `g_unix_is_system_fs_type()`, `g_unix_is_system_device_path()` and
+     * `g_unix_is_mount_path_system_internal()` on `mount_entry`’s properties.
+     * 
+     * The definition of what a ‘system’ mount entry is may change over time as new
+     * file system types and device paths are ignored.
+     * @param mount_entry a `GUnixMount`.
+     * @returns `true` if the unix mount is for a system path.
+     */
+    function mount_is_system_internal(mount_entry: Gio.UnixMountEntry): boolean;
+
+    /**
+     * Gets a {@link GioUnix.MountPoint} for a given mount path. If `time_read` is set, it
+     * will be filled with a unix timestamp for checking if the mount points have
+     * changed since with `g_unix_mount_points_changed_since()`.
+     * 
+     * If more mount points have the same mount path, the last matching mount point
+     * is returned.
+     * @param mount_path path for a possible unix mount point.
+     * @returns a {@link GioUnix.MountPoint}, or `null` if no match is found.
+     * @since 2.66
+     */
+    function mount_point_at(mount_path: string): [Gio.UnixMountPoint | null, number];
+
+    /**
+     * Compares two unix mount points.
+     * @param mount1 a `GUnixMount`.
+     * @param mount2 a `GUnixMount`.
+     * @returns 1, 0 or -1 if `mount1` is greater than, equal to, or less than `mount2`, respectively.
+     */
+    function mount_point_compare(mount1: Gio.UnixMountPoint, mount2: Gio.UnixMountPoint): number;
+
+    /**
+     * Makes a copy of `mount_point`.
+     * @param mount_point a {@link GioUnix.MountPoint}.
+     * @returns a new {@link GioUnix.MountPoint}
+     * @since 2.54
+     */
+    function mount_point_copy(mount_point: Gio.UnixMountPoint): Gio.UnixMountPoint;
+
+    /**
+     * Frees a unix mount point.
+     * @param mount_point unix mount point to free.
+     */
+    function mount_point_free(mount_point: Gio.UnixMountPoint): void;
+
+    /**
+     * Gets the device path for a unix mount point.
+     * @param mount_point a {@link GioUnix.MountPoint}.
+     * @returns a string containing the device path.
+     */
+    function mount_point_get_device_path(mount_point: Gio.UnixMountPoint): string;
+
+    /**
+     * Gets the file system type for the mount point.
+     * @param mount_point a {@link GioUnix.MountPoint}.
+     * @returns a string containing the file system type.
+     */
+    function mount_point_get_fs_type(mount_point: Gio.UnixMountPoint): string;
+
+    /**
+     * Gets the mount path for a unix mount point.
+     * @param mount_point a {@link GioUnix.MountPoint}.
+     * @returns a string containing the mount path.
+     */
+    function mount_point_get_mount_path(mount_point: Gio.UnixMountPoint): string;
+
+    /**
+     * Gets the options for the mount point.
+     * @param mount_point a {@link GioUnix.MountPoint}.
+     * @returns a string containing the options.
+     * @since 2.32
+     */
+    function mount_point_get_options(mount_point: Gio.UnixMountPoint): string | null;
+
+    /**
+     * Guesses whether a Unix mount point can be ejected.
+     * @param mount_point a {@link GioUnix.MountPoint}
+     * @returns `true` if `mount_point` is deemed to be ejectable.
+     */
+    function mount_point_guess_can_eject(mount_point: Gio.UnixMountPoint): boolean;
+
+    /**
+     * Guesses the icon of a Unix mount point.
+     * @param mount_point a {@link GioUnix.MountPoint}
+     * @returns a {@link Gio.Icon}
+     */
+    function mount_point_guess_icon(mount_point: Gio.UnixMountPoint): Gio.Icon;
+
+    /**
+     * Guesses the name of a Unix mount point.
+     * The result is a translated string.
+     * @param mount_point a {@link GioUnix.MountPoint}
+     * @returns A newly allocated string that must     be freed with `g_free()`
+     */
+    function mount_point_guess_name(mount_point: Gio.UnixMountPoint): string;
+
+    /**
+     * Guesses the symbolic icon of a Unix mount point.
+     * @param mount_point a {@link GioUnix.MountPoint}
+     * @returns a {@link Gio.Icon}
+     * @since 2.34
+     */
+    function mount_point_guess_symbolic_icon(mount_point: Gio.UnixMountPoint): Gio.Icon;
+
+    /**
+     * Checks if a unix mount point is a loopback device.
+     * @param mount_point a {@link GioUnix.MountPoint}.
+     * @returns `true` if the mount point is a loopback. `false` otherwise.
+     */
+    function mount_point_is_loopback(mount_point: Gio.UnixMountPoint): boolean;
+
+    /**
+     * Checks if a unix mount point is read only.
+     * @param mount_point a {@link GioUnix.MountPoint}.
+     * @returns `true` if a mount point is read only.
+     */
+    function mount_point_is_readonly(mount_point: Gio.UnixMountPoint): boolean;
+
+    /**
+     * Checks if a unix mount point is mountable by the user.
+     * @param mount_point a {@link GioUnix.MountPoint}.
+     * @returns `true` if the mount point is user mountable.
+     */
+    function mount_point_is_user_mountable(mount_point: Gio.UnixMountPoint): boolean;
+
+    /**
+     * Checks if the unix mount points have changed since a given unix time.
+     * @param time guint64 to contain a timestamp.
+     * @returns `true` if the mount points have changed since `time`.
+     */
+    function mount_points_changed_since(time: bigint | number): boolean;
+
+    /**
+     * Gets a {@link GLib.List} of {@link GioUnix.MountPoint} containing the unix mount points.
+     * If `time_read` is set, it will be filled with the mount timestamp,
+     * allowing for checking if the mounts have changed with
+     * `g_unix_mount_points_changed_since()`.
+     * @returns a {@link GLib.List} of the UNIX mountpoints.
+     */
+    function mount_points_get(): [Gio.UnixMountPoint[], number];
+
+    /**
+     * Checks if the unix mounts have changed since a given unix time.
+     * @param time guint64 to contain a timestamp.
+     * @returns `true` if the mounts have changed since `time`.
+     */
+    function mounts_changed_since(time: bigint | number): boolean;
+
+    /**
+     * Gets a {@link GLib.List} of {@link GioUnix.MountEntry} containing the unix mounts.
+     * If `time_read` is set, it will be filled with the mount
+     * timestamp, allowing for checking if the mounts have changed
+     * with `g_unix_mounts_changed_since()`.
+     * @returns a {@link GLib.List} of the UNIX mounts.
+     */
+    function mounts_get(): [Gio.UnixMountEntry[], number];
+
+    /**
+     * @gir-type Callback
+     */
+    interface DesktopAppLaunchCallback {
+        (appinfo: Gio.DesktopAppInfo, pid: GLib.Pid): void;
+    }
+
+    namespace DesktopAppInfo {
+        // Signal signatures
+        interface SignalSignatures extends GObject.Object.SignalSignatures {
+            "notify::filename": (pspec: GObject.ParamSpec) => void;
+        }
+
+        // Constructor properties interface
+        interface ConstructorProps extends GObject.Object.ConstructorProps, Gio.AppInfo.ConstructorProps {
+            filename: string;
+        }
+    }
+
+    /**
+     * {@link GioUnix.DesktopAppInfo} is an implementation of {@link Gio.AppInfo} based on
+     * desktop files.
+     * 
+     * Note that `<gio/gdesktopappinfo.h>` belongs to the UNIX-specific
+     * GIO interfaces, thus you have to use the `gio-unix-2.0.pc` pkg-config
+     * file or the `GioUnix-2.0` GIR namespace when using it.
+     * @gir-type Class
+     */
+    class DesktopAppInfo extends GObject.Object implements Gio.AppInfo {
+        static $gtype: GObject.GType<DesktopAppInfo>;
+
+        // Properties
+        /**
+         * The origin filename of this {@link GioUnix.DesktopAppInfo}
+         * @construct-only
+         * @default null
+         */
+        get filename(): string;
+
+        /**
+         * Compile-time signal type information.
+         *
+         * This instance property is generated only for TypeScript type checking.
+         * It is not defined at runtime and should not be accessed in JS code.
+         * @internal
+         */
+        $signals: DesktopAppInfo.SignalSignatures;
+
+        // Constructors
+        constructor(properties?: Partial<DesktopAppInfo.ConstructorProps>, ...args: any[]);
+
+        _init(...args: any[]): void;
+
+        static ["new"](desktop_id: string): DesktopAppInfo;
+
+        static new_from_filename(filename: string): DesktopAppInfo;
+
+        static new_from_keyfile(key_file: GLib.KeyFile): DesktopAppInfo;
+
+        // Signals
+        /** @signal */
+        connect<K extends keyof DesktopAppInfo.SignalSignatures>(signal: K, callback: GObject.SignalCallback<this, DesktopAppInfo.SignalSignatures[K]>): number;
+
+        /** @signal */
+        connect_after<K extends keyof DesktopAppInfo.SignalSignatures>(signal: K, callback: GObject.SignalCallback<this, DesktopAppInfo.SignalSignatures[K]>): number;
+
+        /** @signal */
+        emit<K extends keyof DesktopAppInfo.SignalSignatures>(signal: K, ...args: GObject.GjsParameters<DesktopAppInfo.SignalSignatures[K]>): void;
+
+        // Static methods
+        /**
+         * Gets the user-visible display name of the "additional application
+         * action" specified by `action_name`.
+         * 
+         * This corresponds to the "Name" key within the keyfile group for the
+         * action.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @param action_name the name of the action as from   `g_desktop_app_info_list_actions()`
+         * @since 2.38
+         */
+        static get_action_name(info: Gio.DesktopAppInfo, action_name: string): string;
+
+        /**
+         * Looks up a boolean value in the keyfile backing `info`.
+         * 
+         * The `key` is looked up in the "Desktop Entry" group.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @param key the key to look up
+         * @since 2.36
+         */
+        static get_boolean(info: Gio.DesktopAppInfo, key: string): boolean;
+
+        /**
+         * Gets the categories from the desktop file.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         */
+        static get_categories(info: Gio.DesktopAppInfo): string | null;
+
+        /**
+         * When `info` was created from a known filename, return it.  In some
+         * situations such as the {@link GioUnix.DesktopAppInfo} returned from
+         * `g_desktop_app_info_new_from_keyfile()`, this function will return `null`.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @since 2.24
+         */
+        static get_filename(info: Gio.DesktopAppInfo): string | null;
+
+        /**
+         * Gets the generic name from the desktop file.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         */
+        static get_generic_name(info: Gio.DesktopAppInfo): string | null;
+
+        /**
+         * Gets all applications that implement `interface`.
+         * 
+         * An application implements an interface if that interface is listed in
+         * the Implements= line of the desktop file of the application.
+         * @param _interface the name of the interface
+         * @since 2.42
+         */
+        static get_implementations(_interface: string): Gio.DesktopAppInfo[];
+
+        /**
+         * A desktop file is hidden if the Hidden key in it is
+         * set to True.
+         * @param info a {@link GioUnix.DesktopAppInfo}.
+         */
+        static get_is_hidden(info: Gio.DesktopAppInfo): boolean;
+
+        /**
+         * Gets the keywords from the desktop file.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @since 2.32
+         */
+        static get_keywords(info: Gio.DesktopAppInfo): string[];
+
+        /**
+         * Looks up a localized string value in the keyfile backing `info`
+         * translated to the current locale.
+         * 
+         * The `key` is looked up in the "Desktop Entry" group.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @param key the key to look up
+         * @since 2.56
+         */
+        static get_locale_string(info: Gio.DesktopAppInfo, key: string): string | null;
+
+        /**
+         * Gets the value of the NoDisplay key, which helps determine if the
+         * application info should be shown in menus. See
+         * `G_KEY_FILE_DESKTOP_KEY_NO_DISPLAY` and `g_app_info_should_show()`.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @since 2.30
+         */
+        static get_nodisplay(info: Gio.DesktopAppInfo): boolean;
+
+        /**
+         * Checks if the application info should be shown in menus that list available
+         * applications for a specific name of the desktop, based on the
+         * `OnlyShowIn` and `NotShowIn` keys.
+         * 
+         * `desktop_env` should typically be given as `null`, in which case the
+         * `XDG_CURRENT_DESKTOP` environment variable is consulted.  If you want
+         * to override the default mechanism then you may specify `desktop_env`,
+         * but this is not recommended.
+         * 
+         * Note that `g_app_info_should_show()` for `info` will include this check (with
+         * `null` for `desktop_env`) as well as additional checks.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @param desktop_env a string specifying a desktop name
+         * @since 2.30
+         */
+        static get_show_in(info: Gio.DesktopAppInfo, desktop_env: string | null): boolean;
+
+        /**
+         * Retrieves the StartupWMClass field from `info`. This represents the
+         * WM_CLASS property of the main window of the application, if launched
+         * through `info`.
+         * @param info a {@link GioUnix.DesktopAppInfo} that supports startup notify
+         * @since 2.34
+         */
+        static get_startup_wm_class(info: Gio.DesktopAppInfo): string | null;
+
+        /**
+         * Looks up a string value in the keyfile backing `info`.
+         * 
+         * The `key` is looked up in the "Desktop Entry" group.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @param key the key to look up
+         * @since 2.36
+         */
+        static get_string(info: Gio.DesktopAppInfo, key: string): string | null;
+
+        /**
+         * Looks up a string list value in the keyfile backing `info`.
+         * 
+         * The `key` is looked up in the "Desktop Entry" group.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @param key the key to look up
+         * @since 2.60
+         */
+        static get_string_list(info: Gio.DesktopAppInfo, key: string): string[];
+
+        /**
+         * Returns whether `key` exists in the "Desktop Entry" group
+         * of the keyfile backing `info`.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @param key the key to look up
+         * @since 2.36
+         */
+        static has_key(info: Gio.DesktopAppInfo, key: string): boolean;
+
+        /**
+         * Activates the named application action.
+         * 
+         * You may only call this function on action names that were
+         * returned from `g_desktop_app_info_list_actions()`.
+         * 
+         * Note that if the main entry of the desktop file indicates that the
+         * application supports startup notification, and `launch_context` is
+         * non-`null`, then startup notification will be used when activating the
+         * action (and as such, invocation of the action on the receiving side
+         * must signal the end of startup notification when it is completed).
+         * This is the expected behaviour of applications declaring additional
+         * actions, as per the desktop file specification.
+         * 
+         * As with `g_app_info_launch()` there is no way to detect failures that
+         * occur while using this function.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @param action_name the name of the action as from   `g_desktop_app_info_list_actions()`
+         * @param launch_context a {@link Gio.AppLaunchContext}
+         * @since 2.38
+         */
+        static launch_action(info: Gio.DesktopAppInfo, action_name: string, launch_context: Gio.AppLaunchContext | null): void;
+
+        /**
+         * This function performs the equivalent of `g_app_info_launch_uris()`,
+         * but is intended primarily for operating system components that
+         * launch applications.  Ordinary applications should use
+         * `g_app_info_launch_uris()`.
+         * 
+         * If the application is launched via GSpawn, then `spawn_flags`, `user_setup`
+         * and `user_setup_data` are used for the call to `g_spawn_async()`.
+         * Additionally, `pid_callback` (with `pid_callback_data`) will be called to
+         * inform about the PID of the created process. See `g_spawn_async_with_pipes()`
+         * for information on certain parameter conditions that can enable an
+         * optimized `posix_spawn()` codepath to be used.
+         * 
+         * If application launching occurs via some other mechanism (eg: D-Bus
+         * activation) then `spawn_flags`, `user_setup`, `user_setup_data`,
+         * `pid_callback` and `pid_callback_data` are ignored.
+         * @param appinfo a {@link GioUnix.DesktopAppInfo}
+         * @param uris List of URIs
+         * @param launch_context a {@link Gio.AppLaunchContext}
+         * @param spawn_flags {@link GLib.SpawnFlags}, used for each process
+         */
+        static launch_uris_as_manager(appinfo: Gio.DesktopAppInfo, uris: string[], launch_context: Gio.AppLaunchContext | null, spawn_flags: GLib.SpawnFlags): boolean;
+
+        /**
+         * Equivalent to `g_desktop_app_info_launch_uris_as_manager()` but allows
+         * you to pass in file descriptors for the stdin, stdout and stderr streams
+         * of the launched process.
+         * 
+         * If application launching occurs via some non-spawn mechanism (e.g. D-Bus
+         * activation) then `stdin_fd`, `stdout_fd` and `stderr_fd` are ignored.
+         * @param appinfo a {@link GioUnix.DesktopAppInfo}
+         * @param uris List of URIs
+         * @param launch_context a {@link Gio.AppLaunchContext}
+         * @param spawn_flags {@link GLib.SpawnFlags}, used for each process
+         * @param user_setup a {@link GLib.SpawnChildSetupFunc}, used once     for each process.
+         * @param pid_callback Callback for child processes
+         * @param stdin_fd file descriptor to use for child's stdin, or -1
+         * @param stdout_fd file descriptor to use for child's stdout, or -1
+         * @param stderr_fd file descriptor to use for child's stderr, or -1
+         * @since 2.58
+         */
+        static launch_uris_as_manager_with_fds(appinfo: Gio.DesktopAppInfo, uris: string[], launch_context: Gio.AppLaunchContext | null, spawn_flags: GLib.SpawnFlags, user_setup: GLib.SpawnChildSetupFunc | null, pid_callback: Gio.DesktopAppLaunchCallback | null, stdin_fd: number, stdout_fd: number, stderr_fd: number): boolean;
+
+        /**
+         * Returns the list of "additional application actions" supported on the
+         * desktop file, as per the desktop file specification.
+         * 
+         * As per the specification, this is the list of actions that are
+         * explicitly listed in the "Actions" key of the [Desktop Entry] group.
+         * @param info a {@link GioUnix.DesktopAppInfo}
+         * @since 2.38
+         */
+        static list_actions(info: Gio.DesktopAppInfo): string[];
+
+        /**
+         * Searches desktop files for ones that match `search_string`.
+         * 
+         * The return value is an array of strvs.  Each strv contains a list of
+         * applications that matched `search_string` with an equal score.  The
+         * outer list is sorted by score so that the first strv contains the
+         * best-matching applications, and so on.
+         * The algorithm for determining matches is undefined and may change at
+         * any time.
+         * 
+         * None of the search results are subjected to the normal validation
+         * checks performed by `g_desktop_app_info_new()` (for example, checking that
+         * the executable referenced by a result exists), and so it is possible for
+         * `g_desktop_app_info_new()` to return `null` when passed an app ID returned by
+         * this function. It is expected that calling code will do this when
+         * subsequently creating a {@link GioUnix.DesktopAppInfo} for each result.
+         * @param search_string the search string to use
+         */
+        static search(search_string: string): string[][];
+
+        /**
+         * Sets the name of the desktop that the application is running in.
+         * This is used by `g_app_info_should_show()` and
+         * `g_desktop_app_info_get_show_in()` to evaluate the
+         * `OnlyShowIn` and `NotShowIn`
+         * desktop entry fields.
+         * 
+         * Should be called only once; subsequent calls are ignored.
+         * @param desktop_env a string specifying what desktop this is
+         * @deprecated since 2.42: do not use this API.  Since 2.42 the value of the `XDG_CURRENT_DESKTOP` environment variable will be used.
+         */
+        static set_desktop_env(desktop_env: string): void;
+
+        /**
+         * Adds a content type to the application information to indicate the
+         * application is capable of opening files with the given content type.
+         * @param content_type a string.
+         * @returns `true` on success, `false` on error.
+         * @throws GLib.Error
+         */
+        add_supports_type(content_type: string): boolean;
+
+        /**
+         * Obtains the information whether the {@link Gio.AppInfo} can be deleted.
+         * See `g_app_info_delete()`.
+         * @returns `true` if `appinfo` can be deleted
+         * @since 2.20
+         */
+        can_delete(): boolean;
+
+        /**
+         * Checks if a supported content type can be removed from an application.
+         * @returns `true` if it is possible to remove supported     content types from a given `appinfo`, `false` if not.
+         */
+        can_remove_supports_type(): boolean;
+
+        /**
+         * Tries to delete a {@link Gio.AppInfo}.
+         * 
+         * On some platforms, there may be a difference between user-defined
+         * `GAppInfos` which can be deleted, and system-wide ones which cannot.
+         * See `g_app_info_can_delete()`.
+         * @returns `true` if `appinfo` has been deleted
+         * @since 2.20
+         */
+        ["delete"](): boolean;
+
+        /**
+         * Creates a duplicate of a {@link Gio.AppInfo}.
+         * @returns a duplicate of `appinfo`.
+         */
+        dup(): Gio.AppInfo;
+
+        /**
+         * Checks if two `GAppInfos` are equal.
+         * 
+         * Note that the check *may not* compare each individual
+         * field, and only does an identity check. In case detecting changes in the
+         * contents is needed, program code must additionally compare relevant fields.
+         * @param appinfo2 the second {@link Gio.AppInfo}.
+         * @returns `true` if `appinfo1` is equal to `appinfo2`. `false` otherwise.
+         */
+        equal(appinfo2: Gio.AppInfo): boolean;
+
+        /**
+         * Gets the commandline with which the application will be
+         * started.
+         * @returns a string containing the `appinfo`'s commandline,     or `null` if this information is not available
+         * @since 2.20
+         */
+        get_commandline(): string | null;
+
+        /**
+         * Gets a human-readable description of an installed application.
+         * @returns a string containing a description of the application `appinfo`, or `null` if none.
+         */
+        get_description(): string | null;
+
+        /**
+         * Gets the display name of the application. The display name is often more
+         * descriptive to the user than the name itself.
+         * @returns the display name of the application for `appinfo`, or the name if no display name is available.
+         * @since 2.24
+         */
+        get_display_name(): string;
+
+        /**
+         * Gets the executable's name for the installed application.
+         * 
+         * This is intended to be used for debugging or labelling what program is going
+         * to be run. To launch the executable, use `g_app_info_launch()` and related
+         * functions, rather than spawning the return value from this function.
+         * @returns a string containing the `appinfo`'s application binaries name
+         */
+        get_executable(): string;
+
+        /**
+         * Gets the icon for the application.
+         * @returns the default {@link Gio.Icon} for `appinfo` or `null` if there is no default icon.
+         */
+        get_icon(): Gio.Icon | null;
+
+        /**
+         * Gets the ID of an application. An id is a string that
+         * identifies the application. The exact format of the id is
+         * platform dependent. For instance, on Unix this is the
+         * desktop file id from the xdg menu specification.
+         * 
+         * Note that the returned ID may be `null`, depending on how
+         * the `appinfo` has been constructed.
+         * @returns a string containing the application's ID.
+         */
+        get_id(): string | null;
+
+        /**
+         * Gets the installed name of the application.
+         * @returns the name of the application for `appinfo`.
+         */
+        get_name(): string;
+
+        /**
+         * Retrieves the list of content types that `app_info` claims to support.
+         * If this information is not provided by the environment, this function
+         * will return `null`.
+         * This function does not take in consideration associations added with
+         * `g_app_info_add_supports_type()`, but only those exported directly by
+         * the application.
+         * @returns a list of content types.
+         * @since 2.34
+         */
+        get_supported_types(): string[];
+
+        /**
+         * Launches the application. Passes `files` to the launched application
+         * as arguments, using the optional `context` to get information
+         * about the details of the launcher (like what screen it is on).
+         * On error, `error` will be set accordingly.
+         * 
+         * To launch the application without arguments pass a `null` `files` list.
+         * 
+         * Note that even if the launch is successful the application launched
+         * can fail to start if it runs into problems during startup. There is
+         * no way to detect this.
+         * 
+         * Some URIs can be changed when passed through a GFile (for instance
+         * unsupported URIs with strange formats like mailto:), so if you have
+         * a textual URI you want to pass in as argument, consider using
+         * `g_app_info_launch_uris()` instead.
+         * 
+         * The launched application inherits the environment of the launching
+         * process, but it can be modified with `g_app_launch_context_setenv()`
+         * and `g_app_launch_context_unsetenv()`.
+         * 
+         * On UNIX, this function sets the `GIO_LAUNCHED_DESKTOP_FILE`
+         * environment variable with the path of the launched desktop file and
+         * `GIO_LAUNCHED_DESKTOP_FILE_PID` to the process id of the launched
+         * process. This can be used to ignore `GIO_LAUNCHED_DESKTOP_FILE`,
+         * should it be inherited by further processes. The `DISPLAY`,
+         * `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID` environment
+         * variables are also set, based on information provided in `context`.
+         * @param files a {@link GLib.List} of {@link Gio.File} objects
+         * @param context a {@link Gio.AppLaunchContext} or `null`
+         * @returns `true` on successful launch, `false` otherwise.
+         * @throws GLib.Error
+         */
+        launch(files: Gio.File[] | null, context: Gio.AppLaunchContext | null): boolean;
+
+        /**
+         * Launches the application. This passes the `uris` to the launched application
+         * as arguments, using the optional `context` to get information
+         * about the details of the launcher (like what screen it is on).
+         * On error, `error` will be set accordingly. If the application only supports
+         * one URI per invocation as part of their command-line, multiple instances
+         * of the application will be spawned.
+         * 
+         * To launch the application without arguments pass a `null` `uris` list.
+         * 
+         * Note that even if the launch is successful the application launched
+         * can fail to start if it runs into problems during startup. There is
+         * no way to detect this.
+         * @param uris a {@link GLib.List} containing URIs to launch.
+         * @param context a {@link Gio.AppLaunchContext} or `null`
+         * @returns `true` on successful launch, `false` otherwise.
+         * @throws GLib.Error
+         */
+        launch_uris(uris: string[] | null, context: Gio.AppLaunchContext | null): boolean;
+
+        /**
+         * Async version of `g_app_info_launch_uris()`.
+         * 
+         * The `callback` is invoked immediately after the application launch, but it
+         * waits for activation in case of D-Bus–activated applications and also provides
+         * extended error information for sandboxed applications, see notes for
+         * `g_app_info_launch_default_for_uri_async()`.
+         * @param uris a {@link GLib.List} containing URIs to launch.
+         * @param context a {@link Gio.AppLaunchContext} or `null`
+         * @param cancellable a {@link Gio.Cancellable}
+         * @since 2.60
+         */
+        launch_uris_async(uris: string[] | null, context: Gio.AppLaunchContext | null, cancellable: Gio.Cancellable | null): globalThis.Promise<boolean>;
+
+        /**
+         * Async version of `g_app_info_launch_uris()`.
+         * 
+         * The `callback` is invoked immediately after the application launch, but it
+         * waits for activation in case of D-Bus–activated applications and also provides
+         * extended error information for sandboxed applications, see notes for
+         * `g_app_info_launch_default_for_uri_async()`.
+         * @param uris a {@link GLib.List} containing URIs to launch.
+         * @param context a {@link Gio.AppLaunchContext} or `null`
+         * @param cancellable a {@link Gio.Cancellable}
+         * @param callback a {@link Gio.AsyncReadyCallback} to call when the request is done
+         * @since 2.60
+         */
+        launch_uris_async(uris: string[] | null, context: Gio.AppLaunchContext | null, cancellable: Gio.Cancellable | null, callback: Gio.AsyncReadyCallback<this> | null): void;
+
+        /**
+         * Async version of `g_app_info_launch_uris()`.
+         * 
+         * The `callback` is invoked immediately after the application launch, but it
+         * waits for activation in case of D-Bus–activated applications and also provides
+         * extended error information for sandboxed applications, see notes for
+         * `g_app_info_launch_default_for_uri_async()`.
+         * @param uris a {@link GLib.List} containing URIs to launch.
+         * @param context a {@link Gio.AppLaunchContext} or `null`
+         * @param cancellable a {@link Gio.Cancellable}
+         * @param callback a {@link Gio.AsyncReadyCallback} to call when the request is done
+         * @since 2.60
+         */
+        launch_uris_async(uris: string[] | null, context: Gio.AppLaunchContext | null, cancellable: Gio.Cancellable | null, callback?: Gio.AsyncReadyCallback<this> | null): globalThis.Promise<boolean> | void;
+
+        /**
+         * Finishes a `g_app_info_launch_uris_async()` operation.
+         * @param result a {@link Gio.AsyncResult}
+         * @returns `true` on successful launch, `false` otherwise.
+         * @since 2.60
+         * @throws GLib.Error
+         */
+        launch_uris_finish(result: Gio.AsyncResult): boolean;
+
+        /**
+         * Removes a supported type from an application, if possible.
+         * @param content_type a string.
+         * @returns `true` on success, `false` on error.
+         * @throws GLib.Error
+         */
+        remove_supports_type(content_type: string): boolean;
+
+        /**
+         * Sets the application as the default handler for the given file extension.
+         * @param extension a string containing the file extension     (without the dot).
+         * @returns `true` on success, `false` on error.
+         * @throws GLib.Error
+         */
+        set_as_default_for_extension(extension: string): boolean;
+
+        /**
+         * Sets the application as the default handler for a given type.
+         * @param content_type the content type.
+         * @returns `true` on success, `false` on error.
+         * @throws GLib.Error
+         */
+        set_as_default_for_type(content_type: string): boolean;
+
+        /**
+         * Sets the application as the last used application for a given type.
+         * This will make the application appear as first in the list returned
+         * by `g_app_info_get_recommended_for_type()`, regardless of the default
+         * application for that content type.
+         * @param content_type the content type.
+         * @returns `true` on success, `false` on error.
+         * @throws GLib.Error
+         */
+        set_as_last_used_for_type(content_type: string): boolean;
+
+        /**
+         * Checks if the application info should be shown in menus that
+         * list available applications.
+         * @returns `true` if the `appinfo` should be shown, `false` otherwise.
+         */
+        should_show(): boolean;
+
+        /**
+         * Checks if the application accepts files as arguments.
+         * @returns `true` if the `appinfo` supports files.
+         */
+        supports_files(): boolean;
+
+        /**
+         * Checks if the application supports reading files and directories from URIs.
+         * @returns `true` if the `appinfo` supports URIs.
+         */
+        supports_uris(): boolean;
+
+        /**
+         * Adds a content type to the application information to indicate the
+         * application is capable of opening files with the given content type.
+         * @param content_type a string.
+         * @virtual
+         */
+        vfunc_add_supports_type(content_type: string): boolean;
+
+        /**
+         * Obtains the information whether the {@link Gio.AppInfo} can be deleted.
+         * See `g_app_info_delete()`.
+         * @since 2.20
+         * @virtual
+         */
+        vfunc_can_delete(): boolean;
+
+        /**
+         * Checks if a supported content type can be removed from an application.
+         * @virtual
+         */
+        vfunc_can_remove_supports_type(): boolean;
+
+        /**
+         * Tries to delete a {@link Gio.AppInfo}.
+         * 
+         * On some platforms, there may be a difference between user-defined
+         * `GAppInfos` which can be deleted, and system-wide ones which cannot.
+         * See `g_app_info_can_delete()`.
+         * @since 2.20
+         * @virtual
+         */
+        vfunc_do_delete(): boolean;
+
+        /**
+         * Creates a duplicate of a {@link Gio.AppInfo}.
+         * @virtual
+         */
+        vfunc_dup(): Gio.AppInfo;
+
+        /**
+         * Checks if two `GAppInfos` are equal.
+         * 
+         * Note that the check *may not* compare each individual
+         * field, and only does an identity check. In case detecting changes in the
+         * contents is needed, program code must additionally compare relevant fields.
+         * @param appinfo2 the second {@link Gio.AppInfo}.
+         * @virtual
+         */
+        vfunc_equal(appinfo2: Gio.AppInfo): boolean;
+
+        /**
+         * Gets the commandline with which the application will be
+         * started.
+         * @since 2.20
+         * @virtual
+         */
+        vfunc_get_commandline(): string | null;
+
+        /**
+         * Gets a human-readable description of an installed application.
+         * @virtual
+         */
+        vfunc_get_description(): string | null;
+
+        /**
+         * Gets the display name of the application. The display name is often more
+         * descriptive to the user than the name itself.
+         * @since 2.24
+         * @virtual
+         */
+        vfunc_get_display_name(): string;
+
+        /**
+         * Gets the executable's name for the installed application.
+         * 
+         * This is intended to be used for debugging or labelling what program is going
+         * to be run. To launch the executable, use `g_app_info_launch()` and related
+         * functions, rather than spawning the return value from this function.
+         * @virtual
+         */
+        vfunc_get_executable(): string;
+
+        /**
+         * Gets the icon for the application.
+         * @virtual
+         */
+        vfunc_get_icon(): Gio.Icon | null;
+
+        /**
+         * Gets the ID of an application. An id is a string that
+         * identifies the application. The exact format of the id is
+         * platform dependent. For instance, on Unix this is the
+         * desktop file id from the xdg menu specification.
+         * 
+         * Note that the returned ID may be `null`, depending on how
+         * the `appinfo` has been constructed.
+         * @virtual
+         */
+        vfunc_get_id(): string | null;
+
+        /**
+         * Gets the installed name of the application.
+         * @virtual
+         */
+        vfunc_get_name(): string;
+
+        /**
+         * Retrieves the list of content types that `app_info` claims to support.
+         * If this information is not provided by the environment, this function
+         * will return `null`.
+         * This function does not take in consideration associations added with
+         * `g_app_info_add_supports_type()`, but only those exported directly by
+         * the application.
+         * @since 2.34
+         * @virtual
+         */
+        vfunc_get_supported_types(): string[];
+
+        /**
+         * Launches the application. Passes `files` to the launched application
+         * as arguments, using the optional `context` to get information
+         * about the details of the launcher (like what screen it is on).
+         * On error, `error` will be set accordingly.
+         * 
+         * To launch the application without arguments pass a `null` `files` list.
+         * 
+         * Note that even if the launch is successful the application launched
+         * can fail to start if it runs into problems during startup. There is
+         * no way to detect this.
+         * 
+         * Some URIs can be changed when passed through a GFile (for instance
+         * unsupported URIs with strange formats like mailto:), so if you have
+         * a textual URI you want to pass in as argument, consider using
+         * `g_app_info_launch_uris()` instead.
+         * 
+         * The launched application inherits the environment of the launching
+         * process, but it can be modified with `g_app_launch_context_setenv()`
+         * and `g_app_launch_context_unsetenv()`.
+         * 
+         * On UNIX, this function sets the `GIO_LAUNCHED_DESKTOP_FILE`
+         * environment variable with the path of the launched desktop file and
+         * `GIO_LAUNCHED_DESKTOP_FILE_PID` to the process id of the launched
+         * process. This can be used to ignore `GIO_LAUNCHED_DESKTOP_FILE`,
+         * should it be inherited by further processes. The `DISPLAY`,
+         * `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID` environment
+         * variables are also set, based on information provided in `context`.
+         * @param files a {@link GLib.List} of {@link Gio.File} objects
+         * @param context a {@link Gio.AppLaunchContext} or `null`
+         * @virtual
+         */
+        vfunc_launch(files: Gio.File[] | null, context: Gio.AppLaunchContext | null): boolean;
+
+        /**
+         * Launches the application. This passes the `uris` to the launched application
+         * as arguments, using the optional `context` to get information
+         * about the details of the launcher (like what screen it is on).
+         * On error, `error` will be set accordingly. If the application only supports
+         * one URI per invocation as part of their command-line, multiple instances
+         * of the application will be spawned.
+         * 
+         * To launch the application without arguments pass a `null` `uris` list.
+         * 
+         * Note that even if the launch is successful the application launched
+         * can fail to start if it runs into problems during startup. There is
+         * no way to detect this.
+         * @param uris a {@link GLib.List} containing URIs to launch.
+         * @param context a {@link Gio.AppLaunchContext} or `null`
+         * @virtual
+         */
+        vfunc_launch_uris(uris: string[] | null, context: Gio.AppLaunchContext | null): boolean;
+
+        /**
+         * Async version of `g_app_info_launch_uris()`.
+         * 
+         * The `callback` is invoked immediately after the application launch, but it
+         * waits for activation in case of D-Bus–activated applications and also provides
+         * extended error information for sandboxed applications, see notes for
+         * `g_app_info_launch_default_for_uri_async()`.
+         * @param uris a {@link GLib.List} containing URIs to launch.
+         * @param context a {@link Gio.AppLaunchContext} or `null`
+         * @param cancellable a {@link Gio.Cancellable}
+         * @param callback a {@link Gio.AsyncReadyCallback} to call when the request is done
+         * @since 2.60
+         * @virtual
+         */
+        vfunc_launch_uris_async(uris: string[] | null, context: Gio.AppLaunchContext | null, cancellable: Gio.Cancellable | null, callback: Gio.AsyncReadyCallback<this> | null): void;
+
+        /**
+         * Finishes a `g_app_info_launch_uris_async()` operation.
+         * @param result a {@link Gio.AsyncResult}
+         * @since 2.60
+         * @virtual
+         */
+        vfunc_launch_uris_finish(result: Gio.AsyncResult): boolean;
+
+        /**
+         * Removes a supported type from an application, if possible.
+         * @param content_type a string.
+         * @virtual
+         */
+        vfunc_remove_supports_type(content_type: string): boolean;
+
+        /**
+         * Sets the application as the default handler for the given file extension.
+         * @param extension a string containing the file extension     (without the dot).
+         * @virtual
+         */
+        vfunc_set_as_default_for_extension(extension: string): boolean;
+
+        /**
+         * Sets the application as the default handler for a given type.
+         * @param content_type the content type.
+         * @virtual
+         */
+        vfunc_set_as_default_for_type(content_type: string): boolean;
+
+        /**
+         * Sets the application as the last used application for a given type.
+         * This will make the application appear as first in the list returned
+         * by `g_app_info_get_recommended_for_type()`, regardless of the default
+         * application for that content type.
+         * @param content_type the content type.
+         * @virtual
+         */
+        vfunc_set_as_last_used_for_type(content_type: string): boolean;
+
+        /**
+         * Checks if the application info should be shown in menus that
+         * list available applications.
+         * @virtual
+         */
+        vfunc_should_show(): boolean;
+
+        /**
+         * Checks if the application accepts files as arguments.
+         * @virtual
+         */
+        vfunc_supports_files(): boolean;
+
+        /**
+         * Checks if the application supports reading files and directories from URIs.
+         * @virtual
+         */
+        vfunc_supports_uris(): boolean;
+    }
+
+
+    namespace FDMessage {
+        // Signal signatures
+        interface SignalSignatures extends Gio.SocketControlMessage.SignalSignatures {
+            "notify::fd-list": (pspec: GObject.ParamSpec) => void;
+        }
+
+        // Constructor properties interface
+        interface ConstructorProps extends Gio.SocketControlMessage.ConstructorProps {
+            fd_list: Gio.UnixFDList;
+            fdList: Gio.UnixFDList;
+        }
+    }
+
+    /**
+     * This {@link Gio.SocketControlMessage} contains a {@link Gio.UnixFDList}.
+     * It may be sent using {@link Gio.Socket.send_message} and received using
+     * {@link Gio.Socket.receive_message} over UNIX sockets (ie: sockets in the
+     * `G_SOCKET_FAMILY_UNIX` family). The file descriptors are copied
+     * between processes by the kernel.
+     * 
+     * For an easier way to send and receive file descriptors over
+     * stream-oriented UNIX sockets, see {@link Gio.UnixConnection.send_fd} and
+     * {@link Gio.UnixConnection.receive_fd}.
+     * 
+     * Note that `<gio/gunixfdmessage.h>` belongs to the UNIX-specific GIO
+     * interfaces, thus you have to use the `gio-unix-2.0.pc` pkg-config
+     * file or the `GioUnix-2.0` GIR namespace when using it.
+     * @gir-type Class
+     */
+    class FDMessage extends Gio.SocketControlMessage {
+        static $gtype: GObject.GType<FDMessage>;
+
+        // Properties
+        /**
+         * The {@link Gio.UnixFDList} object to send with the message.
+         * @since 2.22
+         * @construct-only
+         */
+        get fd_list(): Gio.UnixFDList;
+
+        /**
+         * The {@link Gio.UnixFDList} object to send with the message.
+         * @since 2.22
+         * @construct-only
+         */
+        get fdList(): Gio.UnixFDList;
+
+        /**
+         * Compile-time signal type information.
+         *
+         * This instance property is generated only for TypeScript type checking.
+         * It is not defined at runtime and should not be accessed in JS code.
+         * @internal
+         */
+        $signals: FDMessage.SignalSignatures;
+
+        // Constructors
+        constructor(properties?: Partial<FDMessage.ConstructorProps>, ...args: any[]);
+
+        _init(...args: any[]): void;
+
+        static ["new"](): FDMessage;
+
+        static new_with_fd_list(fd_list: Gio.UnixFDList): FDMessage;
+
+        // Signals
+        /** @signal */
+        connect<K extends keyof FDMessage.SignalSignatures>(signal: K, callback: GObject.SignalCallback<this, FDMessage.SignalSignatures[K]>): number;
+
+        /** @signal */
+        connect_after<K extends keyof FDMessage.SignalSignatures>(signal: K, callback: GObject.SignalCallback<this, FDMessage.SignalSignatures[K]>): number;
+
+        /** @signal */
+        emit<K extends keyof FDMessage.SignalSignatures>(signal: K, ...args: GObject.GjsParameters<FDMessage.SignalSignatures[K]>): void;
+
+        // Static methods
+        /**
+         * Adds a file descriptor to `message`.
+         * 
+         * The file descriptor is duplicated using `dup()`. You keep your copy
+         * of the descriptor and the copy contained in `message` will be closed
+         * when `message` is finalized.
+         * 
+         * A possible cause of failure is exceeding the per-process or
+         * system-wide file descriptor limit.
+         * @param message a {@link GioUnix.FDMessage}
+         * @param fd a valid open file descriptor
+         * @since 2.22
+         */
+        static append_fd(message: Gio.UnixFDMessage, fd: number): boolean;
+
+        /**
+         * Gets the {@link Gio.UnixFDList} contained in `message`.  This function does not
+         * return a reference to the caller, but the returned list is valid for
+         * the lifetime of `message`.
+         * @param message a {@link GioUnix.FDMessage}
+         * @since 2.24
+         */
+        static get_fd_list(message: Gio.UnixFDMessage): Gio.UnixFDList;
+
+        /**
+         * Returns the array of file descriptors that is contained in this
+         * object.
+         * 
+         * After this call, the descriptors are no longer contained in
+         * `message`. Further calls will return an empty list (unless more
+         * descriptors have been added).
+         * 
+         * The return result of this function must be freed with `g_free()`.
+         * The caller is also responsible for closing all of the file
+         * descriptors.
+         * 
+         * If `length` is non-`null` then it is set to the number of file
+         * descriptors in the returned array. The returned array is also
+         * terminated with -1.
+         * 
+         * This function never returns `null`. In case there are no file
+         * descriptors contained in `message`, an empty array is returned.
+         * @param message a {@link GioUnix.FDMessage}
+         * @since 2.22
+         */
+        static steal_fds(message: Gio.UnixFDMessage): number[];
+    }
+
+
+    namespace InputStream {
+        // Signal signatures
+        interface SignalSignatures extends Gio.InputStream.SignalSignatures {
+            "notify::close-fd": (pspec: GObject.ParamSpec) => void;
+            "notify::fd": (pspec: GObject.ParamSpec) => void;
+        }
+
+        // Constructor properties interface
+        interface ConstructorProps extends Gio.InputStream.ConstructorProps, Gio.PollableInputStream.ConstructorProps, FileDescriptorBased.ConstructorProps {
+            close_fd: boolean;
+            closeFd: boolean;
+            fd: number;
+        }
+    }
+
+    /**
+     * {@link GioUnix.InputStream} implements {@link Gio.InputStream} for reading from a UNIX
+     * file descriptor, including asynchronous operations. (If the file
+     * descriptor refers to a socket or pipe, this will use `poll()` to do
+     * asynchronous I/O. If it refers to a regular file, it will fall back
+     * to doing asynchronous I/O in another thread.)
+     * 
+     * Note that `<gio/gunixinputstream.h>` belongs to the UNIX-specific GIO
+     * interfaces, thus you have to use the `gio-unix-2.0.pc` pkg-config
+     * file or the `GioUnix-2.0` GIR namespace when using it.
+     * @gir-type Class
+     */
+    class InputStream extends Gio.InputStream implements Gio.PollableInputStream, FileDescriptorBased {
+        static $gtype: GObject.GType<InputStream>;
+
+        // Properties
+        /**
+         * Whether to close the file descriptor when the stream is closed.
+         * @since 2.20
+         * @default true
+         */
+        get close_fd(): boolean;
+        set close_fd(val: boolean);
+
+        /**
+         * Whether to close the file descriptor when the stream is closed.
+         * @since 2.20
+         * @default true
+         */
+        get closeFd(): boolean;
+        set closeFd(val: boolean);
+
+        /**
+         * The file descriptor that the stream reads from.
+         * @since 2.20
+         * @construct-only
+         * @default -1
+         */
+        get fd(): number;
+
+        /**
+         * Compile-time signal type information.
+         *
+         * This instance property is generated only for TypeScript type checking.
+         * It is not defined at runtime and should not be accessed in JS code.
+         * @internal
+         */
+        $signals: InputStream.SignalSignatures;
+
+        // Constructors
+        constructor(properties?: Partial<InputStream.ConstructorProps>, ...args: any[]);
+
+        _init(...args: any[]): void;
+
+        static ["new"](fd: number, close_fd: boolean): InputStream;
+
+        // Signals
+        /** @signal */
+        connect<K extends keyof InputStream.SignalSignatures>(signal: K, callback: GObject.SignalCallback<this, InputStream.SignalSignatures[K]>): number;
+
+        /** @signal */
+        connect_after<K extends keyof InputStream.SignalSignatures>(signal: K, callback: GObject.SignalCallback<this, InputStream.SignalSignatures[K]>): number;
+
+        /** @signal */
+        emit<K extends keyof InputStream.SignalSignatures>(signal: K, ...args: GObject.GjsParameters<InputStream.SignalSignatures[K]>): void;
+
+        // Static methods
+        /**
+         * Returns whether the file descriptor of `stream` will be
+         * closed when the stream is closed.
+         * @param stream a {@link GioUnix.InputStream}
+         * @since 2.20
+         */
+        static get_close_fd(stream: Gio.UnixInputStream): boolean;
+
+        /**
+         * Return the UNIX file descriptor that the stream reads from.
+         * @param stream a {@link GioUnix.InputStream}
+         * @since 2.20
+         */
+        static get_fd(stream: Gio.UnixInputStream): number;
+
+        /**
+         * Sets whether the file descriptor of `stream` shall be closed
+         * when the stream is closed.
+         * @param stream a {@link GioUnix.InputStream}
+         * @param close_fd `true` to close the file descriptor when done
+         * @since 2.20
+         */
+        static set_close_fd(stream: Gio.UnixInputStream, close_fd: boolean): void;
+
+        /**
+         * Checks if `stream` is actually pollable. Some classes may implement
+         * {@link Gio.PollableInputStream} but have only certain instances of that class
+         * be pollable. If this method returns `false`, then the behavior of
+         * other {@link Gio.PollableInputStream} methods is undefined.
+         * 
+         * For any given stream, the value returned by this method is constant;
+         * a stream cannot switch from pollable to non-pollable or vice versa.
+         * @returns `true` if `stream` is pollable, `false` if not.
+         * @since 2.28
+         */
+        can_poll(): boolean;
+
+        /**
+         * Creates a {@link GLib.Source} that triggers when `stream` can be read, or
+         * `cancellable` is triggered or an error occurs. The callback on the
+         * source is of the {@link Gio.PollableSourceFunc} type.
+         * 
+         * As with `g_pollable_input_stream_is_readable()`, it is possible that
+         * the stream may not actually be readable even after the source
+         * triggers, so you should use `g_pollable_input_stream_read_nonblocking()`
+         * rather than `g_input_stream_read()` from the callback.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_input_stream_can_poll()` returns `false` for `stream`.
+         * @param cancellable a {@link Gio.Cancellable}, or `null`
+         * @returns a new {@link GLib.Source}
+         * @since 2.28
+         */
+        create_source(cancellable: Gio.Cancellable | null): GLib.Source;
+
+        /**
+         * Checks if `stream` can be read.
+         * 
+         * Note that some stream types may not be able to implement this 100%
+         * reliably, and it is possible that a call to `g_input_stream_read()`
+         * after this returns `true` would still block. To guarantee
+         * non-blocking behavior, you should always use
+         * `g_pollable_input_stream_read_nonblocking()`, which will return a
+         * {@link Gio.IOErrorEnum.WOULD_BLOCK} error rather than blocking.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_input_stream_can_poll()` returns `false` for `stream`.
+         * @returns `true` if `stream` is readable, `false` if not. If an error   has occurred on `stream`, this will result in   `g_pollable_input_stream_is_readable()` returning `true`, and the   next attempt to read will return the error.
+         * @since 2.28
+         */
+        is_readable(): boolean;
+
+        /**
+         * Attempts to read up to `count` bytes from `stream` into `buffer`, as
+         * with `g_input_stream_read()`. If `stream` is not currently readable,
+         * this will immediately return {@link Gio.IOErrorEnum.WOULD_BLOCK}, and you can
+         * use `g_pollable_input_stream_create_source()` to create a {@link GLib.Source}
+         * that will be triggered when `stream` is readable.
+         * 
+         * Note that since this method never blocks, you cannot actually
+         * use `cancellable` to cancel it. However, it will return an error
+         * if `cancellable` has already been cancelled when you call, which
+         * may happen if you call this method after a source triggers due
+         * to having been cancelled.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_input_stream_can_poll()` returns `false` for `stream`.
+         * @param cancellable a {@link Gio.Cancellable}, or `null`
+         * @returns the number of bytes read, or -1 on error (including   {@link Gio.IOErrorEnum.WOULD_BLOCK}).
+         * @throws GLib.Error
+         */
+        read_nonblocking(cancellable: Gio.Cancellable | null): [number, Uint8Array];
+
+        /**
+         * Checks if `stream` is actually pollable. Some classes may implement
+         * {@link Gio.PollableInputStream} but have only certain instances of that class
+         * be pollable. If this method returns `false`, then the behavior of
+         * other {@link Gio.PollableInputStream} methods is undefined.
+         * 
+         * For any given stream, the value returned by this method is constant;
+         * a stream cannot switch from pollable to non-pollable or vice versa.
+         * @since 2.28
+         * @virtual
+         */
+        vfunc_can_poll(): boolean;
+
+        /**
+         * Creates a {@link GLib.Source} that triggers when `stream` can be read, or
+         * `cancellable` is triggered or an error occurs. The callback on the
+         * source is of the {@link Gio.PollableSourceFunc} type.
+         * 
+         * As with `g_pollable_input_stream_is_readable()`, it is possible that
+         * the stream may not actually be readable even after the source
+         * triggers, so you should use `g_pollable_input_stream_read_nonblocking()`
+         * rather than `g_input_stream_read()` from the callback.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_input_stream_can_poll()` returns `false` for `stream`.
+         * @param cancellable a {@link Gio.Cancellable}, or `null`
+         * @since 2.28
+         * @virtual
+         */
+        vfunc_create_source(cancellable: Gio.Cancellable | null): GLib.Source;
+
+        /**
+         * Checks if `stream` can be read.
+         * 
+         * Note that some stream types may not be able to implement this 100%
+         * reliably, and it is possible that a call to `g_input_stream_read()`
+         * after this returns `true` would still block. To guarantee
+         * non-blocking behavior, you should always use
+         * `g_pollable_input_stream_read_nonblocking()`, which will return a
+         * {@link Gio.IOErrorEnum.WOULD_BLOCK} error rather than blocking.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_input_stream_can_poll()` returns `false` for `stream`.
+         * @since 2.28
+         * @virtual
+         */
+        vfunc_is_readable(): boolean;
+
+        /**
+         * Attempts to read up to `count` bytes from `stream` into `buffer`, as
+         * with `g_input_stream_read()`. If `stream` is not currently readable,
+         * this will immediately return {@link Gio.IOErrorEnum.WOULD_BLOCK}, and you can
+         * use `g_pollable_input_stream_create_source()` to create a {@link GLib.Source}
+         * that will be triggered when `stream` is readable.
+         * 
+         * Note that since this method never blocks, you cannot actually
+         * use `cancellable` to cancel it. However, it will return an error
+         * if `cancellable` has already been cancelled when you call, which
+         * may happen if you call this method after a source triggers due
+         * to having been cancelled.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_input_stream_can_poll()` returns `false` for `stream`.
+         * @virtual
+         */
+        vfunc_read_nonblocking(): [bigint | number, Uint8Array | string | null];
+    }
+
+
+    namespace MountMonitor {
+        // Signal signatures
+        interface SignalSignatures extends GObject.Object.SignalSignatures {
+            /**
+             * Emitted when the unix mount points have changed.
+             * @signal
+             * @run-last
+             */
+            "mountpoints-changed": () => void;
+            /**
+             * Emitted when the unix mounts have changed.
+             * @signal
+             * @run-last
+             */
+            "mounts-changed": () => void;
+        }
+
+        // Constructor properties interface
+        interface ConstructorProps extends GObject.Object.ConstructorProps {}
+    }
+
+    /**
+     * Watches `GUnixMounts` for changes.
+     * @gir-type Class
+     */
+    class MountMonitor extends GObject.Object {
+        static $gtype: GObject.GType<MountMonitor>;
+
+        /**
+         * Compile-time signal type information.
+         *
+         * This instance property is generated only for TypeScript type checking.
+         * It is not defined at runtime and should not be accessed in JS code.
+         * @internal
+         */
+        $signals: MountMonitor.SignalSignatures;
+
+        // Constructors
+        constructor(properties?: Partial<MountMonitor.ConstructorProps>, ...args: any[]);
+
+        _init(...args: any[]): void;
+
+        static ["new"](): MountMonitor;
+
+        // Signals
+        /** @signal */
+        connect<K extends keyof MountMonitor.SignalSignatures>(signal: K, callback: GObject.SignalCallback<this, MountMonitor.SignalSignatures[K]>): number;
+
+        /** @signal */
+        connect_after<K extends keyof MountMonitor.SignalSignatures>(signal: K, callback: GObject.SignalCallback<this, MountMonitor.SignalSignatures[K]>): number;
+
+        /** @signal */
+        emit<K extends keyof MountMonitor.SignalSignatures>(signal: K, ...args: GObject.GjsParameters<MountMonitor.SignalSignatures[K]>): void;
+
+        // Static methods
+        /**
+         * Gets the {@link GioUnix.MountMonitor} for the current thread-default main
+         * context.
+         * 
+         * The mount monitor can be used to monitor for changes to the list of
+         * mounted filesystems as well as the list of mount points (ie: fstab
+         * entries).
+         * 
+         * You must only call `g_object_unref()` on the return value from under
+         * the same main context as you called this function.
+         * @since 2.44
+         */
+        static get(): Gio.UnixMountMonitor;
+
+        /**
+         * This function does nothing.
+         * 
+         * Before 2.44, this was a partially-effective way of controlling the
+         * rate at which events would be reported under some uncommon
+         * circumstances.  Since `mount_monitor` is a singleton, it also meant
+         * that calling this function would have side effects for other users of
+         * the monitor.
+         * @param mount_monitor a {@link GioUnix.MountMonitor}
+         * @param limit_msec a integer with the limit in milliseconds to     poll for changes.
+         * @since 2.18
+         * @deprecated since 2.44: This function does nothing.  Don't call it.
+         */
+        static set_rate_limit(mount_monitor: Gio.UnixMountMonitor, limit_msec: number): void;
+    }
+
+
+    namespace OutputStream {
+        // Signal signatures
+        interface SignalSignatures extends Gio.OutputStream.SignalSignatures {
+            "notify::close-fd": (pspec: GObject.ParamSpec) => void;
+            "notify::fd": (pspec: GObject.ParamSpec) => void;
+        }
+
+        // Constructor properties interface
+        interface ConstructorProps extends Gio.OutputStream.ConstructorProps, Gio.PollableOutputStream.ConstructorProps, FileDescriptorBased.ConstructorProps {
+            close_fd: boolean;
+            closeFd: boolean;
+            fd: number;
+        }
+    }
+
+    /**
+     * {@link GioUnix.OutputStream} implements {@link Gio.OutputStream} for writing to a UNIX
+     * file descriptor, including asynchronous operations. (If the file
+     * descriptor refers to a socket or pipe, this will use `poll()` to do
+     * asynchronous I/O. If it refers to a regular file, it will fall back
+     * to doing asynchronous I/O in another thread.)
+     * 
+     * Note that `<gio/gunixoutputstream.h>` belongs to the UNIX-specific GIO
+     * interfaces, thus you have to use the `gio-unix-2.0.pc` pkg-config file
+     * file or the `GioUnix-2.0` GIR namespace when using it.
+     * @gir-type Class
+     */
+    class OutputStream extends Gio.OutputStream implements Gio.PollableOutputStream, FileDescriptorBased {
+        static $gtype: GObject.GType<OutputStream>;
+
+        // Properties
+        /**
+         * Whether to close the file descriptor when the stream is closed.
+         * @since 2.20
+         * @default true
+         */
+        get close_fd(): boolean;
+        set close_fd(val: boolean);
+
+        /**
+         * Whether to close the file descriptor when the stream is closed.
+         * @since 2.20
+         * @default true
+         */
+        get closeFd(): boolean;
+        set closeFd(val: boolean);
+
+        /**
+         * The file descriptor that the stream writes to.
+         * @since 2.20
+         * @construct-only
+         * @default -1
+         */
+        get fd(): number;
+
+        /**
+         * Compile-time signal type information.
+         *
+         * This instance property is generated only for TypeScript type checking.
+         * It is not defined at runtime and should not be accessed in JS code.
+         * @internal
+         */
+        $signals: OutputStream.SignalSignatures;
+
+        // Constructors
+        constructor(properties?: Partial<OutputStream.ConstructorProps>, ...args: any[]);
+
+        _init(...args: any[]): void;
+
+        static ["new"](fd: number, close_fd: boolean): OutputStream;
+
+        // Signals
+        /** @signal */
+        connect<K extends keyof OutputStream.SignalSignatures>(signal: K, callback: GObject.SignalCallback<this, OutputStream.SignalSignatures[K]>): number;
+
+        /** @signal */
+        connect_after<K extends keyof OutputStream.SignalSignatures>(signal: K, callback: GObject.SignalCallback<this, OutputStream.SignalSignatures[K]>): number;
+
+        /** @signal */
+        emit<K extends keyof OutputStream.SignalSignatures>(signal: K, ...args: GObject.GjsParameters<OutputStream.SignalSignatures[K]>): void;
+
+        // Static methods
+        /**
+         * Returns whether the file descriptor of `stream` will be
+         * closed when the stream is closed.
+         * @param stream a {@link GioUnix.OutputStream}
+         * @since 2.20
+         */
+        static get_close_fd(stream: Gio.UnixOutputStream): boolean;
+
+        /**
+         * Return the UNIX file descriptor that the stream writes to.
+         * @param stream a {@link GioUnix.OutputStream}
+         * @since 2.20
+         */
+        static get_fd(stream: Gio.UnixOutputStream): number;
+
+        /**
+         * Sets whether the file descriptor of `stream` shall be closed
+         * when the stream is closed.
+         * @param stream a {@link GioUnix.OutputStream}
+         * @param close_fd `true` to close the file descriptor when done
+         * @since 2.20
+         */
+        static set_close_fd(stream: Gio.UnixOutputStream, close_fd: boolean): void;
+
+        /**
+         * Checks if `stream` is actually pollable. Some classes may implement
+         * {@link Gio.PollableOutputStream} but have only certain instances of that
+         * class be pollable. If this method returns `false`, then the behavior
+         * of other {@link Gio.PollableOutputStream} methods is undefined.
+         * 
+         * For any given stream, the value returned by this method is constant;
+         * a stream cannot switch from pollable to non-pollable or vice versa.
+         * @returns `true` if `stream` is pollable, `false` if not.
+         * @since 2.28
+         */
+        can_poll(): boolean;
+
+        /**
+         * Creates a {@link GLib.Source} that triggers when `stream` can be written, or
+         * `cancellable` is triggered or an error occurs. The callback on the
+         * source is of the {@link Gio.PollableSourceFunc} type.
+         * 
+         * As with `g_pollable_output_stream_is_writable()`, it is possible that
+         * the stream may not actually be writable even after the source
+         * triggers, so you should use `g_pollable_output_stream_write_nonblocking()`
+         * rather than `g_output_stream_write()` from the callback.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_output_stream_can_poll()` returns `false` for `stream`.
+         * @param cancellable a {@link Gio.Cancellable}, or `null`
+         * @returns a new {@link GLib.Source}
+         * @since 2.28
+         */
+        create_source(cancellable: Gio.Cancellable | null): GLib.Source;
+
+        /**
+         * Checks if `stream` can be written.
+         * 
+         * Note that some stream types may not be able to implement this 100%
+         * reliably, and it is possible that a call to `g_output_stream_write()`
+         * after this returns `true` would still block. To guarantee
+         * non-blocking behavior, you should always use
+         * `g_pollable_output_stream_write_nonblocking()`, which will return a
+         * {@link Gio.IOErrorEnum.WOULD_BLOCK} error rather than blocking.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_output_stream_can_poll()` returns `false` for `stream`.
+         * @returns `true` if `stream` is writable, `false` if not. If an error   has occurred on `stream`, this will result in   `g_pollable_output_stream_is_writable()` returning `true`, and the   next attempt to write will return the error.
+         * @since 2.28
+         */
+        is_writable(): boolean;
+
+        /**
+         * Attempts to write up to `count` bytes from `buffer` to `stream`, as
+         * with `g_output_stream_write()`. If `stream` is not currently writable,
+         * this will immediately return {@link Gio.IOErrorEnum.WOULD_BLOCK}, and you can
+         * use `g_pollable_output_stream_create_source()` to create a {@link GLib.Source}
+         * that will be triggered when `stream` is writable.
+         * 
+         * Note that since this method never blocks, you cannot actually
+         * use `cancellable` to cancel it. However, it will return an error
+         * if `cancellable` has already been cancelled when you call, which
+         * may happen if you call this method after a source triggers due
+         * to having been cancelled.
+         * 
+         * Also note that if {@link Gio.IOErrorEnum.WOULD_BLOCK} is returned some underlying
+         * transports like D/TLS require that you re-send the same `buffer` and
+         * `count` in the next write call.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_output_stream_can_poll()` returns `false` for `stream`.
+         * @param buffer a buffer to write     data from
+         * @param cancellable a {@link Gio.Cancellable}, or `null`
+         * @returns the number of bytes written, or -1 on error (including   {@link Gio.IOErrorEnum.WOULD_BLOCK}).
+         * @throws GLib.Error
+         */
+        write_nonblocking(buffer: Uint8Array | string, cancellable: Gio.Cancellable | null): number;
+
+        /**
+         * Attempts to write the bytes contained in the `n_vectors` `vectors` to `stream`,
+         * as with `g_output_stream_writev()`. If `stream` is not currently writable,
+         * this will immediately return %`G_POLLABLE_RETURN_WOULD_BLOCK`, and you can
+         * use `g_pollable_output_stream_create_source()` to create a {@link GLib.Source}
+         * that will be triggered when `stream` is writable. `error` will *not* be
+         * set in that case.
+         * 
+         * Note that since this method never blocks, you cannot actually
+         * use `cancellable` to cancel it. However, it will return an error
+         * if `cancellable` has already been cancelled when you call, which
+         * may happen if you call this method after a source triggers due
+         * to having been cancelled.
+         * 
+         * Also note that if {@link Gio.PollableReturn.WOULD_BLOCK} is returned some underlying
+         * transports like D/TLS require that you re-send the same `vectors` and
+         * `n_vectors` in the next write call.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_output_stream_can_poll()` returns `false` for `stream`.
+         * @param vectors the buffer containing the `GOutputVectors` to write.
+         * @param cancellable a {@link Gio.Cancellable}, or `null`
+         * @returns %`G_POLLABLE_RETURN_OK` on success, {@link Gio.PollableReturn.WOULD_BLOCK} if the stream is not currently writable (and `error` is *not* set), or {@link Gio.PollableReturn.FAILED} if there was an error in which case `error` will be set.
+         * @since 2.60
+         * @throws GLib.Error
+         */
+        writev_nonblocking(vectors: Gio.OutputVector[], cancellable: Gio.Cancellable | null): [Gio.PollableReturn, number];
+
+        /**
+         * Checks if `stream` is actually pollable. Some classes may implement
+         * {@link Gio.PollableOutputStream} but have only certain instances of that
+         * class be pollable. If this method returns `false`, then the behavior
+         * of other {@link Gio.PollableOutputStream} methods is undefined.
+         * 
+         * For any given stream, the value returned by this method is constant;
+         * a stream cannot switch from pollable to non-pollable or vice versa.
+         * @since 2.28
+         * @virtual
+         */
+        vfunc_can_poll(): boolean;
+
+        /**
+         * Creates a {@link GLib.Source} that triggers when `stream` can be written, or
+         * `cancellable` is triggered or an error occurs. The callback on the
+         * source is of the {@link Gio.PollableSourceFunc} type.
+         * 
+         * As with `g_pollable_output_stream_is_writable()`, it is possible that
+         * the stream may not actually be writable even after the source
+         * triggers, so you should use `g_pollable_output_stream_write_nonblocking()`
+         * rather than `g_output_stream_write()` from the callback.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_output_stream_can_poll()` returns `false` for `stream`.
+         * @param cancellable a {@link Gio.Cancellable}, or `null`
+         * @since 2.28
+         * @virtual
+         */
+        vfunc_create_source(cancellable: Gio.Cancellable | null): GLib.Source;
+
+        /**
+         * Checks if `stream` can be written.
+         * 
+         * Note that some stream types may not be able to implement this 100%
+         * reliably, and it is possible that a call to `g_output_stream_write()`
+         * after this returns `true` would still block. To guarantee
+         * non-blocking behavior, you should always use
+         * `g_pollable_output_stream_write_nonblocking()`, which will return a
+         * {@link Gio.IOErrorEnum.WOULD_BLOCK} error rather than blocking.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_output_stream_can_poll()` returns `false` for `stream`.
+         * @since 2.28
+         * @virtual
+         */
+        vfunc_is_writable(): boolean;
+
+        /**
+         * Attempts to write up to `count` bytes from `buffer` to `stream`, as
+         * with `g_output_stream_write()`. If `stream` is not currently writable,
+         * this will immediately return {@link Gio.IOErrorEnum.WOULD_BLOCK}, and you can
+         * use `g_pollable_output_stream_create_source()` to create a {@link GLib.Source}
+         * that will be triggered when `stream` is writable.
+         * 
+         * Note that since this method never blocks, you cannot actually
+         * use `cancellable` to cancel it. However, it will return an error
+         * if `cancellable` has already been cancelled when you call, which
+         * may happen if you call this method after a source triggers due
+         * to having been cancelled.
+         * 
+         * Also note that if {@link Gio.IOErrorEnum.WOULD_BLOCK} is returned some underlying
+         * transports like D/TLS require that you re-send the same `buffer` and
+         * `count` in the next write call.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_output_stream_can_poll()` returns `false` for `stream`.
+         * @param buffer a buffer to write     data from
+         * @virtual
+         */
+        vfunc_write_nonblocking(buffer: Uint8Array | null): bigint | number;
+
+        /**
+         * Attempts to write the bytes contained in the `n_vectors` `vectors` to `stream`,
+         * as with `g_output_stream_writev()`. If `stream` is not currently writable,
+         * this will immediately return %`G_POLLABLE_RETURN_WOULD_BLOCK`, and you can
+         * use `g_pollable_output_stream_create_source()` to create a {@link GLib.Source}
+         * that will be triggered when `stream` is writable. `error` will *not* be
+         * set in that case.
+         * 
+         * Note that since this method never blocks, you cannot actually
+         * use `cancellable` to cancel it. However, it will return an error
+         * if `cancellable` has already been cancelled when you call, which
+         * may happen if you call this method after a source triggers due
+         * to having been cancelled.
+         * 
+         * Also note that if {@link Gio.PollableReturn.WOULD_BLOCK} is returned some underlying
+         * transports like D/TLS require that you re-send the same `vectors` and
+         * `n_vectors` in the next write call.
+         * 
+         * The behaviour of this method is undefined if
+         * `g_pollable_output_stream_can_poll()` returns `false` for `stream`.
+         * @param vectors the buffer containing the `GOutputVectors` to write.
+         * @since 2.60
+         * @virtual
+         */
+        vfunc_writev_nonblocking(vectors: Gio.OutputVector[]): [Gio.PollableReturn, bigint | number];
+    }
+
+
+    /**
+     * @gir-type Alias
+     */
+    type DesktopAppInfoClass = typeof DesktopAppInfo;
+
+    /**
+     * @gir-type Alias
+     */
+    type DesktopAppInfoLookupIface = typeof DesktopAppInfoLookup;
+
+    /**
+     * @gir-type Alias
+     */
+    type FDMessageClass = typeof FDMessage;
+
+    /**
+     * @gir-type Struct
+     */
+    abstract class FDMessagePrivate {
+        static $gtype: GObject.GType<FDMessagePrivate>;
+    }
+
+
+    /**
+     * @gir-type Alias
+     */
+    type FileDescriptorBasedIface = typeof FileDescriptorBased;
+
+    /**
+     * @gir-type Alias
+     */
+    type InputStreamClass = typeof InputStream;
+
+    /**
+     * @gir-type Struct
+     */
+    abstract class InputStreamPrivate {
+        static $gtype: GObject.GType<InputStreamPrivate>;
+    }
+
+
+    /**
+     * Defines a Unix mount entry (e.g. <filename>/media/cdrom</filename>).
+     * This corresponds roughly to a mtab entry.
+     * @gir-type Struct
+     */
+    abstract class MountEntry {
+        static $gtype: GObject.GType<MountEntry>;
+    }
+
+
+    /**
+     * @gir-type Alias
+     */
+    type MountMonitorClass = typeof MountMonitor;
+
+    /**
+     * Defines a Unix mount point (e.g. <filename>/dev</filename>).
+     * This corresponds roughly to a fstab entry.
+     * @gir-type Struct
+     */
+    abstract class MountPoint {
+        static $gtype: GObject.GType<MountPoint>;
+
+        // Static methods
+        /**
+         * Gets a {@link GioUnix.MountPoint} for a given mount path. If `time_read` is set, it
+         * will be filled with a unix timestamp for checking if the mount points have
+         * changed since with `g_unix_mount_points_changed_since()`.
+         * 
+         * If more mount points have the same mount path, the last matching mount point
+         * is returned.
+         * @param mount_path path for a possible unix mount point.
+         * @since 2.66
+         */
+        static at(mount_path: string): [Gio.UnixMountPoint | null, number];
+
+        /**
+         * Compares two unix mount points.
+         * @param mount1 a `GUnixMount`.
+         * @param mount2 a `GUnixMount`.
+         */
+        static compare(mount1: Gio.UnixMountPoint, mount2: Gio.UnixMountPoint): number;
+
+        /**
+         * Makes a copy of `mount_point`.
+         * @param mount_point a {@link GioUnix.MountPoint}.
+         * @since 2.54
+         */
+        static copy(mount_point: Gio.UnixMountPoint): Gio.UnixMountPoint;
+
+        /**
+         * Frees a unix mount point.
+         * @param mount_point unix mount point to free.
+         */
+        static free(mount_point: Gio.UnixMountPoint): void;
+
+        /**
+         * Gets the device path for a unix mount point.
+         * @param mount_point a {@link GioUnix.MountPoint}.
+         */
+        static get_device_path(mount_point: Gio.UnixMountPoint): string;
+
+        /**
+         * Gets the file system type for the mount point.
+         * @param mount_point a {@link GioUnix.MountPoint}.
+         */
+        static get_fs_type(mount_point: Gio.UnixMountPoint): string;
+
+        /**
+         * Gets the mount path for a unix mount point.
+         * @param mount_point a {@link GioUnix.MountPoint}.
+         */
+        static get_mount_path(mount_point: Gio.UnixMountPoint): string;
+
+        /**
+         * Gets the options for the mount point.
+         * @param mount_point a {@link GioUnix.MountPoint}.
+         * @since 2.32
+         */
+        static get_options(mount_point: Gio.UnixMountPoint): string | null;
+
+        /**
+         * Guesses whether a Unix mount point can be ejected.
+         * @param mount_point a {@link GioUnix.MountPoint}
+         */
+        static guess_can_eject(mount_point: Gio.UnixMountPoint): boolean;
+
+        /**
+         * Guesses the icon of a Unix mount point.
+         * @param mount_point a {@link GioUnix.MountPoint}
+         */
+        static guess_icon(mount_point: Gio.UnixMountPoint): Gio.Icon;
+
+        /**
+         * Guesses the name of a Unix mount point.
+         * The result is a translated string.
+         * @param mount_point a {@link GioUnix.MountPoint}
+         */
+        static guess_name(mount_point: Gio.UnixMountPoint): string;
+
+        /**
+         * Guesses the symbolic icon of a Unix mount point.
+         * @param mount_point a {@link GioUnix.MountPoint}
+         * @since 2.34
+         */
+        static guess_symbolic_icon(mount_point: Gio.UnixMountPoint): Gio.Icon;
+
+        /**
+         * Checks if a unix mount point is a loopback device.
+         * @param mount_point a {@link GioUnix.MountPoint}.
+         */
+        static is_loopback(mount_point: Gio.UnixMountPoint): boolean;
+
+        /**
+         * Checks if a unix mount point is read only.
+         * @param mount_point a {@link GioUnix.MountPoint}.
+         */
+        static is_readonly(mount_point: Gio.UnixMountPoint): boolean;
+
+        /**
+         * Checks if a unix mount point is mountable by the user.
+         * @param mount_point a {@link GioUnix.MountPoint}.
+         */
+        static is_user_mountable(mount_point: Gio.UnixMountPoint): boolean;
+    }
+
+
+    /**
+     * @gir-type Alias
+     */
+    type OutputStreamClass = typeof OutputStream;
+
+    /**
+     * @gir-type Struct
+     */
+    abstract class OutputStreamPrivate {
+        static $gtype: GObject.GType<OutputStreamPrivate>;
+    }
+
+
+    namespace DesktopAppInfoLookup {
+
+        // Constructor properties interface
+        interface ConstructorProps extends GObject.Object.ConstructorProps {}
+    }
+
+    export interface DesktopAppInfoLookupNamespace {
+        $gtype: GObject.GType<DesktopAppInfoLookup>;
+        prototype: DesktopAppInfoLookup;
+        /**
+        * Gets the default application for launching applications
+        * using this URI scheme for a particular {@link GioUnix.DesktopAppInfoLookup}
+        * implementation.
+        * 
+        * The {@link GioUnix.DesktopAppInfoLookup} interface and this function is used
+        * to implement `g_app_info_get_default_for_uri_scheme()` backends
+        * in a GIO module. There is no reason for applications to use it
+        * directly. Applications should use `g_app_info_get_default_for_uri_scheme()`.
+        * @param lookup a {@link GioUnix.DesktopAppInfoLookup}
+        * @param uri_scheme a string containing a URI scheme.
+        */
+        get_default_for_uri_scheme(lookup: Gio.DesktopAppInfoLookup, uri_scheme: string): Gio.AppInfo | null;
+    }
+    /**
+     * {@link GioUnix.DesktopAppInfoLookup} is an opaque data structure and can only be accessed
+     * using the following functions.
+     * @gir-type Interface
+     * @deprecated since 2.28: The {@link GioUnix.DesktopAppInfoLookup} interface is deprecated and    unused by GIO.
+     */
+    interface DesktopAppInfoLookup extends GObject.Object {
+    }
+
+
+    export const DesktopAppInfoLookup: DesktopAppInfoLookupNamespace & {
+        new (): DesktopAppInfoLookup; // This allows `obj instanceof DesktopAppInfoLookup`
+    };
+
+    namespace FileDescriptorBased {
+
+        // Constructor properties interface
+        interface ConstructorProps extends GObject.Object.ConstructorProps {}
+    }
+
+    export interface FileDescriptorBasedNamespace {
+        $gtype: GObject.GType<FileDescriptorBased>;
+        prototype: FileDescriptorBased;
+        /**
+        * Gets the underlying file descriptor.
+        * @param fd_based a {@link GioUnix.FileDescriptorBased}.
+        */
+        get_fd(fd_based: Gio.FileDescriptorBased): number;
+    }
+    /**
+     * {@link GioUnix.FileDescriptorBased} is an interface for file descriptor based IO.
+     * 
+     * It is implemented by streams (implementations of {@link Gio.InputStream} or
+     * {@link Gio.OutputStream}) that are based on file descriptors.
+     * 
+     * Note that `<gio/gfiledescriptorbased.h>` belongs to the UNIX-specific
+     * GIO interfaces, thus you have to use the `gio-unix-2.0.pc` pkg-config
+     * file or the `GioUnix-2.0` GIR namespace when using it.
+     * @gir-type Interface
+     * @since 2.24
+     */
+    interface FileDescriptorBased extends GObject.Object {
+    }
+
+
+    export const FileDescriptorBased: FileDescriptorBasedNamespace & {
+        new (): FileDescriptorBased; // This allows `obj instanceof FileDescriptorBased`
+    };
+
+    /**
+     * Name of the imported GIR library
+     * `see` https://gitlab.gnome.org/GNOME/gjs/-/blob/master/gi/ns.cpp#L188
+     */
+    const __name__: string;
+
+    /**
+     * Version of the imported GIR library
+     * `see` https://gitlab.gnome.org/GNOME/gjs/-/blob/master/gi/ns.cpp#L189
+     */
+    const __version__: string;
+}
+
+export default GioUnix;
+
+}
+
+declare module 'gi://GioUnix' {
+    import GioUnix20 from 'gi://GioUnix?version=2.0';
+    export default GioUnix20;
+}
+// END

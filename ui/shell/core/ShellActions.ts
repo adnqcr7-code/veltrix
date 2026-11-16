@@ -1,0 +1,44 @@
+/**
+ * Typed registry for shell-level actions. Mostly populated by app.ts main() at
+ * startup and consumed by widgets that can't import from app.ts directly (circular
+ * dep). It also works the other way for a few WIDGET-OWNED actions whose
+ * implementation must live in the widget (it needs the widget's local state) but
+ * which an IPC command wants to invoke — e.g. `openWindowMenu`: AppTitle registers
+ * it, the `openWindowMenu` IPC command reads it. Those are deterministic
+ * interaction hooks (no synthetic input): pair them with `queryUI` to verify a
+ * menu/surface (open via the hook, then assert its contents).
+ *
+ * Usage in widgets:
+ *   import shellActions from "../core/ShellActions"
+ *   shellActions.openSettings?.()
+ */
+
+import type { WorkspaceMode } from "./WorkspaceModes"
+
+export interface ShellActionsMap {
+  /** Versioned widget catalogue and placement commands for Settings (#571). */
+  widgetCatalog?: (args: string[]) => Promise<string>
+  toggleAppGrid?: () => void
+  /** Open/raise the Settings window (a normal window — not a toggle). */
+  openSettings?: () => void | Promise<void>
+  /** Open the Settings window directly on a page id (e.g. "bluetooth"). */
+  openSettingsPage?: (id: string) => string | Promise<string>
+  /** Open the Settings window on one app's own page, by desktop id. False when the app
+   *  has no page there (Settings then shows the list of apps). */
+  openAppSettings?: (appId: string) => boolean | Promise<string>
+  toggleOverview?: () => void
+  /** Promote the bar to the OVERLAY layer above a fullscreen window (toggle). */
+  toggleBarOverlay?: () => void
+  lockScreen?: () => void
+  unlockScreen?: () => void
+  /** Widget-owned: AppTitle registers this to open the focused window's options
+   *  menu deterministically (no synthetic click). Consumed by the IPC command. */
+  openWindowMenu?: () => void
+  getWorkspaceMode?: (id: number) => WorkspaceMode
+  setWorkspaceMode?: (id: number, mode: WorkspaceMode | "default") => Promise<void> | void
+  toggleWorkspaceMode?: (id?: number) => Promise<WorkspaceMode> | void
+}
+
+const shellActions: ShellActionsMap = {}
+
+export default shellActions

@@ -1,0 +1,494 @@
+// The glass: one shape of a surface — or one fusion group of them, drawn as one silhouette —
+// from the blurred copy of what is under it (glass_gl.rs).
+//
+// LAB hooks. The glass lab (scripts/dev/glass-lab) runs this same file with glass_gl.rs's
+// `LAB_ON`, which gives each hook a value from lab_params.conf; Hyalo ships it with `LAB_OFF`,
+// where `LAB_ADD(i, x)` and `LAB_MUL(i, x)` are `x` and every `#ifdef GLASS_LAB` block is
+// compiled out. Every value 0 is the factory glass. A new layer to try goes here, behind a hook,
+// and becomes the factory's by changing the number the hook wraps (and the lab's neutral).
+//   lab[0..3] free: retired 2026-10-11 with the adaptive tint they tried variations of
+//   lab[4]  bevel profile: + to its exponent (4)                                      ADD
+//   lab[5]  refraction: × (1 + it) on its strength (3 × Snell's)                      MUL
+//   lab[6]  dispersion: its spread, 1 = the fringe there was until 2026-10-05          block
+//   lab[7]  free: retired 2026-10-11 (the light veil of dark content is set_ink_tone's)
+//   lab[8]  light: rotation of the rim's light, degrees                               block
+//   lab[9]  inner glow: × it, 1 = the glow along the edge there was until 2026-10-05  block
+//   lab[10] rim line: × (1 + it) on its width                                         MUL
+//   lab[11] bevel corners: × (1 + it) on how much rounder they get per px of depth;
+//           −1 = every contour keeps the corner's own radius (the fold, until 2026-10-05) MUL
+//   lab[12] bevel width cap: + to its 30 px                                           ADD
+//   lab[13] rim, the side opposite the light: × (1 + it) on its echo (0.70)           MUL
+//   lab[14] rim, the line all round: + to its floor (0; 0.18 until 2026-10-05)           ADD
+//   lab[15] dark contour: a 1 px line along the outline, darkened by it, 0..1           block
+uniform vec4 region_fb;     // the captured region, framebuffer pixels
+uniform mat2 out_to_fb;     // output-pixel offsets → framebuffer-pixel offsets
+uniform vec4 rect;          // the shape, output pixels
+uniform float radius;
+uniform float exponent;
+uniform float opacity;      // how FORMED the glass is in this shape, 0..1 (#764): not a coverage
+uniform vec4 clip;          // what of the shape may show, output px: x, y, w, h
+uniform vec4 outer;         // the window a layer's glass lies in, output px (w 0 = none)
+uniform vec2 outer_par;     // its corners: radius (output px), exponent
+uniform float glass;        // 1: refractive glass — the compositor paints the whole glass
+uniform float refraction;   // output px
+uniform float px_scale;     // output px per logical px: the widths below are logical
+uniform float rim;
+// The shape's tone (set_tone, or set_ink_tone while its content is dark), its ambient already
+// sized for the shape (glass_gl.rs `ToneGl`).
+uniform vec4 tone;          // saturation, ceiling, lift, gain
+uniform vec4 wash;          // r, g, b, a
+uniform vec4 ambient;       // its opacity here, lift, gain, reach (output px)
+uniform float has_pointer;  // 1: a pointer is spliced into the shape (a tooltip, a menu)
+uniform vec2 ptr_a;         // the pointer's triangle, inset by its tip radius, output px
+uniform vec2 ptr_b;
+uniform vec2 ptr_t;
+uniform float ptr_tip_r;
+uniform float ptr_base_r;
+// A fusion group (`set_fusion`): f_count shapes drawn as ONE silhouette, the smooth union of
+// their outlines (glass_gl.rs `draw_plan`). The single-shape uniforms above then describe its
+// first member and are not what is drawn.
+#define FUSE_MAX 8
+uniform float fused;        // 1: a fusion group
+uniform float f_count;
+uniform float f_k;          // the smooth union's width, output px (twice the group's spacing)
+uniform vec4 f_env;         // the group's envelope (set_fusion_merge): x, y, w, h, output px
+uniform vec4 f_env_par;     // its corner radius, exponent; the merge (0..1); its refraction
+uniform vec4 f_rect[FUSE_MAX];   // each member, output px: x, y, w, h
+uniform vec4 f_par[FUSE_MAX];    // radius, exponent, formed (`opacity`), ink_dark (unused here)
+uniform vec4 f_clip[FUSE_MAX];   // what of it may show, output px; w 0 = no clip
+uniform float f_refr[FUSE_MAX];  // its refraction, output px
+// The washes over the toned glass (add_state_region, glass_gl.rs `StatePx`): a button's hover or
+// press, laid over the glass inside a rounded rectangle — the backdrop still shows through.
+#define STATE_MAX 8
+uniform float s_count;
+uniform vec4 s_rect[STATE_MAX];  // output px: x, y, w, h
+uniform vec4 s_wash[STATE_MAX];  // straight sRGB, its opacity
+uniform float s_radius[STATE_MAX]; // its corners, circular, output px
+varying vec2 v_out;
+varying vec2 v_fb;
+
+// A box of half size `half_size` centred on `c`, with the desktop's one corner of radius `r`
+// (crates/veltrix-corner, `corner_sdf`): signed distance in output pixels, negative inside.
+// `e`, the exponent the protocol still carries, no longer shapes anything (owner, 2026-11-02:
+// one corner for everything).
+float box_sdf(vec2 px, vec2 c, vec2 half_size, float r, float e) {
+    return corner_sdf(px - c, half_size, r);
+}
+// The same, centred on the shape.
+float sdf_box(vec2 px, vec2 half_size, float r) {
+    return box_sdf(px, rect.xy + rect.zw * 0.5, half_size, r, exponent);
+}
+// The shape's signed distance.
+float sdf(vec2 px) { return sdf_box(px, rect.zw * 0.5, radius); }
+
+// A triangle's signed distance (Inigo Quilez's, exact): negative inside, either winding.
+float sd_triangle(vec2 p, vec2 p0, vec2 p1, vec2 p2) {
+    vec2 e0 = p1 - p0, e1 = p2 - p1, e2 = p0 - p2;
+    vec2 v0 = p - p0, v1 = p - p1, v2 = p - p2;
+    vec2 pq0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0);
+    vec2 pq1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0);
+    vec2 pq2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);
+    float s = sign(e0.x * e2.y - e0.y * e2.x);
+    vec2 d = min(min(vec2(dot(pq0, pq0), s * (v0.x * e0.y - v0.y * e0.x)),
+                     vec2(dot(pq1, pq1), s * (v1.x * e1.y - v1.y * e1.x))),
+                     vec2(dot(pq2, pq2), s * (v2.x * e2.y - v2.y * e2.x)));
+    return -sqrt(d.x) * sign(d.y);
+}
+
+// The outline moved `t` inward, its corners rounder by as much (radius r + t, until the shape
+// is too thin for it): the bevel's contour at depth t. At t = 0 it is the corner itself. A
+// pointer moves inward with it and stays joined by the same concave arc, so the bevel runs
+// round the pointer: drawn for the body alone, it crossed the pointer's base as a seam.
+// Only the pointer's two sides move in: its base lies inside the body, so it reaches 2t
+// deeper along those sides (within its own width), or a deep bevel would part it from the
+// body's contour and leave a notch above it.
+float inset_sdf(vec2 px, float t) {
+    vec2 h = rect.zw * 0.5 - vec2(t);
+    float d = sdf_box(px, h, max(min(radius + LAB_MUL(11, t), min(h.x, h.y)), 0.0));
+    if (has_pointer > 0.5) {
+        vec2 mid = (ptr_a + ptr_b) * 0.5;
+        float k = 2.0 * t / max(length(mid - ptr_t), 1e-3);
+        vec2 a = ptr_a + (ptr_a - ptr_t) * k;
+        vec2 b = ptr_b + (ptr_b - ptr_t) * k;
+        float slab = abs(dot(px - mid, normalize(ptr_b - ptr_a))) - length(ptr_b - ptr_a) * 0.5;
+        float p = max(sd_triangle(px, a, b, ptr_t), slab) - ptr_tip_r + t;
+        vec2 u = max(vec2(ptr_base_r - d, ptr_base_r - p), vec2(0.0));
+        d = max(ptr_base_r, min(d, p)) - length(u);
+    }
+    return d;
+}
+
+// How deep into the bevel a point is: the t whose contour passes through it, up to w.
+float lens_depth(vec2 px, float w) {
+    vec2 h = rect.zw * 0.5;
+    vec2 q = abs(px - rect.xy - h);
+    float r = min(radius + LAB_MUL(11, w), min(h.x, h.y));
+    // Clear of every corner at every depth up to w (the deepest contour's is the roundest; a
+    // corner reaches up to NC_MAX_REACH of its radius along an edge): the distance to the
+    // nearest side. (Not with a pointer: its bevel reaches into the body's straight sides.)
+    if (has_pointer < 0.5 && (q.x <= h.x - w - NC_MAX_REACH * r || q.y <= h.y - w - NC_MAX_REACH * r))
+        return clamp(min(h.x - q.x, h.y - q.y), 0.0, w);
+    if (inset_sdf(px, 0.0) >= 0.0) return 0.0;
+    if (inset_sdf(px, w) < 0.0) return w;
+    float lo = 0.0;
+    float hi = w;
+    for (int i = 0; i < 12; i++) {
+        float m = 0.5 * (lo + hi);
+        if (inset_sdf(px, m) < 0.0) lo = m; else hi = m;
+    }
+    return 0.5 * (lo + hi);
+}
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+
+// The whole silhouette: the shape, and its pointer if it has one — the inset triangle grown
+// back by the tip radius (a round tip, straight sides where they were), joined to the body
+// by a concave arc of the base radius (hg_sdf's round union).
+float shape_sdf(vec2 px) { return inset_sdf(px, 0.0); }
+
+// ── Fusion ──────────────────────────────────────────────────────────────────
+// The polynomial smooth minimum (Inigo Quilez's): min(a, b) where they are k apart or more,
+// lowered by up to k/4 where they are close — so two outlines less than k/2 apart are joined
+// by a bridge, and the join is round.
+float smin(float a, float b, float k) {
+    float h = max(k - abs(a - b), 0.0) / max(k, 1e-4);
+    return min(a, b) - h * h * k * 0.25;
+}
+// How wide a shape's bevel is: as for one shape alone (main's lens_w).
+float bevel_width(vec4 r, float refr) {
+    return max(min(min(refr / 0.231, min(r.z, r.w) * 0.5), LAB_ADD(12, 30.0) * px_scale), 1.0);
+}
+// The group's silhouette moved inward: each member's outline moved `s` of its own bevel width
+// inward, corners rounder by as much (`inset_sdf`, member by member), all joined by the smooth
+// union. At s = 0 it is the silhouette itself, each member cut by its clip there (the clip is a
+// straight cut, not a contour: a single shape's bevel ignores it too). A member fading out
+// withdraws, by up to the union's width, so a bridge to it recedes as it goes.
+// ⚠️ The arrays are read only with the loop's index: in GLSL ES 1.00 a fragment shader may
+// index a uniform array with nothing else.
+float fused_sdf(vec2 px, float s) {
+    float d = 1e6;
+    for (int i = 0; i < FUSE_MAX; i++) {
+        if (float(i) >= f_count) break;
+        vec4 r = f_rect[i];
+        vec4 p = f_par[i];
+        float t = s * bevel_width(r, f_refr[i]);
+        vec2 h = r.zw * 0.5 - vec2(t);
+        float di = box_sdf(px, r.xy + r.zw * 0.5, h, max(min(p.x + LAB_MUL(11, t), min(h.x, h.y)), 0.0), p.y);
+        vec4 c = f_clip[i];
+        if (c.z > 0.0 && s <= 0.0) {
+            vec2 cq = abs(px - c.xy - c.zw * 0.5) - c.zw * 0.5;
+            di = max(di, max(cq.x, cq.y));
+        }
+        d = smin(d, di + (1.0 - p.z) * f_k, f_k);
+    }
+    // Towards the envelope (set_fusion_merge): a blend of two distance fields, so the silhouette
+    // lies between the union and the envelope at every step — it fills the space between the
+    // members from their middle outwards, never bulges past the envelope, never dents the union
+    // — and at 1 it IS the envelope, its bevel inset as one shape's (one lens, one rim).
+    if (f_env_par.z > 0.0) {
+        float t = s * bevel_width(f_env, f_env_par.w);
+        vec2 h = f_env.zw * 0.5 - vec2(t);
+        float de = box_sdf(px, f_env.xy + f_env.zw * 0.5, h,
+                           max(min(f_env_par.x + LAB_MUL(11, t), min(h.x, h.y)), 0.0), f_env_par.y);
+        d = mix(d, de, f_env_par.z);
+    }
+    return d;
+}
+// What of the members a pixel takes — its bevel's width, its opacity, its ink — each member
+// weighted by how near it is, the nearest whole, one f_k further away nothing.
+vec3 fused_blend(vec2 px) {
+    float dmin = 1e6;
+    for (int i = 0; i < FUSE_MAX; i++) {
+        if (float(i) >= f_count) break;
+        vec4 r = f_rect[i];
+        dmin = min(dmin, box_sdf(px, r.xy + r.zw * 0.5, r.zw * 0.5, f_par[i].x, f_par[i].y));
+    }
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    for (int i = 0; i < FUSE_MAX; i++) {
+        if (float(i) >= f_count) break;
+        vec4 r = f_rect[i];
+        vec4 p = f_par[i];
+        float di = box_sdf(px, r.xy + r.zw * 0.5, r.zw * 0.5, p.x, p.y);
+        float w = clamp(1.0 - (di - dmin) / max(f_k, 1.0), 0.0, 1.0);
+        acc += w * vec3(bevel_width(r, f_refr[i]), p.z, p.w);
+        wsum += w;
+    }
+    return acc / max(wsum, 1e-4);
+}
+// How deep into the group's bevel a point is, as a fraction of it: the s whose contour passes
+// through it.
+float fused_depth(vec2 px) {
+    if (fused_sdf(px, 0.0) >= 0.0) return 0.0;
+    if (fused_sdf(px, 1.0) < 0.0) return 1.0;
+    float lo = 0.0;
+    float hi = 1.0;
+    for (int i = 0; i < 12; i++) {
+        float m = 0.5 * (lo + hi);
+        if (fused_sdf(px, m) < 0.0) lo = m; else hi = m;
+    }
+    return 0.5 * (lo + hi);
+}
+// The silhouette, whichever it is.
+float silhouette(vec2 px) { return fused > 0.5 ? fused_sdf(px, 0.0) : shape_sdf(px); }
+
+uniform float noise;
+uniform float brightness;
+float noise_hash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 1689.1984);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Framebuffer pixels → the blurred copy (level 1, half size).
+vec2 to_src(vec2 fb_px) { return (fb_px - region_fb.xy) * 0.5; }
+vec4 backdrop(vec2 out_offset) { return up(to_src(v_fb + out_to_fb * out_offset)); }
+
+// ── The blur: three of the capture's, mixed by the shape's size (glass_gl.rs `BlurMix`) ──
+// The reference's blur is no single gaussian: it keeps a fifth of the finest detail on a small
+// pane and blurs the coarse far more than one kawase would. The soft copy, the middle one and
+// the full one (`backdrop`), weighted per shape (`blur_mix`), reproduce it within 0.011 at five
+// periods from 8 to 128 pt. A window's backdrop takes the full one alone (0, 0, 1).
+uniform sampler2D mid_tex;
+uniform sampler2D soft_tex;
+uniform float soft_offset;
+uniform vec3 blur_mix;      // soft, middle, full
+vec3 blurred(vec2 out_offset) {
+    vec2 at = to_src(v_fb + out_to_fb * out_offset);
+    vec3 c = blur_mix.z * up(at).rgb;
+    if (blur_mix.y > 0.0) c += blur_mix.y * up_of(mid_tex, src_size, src_used, offset, at).rgb;
+    if (blur_mix.x > 0.0) c += blur_mix.x * up_of(soft_tex, src_size, src_used, soft_offset, at).rgb;
+    return c;
+}
+
+// ── Glass that forms (#764) ─────────────────────────────────────────────────
+// Glass has no opacity: a pane appearing MATERIALIZES — its blur, refraction, tint and rim grow
+// from nothing — and is never the finished glass cross-faded over the sharp backdrop. The blur
+// is grown in the capture (glass_gl.rs `formed_blur`: fewer passes, a shorter reach); what is
+// left here is the sharp copy (level 0, full size) under one pass's least blur (`sharp_mix`),
+// and, in a fusion group blurred for its most formed member, the members formed less.
+uniform sampler2D sharp;
+uniform vec2 sharp_size;
+uniform float sharp_mix;
+uniform float blur_formed;  // how formed the glass the blur was captured for is
+vec3 sharp_at(vec2 out_offset) {
+    vec2 fb = v_fb + out_to_fb * out_offset;
+    return texture2D(sharp, clamp((fb - region_fb.xy) / sharp_size, 0.5 / sharp_size, 1.0 - 0.5 / sharp_size)).rgb;
+}
+// ── A graded blur (set_shape_grade, toolkit/PHASE1.md D7) ───────────────────
+// The blur's strength falls (or rises) linearly from the shape's top edge to its bottom edge:
+// `grade` is it at each, 0..1. One blur cannot be graded, so the capture's four are walked as a
+// ladder — the sharp copy, the soft one, the middle one, the full one, each a step further
+// reach — and each pixel mixes the two rungs either side of its strength: a progressive blur,
+// sharp where the strength is 0. (1, 1): the shape's own blur, as `blurred` mixes it.
+uniform vec2 grade;
+vec3 graded(vec2 out_offset) {
+    if (grade.x >= 0.999 && grade.y >= 0.999) return blurred(out_offset);
+    float t = clamp((v_out.y - rect.y) / max(rect.w, 1.0), 0.0, 1.0);
+    float g = clamp(mix(grade.x, grade.y, t), 0.0, 1.0) * 3.0;
+    vec2 at = to_src(v_fb + out_to_fb * out_offset);
+    if (g < 1.0) return mix(sharp_at(out_offset), up_of(soft_tex, src_size, src_used, soft_offset, at).rgb, g);
+    if (g < 2.0) return mix(up_of(soft_tex, src_size, src_used, soft_offset, at).rgb, up_of(mid_tex, src_size, src_used, offset, at).rgb, g - 1.0);
+    return mix(up_of(mid_tex, src_size, src_used, offset, at).rgb, up(at).rgb, g - 2.0);
+}
+// The backdrop as glass formed `formed` of the way sees it.
+vec3 formed_backdrop(vec2 out_offset, float formed) {
+    vec3 b = graded(out_offset);
+    float w = (1.0 - sharp_mix) * clamp(formed / max(blur_formed, 1e-4), 0.0, 1.0);
+    return w >= 0.999 ? b : mix(sharp_at(out_offset), b, w);
+}
+
+// ── The tone (set_tone) ──────────────────────────────────────────────────────
+// What the glass does to the blurred backdrop, stage by stage, in the order and with the laws
+// measured on the reference's own glass input by input (glass-probe `tweak`, 2026-10-11), all on
+// the sRGB-ENCODED colour, every stage growing with how formed the glass is:
+//   1. saturation about the Rec.709 luma (exact: 0 gives that luma's grey);
+//   2. the ceiling: the luma l goes to l·(1 − (1 − ceiling)·l) — white lands on the ceiling and
+//      the mid tones bend towards it, rising and then falling a little past
+//      l = 1 / (2(1 − ceiling)) (exact on greys, ≤ 0.003 from 0.1 to 0.9). The colour around
+//      the luma is scaled by s^0.75 of the luma's factor s — the measured colours, not exact;
+//   3. levels: lift + (gain − lift)·v (exact);
+//   4. the wash laid over (exact);
+//   5. the ambient: what surrounds the pane, blurred `ambient.w` wide (the reference's 0.35 of
+//      the shorter side; here 17 taps over the blurred capture, which reaches only as far as
+//      the glass's own blur — past it, the capture's edge repeats), through its own levels,
+//      lightening what is darker than it. Dark: within ≈ 0.02 of the reference on plain greys,
+//      0.205 against 0.22 for black among neighbours. Its LIGHT version (which brightens the
+//      mid-highs a little, ≤ 0.03 at the reference's own setting) fits no blend that was tried
+//      and is not modelled: a light tone carries no ambient.
+vec3 ambient_backdrop() {
+    float r = ambient.w;
+    vec3 sum = backdrop(vec2(0.0)).rgb;
+    for (int i = 0; i < 8; i++) {
+        float a = float(i) * 0.785398;
+        vec2 d = vec2(cos(a), sin(a));
+        sum += backdrop(d * r * 0.5).rgb + backdrop(d * r).rgb;
+    }
+    return sum / 17.0;
+}
+vec3 tone_of(vec3 bg, float formed) {
+    float l = dot(bg, LUMA);
+    vec3 c = clamp(mix(vec3(l), bg, mix(1.0, tone.x, formed)), 0.0, 1.0);
+    l = dot(c, LUMA);
+    float s = 1.0 - (1.0 - mix(1.0, tone.y, formed)) * l;
+    c = clamp(vec3(l * s) + (c - vec3(l)) * pow(max(s, 0.0), 0.75), 0.0, 1.0);
+    float lift = tone.z * formed;
+    float gain = mix(1.0, tone.w, formed);
+    c = clamp(vec3(lift) + (gain - lift) * c, 0.0, 1.0);
+    c = mix(c, wash.rgb, wash.a * formed);
+    if (ambient.x > 0.0) {
+        vec3 w = ambient_backdrop();
+        vec3 b = clamp(vec3(ambient.y) + (ambient.z - ambient.y) * w, 0.0, 1.0);
+        c = mix(c, max(c, b), ambient.x * formed);
+    }
+    return c;
+}
+
+void main() {
+    float d = silhouette(v_out);
+    // A fusion group's width of bevel and how formed it is at this pixel (fused_blend); a single
+    // shape's are its own. (Its ink is the CPU's: a dark-ink shape is given its ink tone.)
+    vec3 fb = fused > 0.5 ? fused_blend(v_out) : vec3(0.0, opacity, 0.0);
+    // Cut straight where the clip ends (a list scrolled under its edge), anti-aliased. (A fusion
+    // group's members are cut inside `fused_sdf`; its clip uniform is none.)
+    vec2 cin = min(v_out - clip.xy, clip.xy + clip.zw - v_out);
+    float clipped = clamp(min(cin.x, cin.y) + 0.5, 0.0, 1.0);
+    // Coverage is the silhouette and the clip only; how formed the glass is, is `formed`.
+    float formed = fb.y;
+    float cov = clamp(0.5 - d, 0.0, 1.0) * clipped;
+    // A layer's glass inside a rounded window: nothing past the window's own corners.
+    if (outer.z > 0.0) {
+        float od = box_sdf(v_out, outer.xy + outer.zw * 0.5, outer.zw * 0.5, outer_par.x, outer_par.y);
+        cov *= clamp(0.5 - od, 0.0, 1.0);
+    }
+    if (cov <= 0.0 || formed <= 0.0) discard;
+    if (glass < 0.5) {
+        vec3 c = formed_backdrop(vec2(0.0), formed);
+        // Hyprland's blurFinish: noise, then its brightness (a window's backdrop; 0 and 1 for
+        // the shell's blur-only surfaces).
+        c += (noise_hash(v_out) - 0.5) * noise * formed;
+        c *= mix(1.0, min(1.0, brightness), formed);
+        gl_FragColor = vec4(c * cov, cov);
+        return;
+    }
+
+    // ── Refractive glass ──────────────────────────────────────────────────
+    // The outward normal, from the distance field.
+    vec2 n = vec2(silhouette(v_out + vec2(1.0, 0.0)) - silhouette(v_out - vec2(1.0, 0.0)),
+                  silhouette(v_out + vec2(0.0, 1.0)) - silhouette(v_out - vec2(0.0, 1.0)));
+    n = length(n) > 0.0001 ? normalize(n) : vec2(0.0);
+    float inside = max(-d, 0.0);
+    // Refraction: the pane's edge is a convex bevel, a quarter circle W wide and W thick,
+    // lying ON the backdrop. Looking straight down, a ray meets the bevel's slope at θ, bends
+    // to asin(sin θ / 1.5) (glass's index, Snell) — INWARD — and crosses the glass's height h
+    // there, so it lands h·tan(θ − θr) further in. The backdrop is read from INSIDE the shape,
+    // never beyond it: hard against the edge the slope is steepest and lines bend; further in
+    // the bevel flattens and the backdrop is magnified a little, then nothing. Until
+    // 2026-10-02 the edge read from OUTSIDE, (1 − t)² × refraction over a band the corner's
+    // radius wide — and once refraction grew with the shape (125 px on the app grid, its
+    // band still 32), 157 px of backdrop were squeezed into 32: a window under the grid
+    // showed whole and shrunk, wallpaper round it (owner-caught: "an inverted magnifier").
+    // `refraction` is the most the bevel displaces: 0.231 W at W thick, so W follows from
+    // it — up to half the shape's shorter side, where the whole shape is lens. Thicker
+    // magnifies more (1.5 W: the dock's icons under the app grid's edge, four times their
+    // height); past ≈1.7 W the far side of the peak displaces faster than 1 px per px and the
+    // backdrop folds back on itself, mirrored.
+    // And never wider than BEVEL_MAX: past it a pane is flat glass inside, as a slab is — the
+    // centre of a large pane frosts, only its edge bends (owner, the glass lab, 2026-10-05:
+    // with the bevel half the app grid's height the whole panel was one roof of four faces).
+    // 30 px, MEASURED (glass-probe `refraction-sizes`, run 38201914917, 2026-10-12): the
+    // reference's edge is the same on panes 80 to 240 tall — +20 px at 4 px in, +10 at 6, +5 at
+    // 10, nothing past 12–14 — so the bend does not grow with the pane. 80 px bent a large
+    // pane 19 px still 20 px in.
+    float bevel_max = LAB_ADD(12, 30.0) * px_scale;
+    float lens_w = max(min(min(refraction / 0.231, min(rect.z, rect.w) * 0.5), bevel_max), 1.0);
+    // The bevel's contours are the OUTLINE moved inward, each corner rounder by the depth
+    // (`inset_sdf`, `lens_depth`), so what bends follows the corner's curve at the edge and
+    // turns smoothly round it further in. Three ways it was wrong first: the outline's own
+    // distance field (contours at radius r − t, a crease along the diagonal once the bevel is
+    // wider than the corner is round); that field with corners max(r, W) round (2026-10-02),
+    // which bent along an arc W round INSIDE the true corner and left the corner itself flat —
+    // on the app grid an arc 108 px round inside a 32 px corner (owner-caught: "it bends along
+    // a curve of its own, not the corner's"); then every contour keeping the corner's own
+    // radius, whose normal still turned at once along the diagonal — a fold from each corner,
+    // "like a flap" (owner, 2026-10-05).
+    float lens_in;
+    vec2 ln;
+    if (fused > 0.5) {
+        // A fusion group: the bevel of the whole silhouette, the members' contours joined at
+        // every depth, so it bends round a bridge as it does round a corner.
+        lens_w = fb.x;
+        float sd = fused_depth(v_out);
+        lens_in = sd * lens_w;
+        ln = vec2(fused_sdf(v_out + vec2(1.0, 0.0), sd) - fused_sdf(v_out - vec2(1.0, 0.0), sd),
+                  fused_sdf(v_out + vec2(0.0, 1.0), sd) - fused_sdf(v_out - vec2(0.0, 1.0), sd));
+        ln = length(ln) > 0.0001 && sd < 1.0 ? normalize(ln) : vec2(0.0);
+    } else {
+        lens_in = lens_depth(v_out, lens_w);
+        ln = vec2(inset_sdf(v_out + vec2(1.0, 0.0), lens_in) - inset_sdf(v_out - vec2(1.0, 0.0), lens_in),
+                  inset_sdf(v_out + vec2(0.0, 1.0), lens_in) - inset_sdf(v_out - vec2(0.0, 1.0), lens_in));
+        ln = length(ln) > 0.0001 && lens_in < lens_w ? normalize(ln) : vec2(0.0);
+    }
+    // The profile, then the strength: the quarter circle's height to the 4th power — the bend
+    // gathers at the edge and the inside stays nearly flat — and three times Snell's
+    // displacement. The owner's preset "OK 2" (the glass lab, 2026-10-05) had the 5th; the 4th
+    // is the fit to the reference's edge, with the 30 px cap.
+    float v = pow(1.0 - clamp(lens_in / lens_w, 0.0, 1.0), LAB_ADD(4, 4.0));
+    float q = max(1.0 - v * v, 1e-4);
+    float theta = atan(v / sqrt(q));
+    float bend = lens_w * sqrt(q) * tan(theta - asin(sin(theta) / 1.5));
+    // The bend grows with the glass (#764).
+    vec2 off = -ln * bend * LAB_MUL(5, 3.0) * formed;
+    // No dispersion: the colours bend together (the lab's preset; a red/blue fringe was the
+    // default until then).
+    vec3 bg = formed_backdrop(off, formed);
+#ifdef GLASS_LAB
+    if (lab(6) != 0.0) {
+        float sp = 0.08 * max(lab(6), 0.0);
+        bg = vec3(backdrop(off * (1.0 - sp)).r, bg.g, backdrop(off * (1.0 + sp)).b);
+    }
+#endif
+    vec3 c = tone_of(bg, formed);
+    // The washes, over the tone and under the rim, growing with the glass like its tone.
+    for (int i = 0; i < STATE_MAX; i++) {
+        if (float(i) >= s_count) break;
+        vec4 r = s_rect[i];
+        float sd = box_sdf(v_out, r.xy + r.zw * 0.5, r.zw * 0.5, min(s_radius[i], min(r.z, r.w) * 0.5), 2.0);
+        c = mix(c, s_wash[i].rgb, clamp(0.5 - sd, 0.0, 1.0) * s_wash[i].a * formed);
+    }
+    // Specular rim: a band of light along the edge where it faces the light (top-left) and again
+    // on the opposite side, nothing between — two highlights across a diagonal, as the reference
+    // material's (the lab, 2026-10-05: the echo 0.35 → 0.70, the line all round 0.18 → 0). No
+    // inner glow (owner, 2026-10-05: "the material has to be defined — without inner glow, then
+    // without inner glow"); in the reference the light inside a pane is feedback to a press (#744).
+    vec2 light = normalize(vec2(-0.55, -0.85));
+#ifdef GLASS_LAB
+    if (lab(8) != 0.0) {
+        float an = radians(lab(8));
+        light = vec2(cos(an) * light.x - sin(an) * light.y, sin(an) * light.x + cos(an) * light.y);
+    }
+#endif
+    // 2 logical px of fade inward (owner, 2026-11-05, classic lab: thickness x0.63).
+    // The band was 1.6 px before the October lab trials; 6.4 read too wide, and the
+    // owner chose 3.2 without the halo on 2026-10-06, then narrowed it to 2.0 here.
+    float edge = 1.0 - smoothstep(0.0, LAB_MUL(10, 2.0) * px_scale, inside);
+    float facing = max(dot(n, light), 0.0);
+    float back = max(dot(n, -light), 0.0);
+    float spec = edge * (LAB_ADD(14, 0.0) + 0.82 * facing * facing + LAB_MUL(13, 0.70) * back) * rim;
+#ifdef GLASS_LAB
+    // The inner glow there was until 2026-10-05: wider than the rim, brighter facing the light.
+    if (lab(9) != 0.0) {
+        float band = max(min(radius, min(rect.z, rect.w) * 0.5), 1.0);
+        spec += max(lab(9), 0.0) * (1.0 - smoothstep(0.0, band * 0.6, inside)) * (0.10 + 0.25 * facing) * rim;
+    }
+#endif
+    c = c + spec * formed * (1.0 - c);
+#ifdef GLASS_LAB
+    // A dark line along the outline, one logical px: the reference material's edge at rest, where
+    // its rim of light is off (glass-probe, 2026-10-08: the line at ≈0.63 of the glass inside it,
+    // i.e. lab[15] ≈ 0.37).
+    if (lab(15) != 0.0) c *= 1.0 - clamp(lab(15), 0.0, 1.0) * (1.0 - smoothstep(0.0, px_scale, inside)) * formed;
+#endif
+    gl_FragColor = vec4(c * cov, cov);
+}

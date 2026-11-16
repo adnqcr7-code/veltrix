@@ -1,0 +1,981 @@
+import Gtk from "gi://Gtk?version=4.0"
+import Gdk from "gi://Gdk?version=4.0"
+import GdkPixbuf from "gi://GdkPixbuf"
+import { writeFile, readFile } from "../../../lib/veltrix-kit/platform/file"
+import { execAsync } from "../../../lib/process"
+import GLib from "gi://GLib"
+import GObject from "gi://GObject"
+import Gio from "gi://Gio"
+import Cairo from "gi://cairo"
+import appService from "../../core/AppService"
+import trashService from "../../core/TrashService"
+import { DOCK_CONSTANTS } from "./DockPhysics"
+import compositor from "../../core/CompositorState"
+
+import { dragBus, pointerBus, dockSettings, changeMenuCount, menuState } from "./state"
+import status from "../../core/Status"
+import Theme from "../../core/ThemeManager"
+import { iconAssetPath } from "../../core/Icons"
+import { t } from "../../core/i18n"
+import shellActions from "../../core/ShellActions"
+import { safeDisconnect } from "../../core/signals"
+import { attachTooltip, GlassBubbleMenu } from "../../../lib/veltrix-kit"
+import { renderMenuModel } from "../../common/VeltrixMenu"
+import { INK } from "../../../lib/veltrix-kit/platform/tokens"
+import { cairoDraw } from "../../../lib/veltrix-kit/platform/cairo-draw"
+import { DockIcon } from "./DockIcon"
+import { pickRestoreTarget } from "./restore-order"
+import { captureWindow } from "../../core/WindowCapture"
+import { chromeIsDarkFor } from "../../common/ShellGlass"
+
+/** A `*-symbolic` icon is a mask meant to take the text colour (see DockIcon). */
+const isSymbolicFile = (path: string | null | undefined) => !!path && /-symbolic\.(svg|png)$/.test(path)
+
+// `hypr` kept as this file's name for the compositor, to keep its diff small.
+const hypr = compositor
+
+// Module-level tracker so Dock.tsx can dismiss the active popover when clicking dock background
+let _activeDockMenu: Gtk.Popover | null = null
+export function dismissActiveDockMenu() {
+    if (_activeDockMenu?.visible) _activeDockMenu.popdown()
+}
+
+// ── CLICK-TO-MINIMIZE (dock toggle) ──────────────────────────────────────────
+// A second click on the app whose window is already focused HIDES it — it never
+// closes or kills anything, the app keeps running in the background and a further
+// click brings it back (owner-confirmed 2026-11-13: minimize/restore only).
+//
+// Hyalo has a real minimize (`caps.minimize`, #724): hide = `minimizeWindow`,
+// restore = `focusWindow`. Hyprland has none, so the dock hides into its own
+// dedicated special (scratchpad) workspace `special:veltrix-dock` — deliberately
+// NOT `special:magic`, the user's own scratchpad, so dock-hidden windows never
+// mix with it. A window there is still in `compositor.clients` (DockCore groups
+// with no workspace filter), so its dock item, running dot and addresses all
+// survive the hide — only its workspace name says it is hidden.
+const DOCK_HIDDEN_SPECIAL = "veltrix-dock"
+// Hyprland reports no minimize order, so the dock remembers the order IT hid
+// windows in, and the click restores the LONGEST-hidden one first — the most
+// recently hidden one would trap the click on the newest window forever
+// (Nov 14 sweep #7): restore B, click hides B (it is focused), click
+// restores B again, and an older hidden window is never reached.
+// Longest-hidden-first cycles through all of them. A restored window's entry
+// is deleted in restoreAppWindow, so the map holds only hidden windows.
+const dockHiddenOrder = new Map<string, number>()
+let dockHiddenSeq = 0
+const isDockHidden = (c: { workspace: { name: string } }) =>
+    c.workspace.name === `special:${DOCK_HIDDEN_SPECIAL}`
+const hideAppWindow = (address: string) => {
+    if (compositor.caps.minimize) return compositor.minimizeWindow(address)
+    dockHiddenOrder.set(address, ++dockHiddenSeq)
+    return compositor.sendToSpecial(DOCK_HIDDEN_SPECIAL, address)
+}
+const restoreAppWindow = (address: string) => {
+    // A restored window is no longer hidden, so its hide order goes with it —
+    // otherwise the map grows forever and a stale order can outrank a window
+    // hidden after it (the pick in primaryAction only looks at hidden ones,
+    // but a map that only holds hidden windows cannot lie about that).
+    dockHiddenOrder.delete(address)
+    const client = compositor.clients.find(c => c.address === address)
+    if (client && isDockHidden(client) && !compositor.caps.minimize) {
+        // Hyprland: `focusWindow` alone is not relied on to pull a window out of
+        // a special workspace — move it back onto the workspace the user is
+        // looking at first, then focus it. (Hyalo: `focusWindow` restores a
+        // minimized window by contract, so it takes the plain path below.)
+        // Only windows on OUR special workspace are moved back — a window the
+        // user put on another special workspace keeps the old focus-only path.
+        return compositor.sendToWorkspace(address, compositor.focusedWorkspaceId)
+            .then(() => compositor.focusWindow(address))
+    }
+    return compositor.focusWindow(address)
+}
+
+// --- PERSISTENCE (Moved to share state if needed, but for now referencing global or passing as props?)
+// Ideally DockItem shouldn't manage global pinned state directly, but for now we follow existing pattern.
+// To avoid circular dependency or complex state management refactor, we will export the list management 
+// or keep it in Dock.tsx and pass callbacks. 
+// However, the original code had `pinnedList` as a module-level variable in Dock.tsx. 
+// To extract DockItem, we need to either:
+// 1. Pass `pinnedList` and `setPinnedList` (or similar) as props.
+// 2. Move `pinnedList` management to a separate state file.
+
+// Option 2 is cleaner for "simplification". Let's create a simple state manager or valid approach.
+// For this step, I'll keep it simple: Pass callbacks for pinning logic.
+
+// --- STATE: Removed local dragBus (now using shared state from ./state) ---
+
+// SEPARATOR COMPONENT
+export function Separator(id: string, updateDock: () => void, register: (id: string, s: any) => void,
+    // Callbacks for drop logic
+    onDrop: (sourceId: string) => void
+) {
+    const isSepVertical = dockSettings.position === 'left' || dockSettings.position === 'right'
+    const baseWidth = DOCK_CONSTANTS.SEPARATOR_SLOT
+    const box = new Gtk.CenterBox({
+        css_classes: ["cd-separator-container"],
+        valign: isSepVertical ? Gtk.Align.CENTER : Gtk.Align.END, halign: Gtk.Align.CENTER,
+        width_request: isSepVertical ? DOCK_CONSTANTS.PILL_HEIGHT : baseWidth,
+        height_request: isSepVertical ? baseWidth : DOCK_CONSTANTS.PILL_HEIGHT,
+        hexpand: false,
+        margin_bottom: 0,
+    })
+
+    // For vertical docks the separator is a horizontal hairline, not a vertical one.
+    // Initialize dimensions to match what the tick would set so no layout jump occurs.
+    const line = new Gtk.Box({
+        name: "cd-separator", css_classes: ["cd-separator"],
+        valign: Gtk.Align.CENTER, halign: Gtk.Align.CENTER,
+        width_request: isSepVertical
+            ? DOCK_CONSTANTS.SEPARATOR_HEIGHT
+            : DOCK_CONSTANTS.SEPARATOR_LINE,
+        height_request: isSepVertical
+            ? DOCK_CONSTANTS.SEPARATOR_LINE
+            : DOCK_CONSTANTS.SEPARATOR_HEIGHT,
+        hexpand: false,
+    })
+
+    box.set_center_widget(line)
+
+    const state = {
+        targetScale: 1.0, currentScale: 1.0, velocityScale: 0,
+        targetWidth: baseWidth, currentWidth: baseWidth, velocityWidth: 0,
+        targetMargin: 0, currentMargin: 0, velocityMargin: 0,
+        targetHeight: DOCK_CONSTANTS.SEPARATOR_HEIGHT, currentHeight: DOCK_CONSTANTS.SEPARATOR_HEIGHT, velocityHeight: 0,
+        targetTranslateY: 0, currentTranslateY: 0, velocityY: 0,
+        currentSlideX: 0, targetSlideX: 0, velocitySlideX: 0,
+        staticCenter: 0,
+        virtualCenter: 0,
+        isSeparator: true,
+        widget: box as Gtk.Widget
+    }
+    register(id, state)
+        ; (box as any).setVirtualCenter = (v: number) => {
+            if (Math.abs(state.staticCenter - v) < 0.1) return
+            state.virtualCenter = v
+            state.staticCenter = v
+        }
+
+    // V540: REDUNDANT DROP TARGET REMOVED. Consolidated in global handler.
+    return box
+}
+
+// DOCK ITEM COMPONENT
+interface DockItemProps {
+    appId: string;
+    appItem: any;
+    updateDock: () => void;
+    register: (id: string, s: any) => void;
+    addresses?: string[];
+    clientTitle?: string;
+    // Callbacks for interaction
+    onPin: (id: string) => void;
+    onUnpin: (id: string) => void;
+    onReorder: (sourceId: string, targetId: string) => void;
+    isPinned: boolean;
+    cleanId?: string;
+    /** A minimized window's item (#724): the window's address. It shows a picture of the
+     *  window with its app's icon (`appItem`) as a badge, and a click brings the window back. */
+    window?: string;
+    /** Where the item's icon is now, in its window's coordinates: what the window grows back
+     *  out of when this item restores it (`DockCore`'s minimize targets). */
+    aimFrom?: (address: string, icon: Gtk.Widget) => void;
+}
+
+/**
+ * The size the dock loads its icons at, in DEVICE pixels: the largest a magnified icon
+ * can be drawn (128 logical, `maxIconSize`'s ceiling) times the highest monitor scale.
+ * It was a flat 128, which is exactly right at scale 1 and nowhere else: at scale 2 a
+ * magnified icon covers 256 device pixels, so the GPU stretched a 128 px texture 2×
+ * and the dock went soft while the app grid — `Gtk.Image`, rendered by GTK at the
+ * device size — stayed sharp (owner-caught 2026-09-26). An SVG loaded at this size is
+ * as sharp as the screen; a PNG theme is still limited by the largest size it ships.
+ * A scale change rebuilds the dock (app.ts, `notify::geometry`), so this is re-read.
+ */
+function iconSourceSize(): number {
+    let scale = 1
+    const monitors = Gdk.Display.get_default()?.get_monitors()
+    for (let i = 0; monitors && i < monitors.get_n_items(); i++) {
+        const m = monitors.get_item(i) as Gdk.Monitor | null
+        if (m) scale = Math.max(scale, m.get_scale?.() ?? m.get_scale_factor())
+    }
+    return Math.ceil(128 * scale)
+}
+
+export function DockItem(
+    props: DockItemProps,
+    referenceWidget?: Gtk.Widget
+) {
+    let { appId, appItem, updateDock, register, addresses = [], clientTitle, onPin, onUnpin, onReorder, isPinned, cleanId } = props
+    const { window: windowAddr, aimFrom } = props
+    // The dock's own items (app grid, home, trash) are NOT apps, and must never be
+    // looked up as one: `appService.getAppInfo` falls back to a SUBSTRING match, so
+    // "launcher" resolved to `fcitx5-wayland-launcher.desktop`. Every grid click
+    // launched that input-method helper and only toggled the grid in the `.catch`
+    // once it died — which is what made the grid slow to open AND to close (#550).
+    const isSpecialItem = appId.startsWith("special:") || appId === "launcher" || appId === "home-shortcut" || appId === "trash"
+        || !!windowAddr
+    const isVertical = dockSettings.position === 'left' || dockSettings.position === 'right'
+    let rawId = "void"
+    if (appItem.get_id) {
+        rawId = appItem.get_id() || "void"
+    } else {
+        const key = (appItem as any).id || (appItem as any).icon_name || (appItem as any).name || "void"
+        if (Array.isArray(key)) rawId = key[0]
+        else if (typeof key === "string") rawId = key
+    }
+    rawId = rawId.replace(".desktop", "")
+
+    const edgeAlign = isVertical
+        ? (dockSettings.position === 'right' ? Gtk.Align.END : Gtk.Align.START)
+        : Gtk.Align.START
+
+    const itemBox = new Gtk.Box({
+        name: "cd-item-" + appId,
+        css_classes: ["cd-item"],
+        // Horizontal: VERTICAL orientation stacks [icon zone, dot zone] top-to-bottom.
+        // Vertical:   HORIZONTAL orientation keeps the side-indicator pattern.
+        orientation: isVertical ? Gtk.Orientation.HORIZONTAL : Gtk.Orientation.VERTICAL,
+        valign: isVertical ? Gtk.Align.START : Gtk.Align.END,
+        // Vertical mirrors horizontal: anchored to the screen-edge side (edgeAlign,
+        // not FILL) so the item grows toward screen center as the icon magnifies.
+        halign: isVertical ? edgeAlign : Gtk.Align.START,
+        hexpand: false,
+        // Vertical shrink-wraps to [dotZone + iconBox] so its width is exactly
+        // PILL_PADDING + current icon size; anchored to the edge it stays centered at
+        // rest and grows toward center when magnified.
+        width_request:  isVertical ? -1 : DOCK_CONSTANTS.ICON_SIZE,
+        height_request: isVertical ? DOCK_CONSTANTS.ICON_SIZE   : DOCK_CONSTANTS.PILL_HEIGHT,
+        margin_top:    isVertical ? DOCK_CONSTANTS.ICON_MARGIN : 0,
+        margin_bottom: isVertical ? DOCK_CONSTANTS.ICON_MARGIN : 0,
+        overflow: Gtk.Overflow.VISIBLE,
+        // Focus may ENTER (the icon below is the keyboard stop, Super+Ctrl+D) but the
+        // item itself is not one. `can_focus: false` here used to shut the whole
+        // subtree out of the keyboard — the dock's menus included (#657).
+        can_focus: true,
+        focusable: false,
+        has_tooltip: false,
+    })
+
+    // V457: Live reordering handler for visual states
+    const unsub = dragBus.subscribe((draggingId) => {
+        const isDraggingMe = draggingId === appId || draggingId === cleanId
+        if (isDraggingMe) {
+            itemBox.add_css_class("cd-dragging")
+        } else {
+            itemBox.remove_css_class("cd-dragging")
+        }
+    })
+    itemBox.connect("destroy", unsub)
+
+    const iconBox = new Gtk.Box({
+        name: "cd-icon-box-" + appId,
+        css_classes: ["cd-icon-container"],
+        halign: Gtk.Align.CENTER,
+        valign: isVertical ? Gtk.Align.CENTER : Gtk.Align.END,
+        hexpand: false,
+        // Horizontal: fills the icon zone (everything above the dot zone).
+        vexpand: !isVertical,
+        width_request:  isVertical ? DOCK_CONSTANTS.ICON_SIZE : -1,
+        height_request: isVertical ? DOCK_CONSTANTS.ICON_SIZE : -1,
+        margin_bottom: 0,
+        has_tooltip: false,
+        // Focus may enter: the icon inside is the keyboard stop (see below).
+        can_focus: true,
+        focusable: false,
+    })
+
+    const getIcon = (): { name?: string, path?: string, gicon?: any } => {
+        let name: string | string[] = (appItem as any).icon_name || (appItem as any).icon || appItem.name || "application-x-executable"
+        let candidate: string | null = null
+        try {
+            if (Array.isArray(name)) {
+                // Theme-first chain: a later name in the ACTIVE theme beats an
+                // earlier name that only exists in deep fallbacks (hicolor,
+                // shipped assets). See AppService.resolveIconChain.
+                candidate = appService.resolveIconChain(name)
+            } else {
+                candidate = appService.getIconName(name)
+            }
+        } catch (e) {
+            console.error(`[Dock] getIcon crash for ${(appItem as any).name}:`, e)
+        }
+
+        if (candidate) {
+            if (candidate.startsWith("/") || candidate.startsWith("file://")) {
+                return { path: candidate.replace("file://", "") }
+            }
+            return { name: candidate }
+        }
+
+        // V149.3: THEMED ICON RESOLUTION (GIO) 🛰️
+        // If we have a raw Gio.AppInfo, we extract the GIcon and resolve its names.
+        if (appItem.get_icon) {
+            const gicon = appItem.get_icon()
+            if (gicon instanceof Gio.ThemedIcon) {
+                for (const n of gicon.get_names()) {
+                    const res = appService.getIconName(n)
+                    if (res) {
+                        if (res.startsWith("/") || res.startsWith("file://")) return { path: res.replace("file://", "") }
+                        return { name: res }
+                    }
+                }
+            }
+            return { gicon: gicon }
+        }
+
+        return { name: "application-x-executable" }
+    }
+
+    const res = getIcon()
+    let child: Gtk.Widget
+
+    // HEURISTIC: Is this a themed icon or a full-frame external icon?
+    // We will finalize this after resolving the path for system icons.
+    let isThemed = true
+
+
+    // V132: Custom DrawingArea for Pixel-Perfect Scaling (Zero Popping / Zero Layout Shift)
+    let pixbuf: any = null
+    let resolvedPath = res.path || ""
+    const sourceSize = iconSourceSize() // Load high-res once
+
+    try {
+        if (res.path) {
+            pixbuf = (GdkPixbuf as any).Pixbuf.new_from_file_at_scale(res.path, sourceSize, sourceSize, true)
+        } else if (res.name) {
+            const theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default()!)
+            if (theme.has_icon(res.name)) {
+                const info = theme.lookup_icon(res.name, [], sourceSize, 1, Gtk.TextDirection.NONE, Gtk.IconLookupFlags.FORCE_REGULAR)
+                if (info) {
+                    const file = info.get_file()
+                    if (file && file.get_path()) {
+                        resolvedPath = file.get_path()!
+                        pixbuf = (GdkPixbuf as any).Pixbuf.new_from_file_at_scale(resolvedPath, sourceSize, sourceSize, true)
+                    }
+                }
+            }
+        } else if (res.gicon) {
+            const gicon = res.gicon as any
+            if (gicon.get_file && gicon.get_file()) {
+                resolvedPath = gicon.get_file()!.get_path() || ""
+                if (resolvedPath) pixbuf = (GdkPixbuf as any).Pixbuf.new_from_file_at_scale(resolvedPath, sourceSize, sourceSize, true)
+            }
+        }
+
+        // If still no pixbuf, load the generic fallback icon so the DrawingArea path is always used
+        if (!pixbuf) {
+            const theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default()!)
+            for (const fallbackName of ["application-x-executable", "image-missing"]) {
+                if (!theme.has_icon(fallbackName)) continue
+                const info = theme.lookup_icon(fallbackName, [], sourceSize, 1, Gtk.TextDirection.NONE, Gtk.IconLookupFlags.FORCE_REGULAR)
+                const file = info?.get_file()
+                const path = file?.get_path()
+                if (path) {
+                    try { pixbuf = (GdkPixbuf as any).Pixbuf.new_from_file_at_scale(path, sourceSize, sourceSize, true) } catch (_) {}
+                    if (pixbuf) break
+                }
+            }
+        }
+    } catch (e) {
+        // console.error(`[DockItem] Failed to load pixbuf for ${appId}:`, e)
+    }
+
+    // Finalize Heuristic: Check the resolved path to see if it's truly external
+    // V601: User requested removing all special handling for Antigravity or non-themed icons.
+    // We treat everything as "themed" now so they all get the exact same background plate and scale.
+    isThemed = true
+
+
+    if (pixbuf) {
+        // GPU textures, not a Cairo repaint per frame — see DockIcon.ts for the measurements.
+        const icon = new DockIcon({ valign: Gtk.Align.CENTER, halign: Gtk.Align.CENTER, css_classes: ["cd-icon"] })
+        icon.restSize = () => DOCK_CONSTANTS.ICON_SIZE
+        icon.setPixbuf(pixbuf, isSymbolicFile(resolvedPath), resolvedPath)
+        child = icon
+        // A minimized window: its picture, captured once — the window draws nothing while it
+        // is minimized, so its last frame is what it looks like. The app's icon until it comes.
+        if (windowAddr) {
+            captureWindow(windowAddr, sourceSize, sourceSize).then(tex => {
+                if (tex && icon.get_root()) icon.setThumbnail(tex)
+            }).catch(() => {})
+        }
+    } else {
+        // Fallback for system icons
+        const iconProps: any = {
+            icon_name: res.name || "application-x-executable",
+            pixel_size: DOCK_CONSTANTS.ICON_SIZE,
+            halign: Gtk.Align.CENTER,
+            valign: Gtk.Align.CENTER
+        }
+        child = new Gtk.Image(iconProps)
+        child.set_size_request(DOCK_CONSTANTS.ICON_SIZE, DOCK_CONSTANTS.ICON_SIZE)
+    }
+
+    // Common props
+    child.set_halign(Gtk.Align.CENTER)
+    child.set_valign(Gtk.Align.CENTER)
+    child.set_has_tooltip(false)
+    child.set_size_request(DOCK_CONSTANTS.ICON_SIZE, DOCK_CONSTANTS.ICON_SIZE)
+
+    // Trash icon tracks trash contents (full ↔ empty) in place: hand the DockIcon the new
+    // pixbuf (it rebuilds its textures and redraws) — no widget rebuild, no flash.
+    let unsubTrash: (() => void) | null = null
+    if (appId === "trash" || appId === "special:trash") {
+        const applyTrashIcon = () => {
+            ;(appItem as any).icon_name = trashService.isEmpty
+                ? ["user-trash", "trashcan-empty", "trash", iconAssetPath("nd-user-trash")]
+                : ["user-trash-full", "trashcan-full", "user-trash", "trash", iconAssetPath("nd-user-trash")]
+            const r = getIcon()
+            try {
+                let path = r.path || null
+                if (!path && r.name) {
+                    const theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default()!)
+                    const info = theme.lookup_icon(r.name, [], sourceSize, 1, Gtk.TextDirection.NONE, Gtk.IconLookupFlags.FORCE_REGULAR)
+                    path = info?.get_file()?.get_path() || null
+                }
+                if (path) {
+                    const next = (GdkPixbuf as any).Pixbuf.new_from_file_at_scale(path, sourceSize, sourceSize, true)
+                    if (next) {
+                        pixbuf = next
+                        if (child instanceof DockIcon) (child as DockIcon).setPixbuf(next, isSymbolicFile(path), path)
+                    }
+                }
+            } catch (e) { console.error("[Dock] trash icon swap failed:", e) }
+            if (child instanceof Gtk.Image) (child as Gtk.Image).set_from_icon_name(r.name || "user-trash")
+            else child.queue_draw()
+        }
+        applyTrashIcon() // initial state (trash may already hold items at boot)
+        unsubTrash = trashService.subscribe(applyTrashIcon)
+    }
+
+    const state = {
+        targetScale: 1.0, currentScale: 1.0, velocityScale: 0,
+        targetWidth: DOCK_CONSTANTS.ICON_SIZE, currentWidth: DOCK_CONSTANTS.ICON_SIZE, velocityWidth: 0,
+        targetMargin: DOCK_CONSTANTS.ICON_MARGIN, currentMargin: DOCK_CONSTANTS.ICON_MARGIN, velocityMargin: 0,
+        targetHeight: DOCK_CONSTANTS.PILL_HEIGHT, currentHeight: DOCK_CONSTANTS.PILL_HEIGHT, velocityHeight: 0,
+        targetTranslateY: 0, currentTranslateY: 0, velocityY: 0,
+        currentSlideX: 0, targetSlideX: 0, velocitySlideX: 0,
+        staticCenter: 0,
+        virtualCenter: 0,
+        isSeparator: false,
+        addresses: addresses as string[],
+        clientTitle: clientTitle as string | undefined,
+        widget: itemBox as Gtk.Widget,
+        isBouncing: false,
+        bounceOffsetY: 0
+    }
+    register(appId, state)
+        ; (itemBox as any).setVirtualCenter = (v: number) => {
+            if (Math.abs(state.staticCenter - v) < 0.1) return
+            state.virtualCenter = v
+            state.staticCenter = v
+        }
+
+    // V700: Reverted to vanilla icons. No background plate or squircle clipping.
+    const iconToDisplay = child
+    child.set_size_request(DOCK_CONSTANTS.ICON_SIZE, DOCK_CONSTANTS.ICON_SIZE)
+
+    // (isAntigravity moved up)
+
+    child.set_name("cd-icon-image-" + appId)
+    // The keyboard stop of the dock walk (Super+Ctrl+D) is the ICON, not iconBox:
+    // 🔴 a focusable Gtk.Box is reachable by grab_focus() but NEVER by Tab or the
+    // arrows — GtkBox's focus vfunc only hands focus on to its children, so
+    // child_focus() on it returns false (measured on GTK 4.22, 2026-09-27: the walk
+    // found nothing to land on). Never by a click (focus_on_click: false), which must
+    // not leave a focused icon behind. Keys bubble from here to iconBox's controller.
+    iconToDisplay.focusable = true
+    iconToDisplay.focus_on_click = false
+    iconBox.append(iconToDisplay)
+
+    const DOT_SIZE = 5
+    const GAP = DOCK_CONSTANTS.INDICATOR_GAP
+
+    // DrawingArea + Cairo: always a perfect circle regardless of GTK allocation.
+    const dot = new Gtk.DrawingArea()
+    dot.set_halign(Gtk.Align.CENTER)
+    dot.set_valign(Gtk.Align.CENTER)
+    ;(dot as any).set_content_width(DOT_SIZE)
+    ;(dot as any).set_content_height(DOT_SIZE)
+    dot.set_visible(false)
+    ;(dot as any).set_draw_func(cairoDraw((_area: any, cr: any, w: number, h: number) => {
+        if (w <= 0 || h <= 0) return
+        const r = Math.min(w, h) / 2
+        cr.arc(w / 2, h / 2, r, 0, 2 * Math.PI)
+        const c = chromeIsDarkFor(dot) ? 1 : 0   // dock running-dot — follows the chrome skin
+        cr.setSourceRGBA(c, c, c, INK.solid)
+        cr.fill()
+    }))
+
+    if (isVertical) {
+        // Mirror of the horizontal dotZone (which sits PILL_PADDING tall below the icon):
+        // a PILL_PADDING-wide spacer on the screen-edge side that holds the indicator dot.
+        // It both creates the rest gap to the pill wall AND lets the icon zone grow toward
+        // center cleanly (pure Box layout — no Overlay main-child alignment quirks).
+        dot.set_halign(Gtk.Align.CENTER)
+        dot.set_valign(Gtk.Align.CENTER)
+        const dotZone = new Gtk.CenterBox({
+            orientation: Gtk.Orientation.VERTICAL,
+            width_request: DOCK_CONSTANTS.PILL_PADDING,
+            valign: Gtk.Align.FILL,
+        })
+        dotZone.set_center_widget(dot)
+        if (dockSettings.position === 'right') {
+            itemBox.append(iconBox)   // center side
+            itemBox.append(dotZone)   // screen-edge side (right)
+        } else {
+            itemBox.append(dotZone)   // screen-edge side (left)
+            itemBox.append(iconBox)   // center side
+        }
+        ;(itemBox as any)._cdIconBox = iconBox
+        ;(itemBox as any)._cdDotZone = dotZone
+    } else {
+        // CenterBox guarantees its center_widget gets exactly its natural size (6×6),
+        // rather than being stretched by a Gtk.Box parent layout pass.
+        const dotZone = new Gtk.CenterBox({
+            height_request: DOCK_CONSTANTS.PILL_PADDING,
+            halign: Gtk.Align.FILL,
+        })
+        dotZone.set_center_widget(dot)
+        itemBox.append(iconBox)
+        itemBox.append(dotZone)
+    }
+
+    // TOOLTIP — the shared Veltrix glass tooltip (lib/veltrix-kit/tooltip.ts),
+    // anchored to the icon and pointing away from the dock edge.
+    const tooltipPosition = isVertical
+        ? (dockSettings.position === 'right' ? Gtk.PositionType.LEFT : Gtk.PositionType.RIGHT)
+        : Gtk.PositionType.TOP
+
+    // The dock item's display title: localized special-item names, else the live
+    // window title (focused, else first client), else the app name. Single source
+    // of truth — read lazily by the tooltip the instant before it shows, so it's
+    // always fresh WITHOUT subscribing to title ticks (a subscription would force
+    // a dock redraw + blur pass; Client.title is live anyway).
+    const computeTitle = () => {
+        const focused = hypr.focusedClient
+        let title = appItem.name || "App"
+        if (appId === "home-shortcut" || appId === "special:home") title = t("dock.special.home.label")
+        if (appId === "trash" || appId === "special:trash") title = t("dock.special.trash.name")
+        if (windowAddr) return hypr.clients.find(c => c.address === windowAddr)?.title || title
+        if (focused && addresses.includes(focused.address)) {
+            title = focused.title
+        } else if (addresses.length > 0) {
+            const c = hypr.clients.find(c => c.address === addresses[0])
+            if (c) title = c.title
+        }
+        return title || appItem.name || "App"
+    }
+
+    const tip = attachTooltip(iconBox, computeTitle, {
+        position: tooltipPosition,
+        suppress: () => !!(bubbleMenu && bubbleMenu.popover.visible), // never while the context menu is open
+    })
+
+    // MENU
+    // Dock context menu — a plain Gtk.Popover (NOT Gtk.PopoverMenu, whose native
+    // modelbutton chrome can't be themed to glass). The body is the SAME Cairo glass
+    // bubble as the tooltip (common/GlassBubble) — a rounded capsule with a pointer
+    // aimed back at the dock item — and the rows are the unified veltrix menu
+    // (renderMenuModel, same component as the bar tray menu). It's its own surface,
+    // so it picks up Hyprland's dock-layer popup blur (the painter floors at 0.38).
+    let bubbleMenu: GlassBubbleMenu | null = null
+    let popupIdleId: number | null = null
+
+    const toSentenceCase = (str: string) => str ? str.charAt(0).toUpperCase() + str.slice(1).toLowerCase() : ""
+
+    const ensurePopover = () => {
+        if (bubbleMenu) return
+        bubbleMenu = new GlassBubbleMenu({
+            parent: iconBox,
+            position: tooltipPosition,
+        })
+        bubbleMenu.popover.connect("notify::visible", () => {
+            if (bubbleMenu?.popover.visible) {
+                _activeDockMenu = bubbleMenu.popover
+                changeMenuCount(1)
+            } else {
+                _activeDockMenu = null
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                    changeMenuCount(-1)
+                    return GLib.SOURCE_REMOVE
+                })
+            }
+        })
+    }
+
+    const updateMenuModel = () => {
+        const menuModel = new Gio.Menu()
+        const actionGroup = new Gio.SimpleActionGroup()
+        let actionIdx = 0
+
+        const addAction = (callback: () => void) => {
+            const actionName = `act_${actionIdx++}`
+            const action = new Gio.SimpleAction({ name: actionName })
+            action.connect("activate", callback)
+            actionGroup.add_action(action)
+            return `dock.${actionName}`
+        }
+
+        const addSection = (title: string | null) => {
+            const section = new Gio.Menu()
+            menuModel.append_section(title, section)
+            return section
+        }
+
+        let mainTitle = appItem.name || "App"
+        if (appId === "home-shortcut" || appId === "special:home") mainTitle = t("dock.special.home.label")
+        if (appId === "trash" || appId === "special:trash") mainTitle = t("dock.special.trash.name")
+        if (windowAddr) mainTitle = hypr.clients.find(c => c.address === windowAddr)?.title || mainTitle
+        const mainSection = addSection(mainTitle)
+
+        let desktopActions: string[] = []
+        const gAppInfo = isSpecialItem ? null : appService.getAppInfo(appId)
+        if (gAppInfo && gAppInfo.list_actions) desktopActions = gAppInfo.list_actions()
+
+        if (appId === "launcher" || appId === "special:launcher") {
+            mainSection.append(t("dock.menu.open"), addAction(() => appItem.launch()))
+        } else if (appId === "home-shortcut" || appId === "special:home") {
+            mainSection.append(t("dock.menu.open"), addAction(() => {
+                execAsync(["uwsm", "app", "--", "xdg-open", GLib.get_home_dir()]).catch(print)
+            }))
+        } else if (appId === "trash" || appId === "special:trash") {
+            mainSection.append(t("dock.menu.open"), addAction(() => appItem.launch()))
+            mainSection.append(t("settings.dock.dockitem.empty-trash"), addAction(() => execAsync("gio trash --empty").catch(print)))
+        } else if (windowAddr) {
+            mainSection.append(t("dock.menu.open"), addAction(() => restoreWindow()))
+            mainSection.append(t("dock.menu.close-window"), addAction(() => compositor.closeWindow(windowAddr)))
+        }
+
+        if (desktopActions.length > 0) {
+            const desktopSection = addSection(null)
+            desktopActions.forEach((actionName: string) => {
+                const label = gAppInfo ? gAppInfo.get_action_name(actionName) : toSentenceCase(actionName.replace(/[-_]/g, " "))
+                desktopSection.append(label, addAction(() => {
+                    try { if (gAppInfo && gAppInfo.launch_action) gAppInfo.launch_action(actionName, null) }
+                    catch (e) { console.error(e) }
+                }))
+            })
+        }
+
+        if (!isSpecialItem) {
+            const pinSection = addSection(null)
+            pinSection.append(
+                isPinned ? t("settings.dock.dockitem.unpin") : t("settings.dock.dockitem.keep"),
+                addAction(() => { const cid = cleanId || appId; if (isPinned) onUnpin(cid); else onPin(cid) })
+            )
+        }
+
+        if (state.addresses && state.addresses.length > 0) {
+            const winCount = state.addresses.length
+            if (winCount > 1) {
+                const windowsSection = addSection(null)
+                state.addresses.forEach((addr) => {
+                    const cleanAddr = addr.startsWith("0x") ? addr : "0x" + addr
+                    const rawAddr = addr.replace(/^0x/, '')
+                    const hyprClient = hypr.clients.find(c => c.address === cleanAddr || c.address === rawAddr)
+                    let winTitle = hyprClient?.title || `${t("dock.menu.window-of")} ${appItem.name || "App"}`
+                    if (winTitle.length > 35) winTitle = winTitle.substring(0, 32) + "..."
+                    windowsSection.append(winTitle, addAction(() => {
+                        // Same restore as a dock click: a window the dock hid comes
+                        // back (Hyprland: moved off `special:veltrix-dock` first).
+                        restoreAppWindow(cleanAddr)
+                    }))
+                })
+            }
+            const closeSection = addSection(null)
+            closeSection.append(
+                winCount > 1 ? `${t("settings.dock.dockitem.close-all")} (${winCount})` : t("settings.dock.dockitem.quit"),
+                addAction(() => {
+                    state.addresses.forEach(addr => {
+                        compositor.closeWindow(addr)
+                    })
+                })
+            )
+        }
+
+        // Render the model into the unified veltrix menu rows. renderMenuModel
+        // activates actions on the passed group directly (stripping the "dock."
+        // prefix), so no widget action group is needed. The returned box closes
+        // over actionGroup, keeping it alive as long as the rows live.
+        if (bubbleMenu) {
+            bubbleMenu.clearRows()
+            bubbleMenu.rows.append(renderMenuModel(menuModel, actionGroup, () => bubbleMenu?.popdown()))
+        }
+    }
+
+    const toggleMenu = () => {
+        if (popupIdleId !== null) { GLib.source_remove(popupIdleId); popupIdleId = null }
+        if (bubbleMenu && bubbleMenu.popover.visible) { bubbleMenu.popdown(); return }
+        ensurePopover()
+        updateMenuModel()
+        popupIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            popupIdleId = null
+            if (bubbleMenu) bubbleMenu.popup()
+            return GLib.SOURCE_REMOVE
+        })
+    }
+    const rightClick = new Gtk.GestureClick({ button: 3 })
+    rightClick.connect("released", toggleMenu)
+    iconBox.add_controller(rightClick)
+
+    // DRAG — long-press to enter drag mode, then move to reorder.
+    // Holding the icon for LONG_PRESS_MS ms makes it semi-transparent (drag ready);
+    // releasing before then is treated as a click. Pointer tracking for reorder
+    // preview is handled by Dock.tsx's window-level motion controller, not here.
+    let gestureIsDragging = false
+    let longPressTimer: number | null = null
+    const LONG_PRESS_MS = 400
+
+    const dragGesture = new Gtk.GestureDrag()
+    dragGesture.connect("drag-begin", () => {
+        if (longPressTimer !== null) { GLib.source_remove(longPressTimer); longPressTimer = null }
+        // A minimized window's item is not an app: nothing to pin or reorder.
+        if (windowAddr) return
+        longPressTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, LONG_PRESS_MS, () => {
+            longPressTimer = null
+            if (dragBus.draggingId) return GLib.SOURCE_REMOVE  // another icon owns drag
+            gestureIsDragging = true
+            dragBus.setDragging(cleanId || appId)
+            return GLib.SOURCE_REMOVE
+        })
+    })
+    dragGesture.connect("drag-update", () => {
+        // No-op: reorder preview is driven by Dock.tsx motion events.
+    })
+    dragGesture.connect("drag-end", () => {
+        if (longPressTimer !== null) { GLib.source_remove(longPressTimer); longPressTimer = null }
+        if (gestureIsDragging) {
+            // Signal Dock.tsx to set isDndEnding and suppress the Hyprland-emitted
+            // wl_pointer.leave that follows every drag-end. Regular clicks no longer
+            // need this: the two-stage leave timer (50ms de-magnify, then hideDelay hide)
+            // handles the leave→re-enter cycle correctly without blocking.
+            pointerBus.emitButtonReleased()
+            dragBus.setDragging("")
+        }
+        // Defer flag reset so leftClick.released (fires in the same event batch) still
+        // sees gestureIsDragging = true and skips launching the app after a drag.
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => { gestureIsDragging = false; return GLib.SOURCE_REMOVE })
+    })
+    iconBox.add_controller(dragGesture)
+
+    // A minimized window's item brings it back, growing out of where the item is now (the
+    // pointer is on it, so it may be magnified): focusing a minimized window restores it.
+    const restoreWindow = () => {
+        if (!windowAddr) return
+        aimFrom?.(windowAddr, iconToDisplay)
+        compositor.focusWindow(windowAddr)
+    }
+
+    // CLICK (Focus/Launch)
+    let bounceTimerId: number | null = null
+    const primaryAction = () => {
+        if (windowAddr) {
+            restoreWindow()
+        } else if (addresses.length > 0) {
+            // The app's windows that are SHOWN take turns; with none shown, its longest-
+            // hidden one comes back (#724). A dialog hidden with its window is neither.
+            // "Shown" excludes windows the dock itself hid (Hyalo: minimized; Hyprland:
+            // on `special:veltrix-dock`) as well as minimized ones.
+            const clients = addresses.map(a => hypr.clients.find(c => c.address === a)).filter(c => !!c)
+            const shown = clients.length
+                ? clients.filter(c => !c!.minimized && !isDockHidden(c!)).map(c => c!.address)
+                : addresses
+            if (shown.length === 0) {
+                // Nothing shown: bring back the LONGEST-hidden one. Hyalo orders
+                // by the compositor's `minimizedOrder`; Hyprland has none, so the dock's
+                // own hide order decides, falling back to the first client.
+                // Longest-hidden, not most-recently-hidden: the toggle below
+                // hides the just-restored window on the next click, so
+                // most-recently-hidden would restore the same window forever
+                // and an older hidden one would never come back (Nov 14
+                // sweep #7; the pick itself lives in restore-order.ts).
+                const hidden = clients.filter(c => c!.minimized || isDockHidden(c!))
+                const next = compositor.caps.minimize
+                    ? pickRestoreTarget(hidden.filter(c => c!.minimizedOrder > 0), c => c!.minimizedOrder)
+                    : pickRestoreTarget(hidden, c => dockHiddenOrder.get(c!.address) ?? 0)
+                const target = next ?? clients[0]
+                if (target) restoreAppWindow(target.address)
+                return
+            }
+            const focusedAddr = hypr.focusedClient?.address
+            // Click-to-minimize: the app's ONE shown window is already focused, so
+            // this click hides it instead of re-focusing it (a visible no-op today).
+            // With several shown windows the click keeps cycling to the next one —
+            // the toggle can only land on the focused window when there is one
+            // shown, so cycling and minimizing never fight over the same click.
+            if (shown.length === 1 && focusedAddr && shown[0] === focusedAddr) {
+                hideAppWindow(shown[0])
+                return
+            }
+            const idx = shown.indexOf(focusedAddr || "")
+            const nextIdx = (idx + 1) % shown.length
+            const target = shown[nextIdx]
+            if (target) {
+                compositor.focusWindow(target)
+            }
+        } else if (appId === "launcher" || appId === "special:launcher") {
+            // A toggle, not a launch: no bounce (nothing is starting), no frequency
+            // record, straight to the grid.
+            appItem.launch()
+        } else {
+            // Fallback or Launch
+            try {
+                if (!state.isBouncing) {
+                    state.isBouncing = true
+                    const startTime = Date.now()
+                    const duration = 1200
+                    const amplitude = DOCK_CONSTANTS.ICON_SIZE * 0.35
+                    const originalMargin = iconToDisplay.margin_bottom
+
+                    sync() // Instantly turn on indicator when clicked
+
+                    const animLoop = () => {
+                        if (!state.isBouncing) { bounceTimerId = null; return GLib.SOURCE_REMOVE }
+
+                        const elapsed = Date.now() - startTime
+                        if (elapsed > duration) {
+                            state.isBouncing = false
+                            iconToDisplay.margin_bottom = originalMargin
+                            child.queue_draw()
+                            sync() // Re-evaluate indicator now that bounce is done
+                            bounceTimerId = null
+                            return GLib.SOURCE_REMOVE
+                        }
+
+                        // Calculate unified physics tick
+                        const t = elapsed / duration
+                        const decay = 4.0
+                        const freq = Math.PI * 3.5
+                        const offset = Math.abs(amplitude * Math.exp(-decay * t) * Math.sin(freq * t))
+
+                        // V610: Apply offset physically to the layout margin instead of drawing matrix
+                        iconToDisplay.margin_bottom = originalMargin + offset
+
+                        // Force both layers to draw (although primarily to refresh shadow/bounds)
+                        child.queue_draw()
+
+                        return GLib.SOURCE_CONTINUE
+                    }
+                    if (bounceTimerId !== null) GLib.source_remove(bounceTimerId)
+                    bounceTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, animLoop)
+                }
+
+                // V149: UNIVERSAL HOME ISOLATION (Left Click) 🛰️
+                if (appId === "special:home" || appId === "home-shortcut") {
+                    execAsync(["uwsm", "app", "--", "xdg-open", GLib.get_home_dir()]).catch(print)
+                } else if (appId === "veltrix-settings") {
+                    shellActions.openSettings?.()
+                } else if (isSpecialItem) {
+                    // Trash: its own launch, never an app-registry lookup (see isSpecialItem).
+                    appItem.launch()
+                } else {
+                    // Origin-aware command (gtk-launch / flatpak run) — see AppService.
+                    // getLaunchCommand. cd $HOME because children inherit the launcher's
+                    // CWD (verified) and would open in the AGS process's dir (ui/shell).
+                    // `exec` so the command replaces the shell (clean tree under uwsm).
+                    appService.recordLaunch(appId)
+                    execAsync(appService.getLaunchArgv(appId))
+                        .catch(() => { try { appItem.launch() } catch (_) {} })
+                }
+            } catch (fallbackError) {
+                // If the entire block fails, don't crash the dock
+                console.error(fallbackError)
+            }
+        }
+    }
+    const leftClick = new Gtk.GestureClick({ button: 1 })
+    leftClick.connect("released", () => {
+        if (gestureIsDragging) return  // Button release after a drag — not a click
+        primaryAction()
+    })
+    iconBox.add_controller(leftClick)
+
+    // The keyboard's click and right-click (Super+Ctrl+D walk). Enter/Space act like
+    // the click and END the walk: what they start is a window that needs the keys the
+    // dock's grab is holding. The menu opens on the Menu key, Shift+F10, or the arrow
+    // pointing AWAY from the screen edge (↑ on a bottom dock) — the other arrows walk.
+    const menuArrows = isVertical
+        ? [dockSettings.position === 'right' ? Gdk.KEY_Left : Gdk.KEY_Right]
+        : [Gdk.KEY_Up]
+    const keys = new Gtk.EventControllerKey()
+    keys.connect("key-pressed", (_c: any, keyval: number, _code: number, state: Gdk.ModifierType) => {
+        if (keyval === Gdk.KEY_Return || keyval === Gdk.KEY_KP_Enter
+            || keyval === Gdk.KEY_space || keyval === Gdk.KEY_KP_Space) {
+            status.dock_keyboard = false
+            primaryAction()
+            return true
+        }
+        if (keyval === Gdk.KEY_Menu || menuArrows.includes(keyval)
+            || (keyval === Gdk.KEY_F10 && (state & Gdk.ModifierType.SHIFT_MASK))) {
+            toggleMenu()
+            return true
+        }
+        return false
+    })
+    iconBox.add_controller(keys)
+
+    // V540: REDUNDANT DROP TARGET REMOVED. Consolidated in global handler.
+    // SYNC LOGIC
+    const sync = () => {
+        const focused = hypr.focusedClient
+        const isOpen = addresses.length > 0
+        const isFocused = focused && addresses.includes(focused.address)
+
+        if ((isOpen || state.isBouncing) && dockSettings.showIndicators) {
+            dot.set_visible(true)
+            dot.add_css_class("open")
+            if (isFocused) dot.add_css_class("focused")
+            else dot.remove_css_class("focused")
+        } else {
+            dot.set_visible(false)
+            dot.remove_css_class("open")
+            dot.remove_css_class("focused")
+        }
+        // The tooltip title is no longer pushed here — attachTooltip reads
+        // computeTitle() lazily right before it shows (always fresh, and zero
+        // surface commits on every sync).
+    }
+
+    const hsChangedId = compositor.connect("changed", sync)
+    const themeChangedId = Theme.connect("changed", () => { if (dot.get_mapped()) dot.queue_draw() })
+
+    // Note: notify::title per-client connections removed — they caused a dock surface
+    // commit (and Hyprland blur pass) on every window title update from running apps
+    // (e.g. YouTube tab progress, Discord unread count). compositor.changed fires on actual
+    // structural changes (focus, workspace, open/close) which is sufficient.
+
+    itemBox.connect("destroy", () => {
+        safeDisconnect(compositor, hsChangedId)
+        safeDisconnect(Theme, themeChangedId)
+        // Pending timers would otherwise keep firing against destroyed widgets
+        // (the dock is rebuilt in-process on position/autoHide/geometry changes).
+        if (bounceTimerId !== null) { GLib.source_remove(bounceTimerId); bounceTimerId = null; state.isBouncing = false }
+        tip.destroy()
+        if (longPressTimer !== null) { GLib.source_remove(longPressTimer); longPressTimer = null }
+        if (popupIdleId !== null) { GLib.source_remove(popupIdleId); popupIdleId = null }
+        // Unparent the context menu + drop its glass repaint subscription when the
+        // dock is rebuilt on layout changes.
+        if (bubbleMenu) {
+            bubbleMenu.popdown()
+            bubbleMenu.destroy()
+            bubbleMenu.popover.unparent()
+            bubbleMenu = null
+        }
+        if (unsubTrash) { unsubTrash(); unsubTrash = null }
+    })
+    sync()
+
+        ; (itemBox as any).syncState = (newAddrs: string[], newTitle: string | undefined, newAppItem: any, newIsPinned: boolean) => {
+            addresses = newAddrs
+            clientTitle = newTitle
+            appItem = newAppItem
+            isPinned = newIsPinned
+
+            state.addresses = newAddrs
+            state.clientTitle = newTitle
+
+            sync()
+        }
+
+    return itemBox
+}

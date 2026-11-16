@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Install Veltrix
+Comment=Install this system on a disk
+# A real Exec, unlike veltrix-settings.desktop: the installer is an ordinary
+# application window with its own binary, not a shell surface reached through IPC.
+Exec=veltrix-installer
+Icon=system-software-install
+Type=Application
+Categories=System;
+Keywords=install;installer;setup;
+StartupNotify=true

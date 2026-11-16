@@ -1,0 +1,1512 @@
+# Changelog
+
+All notable changes to Nidara are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- **New keyboard shortcuts.** `Super+Tab` / `Super+Shift+Tab` cycle windows
+  (macOS Cmd+Tab muscle memory; same action as `Alt+Tab`, which stays the
+  documented one). `Super+,` opens Settings (macOS Cmd+,). `Super+H` hides
+  the focused window — the app keeps running and the dock icon brings it back
+  (Hyprland: onto the dock's `special:veltrix-dock` workspace, the same place a
+  dock click hides it; Hyalo: its real minimize). `Super+Alt+arrows` snap the
+  focused window to a half of the usable area and `Super+Alt+C` centres it at
+  its current size — the window is floated first, then its settled box is
+  written once, the same write-once rule as window birth; fullscreen windows
+  and no-focus are silent no-ops. `Super+Print` takes a full-screen screenshot
+  to the clipboard and `Super+Shift+Print` to a file, mirroring the existing
+  region binds. Snap halves are Hyprland-only for now (Hyalo has no
+  absolute-move action yet); centre is mirrored there via its `center` action.
+  Caveat: a window hidden with `Super+H` on Hyprland bypasses the dock's
+  hide-order bookkeeping, so it sorts as the oldest hidden one when several
+  windows of one app are hidden (restore order only — restore itself works).
+
+## [1.2.2] — 2026-11-14
+
+### Fixed
+
+- **Files could not delete anything — the "Move to Trash…" row never
+  appeared.** The extension itself was fine and was seeded on update, but
+  Nautilus loads extensions only at startup and stays resident after its
+  windows close, so a session where Files was already running never picked
+  the newly seeded extension up, no matter how many updates ran.
+  `veltrix-setup` now restarts Files once, the first time the extension is
+  present (tracked by a `~/.config/veltrix/.nautilus-ext-restarted` marker,
+  so later runs never close the user's open Files windows again), via
+  `nautilus -q` on the live session bus — best-effort and fail-soft, so a
+  TTY install with no live session just skips it and Files loads the
+  extension at next login. Trash only, with confirmation, never permanent
+  delete; Nautilus' own "Delete Permanently" row is still not turned on.
+- **`veltrix-update` mistook the delta for the full tarball and the update
+  failed.** Its release parser took the first asset matching
+  `veltrix-*.tar.gz`, but GitHub's API lists assets newest-first, so the
+  delta (uploaded after the tarball) came first and was downloaded as if it
+  were the full tarball, then failed the source-tree check
+  ("no install.sh/VERSION") — that is what blocked the 1.2 → 1.2.1 update.
+  The parser now excludes delta assets (`"-delta-from-"` in the name), so
+  the full tarball is always picked. Note: this release ships **no delta** —
+  the updaters on 1.2 machines still carry the old detection, so a delta
+  asset on this release would be mis-detected again; the 1.2 → 1.2.2
+  update uses the full tarball, and the delta path is safe again from the
+  next release on.
+
+## [1.2.1] — 2026-11-14
+
+### Fixed
+
+- **The bar's close (×) button did nothing for the terminal.** Clicking it
+  while kitty was focused closed nothing. Two changes, both in the close
+  path and nothing else: the button now uses `barItem`'s `onClick` like
+  every other bar control (it had hung its click on a separately-attached
+  `GestureClick` on "released"), and closing the focused window goes
+  through a new `compositor.closeFocusedWindow()` — on Hyprland the same
+  no-arg `hl.dsp.window.close()` Super+Q is bound to, so no address is
+  resolved here and no selector can disagree with the compositor about
+  which window is focused (Hyalo closes the reconciled focused client).
+  The "Exit fullscreen" button got the same `onClick` wiring. The dock's
+  Close, the window menu's Close and Super+Q are unchanged, and the
+  green = fullscreen / yellow = hide / red = kill meanings are untouched.
+
+## [Unreleased]
+
+**Fast updates: an update no longer reinstalls what it already has.**
+`veltrix-update` (Settings → About, "Update now") now tries a delta first
+when the release carries one for the installed version, and the bootstrap
+syncs the new tree into the registered one instead of wiping and
+re-extracting it — so unchanged files keep their mtimes, cargo rebuilds
+only the crates whose sources changed, and the install skips the
+already-done work (the ~700 MB apps pre-download, the venv pip install,
+the native C rebuild) when nothing it depends on changed. A typical
+no-deps-change update should drop from ~10+ minutes to ~1–3 minutes.
+
+### Added
+
+- **Vile browser is now an opt-in extra app (number 10) in the installer.**
+  Adnan's own privacy browser (v48 source, vendored in `vile/` — see
+  `vile/VENDORED.md`) is offered in the extra-apps question; picking it
+  builds it from source with CMake + Qt6 WebEngine (`cmake sqlite
+  qt6-base qt6-webengine` installed on demand, never pre-downloaded),
+  installs the binary to `/usr/local/bin/vile` with a `vile.desktop`
+  file and its own shield icon, and records `vile 0.1.0 (v48)` in the
+  versions log. The prompt says it builds from source and takes a few
+  minutes. Not picking it installs nothing Vile — no package, no
+  Flatpak, no download URL; the source travels in the release tarball.
+  One Veltrix patch in the vendored tree (`qt/main.cpp`):
+  `setDesktopFileName("vile")` so the desktop matches the running
+  window to `vile.desktop`. The list is now 10 apps; `all` selects all
+  ten, and `11` is rejected like any out-of-range number.
+- **Delta support in `bin/veltrix-update` and `bootstrap.sh`** — the
+  updater finds the delta asset for the installed version and its hash
+  (API digest, or its `.sha256` sidecar); the bootstrap applies it in
+  place, verifies every delta file against the `MANIFEST`, then verifies
+  the whole tree, applies deletions, and removes orphans. Any delta
+  failure falls back to the full tarball, which converges the tree.
+
+### Changed
+
+- **Kitty's cat icon is gone — the terminal shows a plain `>_` glyph.**
+  `AppService.seedShippedIconDefaults()` now seeds the Veltrix-drawn
+  `terminal.svg` as the `kitty` icon override, so the dock, app grid,
+  overview and Settings show the plain terminal instead of the cat the
+  kitty package (and WhiteSur) ships for the `Icon=kitty` name — an
+  animal in an icon, banned (halal review BLOCKER). Kitty itself is
+  untouched: still the default terminal (Super+T), only its picture
+  changes. A user who filed their own `kitty.svg` override is never
+  clobbered — the seed only lands where nothing is filed yet.
+
+- **`bootstrap.sh`** — downloads into a staging dir and syncs the new
+  tree into the registered tree with `rsync -a --checksum --delete`
+  (build caches and generated outputs — `target/`, `node_modules/`,
+  `build/`, `@girs/` — are excluded and survive). It no longer wipes
+  `~/Downloads/veltrix-install` first, and it no longer runs
+  `veltrix-setup` a second time (`install.sh` §5 already runs it;
+  `VELTRIX_OS_SETUP_SECOND_PASS=1` restores the duplicate). rsync is
+  installed on demand on the update path only, and the bootstrap falls
+  back to the old full re-extract when rsync is unavailable.
+- **`install.sh`** — whole-tree installs now use the new `sync_tree`
+  helper (rsync `--checksum --delete`, then `fix_tree_perms`) instead of
+  `rm -rf` + `cp -r`; `apps_predownload` is skipped when a choice is
+  already recorded (an update never re-asks the apps question); `npm
+  install` uses `--prefer-offline --no-audit --no-fund`; the venv pip
+  install is skipped when the requirements hash matches and the imports
+  work; the native C rebuild is skipped when a stamp of the sources +
+  toolchain matches and every expected output exists.
+
+### Fixed
+
+- **iPad Mode tiles were visible but dead — no tap did anything.**
+  The home screen showed, but its input region was never stamped: the
+  synchronous stamp in `syncIPad` runs in the same turn as `setVisible`,
+  and `get_allocation()` is a layout pass behind, so on every show it
+  still read 0×0 (hiding zeroes the allocation) and `addWidgetToRegion`
+  skipped the panel. The `onAllocated` hook Bar assigns to every
+  `masterOverlay` child could not save it — only `MorphRevealer` /
+  `ScaleRevealer` ever call it, and the panel's root is a plain
+  `Gtk.Box`. `syncIPad` now re-stamps 50ms after the home screen
+  appears (the defer-a-frame idiom, as cc-edit-mode), with a bounded
+  retry (at most 3 stamps per show) if the frame is slow and the
+  allocation is still 0. The launch path itself was never broken —
+  verified in the sandbox: all six installed tiles launch (signal +
+  process), and the unbuilt / not-installed tiles correctly show the
+  "coming soon" hint.
+
+## [1.2] — 2026-11-13
+
+**Safer, more halal, faster to trust: the version is now plain 1.2, the
+installer offers FreeTube instead of YouTube, and the halal protections
+fail honestly instead of silently.**
+
+### Changed
+
+- **Version 1.2.** The release scheme changes from `0.13.0-vN` to a plain
+  version (`VERSION` is now `1.2`, `pkgver` matches). The update comparison
+  (`isNewerVersion` in `UpdateCheck.ts` / About, `veltrix_release_newer` in
+  `bin/veltrix-update`) understands both schemes, so a machine on `0.13.0-v7`
+  is correctly offered 1.2, and future plain versions compare numerically
+  (1.10 > 1.2). `bootstrap.sh` records the release from the tarball name
+  only when it is a strict version shape.
+- **FreeTube replaces YouTube in the installer apps list** (still 9 apps).
+  FreeTube (`io.freetubeapp.FreeTube`, Flatpak from Flathub) is a
+  privacy-focused YouTube client — no ads, no tracking, no account, no
+  recommendation feed — instead of a YouTube web app opening youtube.com
+  with its ads, tracking and algorithmic recommendations. It still plays
+  YouTube videos. Picking it adds Flathub as a system-wide remote, like
+  Spotify; the prompt, the README and the removal instructions say so.
+  Upstream notes FreeTube is still in beta.
+
+### Added
+
+- **Content Safety fails honestly over an orphaned hosts marker.** A
+  `/etc/hosts` with BEGIN but no END (or END but no BEGIN) used to read as
+  "no block": `on` would append a second block after it and `off` could
+  exit 0 with the stray marker still in the file. Now `on` refuses before
+  mutating anything, `status` reports `partial`, and `off` fails naming
+  the hosts block. Covered by scenario 11 in `content-safety-probe.sh`.
+- **`veltrix-doctor` reports the halal protections.** A new "Content Safety
+  & Audio Filter" section prints the live `veltrix-content-safety status`
+  plus the `org.veltrix.safety` content-filter and `org.veltrix.halal-audio`
+  enabled bits, so a report shows drift the Settings toggles cannot (bit
+  ON, system layers partial/off). Read-only; nothing here changes a
+  protection.
+
+### Fixed
+
+- **`veltrix-update` validates the release tag and tarball name** before
+  comparing or downloading: a tag from the GitHub API that is not a plain
+  dotted version (optionally with the old `-vN` suffix) aborts the update
+  instead of being compared with its non-numeric parts treated as 0.
+
+## [0.13.0] — 2026-10-01
+
+**Settings that every process agrees on, an installer that asks the hard questions, glass that
+keeps its text legible — and the first piece of Nidara's own compositor, kept out of the release.**
+
+Settings moved to GSettings, so a change made anywhere — Settings, the Control Center, the
+Assistant, `gsettings` — reaches the desktop at once, and your old files are imported once, on
+update. Applications learn the appearance from the portal and nothing else. The shell stopped
+borrowing a GTK theme: what it draws is ours, and the apps it launches get their own theme back.
+
+The installer can encrypt the disk, pick a kernel and the NVIDIA driver for your card, measures
+its mirrors from your machine, and says before touching anything when the machine cannot take
+the install — not enough memory, a legacy BIOS, Secure Boot enforced, a BitLocker volume.
+
+**Hyalo**, Nidara's own Wayland compositor (#680), is in the source tree and runs the whole
+desktop as a preview session. It is **not** in this release's packages: it cannot lock the screen
+or notice you are idle yet, and a desktop that does not lock is not one to hand out. Hyprland
+remains the session everybody gets.
+
+### Added
+
+- **Disk encryption in the installer** (LUKS, opt-in), with what it costs and what it does not
+  protect stated before you choose (#310).
+- **A System step**: the kernel, and the NVIDIA driver that matches your card (#311, #495);
+  multilib on, printing (CUPS) in the system package (#492).
+- **The installer checks the machine first**: low memory, legacy BIOS, Secure Boot enforced,
+  BitLocker volumes that cannot be shrunk (#448, #493); a battery warning that reads UPower and
+  clears when the charger goes in; country and time zone suggested from your network.
+- **Mirrors measured from this machine**, not read off a table (#311). A stalled install says it
+  is the network, and can be stopped; the run page is one card that counts five phases with
+  real package numbers and the elapsed time.
+- **Floating or tiling, per workspace** — Settings → Desktop, and where you read a workspace's
+  mode you can change it (#513).
+- **Each app has a page in Settings**: who it is, whether it is isolated (Flatpak), and its
+  permissions — Ask, Allow or Deny — editable. Camera, microphone and location are asked for
+  with Nidara's own consent prompt (#535).
+- **Nidara's icon spec and its own interface icon theme**, chosen in Settings → Appearance (#587).
+- **Three glass materials and Reduce transparency**; windows can be transparent (#674).
+- **Wi-Fi in the bar and the Control Center**: signal and state in the bar, known and other
+  networks, leave a network, details behind a chevron. **Ethernet**: a switch that holds across a
+  reboot, and IP and DNS of your own — for the cable and for every saved Wi-Fi network.
+- **The Control Center, Notification Center, bar panels and dock work from the keyboard**, with
+  one focus ring.
+- **Typing Chinese and Japanese**: an input method ships with the languages we offer (#500).
+- **Game mode silences notifications while you play** (Settings → Gaming, on by default;
+  critical ones still show).
+- **`nidara-kit`, the platform library, is its own package** (LGPL-3.0-or-later), with types and
+  a guide for authors of apps outside this repository (#108).
+
+### Changed
+
+- **Settings live in GSettings** — widgets and the Control Center layout, dock pins, the clock,
+  appearance, the Assistant's gates, game mode and more (#573). Your old JSON files are imported
+  once and kept as `*.migrated`.
+- **Applications read the appearance from the portal only**: accent, colour scheme, contrast and
+  font reach ours and everybody else's apps the same way (#534).
+- **The shell runs on no GTK theme**: GTK's geometry, our paint, for every widget it draws (#107).
+- **Apps start as systemd services** — the session's environment, their output in the journal, not
+  the shell's children.
+- **The bar**: three pieces of glass, every icon at 18 px on a 4 px grid, a tooltip on every
+  capsule, one order for its right side edited in the bar itself, an overflow that unfolds in line,
+  the "Ni" mark, a Control Center icon that shows it is open, and a Top bar page in Settings.
+- **The glass keeps its text legible by itself**, adapting its tint to what is behind it; the
+  shell's skin is dark whatever the wallpaper.
+- **Game mode's session runs in the shell** — the wallpaper, the power profile, notifications and
+  the way back — and the compositor only gives a game its own workspace. The **Transition**
+  setting is gone: it had done nothing since May.
+- **kitty is the terminal for apps that ask for one** (`Terminal=true`), unless you chose another.
+- **A new floating window steps aside only when it would bury another**, and the top edge — where
+  the header is — always stays on screen (#11, #512).
+- Packaging: `pavucontrol` is no longer a dependency; `rtkit` is, so PipeWire gets realtime
+  priority; printing moved to `nidara-system`.
+
+### Fixed
+
+- **Apps launched from the desktop came up with no GTK theme** — the shell's own setting leaked
+  into every child.
+- **An unanswered Wi-Fi password dialog blocked every later join**; Wi-Fi secrets go through
+  NetworkManager's agent, never a command line.
+- **The dock no longer fills memory** (#100), and magnification stopped redrawing icons on the CPU.
+- **Floating windows go back where they were when the only monitor returns** (#594).
+- **The login screen** has one skin with fixed ink, and logs to the journal again.
+- **Installer**: the keyboard you choose reaches the desktop, from the whole catalogue (#498); the
+  EFI partition has one place to go (#430); a disk too small is refused on the disk page; networks
+  joined on the live medium reach the installed system; the log outlives the window; a reinstall
+  hides the entry it replaced; an NVIDIA GPU no longer breaks the System and Summary pages.
+- **A switch says what it toggles**, to a screen reader and to the Assistant's computer use.
+- **The computer-control kill switch (Super+Shift+Escape) works even while an app holds the
+  shortcuts** (a virtual machine, Chrome's keyboard lock).
+
+### Hyalo (preview — in the source, not in the packages)
+
+The compositor of our own, on Smithay (#680): a real session on hardware (#681) running the whole
+desktop through one compositor interface the shell shares with Hyprland (#682) — its own window
+manager (floating and tiling, rules, bindings), Settings' input and display pages, window
+thumbnails, the Assistant's computer use, game mode, and the protocols applications expect:
+sandboxed (Flatpak) clients kept away from privileged interfaces, activation, held shortcuts,
+touchpad gestures (#699), modal dialogs (#700), and an app holding the shortcuts — a virtual
+machine, a remote desktop — with Super+Escape to take them back (#698). From a source checkout:
+`hyalo/scripts/install-preview.sh`.
+
+## [0.12.1] — 2026-09-07
+
+**The AI-control notice still stuck out of the panel, and 0.12.0 said it was fixed.**
+
+Its labels wrap now and the card asks for the grid's width, and with both of those true it was
+still 412px wide against a 356px grid in Spanish — a size request is a floor, nothing above the
+card capped it, so it was given its natural width, and a wrapping label only wraps when it is
+given less than it asked for. It has a ceiling now (`NidaraClamp`, since GTK4 CSS has no
+`max-width`), and the card is exactly as wide as the grid it sits on.
+
+The instrument that missed it was fixed in the same change: every text budget asks whether a
+string fits a box of N pixels, with N read from the source, and cannot ask whether the box *is*
+N pixels. `text-budget.js --verify` now measures the Control Center's two boxes against a real
+window and fails when one is not the size the sweep assumes.
+
+## [0.12.0] — 2026-09-07
+
+**Both ways in got fixed: the screen you log in on, and the disk the installer writes to.**
+
+The greeter had been arriving on the second attempt for as long as anyone had watched it. Its
+compositor aborted on every single boot — it asked the kernel for a real GPU before the kernel had
+one — and what put the login screen on your monitor was greetd retrying after the crash. Handing
+that session over to yours was not slow either, it was a collapse: the greeter dropped the display
+before the things it had started were finished with it. Neither is a thing you could have reported
+precisely, because both look like "logging in takes a moment".
+
+The installer stopped negotiating about the disk. Entire-disk and manual mode both hand a real
+layout to `archinstall` in its own schema, the partition table is a table you can read and claim
+space in, and an EFI partition that is not ours — the one case where a mistake lands on somebody
+else's operating system — is refused with the reason on screen.
+
+### Added
+
+- **One keyboard catalogue, two places that ask.** The installer offered 28 layouts and Settings
+  offered 62, from two lists that did not know about each other. Both now derive from
+  `xkeyboard-config` itself — **597 layouts**, with variants — and eight of the keyboards we used
+  to offer wrote a console keymap that does not exist on the installed system.
+
+- **The installer can be walked without an ISO.** A preview mode runs the whole flow on a
+  developer's desktop, which is how most of the fifty defects below were found at all.
+
+- **The disk logic is a CI job.** The `disk_config` the installer emits, the layouts it must
+  refuse, what the account form accepts, and what may be touched on a shared EFI partition are
+  now pure functions with probes over them — and each probe is preceded by a step that deletes
+  one of its own rules and requires the probe to catch it.
+
+### Changed
+
+- **The installer writes the partitions itself and hands the result to archinstall**, in both
+  modes. Swap is declared in the installed `fstab` rather than left to a generator, a hand-made
+  btrfs root gets the subvolume layout, and erasing a whole disk installs btrfs without pretending
+  to ask.
+
+- **Three pages that asked the same question became one that asks the country**, in the order the
+  rest of the ecosystem asks it — language first — with one vocabulary for places and languages
+  instead of a third private one, and a search that matches what people type rather than what they
+  can read.
+
+- **An a11y query resolves the app that matches, instead of every app on the bus.** Asking one
+  window what it contains was costing a round trip to every application running, and leaking file
+  descriptors on each one. This is what an agent driving the desktop pays on every step.
+
+### Fixed
+
+- **The greeter waits for a real GPU before starting its compositor.** Measured on the machine
+  that reported it, the GPU arrives 232 ms after the session does; before this, aquamarine threw,
+  greetd retried, and the retry is what you saw.
+
+- **The login screen stops what it started before it drops the display.** The wallpaper daemon it
+  spawns was not exiting at the handoff — it was crashing, because the display went away first.
+
+- **Every unlock logged a PAM `setuid` failure from our own lock stack.** The journal's priority is
+  what separated the two branches of `pam_unix`: one benign, one giving up.
+
+- **The keyboard you chose in the installer reaches the greeter.** A `sed` that had matched nothing
+  since May meant the login screen typed `us` whatever you picked — and the indicator said the
+  right thing while the keys did not.
+
+- **The selected row on the login screens follows your accent.** `--nidara-state-selected` was the
+  one accent token the greeter and lockscreen never emitted, so a user who picked green got green
+  everywhere except the row under the cursor in a dropdown, which stayed blue.
+
+- **A Control Center tile no longer grows out of the panel to fit its own name.** A wrapping label's
+  minimum width is its longest unbreakable word, and a minimum cannot be squeezed — so five tile
+  titles in six languages were quietly pushing their tile past the edge that clips it, and the AI
+  status banner overflowed in seven of the twelve locales. The names that did not fit are shorter
+  now, the compounds carry a soft hyphen, and the text-budget gate measures all three fixed-width
+  boxes instead of one.
+
+- **An EFI partition too small for a kernel is refused with the number**, a partition that may not
+  be ours says so on every edit, and the ESP has to be FAT32 in manual mode too.
+
+- **The installer's account form states its rules once**, answers at the field, and answers all at
+  once — instead of one complaint at a time from a dialog.
+
+- **A dropdown, an icon button and a table cell can say what they are.** `Gtk.DropDown` overwrites
+  the accessible label a caller sets, which left the installer's controls nameless to a screen
+  reader and to the agent surface both.
+
+- **A stacked row refused focus for everything inside it**, so no text entry in one could be typed
+  into.
+
+- **A dock pin for an app that is not installed drew a gear that launches nothing.**
+
+## [0.11.0] — 2026-09-02
+
+**On somebody else's Arch, Nidara Desktop is a package now — and that is the only way in.**
+`install.sh` was the documented route, and it behaved like the owner of the machine: its first
+step ran `pacman -Syu --needed --noconfirm` over eighty package names. Measured on a maintainer's
+own desktop the day it was found, that is 44 packages upgraded and both kernels going
+7.1.11 → 7.2.2, which leaves the running kernel with no modules directory on disk until a reboot.
+Nobody had asked for a system upgrade.
+
+Add the repository, then `sudo pacman -Syu nidara-desktop`. Dependencies resolve as dependencies,
+`nidara-setup` runs from the package, and upgrading or removing it is pacman's job. The README
+leads with those commands — signing key, fingerprint and repository stanza included — instead of
+ending with them as an aside, and it says plainly what is guaranteed where: on an image we
+produce the whole system is ours; on your own Arch we support the package and promise nothing
+about your kernel, your graphics stack or your bootloader, because we did not choose them.
+
+`install.sh` keeps `--dev` and nothing else. It is the contribution path, where taking a machine
+over is legitimate because the machine is a development box.
+
+Two more things arrive with it, both about the desktop being yours: somewhere to hang your own
+scripts on the events the shell owns, and a settings store that can refuse a bad value and carry
+a renamed one forward.
+
+### Added
+
+- **Your own scripts, on the shell's events: `~/.config/nidara/hooks/<event>.d/`.**
+  `hyprland-user.lua` is the one place an install can be extended by hand, and it reaches the
+  compositor only. Everything the shell owns — the accent, dark and light, the wallpaper, an
+  update landing, the session starting, a battery going flat — was on the other side of a
+  TypeScript rebuild, which for anyone who is not going to run one meant it did not exist. Drop
+  an executable into the directory for an event and it runs, in order, with a timeout, each
+  failure isolated from the next. `nidara-hook --list` prints the six events and what each one
+  passes; `nidara-hook <event>` fires one by hand so you can test your script without waiting
+  for the real thing to happen.
+
+- **A renamed setting can stop being read forever.** `nidara-migrate` runs dated units once per
+  machine and records that it did. The first one converts the old `transparency` value into
+  `windowOpacity`, and the reader that had been quietly honouring both is gone — which is the
+  point: until now a key could only be renamed by leaving the old name in the code for ever.
+
+- **Settings search finds pages, not only the settings on them.** Typing a page's own name found
+  nothing on fifteen of the eighteen pages: "Audio" did not find Audio. Some pages contribute no
+  rows on purpose — a sound card and a playing app are hardware, not settings — so the index
+  itself had to learn about pages.
+
+- **Wallpaper thumbnails decode off the main thread and are cached on disk**, so opening
+  Appearance with a full wallpaper folder no longer stalls the shell while it draws.
+
+### Changed
+
+- **One dependency list, derived**, instead of two kept in step by hand.
+
+- **The calculator widget is gone, and `gnome-calculator` with it.** It was a launcher wearing a
+  widget's contract: one process spawn behind an icon, no state to read, nothing that changes
+  while you look at it — and for that it held a slot in the bar, a seed position in the Control
+  Centre and a translated name in twelve locales. It also meant every installed machine carried
+  a calculator because the shell wanted an icon to launch. A calculator belongs in the
+  application layer, and that is where it will come back.
+
+- **The settings files have an owner.** Writes are durable and atomic, the expensive sliders
+  commit once per drag instead of once per pixel, and a value that makes no sense is refused at
+  the door rather than written and read back.
+
+### Fixed
+
+- **Reaching a window through the shell now brings it to the front.** Selecting the second of two
+  grouped windows from a dock icon focused it *under* whatever was on top: in Hyprland, raising
+  is a separate dispatcher from focusing, and we were sending only one of them. Six routes arrive
+  at that one method — the dock menu, the window switcher, the tray, notification actions,
+  `nidara-ipc focusWindow` and the Assistant — and all six were affected.
+
+- **Nothing floating hangs off the top of the screen any more**, and floating windows open at a
+  size that fits the monitor they open on.
+
+- **A boolean compositor option no longer reads as off** when Settings asks Hyprland for its
+  current value.
+
+- **Six settings were not registered at all** — mouse, touchpad, keyboard, dock and bar entries
+  that search and the agent surface could not see, because nothing had ever declared them.
+
+- **The installer** stops filling in a password nobody chose, and the full name you type reaches
+  the account it creates.
+
+- **Files seeded under `sudo` were left group-`root`.** `chown user file` sets the owner and
+  leaves the group alone, so everything `nidara-setup` and `install.sh` created belonged to a
+  group nothing else in the directory used. Nothing was broken by it, which is why it lasted
+  months — and the keyring warning that fired on exactly the machines it was meant to clear was
+  the first thing to read that group.
+
+- **The app grid's crash**: icons whose SVG carries text no longer travel as file names into a
+  worker thread. The upstream GTK bug (gtk#8295) now has a reproducer it can actually run, and a
+  measured rate rather than an assertion.
+
+## [0.10.1] — 2026-08-30
+
+**The icons are Papirus from the first frame.** On the first login of a machine installed
+from a Nidara image, the dock painted its icons in Adwaita for a couple of seconds and then
+switched. Only that path was affected — a desktop installed with `install.sh` on your own
+Arch never showed it.
+
+The theme is now a **system default** instead of a value written into each new account
+before its first login. The installer sets a machine up inside a chroot, for a person who
+has not logged in yet, and a per-user write cannot land there: the account's dconf storage
+does not exist until the first login. A system default needs no session, no runtime
+directory and no cooperation from the installer.
+
+It also says what was always meant: your own choice comes first. If you pick another icon
+theme, it stays — the default only answers for accounts that have not chosen.
+
+### Fixed
+
+- **The icon theme reaches GTK before anything is drawn**, through
+  `/etc/dconf/db/local.d/00-nidara-appearance` and `/etc/dconf/profile/user`, refreshed by a
+  pacman hook so an upgrade that changes the default takes effect at once. The keyfile is
+  generated when the package is built, from the same `defaults/appearance.json` the shell
+  reads, so the two cannot drift apart.
+
+- **`nidara-setup` no longer claims to have done it.** It printed "Icon theme → Papirus
+  (seeded before first login)" while writing nothing, because it checked the exit code of a
+  command that exits 0 while failing and sent the only report of the failure to a discarded
+  stderr. It now reads the result back and warns, naming the file that is missing, if the
+  default is not actually reachable.
+
+### Changed
+
+- **`dconf` is a declared dependency.** It was being called and had only ever arrived as a
+  transitive dependency of the GTK stack — present on every machine so far, guaranteed on
+  none.
+
+## [0.10.0] — 2026-08-30
+
+**The package you install is now called `nidara-desktop`.** Nothing about the desktop itself
+changed — this release exists to stop one name meaning two things.
+
+Nidara is an operating system; Nidara Desktop is the desktop environment inside it, and
+this repository is the second one. Until now the pacman package was called `nidara`, so
+`pacman -Qi nidara` answered "what version of Nidara do you have?" with the desktop's
+number, which is not the same question.
+
+### Changed
+
+- **`nidara` → `nidara-desktop`.** **You do not have to do anything.** The next
+  `pacman -Syu` — or `nidara-update`, which runs it for you — swaps the package over by
+  itself, keeps every file exactly where it is, and does not ask you anything. Your
+  configuration in `~/.config/nidara/` is untouched, as always.
+
+  Anything you have already written that says `nidara` keeps working: the old name still
+  resolves, so `sudo pacman -S nidara` installs the same thing. What changes is what you
+  see afterwards — `pacman -Qi nidara-desktop` for the desktop's version, and the
+  installed package list now reads `nidara-desktop`, `nidara-installer`, and (on a machine
+  installed from a Nidara image) `nidara-apps`, `nidara-system` and `nidara-release`. Five
+  names for five different things, and none of them borrowing the name of the whole.
+
+- **The README says which of the two things it is describing**, from the title down —
+  including, in Installation, that somebody who wants a whole operating system on a blank
+  disk is on the wrong page and where to go instead. Three claims that had stopped being
+  true went with it: a planned Calamares installer (reconsidered and dropped — the one that
+  exists is built from this repository's own toolkit), Astal's PAM library described as
+  still in use (nothing of Astal has been loaded since 0.8.0), and a trademark notice that
+  covered one name when there are two.
+
+## [0.9.0] — 2026-08-30
+
+**Nidara can install itself.** This release adds the fourth thing in the repository that
+is a whole application: an installer, eight screens of it, that takes a live medium and
+turns a disk into a working Nidara. It does not ship with the desktop — it is a separate
+package that only the installation image ever names, because a computer somebody is
+using should not carry a program whose job is to erase a disk.
+
+Everything else in here is smaller, and most of it is About finally being able to answer
+what this computer actually is.
+
+### Added
+
+- **The installer.** Language, keyboard, timezone, disk, account, a summary that shows
+  you exactly what is about to happen, and a live log while it happens. It speaks all
+  twelve languages Nidara ships, and it changes language the moment you pick one — the
+  step titles, the buttons and the sidebar, not just the page you are on. The keyboard
+  step applies your layout to the live session immediately and gives you a box to type
+  in, so you find out whether it is the layout you meant before you install with it.
+
+- **Two ways to give it a disk.** *Erase the whole disk* detects the drives, warns in
+  plain words which one it is about to wipe, and lets you choose between Btrfs — with
+  the subvolume layout snapshots need, already laid out — and ext4. *Manual
+  partitioning* lists the partitions you already have and lets you assign mount points
+  one by one, with a button that opens GParted and a refresh for when you come back.
+  It knows what dual boot looks like: an existing EFI partition is left **unformatted**
+  by default, so the bootloader Windows or another Linux depends on survives.
+
+- **The machine boots quietly, and it boots as itself.** A system Nidara installs comes
+  up without the wall of kernel text, goes straight to the login screen, and the boot
+  menu entry says Nidara rather than Arch Linux. If another operating system is on the
+  disk, the menu waits for you; if Nidara is alone, it does not.
+
+- **You choose the computer's name.** The account step asks for it alongside the
+  username, so `you@your-machine` is something you decided.
+
+- **About knows what this computer is.** It reads the operating system, the desktop
+  version, the kernel, the hardware and the session, and shows the same facts as the
+  Settings page that goes into more detail — one reader answers both, so the two can no
+  longer disagree with each other.
+
+### Changed
+
+- **Logging in is quiet now.** The handover from the login screen to your desktop used
+  to leak Hyprland and session-manager messages onto the console for a moment, on every
+  single login. It does not any more. Nothing is lost: the logs still go to disk
+  exactly as before, they just stop being shown to you.
+
+- **The installer looks like Settings, because it is the same window.** The sidebar, the
+  header, the footer, the rows and the selection checkmarks all come from the shared
+  widget kit rather than being rebuilt, and it follows the accent colour and the window
+  transparency you chose in Settings — including while you change them.
+
+### Fixed
+
+- **The login screen and the lock screen stop washing out over pale wallpapers.** They
+  wore a single dark skin over every background; on a light wallpaper that read as a
+  grey sheet rather than glass. They now use the same material as the rest of the
+  desktop, with the same threshold for when a background is too bright to sit on
+  directly.
+
+- **About's text is readable in light mode.** It was being painted with a colour chosen
+  for a dark background.
+
+## [0.8.1] — 2026-08-24
+
+0.8.0 shipped a system menu that could not turn the computer off. This fixes that, and
+gives the terminal two changes it had coming.
+
+### Fixed
+
+- **Shutting down, restarting and logging out work again.** In 0.8.0 the confirmation
+  page appeared, the button clicked, and nothing happened — the menu just stayed open
+  and stopped responding. The guard that stops a double click from firing two power
+  actions at once was being armed by the confirm button itself, one step before the
+  action it was confirming checked that same guard and gave up. Suspend and Lock were
+  never affected; they don't ask for confirmation, so they never went through it.
+
+### Changed
+
+- **The terminal is dark now, whatever theme the rest of the desktop is in.** It used to
+  follow the light/dark toggle, and a light terminal reads plain text beautifully while
+  quietly ruining coloured output: seven of the fourteen ANSI colours fell below a 3:1
+  contrast ratio on the light palette, bright yellow at 1.2:1, which is not dim but
+  invisible. `ls`, `git` and every full-screen terminal program pick their colours
+  against a dark background, so that is what Nidara gives them now. Terminals you have
+  already configured are left exactly as they are, and kitty can still switch on its own
+  if you want it to — the config file explains how, and `scripts/dev/terminal-contrast.py`
+  will tell you whether the palette you write is readable before you live with it.
+
+- **222 MB less on disk, for the same terminal font.** Nidara shipped JetBrains Mono in
+  its "Nerd Font" build — the same typeface with some ten thousand pictograms patched
+  into every weight and style, at 232 MB. It now ships the plain typeface plus those
+  pictograms as a small separate font, 9.8 MB between them, and tells the terminal
+  exactly which font draws which symbols instead of leaving it to chance. On screen the
+  Powerline separators in a shell prompt come out identical pixel for pixel; the icons
+  are about a pixel heavier. **If you are updating rather than installing fresh, nothing
+  changes for you until you ask.** Nidara seeds a terminal config once and never rewrites
+  it, so your `kitty.conf` — and the desktop's monospace font setting — still name the
+  patched font, and it stays on your disk doing its job. Setup now tells you that, what
+  the old font costs on your machine, and what to point at instead if you want the space
+  back. It does not touch either file, and it does not suggest removing a font your own
+  configuration is still asking for.
+
+## [0.8.0] — 2026-08-24
+
+The release where Nidara stops running on anybody else's code. AGS and Astal are gone —
+the application host, the bundler, the IPC client, the thirteen services and the PAM
+authentication that unlocks your screen are all ours now — and with them went the last
+pinned upstream: your machine no longer builds anything from source except Nidara itself.
+On top of that the glass got its real material (one rim, one corner, a drop shadow that
+keeps a panel visible over a white window) and now ships at 48% instead of its thinnest
+setting, in whatever theme your system asks for rather than the dark one Nidara used to
+force on you.
+
+### Removed
+
+- **Eighteen packages of AGS and Astal.** Every service the shell used to borrow is
+  native TypeScript now — network, Wi-Fi and Ethernet, battery, Hyprland, MPRIS, apps,
+  Bluetooth, audio, notifications and the system tray — and so are the two pieces
+  underneath them: the runtime that hosted the three bundles and the bundler that built
+  them. PAM authentication moved into a C library of ours (`lib/nidara-auth`), which was
+  the last one left. Nothing about this is visible while you use the desktop; what is
+  visible is that `install.sh` no longer compiles a stack of Vala before it gets to
+  Nidara, and that a clean install now finishes in a couple of minutes.
+
+- **The old packages on machines that updated.** Stopping the install of something is not
+  removing it: pacman had recorded all eighteen as explicitly installed, so nothing would
+  ever have flagged them (~14.7 MB, 11.2 of it `/usr/bin/ags`). Setup now lists the ones
+  actually present on your system and prints the exact `pacman -Rns` line. It does not
+  remove anything — that is your call, not a setup script's.
+
+- **Three portal permission backends that never asked you anything.** `Account`,
+  `DynamicLauncher` and `Background` were implemented approving every request: your real
+  name and avatar handed to any application that asked, a web app installed with the name
+  and icon it chose for itself, background activity always allowed. Two of the three were
+  already being served by a backend that shows a dialog, so naming ourselves did not fill
+  a gap — it removed a question. They are unrouted until they can say no.
+
+### Added
+
+- **A drop shadow under every piece of glass that floats.** Over a maximised white window
+  a glass panel used to nearly vanish, and the way it vanished was specific: the rim's
+  bright half disappears into the white and the panel reads as broken rather than
+  transparent. The control centre, the notification centre, the bar's capsules, the
+  Activity Island, the dock, the app grid, Prism and the bubble menus all sit on a shadow
+  now.
+
+- **A 4K wallpaper collection, and a gallery that does not need the network.** A cohesive
+  Liquid Glass and caustics set (Milad Fakurian, Unsplash License) ships with the desktop,
+  with its own wallpaper for the login screen, and Settings → Appearance shows them as
+  centred thumbnails.
+
+- **Search learns which applications you actually open.** Launches are counted with a
+  14-day half-life, and frequent applications win ties within their matching tier — the
+  ranking stays honest (a better textual match still wins), it just stops asking you to
+  disambiguate the same two names every day.
+
+- **Tray menus render what applications declare.** Checkmarks on toggle items, the icons
+  an application asks for, and greyed-out rows where it says a row is unavailable.
+
+- **A wallpaper portal, and GNOME apps that agree with the shell.** Setting a wallpaper
+  from Nautilus or Loupe works, and the shell's own wallpaper stays in sync with
+  `org.gnome.desktop.background` in both directions.
+
+- **The Activity Island reads media that plays in a background tab.** For Chrome, Firefox,
+  Brave, Edge and Zen it matches the window title against the track, so the island stays
+  compact when the player is what you are looking at and expands when it is not.
+
+- **The other eleven languages caught up.** German, French, Italian, Japanese, Dutch,
+  Polish, both Portuguese variants, Russian and Chinese are complete at 698/698 keys, and
+  the Spanish catalogue was reworked for the terms desktops actually use.
+
+### Changed
+
+- **Glass ships at 48%, the dock at its floor, and dark mode is no longer forced.** All
+  four surfaces used to default to the thinnest glass in the range, which is thin enough
+  that white text over a bright wallpaper lands near 3:1 — legible on the developer's dark
+  wallpaper and not on yours. The dock stays at the floor deliberately: it sits over the
+  wallpaper, not over windows. And Nidara no longer decides you want a dark desktop; it
+  starts from what your system asks for. Existing installs keep the settings they have.
+
+- **One material, everywhere, including the login screen.** The dark tint is a single
+  Deep Slate token across every Cairo surface and every CSS window; the rim is one Fresnel
+  ramp instead of three tables that had already disagreed in four places; corners are
+  continuous cubic Bézier squircles rather than a polygon; and the greeter and the
+  lockscreen — which live behind a directory boundary that had quietly excluded them from
+  the whole wave — got the same optics, the same blur and the same glass floor.
+
+- **The dark line along every curved edge is gone.** It was read as a Cairo artefact for
+  months and it was not: the compositor's `blur:brightness` sat at 0.8, which darkens
+  exactly the pixels a curve puts at the edge of a blurred region.
+
+- **The dock stops blurring behind the shadows of magnified icons**, now that the glass
+  floor is high enough for the blur threshold to rise without the panel thinning out.
+
+- **CI stops running the same jobs three times per change**, and every job has a timeout —
+  a hung package install once sat there for six hours.
+
+### Fixed
+
+- **A Wi-Fi adapter plugged in after login stayed invisible for the whole session.** The
+  device list was resolved once, at startup, and nothing subscribed to NetworkManager's
+  device-added signal.
+
+- **The first session of a clean install ran in Adwaita icons.** Nothing wrote the icon
+  theme until the shell was already about two seconds into the session, and everything
+  drawn before that had already been rasterized.
+
+- **Enter in the app grid opened nothing until you pressed an arrow key.** Typing a query
+  that left one obvious result did nothing on Enter; every other launcher on the machine
+  opens the top result.
+
+- **The shell's log had been dying at "Global Styles READY!"** since the audio rewrite —
+  a WirePlumber init flag routes the whole process's GLib logging through its own writer,
+  which then filters nearly all of it away. Nothing reported the loss.
+
+- **Two faults in the unlock path.** An informational PAM message (an expiry warning, a
+  failed-login count) could answer the next password prompt with an empty string; and the
+  expired-password warning PAM sends was being discarded, so the one message that explains
+  why login keeps failing was the one nobody could see.
+
+- **Bluetooth pairing recovers from a registration that was already in place**, instead of
+  refusing to pair for the rest of the session.
+
+- **Settings → AI no longer hangs if the keyring does not answer.** Saving or clearing an
+  API key gives up after 12 seconds and tells you, rather than leaving the buttons dead.
+
+- **The clock stopped shoving the rest of the bar sideways** every time a digit changed
+  (proportional digits, now tabular), and the bar no longer collides with the Activity
+  Island when both grow.
+
+- **The Activity Island**: it stayed on screen and completely dead to input under the game
+  overlay; its title flashed white while opening or closing the player in light mode; and
+  it — along with the app grid — never obeyed the appearance pin in Settings.
+
+- **Smaller ones**: dropdown popovers lost their top and bottom margins when libadwaita
+  left the process; Settings' sidebar rows carried 2 px of padding that belonged to
+  Adwaita; the About page invented a version number when it could not read one and now
+  says so; the system menu could act twice on a double click; and the wallpaper gallery
+  had an invalid margin.
+
+## [0.7.2] — 2026-08-17
+
+Two volume fixes, both found by running the released build rather than reading it.
+
+### Fixed
+
+- **The Control Center read 0% volume from every login.** The slider was built
+  before the audio endpoint had reported anything and then never asked again, so
+  it showed 0% with the sound at whatever you had left it, and only corrected
+  itself once something changed the volume from outside the shell. Dragging it
+  always worked — it was the number and the fill that lied. The same missing read
+  affected the volume panel in the top bar, Settings → Sound and the Control
+  Center's volume detail; and if audio arrives after the shell does, those
+  controls now come to life instead of staying dead for the session.
+
+- **Waking from suspend could set your volume to something you never chose.** A
+  pair of hooks saved the volume before sleep and re-applied it on wake — a
+  workaround from May for a WirePlumber that no longer needs one. On the current
+  stack the volume survives both a suspend and a full power cycle by itself, so
+  the pair did nothing in the ordinary case and re-applied a stale value in any
+  case where the saving half had not refreshed its file. Both halves are gone;
+  waking still re-enables the displays.
+
+## [0.7.1] — 2026-08-17
+
+A settings release. Every one of Settings' 21 pages was read line by line against
+what it actually reads and writes, and most of what follows is what that found:
+controls that showed a value from when the window opened, controls that wrote a
+key nothing reads, and two controls fighting over one setting.
+
+### Fixed
+
+- **The pointer kept the old cursor until you left the window.** Changing the
+  cursor theme or size did nothing you could see until you moved the pointer out
+  of whatever window you changed it from. Two separate faults: the accessibility
+  page and the appearance page each had a cursor-size control and only one of them
+  reached the compositor, and Hyprland only repaints the pointer when it is told a
+  *different* shape name — so the shell now names another shape and names the
+  original straight back, in one pass, with nothing composited in between.
+
+- **Settings pages showed you the state of the world when the window opened.**
+  Nearly every page asked the system once, at build time, and a frozen value looks
+  exactly like a correct one. The pages that show a value read it again when you
+  come back to them now — text size, the AI provider's fields, appearance, the
+  users list, the VPN list, and the rest.
+
+- **Choosing a default web browser never took effect.** The row wrote `text/html`,
+  while everything that opens a link reads `x-scheme-handler/http`. The other rows
+  were partial in the same way: "Image viewer" set only `image/jpeg`, so a PNG kept
+  opening in the old app. Each row now writes its whole category — and offers only
+  applications that actually handle it, instead of listing a text editor as a
+  candidate web browser.
+
+- **Do Not Disturb could only be switched on.** The bar toggle set the flag and
+  had no path back to off.
+
+- **Two keyboard controls wrote one setting, and the one that lost reset your
+  variant.** Related: a layout the dropdown does not know about — `es,us`, or any
+  XKB variant — was displayed as "English (US)", one click away from making that
+  display true and wiping your second layout. A value the list does not contain is
+  now shown as itself rather than rounded down to the first entry.
+
+- **"Enable animations" quieted your applications and left the desktop moving.**
+  It wrote a GNOME key that GTK reads and Nidara never did, so overlays kept
+  popping, the dock kept springing and Hyprland kept animating every window and
+  workspace. It is now "Reduce motion", and it is the real thing.
+
+- **Opening Settings rewrote a file your login reads.** All 21 pages are built when
+  the window opens, so Region's locale dropdown ran every time and wrote
+  `region.json` and `~/.config/environment.d/nidara-locale.conf` no matter which
+  page you actually wanted. The writes were byte-identical, which is why nothing
+  ever looked wrong.
+
+- **Leaving a game put your power profile on Balanced.** Game mode captured
+  nothing on the way in and set a constant on the way out, so a session started
+  from Power saver ended somewhere else with nothing said.
+
+- **A second monitor showed two controls for one setting.** Options that are global
+  were drawn once per screen, so changing one left the other showing the old value.
+
+- **Settings could take on a key but never drop one**, so a retired setting
+  outlived the code that gave it meaning.
+
+- **The Gaming page's wallpaper selector could end up showing nothing selected**
+  while a mode was still in force — clicking the already-selected segment turned it
+  off. Settings had two segmented controls with the same look and different
+  mechanics; there is one now.
+
+- **The window menu acted on a window the bar had already stopped naming**, and the
+  Activity Island could paint chips in places clicks never reached.
+
+- **Two of the four shell surfaces never noticed the monitor changing shape**, so a
+  resolution or scale change left them measuring against the old geometry.
+
+- **The Assistant's pointer work took away the focus it had just set**, which broke
+  the step right after it.
+
+- **Ten languages carried two Settings descriptions that no longer matched.** The
+  English had been rewritten to say a change is system-wide rather than account-only;
+  the translations still said "requires a session restart". A missing translation
+  falls back to English and looks untranslated — one that has gone stale reads
+  perfectly and is wrong, so CI now tracks both.
+
+### Changed
+
+- **The nidara package declares the build dependencies it actually uses.** Two of
+  them existed in the release build container only because another package happened
+  to pull them in first. That is the exact shape of the fault that killed the v0.7.0
+  release halfway through.
+
+- **Sliders, settings rows and group footers moved into the shared kit**, so they
+  pick up the accent and the light/dark surface the same way everywhere instead of
+  four pages each building their own.
+
+## [0.7.0] — 2026-08-11
+
+### Fixed
+
+- **The login card was invisible.** Since 0.6.0, the greeter drew its background
+  and nothing else: no card, no username, no password field. You could still log
+  in by typing blind and pressing Enter, which is the only reason it was not
+  reported sooner. A single failing line in a signal handler was aborting the
+  rest of the card's construction silently — nothing crashed, nothing logged.
+  CI now boots the greeter and the lockscreen and fails if either comes up empty.
+
+- **Every install that built its package locally left you locked out of your own
+  package cache.** The build ran as root and left root-owned files behind, so the
+  next `pacman` invocation refused to write there. Anyone whose install fell back
+  to a local build — the normal path whenever the prebuilt package is behind —
+  hit it.
+
+- **Text was being shaved at the top.** Capital letters and accents lost their
+  first pixel row across the whole shell, because the baseline never landed on a
+  pixel boundary. Fixing it properly also fixed the accessibility text slider,
+  which was snapping to whole pixels and therefore skipping sizes: font sizes are
+  in points now, and the crispness comes from the metric hint it was missing.
+
+- **Picking a font whose name contains a style quietly switched your desktop to
+  something else.** Choosing "Inter Medium" set the interface to a different
+  family entirely; this machine had been running the wrong font for months
+  without anyone noticing.
+
+- **Russian shipped with a truncated menu entry.** "Специальные возможности" did
+  not fit the sidebar at the default text size, in a released version. It is
+  abbreviated now, and a new CI gate measures every sidebar entry in all twelve
+  languages at every text scale, so the next one cannot ship unnoticed.
+
+- **The lock screen's "wrong password" message misbehaved three ways.** It moved
+  the field you were about to retype in, it stayed on screen after every reason
+  to still be there had passed, and the entrance animation never ran at all on
+  the lock. All three are fixed, and the clock now appears with the first frame
+  instead of jumping into place.
+
+- **Settings pages were each quietly a different window.** Page width was derived
+  from content, so switching pages resized the window under your pointer. The
+  content pane is a constant width now. The breadcrumb also showed only one
+  ancestor, so a three-level page lost the one that says where you are.
+
+- **The Sound page had two empty sections**, and the alert dialog Settings opens
+  spent three days with no styling at all.
+
+### Changed
+
+- **The desktop got substantially cheaper to draw.** The bar, the Activity
+  Island, the dock and the app grid were each asking the compositor to blur an
+  entire monitor in order to show a strip, a capsule or a panel — and the app
+  grid was taking the dock's blur down with it every time it opened. Each surface
+  now declares only the region it occupies. Opening the Control Center costs
+  nothing measurable where it used to cost real frames, and the Workspace
+  Overview shows live window content rather than placeholders.
+
+- **Clicking outside a panel to dismiss it is the compositor's job now.** The
+  invisible full-screen catchers the shell used for this are gone, replaced by
+  the Wayland protocol built for it.
+
+- **The greeter and the lockscreen rejoined the design system.** They had drifted
+  into their own look and their own copies of widgets Nidara already had — one of
+  those copies had stopped describing the screen accurately. They share the real
+  components now.
+
+## [0.6.0] — 2026-08-04
+
+### Added
+
+- **The Assistant stopped talking about your desktop and started working on it.**
+  In 0.5.0 it could hold a conversation and flip a setting. It now reads Nidara's
+  own configuration, the shipped defaults and the shell log, so when you say
+  something is wrong it goes and looks instead of theorising — and, if you allow
+  it, it can edit the handful of files no service owns (your Hyprland overrides
+  and the idle timers) to add a keybind or change a timeout for you.
+
+  Writing is **off by default** and deliberately a separate switch from
+  everything else: those files exist to hold commands, so writing them schedules
+  commands for your next session. Everything it writes is plain text you can
+  read, and `~/.config/nidara/` becomes a **git repository** on its first write —
+  every change it makes is a commit you can inspect or roll back.
+
+  It also stopped forgetting. The conversation survives a shell reload, and it
+  answers questions about its own permissions accurately rather than describing
+  half of them.
+
+- **The Assistant can work in other applications — if you let it.** Previously it
+  was capable inside Nidara and blind outside it. It can now perceive and act on
+  third-party windows through the accessibility layer, which is what "open the
+  calculator and compute this" actually requires. Both halves — *seeing* and
+  *acting* — are **off by default** and are separate switches in Settings → AI.
+  `Super + Shift + Escape` still revokes everything instantly.
+
+- **You can see which window the Assistant is working in.** While it runs a turn,
+  the focused window's border glows. It was doing real work in somebody else's
+  window with nothing on screen to say so.
+
+- **Your clipboard keeps images.** Copying an image from a browser stored the
+  page's URL instead — every time — so no image ever reached the history. Images
+  are now kept alongside text, and the panel gained per-entry delete.
+
+- **Screen recording asks what you actually meant.** "Include audio" used to mean
+  *the default microphone*, which on most machines meant silence. You now choose
+  the source — your desktop's output or any specific microphone — and the format
+  (MP4, MKV or WebM).
+
+- **Scrollbars you can grab.** Long lists across the shell now show a scrollbar of
+  their own that stays a fixed width and can actually be dragged, instead of GTK's
+  overlay bar that grew as your pointer neared it and slid out from under the
+  button you were aiming for.
+
+### Changed
+
+- **Two switches left Settings → Top bar.** "Show the system menu" hid the only
+  graphical way to shut down, restart or log out, and "show the workspace
+  switcher" had quietly grown into a switch that also hid media, recording and
+  the Assistant — including the only indicator that says your screen is being
+  recorded. Both are gone; they read as preferences but were ways to lose a
+  capability. "Show the app title" stays.
+- **Settings rows stop crowding.** Rows that carried several controls were fitting
+  them into space built for one. Text fields now take the full width with their
+  buttons underneath, and pickers that show a value actually carry it.
+- **One radius ladder, one halo.** A sweep of the design system removed a second,
+  conflicting set of corner radii and the stray hover halos that came with it, so
+  menus, dropdowns and cards round and highlight the same way everywhere.
+- **The Assistant's chip and the battery glyph are drawn to the icon grid.** The
+  battery was the one bar icon painted by hand at a size picked by eye, which left
+  its capsule 9px wider than its neighbours; the player's chip showed square cover
+  art inside a circle.
+
+### Fixed
+
+- **An overlay no longer freezes the dock.** Opening a shell surface could leave
+  the dock unresponsive until something else took the pointer, and the error bar
+  stayed on screen after the event that raised it was gone.
+- **Settings pages keep their contents.** A page you stepped away from was torn
+  down as if it had been closed, so coming back to it showed a page that had
+  stopped updating.
+- **Applications are identified by what they are, not by what they look like.**
+  One app could appear under three different names across the dock, the app grid
+  and the window title, with only one of them working on each surface.
+- **The Activity Island's menus are blurred like everything else.** Moving the
+  island to its own layer left its player-source menu flat.
+- **A single clip stored in the wrong text encoding hid the other 749.** One
+  UTF-16 entry silently truncated the whole clipboard history.
+- **Three widgets' buttons were the right colour only by accident** — they
+  depended on where they happened to be rendered rather than on their own style.
+
+## [0.5.0] — 2026-07-26
+
+### Added
+
+- **The Assistant — experimental, and yours to switch on.** Nidara now has a
+  built-in conversational assistant living in the Activity Island (`Super+A`).
+  It is **off until you configure it** in Settings → AI, and it brings no model
+  of its own: you choose a provider — Anthropic, OpenAI, Google or SpaceXAI, any
+  OpenAI-compatible endpoint, or a local model through Ollama or llama.cpp,
+  which needs no key at all — and it talks to your account. Your API key is
+  stored in the desktop keyring, never in a config file, and nothing leaves your
+  machine until you opt in.
+
+  It drives the desktop through exactly the same command surface an external
+  agent uses, so it can do nothing you have not allowed in Settings → AI: the
+  computer-use permissions stay off by default, and the kill switch
+  (`Super+Shift+Esc`) still revokes everything instantly. Answers stream as they
+  arrive, the capsule shows a working state while a turn runs, and closing the
+  island does not cancel it.
+
+  Marked experimental deliberately: it works, it is useful, and it is younger
+  than the rest of the desktop. Expect rough edges, and expect it to change.
+
+### Fixed
+
+- **The login keyring now unlocks with your session.** Signing in left the
+  keyring closed, so the first application that wanted a secret — a browser, a
+  mail client, the Assistant itself — asked for your login password a second
+  time, every session. A systemd socket was winning a race against PAM's
+  keyring daemon and taking over with no password to unlock anything.
+
+  On existing installs the change lands after a **reboot**, not merely a new
+  login: masking a unit does not stop the copy already running, and a lingering
+  user session keeps it alive across logout. Note too that the desktop now uses
+  the keyring PAM unlocks; if yours was created outside your login password, its
+  secrets are not migrated. Nothing is deleted — the old keyring file stays in
+  `~/.local/share/keyrings/` and Seahorse can open it if you know its password.
+- **Your wallpaper survives a reboot.** Setting a wallpaper worked, but the
+  desktop came back to the shipped default on the next boot.
+- **Typing goes to your window again after closing a shell surface.** Closing
+  the app grid — and, on every shell reload, doing nothing at all — left the
+  dock holding the keyboard, so keystrokes went nowhere until you moved the
+  mouse. It also made every other overlay look broken afterwards.
+- **The bar's title capsule stops lying about what is focused.** It fell back to
+  the workspace name after closing the overview, the Assistant or the search,
+  and it kept naming a window from the workspace you left when you switched
+  workspaces from the app grid. The dock's focus ring, the window menu and
+  "screenshot the focused window" were blind for the same reason.
+- **Switching to an empty workspace from the overview stays there.** The
+  compositor bounced you back to the workspace you came from a few milliseconds
+  later — only ever on empty ones, which is why it read as random.
+- **The login screen no longer greets you with Hyprland's release notes.**
+  Hyprland shows an "updated to X" panel the first time it starts after a
+  version change; on the greeter it landed on top of the login card, so the
+  first boot after any system upgrade that carried Hyprland covered the password
+  field with someone else's news.
+- **The Activity Island's blur reaches the bar underneath it.** The island's
+  expanded panels now sit on their own layer, so the glass blurs what is behind
+  them instead of stacking a seam over the bar mid-morph.
+
+## [0.4.0] — 2026-07-20
+
+### Added
+
+- **The Activity Island.** The workspaces capsule at the bar's center is now a
+  living, multi-purpose surface. Its panels don't pop over it — the capsule
+  itself transforms: the workspace overview grows out of the pill as one
+  continuous glass shape and condenses back into it when it closes.
+- **Now Playing on the island.** While media plays, the capsule morphs into a
+  mini player — cover art, title and a live equalizer. Clicking it expands the
+  full player panel, the cover art flying into place. A short pause or a track
+  change never flickers the capsule back and forth, and it returns to the
+  workspace dots when the player quits.
+- **Live activities, with priorities.** The island now hosts live system
+  state: an active screen recording shows a pulsing REC dot with the elapsed
+  time (an active capture outranks music), and a critically low battery takes
+  over the capsule and opens an alert on its own — it dismisses itself the
+  moment you plug in. This is the groundwork the native assistant will build
+  on.
+- **Notification Center, polished end to end.** Notification groups stack as
+  cards with a peeking edge and expand with a smooth choreography; hovering a
+  notification reveals its controls in the corner; swiping flings it out the
+  way it came (swiping a collapsed group clears the whole group); "Clear
+  notifications" cascades the list out top-to-bottom. Banners respect
+  freedesktop urgency, transient and replacement semantics, and now show above
+  open panels.
+
+### Fixed
+
+- Notification ordering no longer goes stale when an older group receives the
+  newest message, and timestamps refresh each minute without rebuilding the
+  cards under your pointer.
+- The shell log is quieter: two recurring GTK/GJS warnings (one per media
+  update, one per notification swipe) are fixed at the source.
+
+## [0.3.3] — 2026-07-18
+
+### Fixed
+
+- **Exiting fullscreen no longer sends the dock into a reserved-space storm.**
+  A 0.3.2 regression in the dock's new real-time spring clock could make the
+  slide animation diverge while a fullscreen window starved the dock's frame
+  clock (and permanently on true 60 Hz displays): on exit, windows retiled
+  repeatedly and the dock took seconds to reappear. Springs now integrate in
+  numerically stable substeps — the animation feel is unchanged.
+
+## [0.3.2] — 2026-07-18
+
+### Changed
+
+- **Dock magnification now defaults to its full size (128px).** Hovering the
+  dock grows icons to double their resting size on fresh installs; existing
+  installs keep whatever they had configured.
+- **Dock animations feel the same on every monitor.** The magnification and
+  auto-hide springs are now clocked by real time instead of frames, so a 60 Hz
+  monitor gets the same snappy feel as a 144 Hz one (it used to run 2.4× slower
+  there), and mixed-refresh multi-monitor setups stay consistent.
+
+### Fixed
+
+- **Reordering dock icons now tracks the pointer precisely.** Dragging an icon
+  across the pinned/open-apps separator used to need the pointer well past it,
+  and the whole open-apps zone inherited that lag; the drop preview also
+  flickered when the pointer sat exactly between two positions. Both gone.
+- **Control Center and Notification Center no longer swallow clicks around
+  them.** Their clickable area now matches the visible panels exactly —
+  including the Control Center's edit mode — so clicking beside a panel reaches
+  whatever is beneath instead of doing nothing.
+- **Long window titles no longer overflow the window menu.** Group-member rows
+  in the bar's window menu truncate with an ellipsis instead of stretching past
+  the menu's glass capsule.
+
+## [0.3.1] — 2026-07-15
+
+### Changed
+
+- **System-tray icons each get their own capsule.** Every tray icon now sits in
+  its own glass capsule, coherent with every other bar icon, instead of being
+  grouped together in a single pill.
+- **Tooltip and menu pointers are shorter and sharper** — the little pointer that
+  aims from a bubble toward its anchor now sits closer to it and reads crisper.
+
+### Fixed
+
+- **Left-clicking a tray icon now brings the app to the front.** It focuses the
+  app's window — switching to its workspace if needed — instead of silently doing
+  nothing. (A Wayland app can't raise itself, so the desktop does it.)
+- **The login screen now shows dates and CJK text in the selected language.** The
+  greeter runs under the matching locale, so its clock's date names are localized
+  and Chinese/Japanese/Korean text uses the correct regional glyph shapes; before,
+  it defaulted to English dates and the wrong CJK faces.
+- **The launcher icon no longer halos on the dock.** Its drop shadow was being
+  blurred by the dock's own frosted layer into a faint halo; the shadow (invisible
+  anyway on a blurred layer) has been removed.
+
+## [0.3.0] — 2026-07-13
+
+### Added
+
+- **Language selection everywhere it was missing.** The login screen now has a
+  language selector (every language shown by its own name), and installs now
+  generate the system locales for all shipped languages — so Settings →
+  Language & Region actually offers them. In 0.2.0 the translations shipped
+  inside the desktop, but most systems had no generated locale to select them
+  with.
+- **European Portuguese (pt-PT)** joins as the 12th language — a genuine
+  European translation (utilizador, palavra-passe, ficheiro…), distinct from
+  Brazilian Portuguese. The login screen and the lock screen now speak all 12
+  languages as well.
+
+### Fixed
+
+- **Chinese and Japanese now render with their correct regional character
+  forms.** All CJK text used to fall back to the Korean variant of the Noto
+  CJK fonts (a quirk of stock fontconfig on Arch), so Chinese and Japanese
+  users read their hanzi/kanji with Korean stroke shapes. Each language now
+  gets its proper regional variant (Simplified, Traditional, Japanese, Korean)
+  across the whole session — applications included. The Noto CJK fonts are
+  also installed by default, so 简体中文 and 日本語 in the language pickers no
+  longer render as empty boxes on a clean install.
+- A garbage-collection crash in a core layout container (NidaraClamp) that
+  could error when interface views were rebuilt.
+
+## [0.2.0] — 2026-07-12
+
+### Added
+
+- **Nidara now speaks 11 languages.** French, German, Italian, Brazilian
+  Portuguese, Polish, Dutch, Russian, Simplified Chinese and Japanese join
+  English and Spanish. The desktop follows your system language; change it in
+  Settings → Language & Region.
+- **You can now see your AI agent's cursor.** When an agent acts through
+  computer control (off by default, Settings → AI), an accent-colored pointer
+  with an "AI" badge travels to the target and pulses where the action lands —
+  you always see where the agent clicked, and it backs off the moment you move
+  your own mouse. The red bar indicator and the Super+Shift+Esc kill switch
+  still stop everything instantly.
+- Autostart entries can now be added by picking from your installed apps —
+  search, pick, done. The raw-command field remains for advanced entries.
+
+### Changed
+
+- Clocks and dates across the desktop — top bar, login screen and lock
+  screen — now follow your system regional format: localized day and month
+  names and the native field order, including year-first formats such as
+  Chinese and Japanese (e.g. 7月12日 土曜日). Dates no longer render in
+  hardcoded English.
+- Autostart moved from its own sidebar page into Settings → Apps, and it now
+  appears in Settings search.
+- A consistency pass over the English and Spanish interface texts (sentence
+  case throughout, unified terminology).
+
+### Fixed
+
+- Autostart entries edited in Settings now take effect on a standard install —
+  the old page wrote to a file Hyprland never read, so its entries silently
+  never launched.
+
+## [0.1.7] — 2026-07-11
+
+### Added
+
+- Default terminal configuration: kitty now ships with a Nidara config on new
+  setups — window padding that keeps text clear of the rounded corners, the
+  JetBrains Mono font, a subtle glass transparency, and terminal colors that
+  follow the system dark/light toggle live. Seeded only when you have no kitty
+  config of your own; an existing setup is never touched, and once seeded the
+  file is yours (updates never overwrite it).
+
+### Changed
+
+- Laptops now suspend after 30 minutes of idle by default (desktops never
+  auto-suspend); Settings → Power overrides this either way.
+
+### Fixed
+
+- Appearance → Fonts on a fresh install showed "Adwaita Mono" — a font Nidara
+  doesn't ship — as the monospace font. The bundled JetBrains Mono is now the
+  default; a font you picked yourself is never overridden.
+- Users created after install time (Settings → Users, `useradd`, archinstall)
+  now get their per-user configuration seeded at first login, before the
+  desktop loads — previously they landed on an unthemed session with defaults
+  missing. A deleted `~/.config/nidara` heals itself the same way.
+- Users without a profile photo now see the same avatar glyph on the login
+  screen, the lock screen and Settings, instead of a different placeholder on
+  each.
+
+## [0.1.6] — 2026-07-10
+
+### Added
+
+- The login screen now remembers the last user who signed in and preselects them at
+  boot — avatar, name and their appearance/clock preferences — instead of always
+  presenting the first account.
+
+### Fixed
+
+- Settings → Users no longer shows "Unknown" as the display name on systems installed
+  without a full name (e.g. archinstall); setting a name now takes effect immediately
+  across Settings, the login screen and the lock screen.
+- The language and keyboard layout picked at the login screen now survive a reboot,
+  and stray greeter dotfiles no longer land in the filesystem root.
+- Creating a user: cancelling the password authorization no longer closes the dialog
+  as if it had succeeded (the account existed but couldn't log in) — the error is
+  shown and Create retries just the password step; a blank password now intentionally
+  creates a locked account, as the field promised; picking an existing username now
+  says exactly that.
+- The Other Users list no longer goes blank after creating or deleting a user.
+- "Change Password" on a user row now opens (it failed silently before) and survives
+  a cancelled authorization prompt.
+- The administrator toggle no longer re-opens the authorization prompt in an endless
+  loop when cancelled, has a visible label now, and the user glyph in the list is no
+  longer black in dark mode.
+
+## [0.1.5] — 2026-07-09
+
+### Fixed
+
+- The lock screen now shows the default wallpaper on fresh installs — until a wallpaper
+  was picked in Settings it painted a flat backdrop. It also falls back gracefully (user
+  wallpaper → default) when the configured image no longer exists on disk, instead of
+  going blank. Groundwork included for assigning independent wallpapers to the desktop,
+  lock screen and login screen from Settings in a future release.
+- On multi-user machines the lock screen now shows — and verifies the password of — the
+  user who actually locked the session; previously it always presented the first user
+  account, locking everyone else out of their own session.
+- The login screen's clock now honors the time and date format chosen in Settings even
+  when the user's home directory is private (mode 700).
+- Config files generated before the Nidara rename no longer keep "Crystal Shell" headers
+  forever — they're rewritten (comments only, never user content) on the next
+  install or update.
+
+## [0.1.4] — 2026-07-09
+
+### Changed
+
+- Settings → Apps → **Installed Apps** (formerly "App Icons") now opens each app on its
+  own page instead of a pop-up dialog — more room for the icon override, which now applies
+  instantly (no Apply/Cancel), and a natural home for future per-app settings. Each row now
+  shows the app's id as its subtitle.
+
+### Fixed
+
+- The tails of letters like g, j, y and p no longer linger as faint leftover fragments — nor
+  get clipped short — in the Installed Apps search while filtering the list.
+
+## [0.1.3] — 2026-07-07
+
+### Changed
+
+- **Nidara now installs as a real pacman package (`nidara`).** System installs consume it
+  prebuilt from the project's signed repo (or build it on the spot from the same in-repo
+  recipe when the repo doesn't serve the release yet) — pacman owns every installed file,
+  so Nidara upgrades with the rest of the system (`pacman -Syu`) and removes cleanly
+  (`pacman -R nidara`). Existing installs migrate automatically on their next
+  `nidara-update`; user config is untouched.
+- `nidara-update` on package installs is now a full system upgrade plus the idempotent
+  setup pass, reloading the running session only when the version actually changed.
+- New `nidara-setup` binary carries the first-time setup packaging can't do (greeter,
+  services, per-user config seeding) — with the repo configured,
+  `sudo pacman -S nidara && nidara-setup` is a complete install.
+
+### Added
+
+- `toggleAbout` IPC action — the About window can now be opened, verified and closed
+  deterministically (agent tooling parity with the other surfaces).
+- Community docs: Code of Conduct (Contributor Covenant 2.1) and a Credits section.
+
+### Fixed
+
+- Upgrading or reinstalling under a live session no longer leaves a stuck Hyprland
+  "cannot open … hyprland.lua" error banner — replacing the packaged config file killed
+  the compositor's config watch; both update paths now reload it once the new file is
+  in place.
+
+## [0.1.2] — 2026-07-06
+
+### Fixed
+
+- With a surface open (Control Center, Notification Center, system menu, or a widget
+  pill), clicking another bar capsule now switches to it in a single click — the first
+  click no longer just dismisses. Clicking anywhere below the bar still dismisses.
+- The widget expansion panel no longer flashes at the previous pill's position when
+  jumping directly from one pill to another.
+- Updates no longer abort on the repository's moving `ci-assets` tag — `nidara-update`
+  fetches only release tags (`v*`).
+- Updates no longer silently drop agent-carried local fixes: when a patch stack is
+  registered (`~/.config/nidara/.patches`), `nidara-update` and `install.sh --update`
+  refuse the blind reinstall and point at the carry flow (rebase onto the new release,
+  then `install.sh --update-apply`).
+
+## [0.1.1] — 2026-07-05
+
+### Security
+
+- The prebuilt dependency repo ([nidara-repo](https://github.com/nidara-project/nidara-repo))
+  is now GPG-signed end-to-end: CI signs every package and the repo database, and
+  `install.sh` imports the project key and enforces signature verification
+  (`SigLevel = Required DatabaseOptional`). Existing installs are migrated automatically
+  on their next update. No changes to the desktop itself.
+
+## [0.1.0] — 2026-07-05
+
+First public release. Nidara is a full Wayland desktop environment for Arch Linux,
+built on Hyprland and AGS v3 (Aylur's GTK Shell), registering as a proper login session.
+
+### Desktop
+
+- **Compositor** — Hyprland (Wayland) with smooth animations and tiling + floating
+  window management; Lua-based config with a user override file
+  (`~/.config/nidara/hyprland-user.lua`).
+- **Bar** — live clock, workspaces, system tray, resource indicators, and a system
+  menu with inline power actions.
+- **Dock** — hover magnification with spring physics; bottom, left, and right
+  positions.
+- **App Launcher** — full-screen grid with instant fuzzy search.
+- **Control Center** — volume (WirePlumber), brightness, Wi-Fi, Bluetooth, battery,
+  and MPRIS media, with a resizable tile grid and per-widget bar/CC placement.
+- **Notification Center** — grouped notifications with inline actions.
+- **Login & Lock** — a greetd-based greeter (`nidara-greeter`) and a lock screen
+  (`nidara-lock`, on `ext-session-lock-v1`), both sharing the Nidara look; no regreet,
+  no hyprlock.
+- **Idle management** — hypridle with configurable screen-off, lock, and suspend timers.
+- **Hardware & media keys** — volume, mic mute, brightness (floored above black), and
+  MPRIS transport (`XF86*`) bound out of the box, working on the lock screen too.
+- **Familiar shortcuts** — `Alt + Tab` window cycling, `Super + M` maximize,
+  `Super + Space` Search, `Super + Ctrl (+ Shift) + ←/→` workspace navigation,
+  alongside the tiling basics (focus, resize, float, fullscreen, pseudo-tile).
+
+### Settings
+
+- Multi-page settings panel: Appearance, Display, Audio, Network, Input, Bluetooth,
+  Language & Region, Applications (default apps + per-app icon overrides), Dock & Panel,
+  Control Center (controls placement), Notifications, Autostart, Power, Accessibility, Gaming, Users, AI, and About.
+- Live Wi-Fi (connect/forget/detail), Bluetooth (pairing agent with passkey/PIN dialogs),
+  and audio device management.
+
+### Design system
+
+- Nidara design system: dynamic accent colors, glassmorphism/material tokens, and
+  dark/light mode, generated at runtime by the theme engine.
+- libadwaita apps follow the Nidara accent live via a desktop-portal backend.
+
+### Gaming
+
+- Game mode: Steam games auto-move to a dedicated `gamespace` workspace (no
+  blur/shadow/animations, `immediate` mode), with optional library-art wallpaper and a
+  performance power profile. `Super + B` floats the bar above any fullscreen window.
+
+### AI-native tooling
+
+- Bundled **MCP server** (`nidara-mcp`) that lets an AI agent see and control the running
+  desktop through the official interface — read state, change settings, run shell actions,
+  and take screenshots to verify its work.
+- An in-repo agent skill (`.claude/skills/nidara/`) ships with the code so coding agents
+  can extend and fix the desktop.
+- All agent capabilities are governed by consent toggles in **Settings → AI** (config
+  writes, screenshots, and the MCP server itself can each be switched off, effective
+  immediately).
+
+### Installation & updates
+
+- `install.sh` provisions onto an existing minimal Arch system: installs dependencies,
+  builds the Astal/AGS libraries from pinned sources (no AUR helper) and hands them to
+  pacman, builds the three bundles, and registers the Wayland session. Enables `greetd`
+  only when no display manager is already present.
+- Stateless updates via `nidara-update`; user config in `~/.config/nidara/` is never
+  overwritten.
+- First-run defaults are seeded from the existing Arch setup (keyboard layout, timezone,
+  locale) without prompting.
+
+### Internationalization
+
+- All UI strings routed through `t()`; English and Spanish included.
+
+[0.1.2]: https://github.com/nidara-project/nidara-desktop/releases/tag/v0.1.2
+[0.1.1]: https://github.com/nidara-project/nidara-desktop/releases/tag/v0.1.1
+[0.1.0]: https://github.com/nidara-project/nidara-desktop/releases/tag/v0.1.0

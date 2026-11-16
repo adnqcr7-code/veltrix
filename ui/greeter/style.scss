@@ -1,0 +1,937 @@
+/* Veltrix — Greeter / Lock stylesheet
+   No GTK theme is loaded (`useNoGtkTheme()`, GTK_THEME=Empty), so this is the ONLY CSS.
+   No Adwaita to fight. No resets needed. Just define what we want.
+   GTK4 CSS subset: no color-mix(), no rgba(var(), n), no filter. */
+
+// This sheet is SHARED by two bundles — `ui/greeter` and `ui/lockscreen` —
+// which is why every class is named `.greeter-*`. A change here lands on the
+// login screen too; both have to be looked at.
+//
+// There are NO lock-only rules left. There used to be a
+// `window.veltrix-lock-window { … }` block switching the CSS box off for the
+// three capsules, because only the lockscreen painted them. Both surfaces paint
+// them now (ui/lib/veltrix-kit/platform/glass-capsule.ts), so the box is off for everyone and the
+// difference between the two screens is down to one thing: where the pixels
+// behind the glass come from. The class is still set on the window — keep it,
+// it is the hook if a genuine divergence ever appears.
+//
+// ── Where the numbers come from ─────────────────────────────────────────────
+// The type ramp, the weights, the spacing scale, the motion curves and the
+// radius ladder are the SHELL'S, imported from `ui/lib/veltrix-kit/styles/_tokens.scss`.
+// They used to be re-typed here, which is how this surface silently fell a
+// generation behind the rest of the DE: the shell's ramp moved and nothing
+// forwarded the change (the date sat at 13px under an 88px clock, two numbers
+// nobody chose together). If a size here is not a `$fs-*`, it is a bug.
+@use '../lib/veltrix-kit/styles/tokens' as *;
+@use '../lib/rtl';
+
+// ── The kit's stylesheet ────────────────────────────────────────────────────
+// `ui/lib/veltrix-kit/` has been importable from here forever; its LOOK arrived
+// with this line (2026-08-10). What earns it is `VeltrixDropDown`: the three
+// selectors on these two screens were raw `Gtk.DropDown`s carrying the whole
+// unfixed saga — GTK's checkmark eating 22px of every row, GTK's scroll bar
+// growing toward the pointer so a click near an option's trailing edge lands on
+// the bar (live here: the language list is 12 items, the only one that scrolls),
+// and a focus ring drawn twice.
+//
+// 🔑 SOURCE ORDER IS THE MECHANISM. The kit's sheet (`kit.css`: the base layer
+// and the components) is no longer compiled into this one (tech-debt #108 phase
+// 2); `withKitSheet()` loads it at runtime in the SAME provider, BEFORE this file
+// — so everything below still out-ranks the kit at equal specificity. That is
+// deliberate and it is what makes the two bare-element collisions safe:
+// `dropdown > button` and `dropdown popover` exist in both sheets with the same
+// specificity, and these screens keep their own. See the dropdown section.
+
+// ── Palette ─────────────────────────────────────────────────────────────────
+// The one thing that is legitimately local. The shell rewrites its colour
+// tokens at runtime per light/dark mode (VeltrixTheme.generateTokensCss); these
+// two surfaces are permanently dark glass over the user's wallpaper, so the
+// values are fixed and the shell's DARK set is the right source for them.
+* {
+  // Noto Sans Arabic: the greeter and lockscreen (which wears this sheet)
+  // render Arabic — the password prompt, the locale bar, the unlock card —
+  // and Inter has no Arabic glyphs, so without this the fallback is whatever
+  // fontconfig picks. (Bilingual feature, 2026-11-12.)
+  font-family: "Inter", "Noto Sans Arabic", "Noto Sans", sans-serif;
+
+  @include radius-vars;
+
+  --veltrix-accent:         #00E5FF;
+  // Pre-computed alpha variants — GTK4 CSS has no rgba(var(), n).
+  // LOCKSTEP with the accent tokens initAppearance() → generateTokensCss()
+  // emits (formerly accentCssFor(), which no longer has live callers): same
+  // names, same alphas. What is written here is the pre-load fallback (default
+  // cyan), so the two lists must not drift apart.
+  --veltrix-accent-rgb:     0, 229, 255;
+  --veltrix-accent-10:      rgba(0, 229, 255, 0.10);
+  --veltrix-accent-30:      rgba(0, 229, 255, 0.30);
+  // (--veltrix-focus-ring, a 35 %-alpha accent halo, is GONE from both this block
+  // and accentCssFor(). It was the dull focus state; the ring is now solid
+  // accent via the shared `veltrix-focus-ring` mixin, which reads
+  // --veltrix-accent directly.)
+
+  // The shell's dark text ramp, verbatim (_base.scss). It used to be a
+  // near-miss copy — 0.70/0.45 against the shell's 0.80/0.55 — so secondary and
+  // dim text read a step darker here than anywhere else in the DE, on the one
+  // surface that sits directly on an arbitrary wallpaper with no card behind
+  // it. `-dim` is also the shell's name for it; `--veltrix-text-muted` existed
+  // only in this file.
+  --veltrix-text:           rgba(255, 255, 255, 0.95);
+  --veltrix-text-secondary: rgba(255, 255, 255, 0.8);
+  --veltrix-text-dim:       rgba(255, 255, 255, 0.55);
+  --veltrix-text-disabled:  rgba(255, 255, 255, 0.35);
+
+  // The lock/greeter GLASS. No shell equivalent by name and that is correct:
+  // the shell's capsules are painted in Cairo, not drawn by CSS, so it has no
+  // `--veltrix-glass` token to inherit. What it does have is the same VALUES —
+  // `-border-sm` is the shell's Cairo rim colour exactly (`LOCK_GLASS.rimSubtle`,
+  // white 0.14). It used to say "the shell's `--veltrix-edge`"; that token was
+  // buried on 2026-09-20 (tech-debt #106) once Cairo was the only thing painting
+  // a rim anywhere.
+  //
+  // ⚠️ MIRRORED as numbers in `ui/lib/veltrix-kit/platform/tokens.ts` (LOCK_GLASS), because the
+  // lockscreen paints these capsules itself (widget/GlassBackdrop.ts) and a
+  // Cairo painter cannot read a CSS custom property. Same deal as the radius
+  // ladder: two representations, one decision, they move together.
+  // ⚠️ The body FILL is the painter's alone now: its CSS copy (`--veltrix-glass`,
+  // 0.24 = LOCK_GLASS.fill.a = the shell's GLASS_RANGE.min) was declared in both
+  // skins and read by no rule, and it went on 2026-09-20 with the rest of the
+  // orphans (tech-debt #106). The value itself did not move — it lives in
+  // LOCK_GLASS, where `blur-threshold-check` reads it. The two RIMS below are still
+  // CSS, for the surfaces still drawn that way (the avatar ring, the dropdown
+  // popovers, the separator). Change one, change the other.
+  --veltrix-glass-border:   rgba(255, 255, 255, 0.22);
+  --veltrix-glass-border-sm:rgba(255, 255, 255, 0.14);
+
+
+  // (--veltrix-glass-light and --veltrix-danger were declared here with zero
+  // consumers. The danger one could not have had any: see .greeter-error, which
+  // deliberately does NOT tint itself red. --veltrix-danger is back below, this
+  // time with one: the kit's alert dialog.)
+
+  // ── THE KIT'S TOKEN CONTRACT ──────────────────────────────────────────────
+  // The 16 custom properties `ui/lib/veltrix-kit/styles/_components.scss` reads and this
+  // sheet did not define. They are NOT optional decoration: an undefined custom
+  // property does not warn — GTK drops the whole declaration — so importing the
+  // kit without these fails SILENTLY, on the two surfaces that have no dev mode
+  // and build against a fixed /usr/share path. (The radius ladder the kit also
+  // reads is already satisfied, by `radius-vars` above.)
+  //
+  // Values are the shell's DARK set verbatim (_base.scss), for the reason
+  // already given for the text ramp: these screens are permanently dark glass,
+  // so the shell's dark tokens ARE their palette, and a near-miss copy is how
+  // this surface fell a generation behind the last time.
+  //
+  // 🔑 The list is what the kit ACTUALLY READS, measured against the compiled
+  // sheet — not what it might one day want. `--veltrix-shadow-md` was in the
+  // first draft and came straight back out: the `glass()` mixin names it, but
+  // no kit rule calls that mixin, so nothing read it. Same discipline as the
+  // consumerless classes deleted in #109–#111. The check is two commands
+  // against style.css, so re-run them instead of guessing:
+  //   read  = grep -oE 'var\(--veltrix-[a-z0-9-]+' style.css | sort -u
+  //   given = grep -oE '^ *--veltrix-[a-z0-9-]+:'  style.css | sort -u
+  --veltrix-surface-back:   rgba(255, 255, 255, 0.04);
+  --veltrix-surface:        rgba(255, 255, 255, 0.08);
+  --veltrix-surface-hover:  rgba(255, 255, 255, 0.12);
+  --veltrix-surface-active: rgba(255, 255, 255, 0.16);
+  --veltrix-surface-raised: rgba(255, 255, 255, 0.20);
+  // One step above raised: the hover of anything whose resting fill IS raised.
+  // Added 2026-08-26 with `.veltrix-circle-btn` joining the kit's sheet — this
+  // sheet compiles the kit, so it owes every token the kit's rules name, whether
+  // or not this bundle builds the widget yet (`scripts/ci/token-contract-check.mjs`).
+  --veltrix-surface-strong: rgba(255, 255, 255, 0.30);
+  // The DEFAULT cyan, for the moment before the accent tokens load and for a config
+  // with no accent in it. Any real accent overwrites this at runtime — including the
+  // light skin's lighter alpha; see the note in the skin block below.
+  --veltrix-state-selected: rgba(0, 229, 255, 0.22);
+  --veltrix-border:         rgba(127, 127, 127, 0.15);
+  --veltrix-accent-fg:      #ffffff;
+  --veltrix-danger:         #ff3b30;
+  --veltrix-danger-rgb:     255, 59, 48;
+  --veltrix-bg:             rgba(22, 22, 34, 0.5);
+
+  // ⚠️ THIS PREMISE EXPIRED, and the value outlived it by long enough to ship.
+  // It used to read "these screens do NOT get popup blur", and 0.97 was chosen so a
+  // near-opaque list would stay legible without any. The greeter's compositor config
+  // has carried `blur_popups = true, popups_ignorealpha = 0.30` since the glass moved
+  // to LOCK_GLASS — its own comment says blur_popups "is not optional at this glass" —
+  // so the blur has been there all along and the popovers were simply painting over
+  // it: solid slabs on a screen made of glass, which is what they looked like.
+  //
+  // Now the shell's rule, applied here: `popoverAlpha = max(bgAlpha, 0.38)`
+  // (ui/shell/core/VeltrixTheme.ts), which with the shipped 0.48 glass is 0.48. Above
+  // `popups_ignorealpha` (0.30) with room to spare, so the popup is blurred rather
+  // than merely transparent. The tone comes with it: `rgba(22, 22, 34, …)` is what
+  // `--veltrix-bg` above already uses verbatim from the shell, and the darker
+  // `14, 14, 22` only existed to keep an opaque slab from reading as a grey haze —
+  // the reason died with the opacity.
+  --veltrix-popover-bg:     rgba(22, 22, 34, 0.48);
+  --veltrix-popover-border: rgba(255, 255, 255, 0.14);
+}
+
+// ── There is no light skin any more ─────────────────────────────────────────
+// Until 2026-09-21 this file carried a SECOND palette under `window.skin-light`,
+// and the greeter measured its wallpaper to decide which of the two to wear
+// (tech-debt #82's login half). The owner removed the mechanism — #613: a login
+// screen that analyses its backdrop to choose an ink is a decision nobody can
+// inspect (its log went to /dev/null, #614), it was already being overridden in
+// production (#612), and GNOME and Windows both draw this screen with fixed
+// light ink over a veil instead. So this surface is what its comment above always
+// said it was: permanently dark glass over the user's wallpaper, white ink, and
+// the scrim below is what buys the hero its contrast.
+
+// ── Shipped icons ───────────────────────────────────────────────────────────
+// Same rule, same reason as the shell's _reset.scss: the icons we ship are
+// SYMBOLIC files (#587), so GTK paints them with the CSS `color` of their node
+// and the skin only has to move --veltrix-text. Consumers: ui/lib/veltrix-kit/platform/icons.ts (power
+// bar, keyboard glyph) and the avatar fallback in ui/lib/avatar.ts.
+// This was `-gtk-icon-filter: invert(1)` for as long as the drawings were
+// non-symbolic and rendered black, with a second rule turning the invert OFF
+// under the light skin. Both are gone: a colour needs no mode of its own.
+.nd-icon { color: var(--veltrix-text); }
+
+// ── Window ─────────────────────────────────────────────────────────────────
+window,
+window > .background,
+window > decoration,
+window > contents {
+  background: transparent;
+  box-shadow: none;
+}
+
+// ── Wallpaper scrim ─────────────────────────────────────────────────────────
+// The date, the clock and the username are the ONLY text on either screen with
+// no glass behind them, and on a light wallpaper they do not merely dim — they
+// disappear (rendered on an 87 %-luminance backdrop with scripts/dev/lock-probe.js,
+// 2026-08-09: the whole hero block was gone). White text has no defence there.
+//
+// A shadow alone was the obvious answer and it was the WEAKEST of the five
+// candidates: it outlines the glyph without raising the background contrast, so
+// the hero went from invisible to ghostly. What works is lifting the contrast
+// underneath and then letting the shadow do the edge — hence both, here and on
+// the labels below.
+//
+// The gradient is stronger at the ends (date/clock at the top, power bar at the
+// bottom) and lighter through the middle, so the wallpaper survives where
+// nothing has to be read over it. GNOME and Windows 11 both scrim their lock
+// wallpaper; neither leaves the text bare.
+//
+// 🔑 THE CEILING IS NOT A STYLE CHOICE, IT IS THE BLUR THRESHOLD. The greeter is a
+// transparent layer over awww's wallpaper with `blur = true, ignore_alpha = 0.23`
+// (config/greetd/hyprland-greeter.lua); the lockscreen paints its own wallpaper and
+// gets no compositor blur at all. Any pixel of ours at or above that threshold has
+// BLURRED wallpaper behind it on the login screen and sharp wallpaper on the lock —
+// so the two screens stop matching, and worse, the blur lands wherever a GRADIENT
+// happens to cross the number, as a hard edge across the wallpaper.
+//
+// ⚠️ That is not hypothetical: it shipped. This block was written against
+// `ignore_alpha = 0.3` and capped at 0.28 for exactly that reason. The threshold
+// later moved to 0.23 (the glass dropped to LOCK_GLASS 0.24 and the rule has to sit
+// under it — see the lua), the cap did not move with it, and the login screen grew a
+// frosted band across the top and bottom third with a visible line where the
+// gradient crossed 0.23. MEASURED 2026-08-25 in a VM: the boundary sat at 85.8 % of
+// the screen's height, which is where 0.16 → 0.28 crosses 0.23, to the pixel.
+//
+// 🔑 THE INVARIANT, and it is about the COMPOSITE, not any single declaration:
+// everything we paint that must keep sharp wallpaper behind it — this scrim, plus
+// the hero's text-shadow ON TOP of it — has to add up to less than `ignore_alpha`:
+//
+//     a_total = 1 − (1 − a_scrim)(1 − a_shadow1)(1 − a_shadow2)  <  0.23
+//
+// At the clock (72px down, so the gradient is still near its top value) that is
+// 1 − 0.87 × 0.95 × 0.96 = 0.20, with 0.03 of headroom. Anything that raises one of
+// the three has to lower another. `scripts/ci/blur-threshold-check.mjs` computes
+// this sum and fails on it, because this is the second time these numbers drifted
+// apart in different files and neither time did anything break loudly.
+//
+// The cost is honest and worth knowing: the protection this scrim gives the hero on
+// a LIGHT wallpaper is weaker than the 0.28 it had. Making it stronger again means
+// either giving the hero a glass body of its own (it deliberately has none) or
+// frosting the whole wallpaper uniformly — a design decision, not a tweak.
+.greeter-scrim {
+  background-image: linear-gradient(to bottom,
+    rgba(0, 0, 0, 0.13) 0%,
+    rgba(0, 0, 0, 0.08) 34%,
+    rgba(0, 0, 0, 0.08) 66%,
+    rgba(0, 0, 0, 0.13) 100%);
+}
+
+
+// ── Text with no glass behind it ─────────────────────────────────────────────
+// THE MEMBERSHIP RULE, not a list of favourites: everything on either screen
+// that sits DIRECTLY on the wallpaper goes here. Anything inside a painted
+// capsule (the password placeholder, the power and locale bars) must NOT — it
+// already has a body behind it, and a shadow there only muddies the glass.
+//
+// See .greeter-scrim for why this is capped at 0.28 and why the shadow is not
+// the whole fix.
+//
+// ⚠️ It shipped for three days as date/clock/username only, because those are
+// what the LOCKSCREEN has and that is the specimen the fix was rendered against.
+// The greeter has three more — the caps warning, the session selector and the
+// error line — and on a light wallpaper they were invisible (caught 2026-08-09
+// the first time the FULL greeter went through lock-probe.js). When a fix lands
+// on a shared stylesheet, render the surface with MORE widgets, not the one you
+// were looking at.
+.greeter-date,
+.greeter-clock,
+.greeter-username {
+  // ⚠️ These two alphas are HALF of the sum the scrim's comment governs — they are
+  // painted over it, so they compound with it. At 0.28/0.26 the clock carried a
+  // frosted halo the shape of its own shadow: every pixel of the falloff above 0.23
+  // had blurred wallpaper behind it, and the ring ended in a hard edge where the
+  // falloff crossed the threshold. Read the invariant there before changing these.
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.05), 0 0 14px rgba(0, 0, 0, 0.04);
+}
+
+
+.greeter-date {
+  // 13px under an 88px clock is a 1:6.8 ratio — outside every system that ships
+  // a lock screen (1:3.4 to 1:4.8 across the shipping systems we measured). At
+  // $fs-title-3 it reads as the clock's label instead of a caption stranded
+  // above it, and lands at 1:5.2.
+  //
+  // The tracking stays an ABSOLUTE 2px on purpose: as the size grows the same
+  // 2px is proportionally less (0.154em → 0.118em), which is the direction
+  // tracking should move. Uppercase + tracking is a small-caption device — it is
+  // why the next rung up ($fs-title-2, 22px) was rejected: at that size this
+  // line stops labelling the clock and starts competing with it.
+  font-size: $fs-title-3;
+  font-weight: $fw-semibold;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--veltrix-text);
+}
+
+.greeter-clock {
+  // The DISPLAY register, not a rung of the ramp — see _tokens.scss for why the
+  // hero clock is deliberately outside the UI type scale. Same pixels as before;
+  // the number simply has a name and a reason now.
+  font-size: $fs-display;
+  font-weight: $fw-display;
+  letter-spacing: -4px;  // −0.045em: display numerals want tight tracking
+  color: var(--veltrix-text);
+}
+
+// ── Avatar ──────────────────────────────────────────────────────────────────
+// Photo rendering lives in ui/lib/avatar.ts (Gtk.Picture + pre-cropped square
+// pixbuf); the pill radius here is what clips it into the circle.
+.greeter-avatar {
+  border-radius: var(--veltrix-radius-pill);
+  border: 2px solid var(--veltrix-glass-border);
+}
+
+// Generic-glyph fallback (no photo, or a file the greeter user can't read):
+// give the circle a visible surface so the outline isn't empty. The color
+// only paints the last-resort SYMBOLIC theme icon; the shipped Lucide glyph
+// (avatar.ts adds .nd-icon) renders black and is inverted to white below —
+// same mechanism as the shell's _reset.scss. The greeter card is always dark
+// glass, so an unconditional invert is safe here.
+.greeter-avatar-fallback {
+  // ⚠️ 0.24, and the number is NOT a tone choice — it is the blur threshold again,
+  // from the side the scrim's comment does not cover. This is a BODY: it is supposed
+  // to have frosted wallpaper behind it, like every other glass on this screen. To
+  // get that it has to clear `ignore_alpha` (0.23) BY ITSELF.
+  //
+  // At 0.10 it never did. It cleared it by leaning on the scrim underneath —
+  // 1 − 0.84 × 0.90 = 0.244, four thousandths over the line — which nothing said
+  // anywhere, and which stopped being true the moment the scrim was capped
+  // (0.16 → 0.08 gives 0.172, and the circle went sharp). Caught on screen, not by
+  // reading. The other bodies here were never exposed to it: the card, the password
+  // field and the power pills are painted with `--veltrix-glass` (0.24), which clears
+  // the threshold alone.
+  //
+  // White, not `--veltrix-glass`: this circle is deliberately a LIGHT surface — it
+  // exists to give the outline a visible body when there is no photo — and the dark
+  // glass renders it as a disc noticeably darker than its surroundings. Rendered both
+  // in a VM before choosing. Same alpha as the glass, opposite tone, on purpose.
+  background: rgba(255, 255, 255, 0.24);
+  color: var(--veltrix-text-secondary);
+}
+// (the invert itself is the shared `.nd-icon` rule at the top of this file)
+
+// ── Username ────────────────────────────────────────────────────────────────
+.greeter-username {
+  // Was a freehand 20px, between two rungs and on neither. $fs-title-3 is the
+  // card-title rung and this IS the card's title; it also puts the identity on
+  // the same size as the date, which is right — they are the two labels of the
+  // screen, in two different blocks that never appear side by side.
+  font-size: $fs-title-3;
+  font-weight: $fw-semibold;
+  color: var(--veltrix-text);
+  letter-spacing: 0.2px;
+}
+
+// ── Password entry ─────────────────────────────────────────────────────────
+// GTK4's node for Gtk.PasswordEntry is `entry` (not passwordentry), and in a
+// composite entry the keyboard focus lands on the inner `text` node — so the
+// outer widget gets :focus-within, never :focus. Both are matched below.
+//
+// ── THE BOX IS PAINTED, NOT DRAWN HERE ───────────────────────────────────────
+// ui/lib/veltrix-kit/platform/glass-capsule.ts paints the rim and the body on one rounded path, for
+// BOTH bundles, so this rule must not draw a box underneath: two stacked shapes
+// bring back the very seam the painter exists to remove.
+//
+// This replaces a run of increasingly awkward CSS workarounds, and the whole
+// dead end is worth keeping so nobody walks back into it. `--veltrix-radius-pill`
+// (9999px) is clamped by GTK to exactly half the height, which makes each side's
+// two arcs meet at a single tangent point, and GTK's border rendering leaves ONE
+// brighter pixel right there — a "dot" in the middle of each cap. Backing the
+// radius off by one pixel removes the dot and replaces it with a 2px STRAIGHT
+// SEGMENT, which was shipped on the belief that it was invisible and is not: at
+// 9× it is unmistakable, and the user saw it at 1:1. `box-shadow: inset` instead
+// of `border` seams identically. There is no third setting — the failure is the
+// border primitive, not the number.
+//
+// FOCUS. An input shows focus as its own EDGE going accent, never as a ring
+// (see `veltrix-focus-ring` in ui/lib/veltrix-kit/styles/_tokens.scss: one control must not
+// show both). The edge is the painted rim, so the painter owns this state too —
+// `withGlassCapsule(entry, "subtle", followFocus: true)` in both bundles.
+.greeter-password {
+  background: transparent;
+  border: none;
+  color: var(--veltrix-text);
+  caret-color: var(--veltrix-text);
+  padding: 0 16px;
+  min-height: 40px;
+  outline: none;
+
+  &:focus,
+  &:focus-within { outline: none; }
+
+  // ⚠️ `caret-color` here is a GUARD, not decoration. The kit's sheet styles
+  // bare `entry` — including `entry > text { caret-color: var(--veltrix-accent) }`
+  // — and it reaches the inner `text` node directly, so the `caret-color` this
+  // rule's PARENT sets is inherited and loses to it. Without this line the
+  // import silently turns the caret on both login screens accent-blue. Right in
+  // Settings (accent marks where your keystrokes go, on a card full of fields);
+  // wrong here, where accent is the login button's focus ring and this is the
+  // only field on screen.
+  //
+  // Everything else the kit's `entry` block declares lands harmlessly: this
+  // class out-ranks bare `entry` on background, border, padding and min-height,
+  // and the one property it does NOT declare — `border-radius` — falls on a box
+  // that is switched off. The focus ring is not a CSS outline here at all; it is
+  // the capsule's rim (`withGlassCapsule(passwordEntry, "subtle", true)`).
+  > text { color: var(--veltrix-text); caret-color: var(--veltrix-text); }
+
+  // ⚠️ The peek icon is an `image`, NOT a `button`. This block selected
+  // `> button` until 2026-08-09 and had therefore never matched anything —
+  // verified by dumping the widget's CSS node tree, with and without text in the
+  // field: `entry.password` has exactly three children, `text` and two `image`s.
+  // Same class of dead rule as the `margin-start` on the dropdowns, and the same
+  // lesson: on a composed GTK widget, DUMP THE TREE instead of assuming the node.
+  //
+  // Fixed rather than deleted, unlike `margin-start`, because the intent here is
+  // load-bearing: the eye is a passive affordance and must sit BELOW the caps
+  // indicator that shares the field with it. Without this it inherited the
+  // entry's full `--veltrix-text` and the two read as equals.
+  > image {
+    color: var(--veltrix-text-dim);
+    &:hover { color: var(--veltrix-text-secondary); }
+  }
+
+  // Gtk.PasswordEntry builds its OWN caps-lock warning inside the field, and
+  // there is no property to turn it off — which is why neither surface adds one
+  // of its own (the greeter used to, and showed two warnings for one state).
+  // It is the only indicator now, so it is brighter than the peek button beside
+  // it: a STATE should not read as one more affordance. Full `--veltrix-text`
+  // against the button's `-dim`.
+  //
+  // Left neutral rather than warning-tinted. By the mark rule this icon is a
+  // legitimate place for semantic colour — it SUBSTITUTES for text there is no
+  // room for, which is the first of the two jobs a mark can do — but yellow was
+  // just rejected on this screen and the difference is worth deciding on its own,
+  // not inheriting from here.
+  image.caps-lock-indicator { color: var(--veltrix-text); }
+}
+
+// ── Login / Unlock button ───────────────────────────────────────────────────
+// Glass, not accent: the accent is reserved for state, and on an accent-filled
+// button the accent focus ring drew accent on accent.
+//
+// The box is painted (see .greeter-password) — `withGlassCapsule(btn, "strong")`,
+// the heavier rim marking it as the primary control. Hover and active stay in
+// CSS: they are a plain fill with no border to seam, and they read on top of the
+// painted body.
+//
+// FOCUS: a BUTTON shows a ring, and only a ring. This used to draw an accent
+// border AND a 35 %-alpha halo — both of the affordances at once, and the halo so
+// faint the user read the state as "dull". Now it is the shell's own ring, solid
+// accent, and the capsule is wrapped with followFocus:false so the rim stays
+// neutral underneath it.
+.greeter-login-btn {
+  background: transparent;
+  border: none;
+  color: var(--veltrix-text);
+  // 🔑 THE RADIUS HAS TO BE ON THE BASE RULE, not only on the states that paint
+  // something. The widget draws no box at rest — the capsule is painted behind
+  // it — so it is tempting to declare the radius only under :hover/:active,
+  // where a fill actually appears. But `outline` follows the widget's OWN
+  // border-radius, so a radius-less button gets a rounded-RECTANGLE focus ring
+  // around a pill (user-caught 2026-08-09, reproduced offscreen). The hover fill
+  // and the focus ring are two consumers of one number.
+  border-radius: $veltrix-radius-pill;
+  padding: 0 24px;
+  font-weight: $fw-semibold;
+  font-size: $fs-body;
+  min-height: 40px;
+  outline: none;
+
+  &:hover  { background: rgba(255, 255, 255, 0.10); }
+  &:active { background: rgba(255, 255, 255, 0.16); }
+  &:focus,
+  &:focus-within { @include veltrix-focus-ring; }
+  &:disabled { color: var(--veltrix-text-dim); }
+
+  spinner {
+    min-width: 14px;
+    min-height: 14px;
+    color: #fff;
+  }
+}
+
+// ── Card + hero entrance ─────────────────────────────────────────────────────
+// NOT HERE ANY MORE, and that is the point. The entrance used to be
+// `.greeter-card { opacity: 0; margin-top: 40px; transition: … }` plus a
+// `-shown` class, and it worked in the greeter and in any ordinary window while
+// SNAPPING on the lockscreen — measured with frames flowing and the FROM state
+// laid out: the whole 21px in under 8ms, no interpolation at all.
+//
+// A CSS transition has a precondition that cannot be satisfied on a
+// session-lock surface: something painted to interpolate FROM. That surface gets
+// no frames for ~60ms after `map` and then delivers its first two ticks about 2ms
+// apart, so the initial state is laid out and never painted.
+//
+// So the animation is driven from the frame clock instead — `ui/lib/entrance.ts`,
+// which sets the initial state before the first map and owns the curve
+// ($ease-emphasized, solved). Both blocks travel ~21px over 450ms.
+//
+// ⚠️ Do not "restore" opacity/transition rules for `.greeter-card` or
+// `.greeter-hero` here. They would fight the JS that now owns both properties,
+// and on the one surface that matters they never worked.
+
+// ── The failure message's reserved slot ──────────────────────────────────────
+// The height is RESERVED so the message cannot move the card. Before this,
+// showing it grew the card by 30px and — because the card is centred — lifted the
+// avatar, the name, the password field and the button by 15px each, which meant
+// failing a password moved the field you were about to retype in.
+//
+// 🔑 THE RESERVATION IS THE `opacity`, NOT A HEIGHT — and this block carried a
+// `min-height: 30px` for about ten minutes that looked like the mechanism and was
+// not. Measured: **an empty Gtk.Label still measures one line**, so the capsule is
+// 24px tall whether it holds "Wrong password" or nothing at all. Toggling
+// `opacity` keeps it ALLOCATED, and the slot's height therefore never changes.
+// (`visible = false` is what breaks this: a hidden widget gets no allocation.)
+//
+// The `min-height` was removed because it only made the slot 6px TALLER than the
+// capsule it holds — the no-shift property was already there without it, and the
+// mutation test proved it: setting it to 0 changed nothing. Reserving by number
+// would also have been the fragile version, since the right number is the user's
+// UI font, not a constant.
+//
+// One line really is the worst case: all 48 real messages (12 locales ×
+// wrongPassword/noSession/loginError/accountUnavailable) measure 24px, none wraps,
+// and the widest is 216px against the card's 280 — the lockscreen's
+// `accountUnavailable`, added 2026-08-23, peaks at 187px in Russian.
+.greeter-error-slot {
+  // Fading suits what this is now: a message that expires on its own should leave
+  // the way it came rather than blink out.
+  > * { transition: opacity $dur-slow $ease; }
+}
+
+// ── Multi-user switcher ──────────────────────────────────────────────────────
+.greeter-user-chip {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 2px;
+  min-height: 0;
+  border-radius: var(--veltrix-radius-pill);
+
+  &:hover { background: rgba(255, 255, 255, 0.08); }
+  // Without this the chip keeps GTK4's built-in focus ring, which is its own
+  // blue and ignores the user's accent — a second ring vocabulary on a screen
+  // that already has one. The `:checked` accent border below is SELECTION, a
+  // different state, and the ring's offset keeps the two readable together.
+  outline: none;
+  &:focus-visible { @include veltrix-focus-ring; }
+
+  // Both the Gtk.Picture (photo) and the Gtk.Image (glyph fallback) carry this
+  // class — the chip draws its own selection ring instead of the glass border.
+  .greeter-chip-avatar {
+    border-radius: var(--veltrix-radius-pill);
+    border: 2px solid transparent;
+  }
+  &:checked .greeter-chip-avatar { border-color: var(--veltrix-accent); }
+}
+
+// ── The two card messages ────────────────────────────────────────────────────
+// NEITHER RED NOR YELLOW (user, 2026-08-09), and it turns out the design system
+// already said so from the other side: semantic colour goes in a MARK or a
+// FILL, never in the copy. `.greeter-caps` was the one place in the project
+// still breaking that rule, and on a light wallpaper the yellow read WORSE than
+// plain white — a mid-tone hue on an unknown background is the one thing that
+// can vanish in both directions, which is exactly why `.greeter-error` had
+// already been talked out of red.
+//
+// So both messages are plain neutral text, and NOTHING replaces the colour.
+//
+// A warning-coloured dot was tried and removed the same day (user, 2026-08-09).
+// The shell does have that pattern — .island-rec-dot, .agent-tool-dot,
+// .agent-error-dot, .bar-cc-badge — but every one of those lives in the island
+// or the bar, where there is no room for a word and the mark SUBSTITUTES for the
+// text. Here the sentence already says it. A mark that repeats the copy next to
+// it is decoration, and the capsule these now sit on is what makes them
+// noticeable anyway.
+//
+// And both sit on a PAINTED CAPSULE, because that is what actually made them
+// legible. They live in the middle of the card, where the scrim is deliberately
+// at its weakest, and white text on a near-white wallpaper cannot be rescued by
+// a veil capped at 0.28 — rendered at 0.16 / 0.20 / 0.24 to be sure, the gain
+// was marginal and it cost wallpaper across the whole centre of the screen.
+// Everything else on this screen that has to be read sits on glass; these two
+// were the exception, not the rule.
+.greeter-error {
+  color: var(--veltrix-text);
+  font-size: $fs-caption;
+  padding: 3px 12px;
+  min-height: 18px;
+}
+
+@keyframes greeter-shake {
+  0%, 100% { margin-left: 0; }
+  20%       { margin-left: -8px; }
+  40%       { margin-left: 8px; }
+  60%       { margin-left: -6px; }
+  80%       { margin-left: 6px; }
+}
+
+.greeter-shake { animation: greeter-shake 0.4s ease; }
+
+// ── Gtk.DropDown — session and keyboard layout selectors ─────────────────────
+// These are `VeltrixDropDown`s now (LoginCard.ts, LocaleBar.ts), so their POPUP
+// is the kit's — that block used to live here and is gone; the kit owns it.
+//
+// What stays here is the TRIGGER, and it is a deliberate divergence, not a
+// leftover. The kit styles the trigger as an INPUT (surface-back fill, 2px
+// border, radius-sm, 4px/14px padding, 20px content floor) because in Settings
+// it sits on a card next to text fields. These three sit on painted glass over
+// the user's wallpaper, and two of them sit INSIDE a capsule beside an icon and
+// a separator, clamped to 18px so they end up exactly as tall as
+// .greeter-power-btn. Taking the kit's trigger would break that alignment
+// outright — this is geometry, not taste. So: ghost pill here, input on the
+// card, one popup shared.
+//
+// This block and the kit's `dropdown > button` have the SAME specificity; this
+// one wins purely because Sass emits the module first (see the @use at the top).
+// If that import ever moves below here, these screens silently become Settings.
+//
+// `dropdown > button` WITHOUT `.combo`: on current GTK4 the internal button
+// does NOT carry the .combo class, so every `button.combo` selector is dead
+// (verified empirically in the VM — the button rendered with Adwaita defaults,
+// visibly taller than its siblings). Same lesson as the shell's _components.scss.
+dropdown > button {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  background-image: none;
+  min-height: 0;
+  padding: 0;
+  // Same reason as .greeter-user-chip: otherwise GTK's own blue ring shows up.
+  // These read as ghost BUTTONS here, not as the bordered input the shell's
+  // dropdown trigger is, so they take the ring rather than an accent edge. The
+  // radius comes from the two variants below — both are pills — and it has to be
+  // there for the ring to follow the shape (see .greeter-login-btn).
+  outline: none;
+  &:focus-visible { @include veltrix-focus-ring; }
+
+  label { color: inherit; font-size: inherit; }
+  // ⚠️ `margin-start` was declared on both of these and GTK4 CSS HAS NO SUCH
+  // PROPERTY — it logs "No property named margin-start" and does nothing. GTK4
+  // dropped the logical margin longhands; the physical `margin-left` is what
+  // exists. Removed rather than translated (2026-08-09): it never applied, so
+  // translating it would ADD a 4px gap that has never shipped, on a control the
+  // greeter's dropdowns share. If the gap is wanted, that is a deliberate change
+  // with a render behind it, not a silent side effect of clearing a warning.
+  //
+  // 🔑 The next line is that same decision, defended. The kit ships
+  // `dropdown > button > box > label { margin-left: 8px }` — the gap is right
+  // THERE because a Settings trigger can carry an icon before its label — and
+  // nothing here out-ranked it, so importing the kit would have handed these
+  // three exactly the indent that was just refused: silently, and at 8px rather
+  // than 4. Zeroed on purpose, not left to luck. These triggers are label +
+  // arrow, never an icon, so the gap has nothing to separate.
+  > box > label { margin-left: 0; }
+  // The base layer gives every dropdown's box GTK's 6px gap (#107 step 5); this
+  // screen spaces its chevron with the arrow's own `margin-left` below, so the
+  // two would stack to 11px. Zero here keeps the 5px that comment argues for.
+  > box { border-spacing: 0; }
+  // 🔑 The second guard, and this one was NOT predicted — it was caught by
+  // rendering the whole surface before and after and diffing the pixels. The
+  // kit's trigger is `$fw-medium` (500) because in Settings it is a control on a
+  // card; these are dim, subordinate labels on glass, and the greeter's own
+  // variants below override the SIZE but never the WEIGHT, so 500 came through.
+  // It is not only a tone change: heavier glyphs are wider, so the language pill
+  // grew ~2px and pushed its own label and chevron sideways — an import silently
+  // moving a laid-out control.
+  //
+  // 🔑 And it was the ONLY thing the import moved. With this line the greeter
+  // renders 0 different pixels out of 3,686,400 against the sheet before it
+  // (scripts/dev/lock-probe.js, SCOPE=greeter, both sheets, `magick compare
+  // -metric AE`). That is the check to repeat for step 2 of the kit migration,
+  // and it is worth more than reading the cascade: the margin above was found by
+  // reading and this one was not.
+  font-weight: 400;
+  image { color: inherit; -gtk-icon-size: 10px; }
+  // GtkDropDown's chevron is an `arrow` node, not `image` — uncapped it renders
+  // at 16px and makes the combo visibly taller than its sibling buttons.
+  //
+  // ⚠️ AND IT NEEDS ITS SOURCE SPELLED OUT HERE, which is the whole reason this line
+  // has three properties instead of two. `arrow` is a BUILTIN-ICON node: it has no
+  // content of its own and draws whatever `-gtk-icon-source` names. That normally
+  // comes from the platform theme — but `ui/greeter/app.ts` loads NO GTK theme
+  // (`useNoGtkTheme()`), deliberately, so that this sheet has nothing beneath
+  // it to fight. No theme means no `-gtk-icon-source`, so until 2026-08-24 all THREE
+  // chevrons on this screen (the session selector and the locale bar's two) kept
+  // their 10px box and drew NOTHING.
+  //
+  // 🔑 Why it survived so long: the peek icon in the password field and every shipped
+  // Lucide glyph render fine, because those are `icon-name`/`gicon` set in CODE and
+  // owe the theme nothing. Only the CSS-sourced node goes blank — so the screen looks
+  // like it has icons, and one specific kind of icon is missing.
+  arrow {
+    color: inherit;
+    -gtk-icon-size: 10px;
+    // The gap the comment above refused to add by accident, added on purpose: with
+    // the chevron finally RENDERING (it drew nothing until 2026-08-24) it sat flush
+    // against the last glyph of its label and read as part of the word. 5px is the
+    // same optical gap the kit gives a Settings trigger, minus the 3px of visual
+    // padding the Lucide glyph carries inside its own box. `margin-left`, not
+    // `margin-start`: GTK4 has no logical margin longhands — see above.
+    margin-left: 5px;
+    // ⚠️ OUR chevron, by PATH — not `-gtk-icontheme("pan-down-symbolic")`.
+    //
+    // That name resolves against the ICON theme, which is a different thing from the
+    // blank GTK theme above and is NOT ours: on this dev host alone ~40 installed
+    // themes provide it (Adwaita, Papirus — which install.sh installs — MacTahoe,
+    // Colloid…). Using it would make the shape of the login screen's chevron depend on
+    // whichever icon theme the `greeter` system user happens to have, which is exactly
+    // the defect `ui/lib/veltrix-kit/platform/icons.ts` was written to end for the power glyphs:
+    // "Veltrix's own power bar was the one surface in the DE not using Veltrix's icons.
+    // Commandment 10." A chevron is no different.
+    //
+    // So: the shipped Lucide glyph, reached relatively. The path holds in both layouts —
+    // installed (`/usr/share/veltrix/ui/greeter/` → `../shell/assets/…`) and from source
+    // (`ui/greeter/` → `../shell/assets/…`) — which is why it is not absolute.
+    //
+    // ⚠️ The filter is not optional and not cosmetic, and it is deliberately
+    // `brightness(0) invert(1)` rather than a bare `invert(1)`.
+    //
+    // This is the one glyph that does NOT arrive through `Gtk.Image` — an `arrow` is a
+    // CSS node with no widget to hang a class on, so it comes in through
+    // `-gtk-icon-source`, which loads the file as a plain image rather than looking it
+    // up as an icon. Whether that path honours the `-symbolic` suffix and recolours from
+    // `color`, the way a looked-up icon does, is the one thing about this rule I could
+    // not measure off-screen: every harness I built rendered the `arrow` node empty.
+    // So the filter is written to land on white either way — `brightness(0)` flattens
+    // whatever came out to black, `invert(1)` turns that white. Unconditional is safe
+    // for the same documented reason as before: both these surfaces are permanently
+    // dark glass.
+    //
+    // Consequence to know: the chevron does not follow `color`, so it does not brighten
+    // with the label on `:hover`. That was already true before the icons became
+    // symbolic, and this rule keeps it true on purpose rather than by accident.
+    -gtk-icon-source: url("../shell/assets/icons/veltrix/scalable/actions/nd-pan-down-symbolic.svg");
+    -gtk-icon-filter: brightness(0) invert(1);
+  }
+}
+
+// Session selector — visible, medium weight
+dropdown.greeter-session-dropdown > button {
+  color: var(--veltrix-text-secondary);
+  font-size: $fs-caption;
+  padding: 4px 10px;
+  border-radius: var(--veltrix-radius-pill);
+
+  &:hover  { background: rgba(255, 255, 255, 0.08); color: var(--veltrix-text); }
+  &:active { background: rgba(255, 255, 255, 0.06); }
+}
+
+// Keyboard + language selectors — compact, dimmed
+// min-height 18px + 3px vertical padding keep the bottom-pill buttons
+// (this, .greeter-power-btn) the exact same height.
+dropdown.locale-bar-dropdown > button {
+  color: var(--veltrix-text-dim);
+  font-size: $fs-caption;
+  padding: 3px 8px;
+  min-height: 18px;
+  border-radius: var(--veltrix-radius-pill);
+
+  &:hover  { background: rgba(255, 255, 255, 0.07); color: var(--veltrix-text-secondary); }
+  &:active { background: rgba(255, 255, 255, 0.05); }
+}
+
+// Popover list — DELETED, and that deletion is the point of this change.
+//
+// A near-copy of the kit's block used to sit here, frozen at the generation
+// before PR #86 fixed it: the fill and the padding were on GTK's own `> row`,
+// which also carries GTK's CHECKMARK (18px icon + 4 spacing) — so every option
+// on the login screen was indented around a mark nobody chose, and no fill of
+// ours could ever own that node. `:selected` drew ACCENT, on a list where GTK
+// moves :selected with the POINTER (hover-select), so merely dragging through
+// the language list flashed the accent down twelve rows. GTK's scroll bar was
+// left in place, the one that grows toward the pointer so a click near an
+// option's trailing edge lands on the bar instead of the option — and the
+// language list is the only list on these two screens long enough to scroll.
+//
+// `VeltrixDropDown` fixes all three at once, in `ui/lib/`, for every bundle. The
+// tone that WAS local survives as `--veltrix-popover-bg` in the palette above.
+// Nothing replaces this block: deleting it is what lets the kit's win.
+
+// ── Locale bar ───────────────────────────────────────────────────────────────
+// Painted (see .greeter-power-bar). Same derivation for the inset: the painted
+// pill is 26/2 = 13, the dropdown buttons inside clamp to 18/2 = 9, so 4.
+.locale-bar {
+  background: transparent;
+  border: none;
+  padding: 4px;
+}
+
+// The keyboard glyph is the only thing in this capsule that is BARE INK — every
+// other child is a dropdown that paints its own hover pill. That distinction is
+// what the left margin is for, and it is the same rule the power bar below spells
+// out from the other side.
+//
+// `.locale-bar`'s uniform `padding: 4px` is the CONCENTRIC inset: outer pill
+// radius (32/2 = 16) minus the dropdown button's own clamped pill (24/2 = 12), so
+// a hover fill sits evenly inside the cap. Correct — for a fill. Ink has nothing
+// between itself and the curve, and the dropdown's own `padding: 3px 8px` means
+// its glyphs sit 4 + 8 = 12px in from the capsule's edge. Measured on
+// `scripts/dev/lock-probe.js` (2026-08-16): the icon's ink was at 4px and the
+// language dropdown's arrow at 12px — three times the clearance on the right,
+// which is exactly what the user saw as "the icon is stuck to the left".
+//
+// So the icon carries the difference itself, 8px, landing its ink 12px in. It goes
+// on the ICON and not on the container's padding-left on purpose: the correction
+// belongs to the thing that is bare ink, so reordering this row cannot leave it
+// behind.
+//
+// ⚠️ 12px is NOT "symmetry with the right end", and the difference is worth
+// knowing before anyone tunes it again. Photometry on the rendered capsule (same
+// probe, `-locale.png` crop) says the visible ink clears the RIGHT cap by 17px,
+// not 12: the ▾ glyph does not fill the 8px padding it sits in. That 17 is an
+// accident of GTK's arrow, not a chosen number, and chasing it would push a dense
+// 12px square glyph out to where a light triangle happens to land.
+//
+// The number that IS derived: the icon's ink must clear the cap by about what it
+// clears the straight edges by. The glyph is 12px tall in a 32px capsule, so its
+// vertical clearance is (32 − 12) / 2 = 10px. 12 horizontal against 10 vertical —
+// marginally more at the curve, which is what a cap wants, since the arc falls
+// away above and below the ink's own height.
+.locale-bar-icon {
+  color: var(--veltrix-text-dim);
+  margin-left: 8px;
+  margin-right: 2px;
+}
+
+// ── Bare GTK nodes this bundle builds and must therefore draw ────────────────
+// Commandment 11, and the same trap as the shell's copy: `.locale-bar-sep` below
+// paints the one separator these screens build today, so a plain
+// `new Gtk.Separator()` added tomorrow would be an invisible one. These screens are
+// the worst place for that — they have no dev mode, so nobody would see it until a
+// VM pass. The class below out-ranks this.
+separator {
+  background: var(--veltrix-glass-border-sm);
+  min-width: 1px;
+  min-height: 1px;
+}
+
+.locale-bar-sep {
+  background: var(--veltrix-glass-border-sm);
+  min-width: 1px;
+  min-height: 14px;
+  margin: 4px 2px;
+}
+
+// ── Power bar ────────────────────────────────────────────────────────────────
+// Painted like the other two (see .greeter-password). The box is gone from CSS;
+// what is left is the INSET, and that number is derived, not chosen.
+//
+// A row's hover fill spans its container, so the container's padding IS the
+// fill's margin — and the goal is ONE gap: the fill should stand as far from the
+// corner's curve as it does from the straight edge. For circular corners
+// `rowInsetFor()` (ui/lib/veltrix-kit/platform/tokens.ts) collapses to plain concentricity,
+// `outer − inner`: the painted bar is a true pill at 32/2 = 16, the button's own
+// pill clamps to 22/2 = 11, so the inset is 5 — on all four sides.
+//
+// It used to be `4px 6px`, which put the halo half again as wide at the ends as
+// at the top and bottom; the user saw it before anyone measured it. No menu
+// system runs a ratio like that (AppKit ~5/4, Windows 11 flyouts 4/4), and this
+// is the second time the same mistake has been caught by eye in this project —
+// the first was the shell's own menu rows.
+//
+// The height is unchanged: 22 + 5 + 5 = 32, exactly what 22 + 4 + 4 + 2·border
+// used to make. And the padding is still what keeps the buttons INSIDE the bar:
+// remove it (done briefly on 2026-08-09) and they stretch to full height, so
+// their hover becomes the same capsule as the bar itself.
+.greeter-power-bar {
+  background: transparent;
+  border: none;
+  padding: 5px;
+}
+
+// The bar around them is already the glass surface, so the buttons are just
+// their content until you touch them.
+//
+// Full pill radius here, unlike a CSS-drawn capsule, and that is not an
+// inconsistency: the seam is a BORDER artifact and this button never draws a
+// border — hover and active are a plain fill, a single path with nothing to
+// join — so `9999px` is safe and the hover reads as a proper capsule rather
+// than a rounded rectangle.
+//
+// FOCUS: the shell's ring, solid accent. It was a 35 %-alpha halo, which is what
+// the user meant by the focus on these buttons looking dull — see
+// `veltrix-focus-ring` in ui/lib/veltrix-kit/styles/_tokens.scss.
+.greeter-power-btn {
+  background: transparent;
+  border: none;
+  border-radius: $veltrix-radius-pill;
+  color: var(--veltrix-text);
+  padding: 0 16px;
+  font-size: $fs-small;
+  min-height: 22px; // lockstep with the locale-bar dropdowns next to it
+  outline: none;
+
+  &:hover  { background: rgba(255, 255, 255, 0.10); }
+  &:active { background: rgba(255, 255, 255, 0.16); }
+  &:focus,
+  &:focus-within { @include veltrix-focus-ring; }
+}
+
+// ─── RTL mirrors (bilingual feature, 2026-11-12) ────────────────────────────
+// The shared `:dir(rtl)` overrides live in ui/lib/_rtl.scss, `@use`d at the
+// top of this sheet. What is here is greeter-local: rules whose base exists
+// only on this screen, plus one guard for a shared rule this screen refuses.
+//
+// GTK4 CSS has no logical margin properties (see ui/lib/_rtl.scss) — these
+// are `:dir(rtl)` overrides with physical properties, same as the shared ones.
+
+// The login chevron: base `dropdown > button arrow { margin-left: 5px }`
+// (~line 707). The chevron sits after its label; under RTL it sits before it
+// and the gap follows. The glyph is pan-DOWN, so it needs no flip.
+dropdown > button arrow:dir(rtl) { margin-left: 0; margin-right: 5px; }
+
+// The locale bar's icon: base `.locale-bar-icon { margin-left: 8px;
+// margin-right: 2px }` (~line 829). The 8px is the capsule-edge clearance;
+// under RTL the capsule mirrors and the clearance swaps sides with it.
+.locale-bar-icon:dir(rtl) { margin-left: 2px; margin-right: 8px; }
+
+// ⚠️ Guard for the shared kit override. The kit ships
+// `dropdown > button > box > label { margin-left: 8px }` and ui/lib/_rtl.scss
+// flips it to the right — correct for an icon-bearing trigger. These triggers
+// are label + arrow, never an icon, so the gap has nothing to separate: the
+// greeter zeroes it (see the comment above `> box > label` in this file) and
+// re-zeroes it here, under RTL too. Same specificity as the shared override,
+// later in this sheet, so this wins.
+dropdown > button > box > label:dir(rtl) { margin-left: 0; margin-right: 0; }

@@ -1,0 +1,173 @@
+// What is wrong with the account form right now, per field — and whether it is
+// complete enough to install with.
+//
+// ⚠️ It is ONE function returning both because `steps/account.ts` had two, and
+// they were two hand-maintained expressions of the same rules: four `if` chains
+// filling four error strings, and then a separate seven-term `isValid` boolean
+// repeating every one of those conditions. Nothing made them agree. That is the
+// shape `manualProblems` exists to prevent on the disk page, where it had already
+// cost a Continue button that went dead with nothing on screen saying why (D-16).
+//
+// ⚠️ `valid` is NOT "no messages". An untouched empty field produces no message
+// on purpose — see `touched` — and is still not something to install with, so the
+// completeness half is stated separately rather than inferred from the absence of
+// text.
+//
+// It lives in `lib/` rather than in the page for the reason `manual-problems.ts`
+// does: the page imports Gtk, so a rule that lives there can only be checked by
+// typing into it.
+
+import { t } from "./i18n"
+
+/** useradd's own rule, and the reason a capitalised name is refused. */
+export const USERNAME_REGEX = /^[a-z_][a-z0-9_-]{0,31}$/
+
+/** RFC 1123 label: alphanumeric ends, dashes inside, 63 characters. */
+/**
+ * Below this, the account page warns that the password is short — and lets the
+ * person continue. 8 is the floor NIST SP 800-63B sets for a memorised secret a
+ * person chooses; it is where "short" stops being a matter of opinion.
+ */
+export const PASSWORD_ADVISED_MIN = 8
+
+export const HOSTNAME_REGEX = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/
+
+/** What every derived hostname ends in, and the reason it is not the whole name. */
+const HOSTNAME_SUFFIX = "-veltrix"
+
+/**
+ * The machine's name, suggested from the account's, while nobody has typed one.
+ *
+ * ⚠️ It must not be a CONSTANT, and it used to be one: the page opened with
+ * `veltrix` already sitting in the field — a value, not a hint, and a person who
+ * accepted it could not tell it apart from one they had chosen. The damage is
+ * not that it went unchosen. It is that every Veltrix machine then answers to the
+ * same name, so the second one on a network collides with the first in mDNS
+ * (`veltrix.local`), in the router's lease list, and in anybody's `ssh veltrix` —
+ * a default that breaks precisely by being used twice. Deriving it from the
+ * username is what Ubuntu does, and this is why.
+ *
+ * A username is not a hostname: `useradd` allows `_` and a leading underscore,
+ * RFC 1123 allows neither. Anything a hostname cannot carry becomes a dash,
+ * dashes cannot be the ends, and the stem is cut so the result still fits in the
+ * 63 characters HOSTNAME_REGEX will accept — a suggestion that fails the
+ * validation next to it is a complaint about a field nobody touched.
+ *
+ * Empty in, empty out: with no username there is nothing to suggest, and the
+ * field goes back to showing its placeholder.
+ */
+export function deriveHostname(username: string): string {
+  const stem = username
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 63 - HOSTNAME_SUFFIX.length)
+    .replace(/-+$/, "")
+  return stem ? `${stem}${HOSTNAME_SUFFIX}` : ""
+}
+
+/**
+ * Is this hostname still a SUGGESTION, or did somebody type it?
+ *
+ * The page cannot ask the widget: a restored draft looks identical either way.
+ * It asks this instead — empty, or exactly what the username would have
+ * produced, means nobody has claimed the field, so walking back to correct the
+ * username updates the machine's name too. Anything else is theirs and is left
+ * alone, which is what makes the following a suggestion rather than a fight.
+ */
+export function hostnameStillFollows(hostname: string, username: string): boolean {
+  return hostname === "" || hostname === deriveHostname(username)
+}
+
+/**
+ * Names the installed system already gives to something else. Taking one does
+ * not fail at install time — it fails at `useradd`, inside the chroot, with the
+ * log folded shut.
+ */
+const SYSTEM_USERS = new Set([
+  "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail",
+  "news", "uucp", "proxy", "www-data", "backup", "list", "irc", "gnats",
+  "nobody", "systemd-network", "systemd-resolve", "messagebus",
+  "systemd-timesync", "avahi", "polkitd", "rtkit", "live",
+])
+
+export interface AccountFields {
+  fullName: string
+  username: string
+  hostname: string
+  password: string
+  confirm: string
+}
+
+export interface AccountProblems {
+  username: string
+  hostname: string
+  password: string
+  confirm: string
+  /**
+   * Advice about the password that does NOT hold the flow — deliberately apart
+   * from the four messages above, which are all reasons Continue is off. See
+   * `PASSWORD_ADVISED_MIN`.
+   */
+  passwordWarning: string
+  /** Every rule satisfied — what `ready()` asks, and what may be stored. */
+  valid: boolean
+}
+
+/**
+ * @param touched Has the person edited anything yet? A form that opens
+ *   pre-filled must not greet them with four complaints about fields they have
+ *   not touched, so the REQUIRED messages wait for the first edit. Format and
+ *   mismatch messages do not: those describe something that is actually typed.
+ */
+export function accountProblems(f: AccountFields, touched: boolean): AccountProblems {
+  let username = ""
+  if (f.username.length > 0) {
+    if (!USERNAME_REGEX.test(f.username)) {
+      username = t("accountErrUsernameFormat")
+    } else if (SYSTEM_USERS.has(f.username)) {
+      username = t("accountErrUsernameReserved")
+    }
+  }
+
+  let hostname = ""
+  if (f.hostname.length > 0) {
+    if (!HOSTNAME_REGEX.test(f.hostname)) {
+      hostname = t("accountErrHostnameFormat")
+    }
+  }
+
+  const password = ""
+
+  // Advice, not a rule (decided 2026-09-14). It is the account's own password,
+  // typed by its owner on their own machine, and a refusal here is how people end
+  // up with `Password1!`. Silent on an empty box — that is the required-field
+  // case, and the untouched form must open without complaints.
+  const passwordWarning = f.password.length > 0 && f.password.length < PASSWORD_ADVISED_MIN
+    ? t("accountWarnPasswordShort")
+    : ""
+
+  let confirm = ""
+  if (f.confirm.length > 0 && f.password !== f.confirm) {
+    confirm = t("accountErrPasswordMismatch")
+  }
+
+  const valid = f.username.length > 0
+    && USERNAME_REGEX.test(f.username)
+    && !SYSTEM_USERS.has(f.username)
+    && f.hostname.length > 0
+    && HOSTNAME_REGEX.test(f.hostname)
+    && f.password.length > 0
+    && f.password === f.confirm
+
+  return { username, hostname, password, confirm, passwordWarning, valid }
+}
+
+/**
+ * ':' and newlines would corrupt the passwd GECOS entry the full name ends up
+ * in, and `usermod` rejects them with a generic error — stripped up front, the
+ * same way Settings → Users does when it creates an account.
+ */
+export function cleanFullName(raw: string): string {
+  return raw.trim().replace(/[:\n\r]/g, "")
+}

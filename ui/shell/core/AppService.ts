@@ -1,0 +1,1129 @@
+import Gio from "gi://Gio"
+import GObject from "gi://GObject"
+import GLib from "gi://GLib"
+import Gtk from "gi://Gtk?version=4.0"
+import { iconDirection } from "../../lib/rtl"
+import Gdk from "gi://Gdk?version=4.0"
+import { readFile } from "../../lib/veltrix-kit/platform/file"
+import { rankApps } from "./app-search"
+import appFrequency from "./AppFrequency"
+import { SHELL_ROOT } from "./Paths"
+import { spawnCommandLine } from "../../lib/process"
+
+export interface AppData {
+    id: string
+    name: string
+    exec: string
+    icon: string | null
+    wmClass: string | null
+    /**
+     * The `Icon=` field verbatim — a themed name or an absolute path, NOT resolved.
+     * `icon` above is the canonicalized result and is what you draw; this is the key
+     * an icon OVERRIDE is filed under (`setIconOverride`), so a surface that offers
+     * "change this app's icon" has to carry it around unmodified.
+     */
+    rawIcon: string
+    /** `Keywords=`, for search only. */
+    keywords: string[]
+    /**
+     * `g_app_info_should_show()`: false for NoDisplay/Hidden entries and for anything
+     * this desktop isn't in `OnlyShowIn`. The registry keeps them — a hidden entry is
+     * still the thing that names a window and owns its icon — but a launcher must not
+     * LIST them. Filter through `listApps()`/`queryApps()` rather than `getAllApps()`.
+     */
+    visible: boolean
+}
+
+// Icons that are file-type placeholders or symbolic UI icons — not real app icons.
+// Avoid using these as app icons; try to find a better themed alternative first.
+const BAD_ICONS = [
+    "image-missing",
+    "text-x-generic",
+    "audio-x-generic",
+    "video-x-generic",
+    "application-x-executable",
+    "preferences-system-details-symbolic",
+    "preferences-system-symbolic",
+    "dialog-information-symbolic",
+    "application-default-icon",
+    "unknown"
+]
+
+// Every file manager collapses into the dock's single Home/Finder shortcut.
+// Dock grouping ONLY — see resolveHyprlandClass vs resolveWindowApp.
+const FILE_MANAGER_CLASSES = ["org.gnome.nautilus", "nautilus", "thunar", "dolphin", "pcmanfm", "nemo", "nemo-desktop"]
+
+class AppService {
+    private cache = new Map<string, AppData>()
+    private gAppCache = new Map<string, any>()
+    private nameMap = new Map<string, string>()
+    private wmMap = new Map<string, string>() // Map wmClass -> Desktop ID
+    private listeners = new Set<() => void>()
+    private launchListeners = new Set<(id: string) => void>()
+    private isReloading = false // Lock to avoid concurrent reloads during boot
+    private monitors: Gio.FileMonitor[] = []
+    private reloadTimer: number | null = null
+    private structuralListeners = new Set<() => void>()
+
+    constructor() {
+        // Patch XDG_DATA_DIRS before any Gio.AppInfo call so Flatpak/Snap apps are
+        // visible even when the compositor starts without sourcing /etc/profile.d/.
+        // This also benefits the children we launch (see patchXdgDataDirs).
+        this.patchXdgDataDirs()
+
+        // Global Theme Discovery
+        const theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+
+        // Search paths ordered so system icons take priority over pixmaps
+        const localIcons = GLib.get_home_dir() + "/.local/share/icons"
+        const systemIcons = "/usr/share/icons"
+        const localShareIcons = "/usr/local/share/icons" // V126: Support for locally installed app icons (e.g. Rofi)
+        const pixmaps = "/usr/share/pixmaps" // V126: Legacy standard fallback
+        const flatpakIcons = "/var/lib/flatpak/exports/share/icons"
+        const snapIcons = "/var/lib/snapd/desktop/icons"
+
+        // STANDARD PATHS FIRST (Including Flatpak & Snap)
+        theme.add_search_path(localIcons)
+        theme.add_search_path(localShareIcons)
+        theme.add_search_path(pixmaps)
+        theme.add_search_path(systemIcons)
+        theme.add_search_path(flatpakIcons)
+        theme.add_search_path(snapIcons)
+
+        // Shipped-default icons for the six AI-icon apps (see the method):
+        // before the first registry scan, so listApps() already resolves them.
+        this.seedShippedIconDefaults()
+
+        this.reload()
+        this.watchAppDirs()
+
+        // Deep Sync: Secondary scan for boot resilience
+        GLib.timeout_add(GLib.PRIORITY_LOW, 5000, () => {
+            this.reload()
+            return GLib.SOURCE_REMOVE
+        })
+
+        let lastTheme = theme.get_theme_name()
+        theme.connect("changed", () => {
+            const name = theme.get_theme_name()
+            if (name === lastTheme) return // skip if name unchanged to avoid redundant reloads
+            lastTheme = name
+
+            // Debounce theme changes to prevent GListStore conflicts during start-up
+            GLib.timeout_add(GLib.PRIORITY_LOW, 2000, () => {
+                console.log(`[AppService] System theme changed to ${name}, refreshing registry...`)
+                this.reload()
+                return GLib.SOURCE_REMOVE
+            })
+        })
+    }
+
+    private patchXdgDataDirs() {
+        // NOTE: this CANNOT make Gio.AppInfo in THIS process see Flatpak/Snap apps —
+        // GLib caches the data dirs on first use (GTK init runs before us), verified
+        // 2026-06-12. The real fix lives in bin/veltrix-ui, which exports
+        // XDG_DATA_DIRS before gjs starts. This patch still matters as a safety net
+        // for the env *inherited by launched children* (gtk-launch under `uwsm app`)
+        // when the shell was started some other way (e.g. scripts/run.sh by hand).
+        const home = GLib.get_home_dir()
+        // The "share" roots whose applications/ and icons/ subdirs Flatpak/Snap export to
+        const extraShares = [
+            "/var/lib/flatpak/exports/share",
+            `${home}/.local/share/flatpak/exports/share`,
+            "/var/lib/snapd/desktop",
+        ]
+        const current = GLib.getenv("XDG_DATA_DIRS") ?? "/usr/local/share:/usr/share"
+        const parts = current.split(":").filter(Boolean)
+        const added: string[] = []
+        for (const share of extraShares) {
+            if (GLib.file_test(share, GLib.FileTest.IS_DIR) && !parts.includes(share)) {
+                parts.push(share)
+                added.push(share)
+            }
+        }
+        if (added.length > 0) {
+            GLib.setenv("XDG_DATA_DIRS", parts.join(":"), true)
+            console.log(`[AppService] Patched XDG_DATA_DIRS with: ${added.join(", ")}`)
+        }
+    }
+
+    private watchAppDirs() {
+        const home = GLib.get_home_dir()
+        const dirs = [
+            "/usr/share/applications",
+            "/usr/local/share/applications",
+            `${home}/.local/share/applications`,
+            "/var/lib/flatpak/exports/share/applications",
+            `${home}/.local/share/flatpak/exports/share/applications`,
+            "/var/lib/snapd/desktop/applications",
+        ]
+
+        const debouncedReload = () => {
+            if (this.reloadTimer !== null) GLib.source_remove(this.reloadTimer)
+            this.reloadTimer = GLib.timeout_add(GLib.PRIORITY_LOW, 1500, () => {
+                this.reloadTimer = null
+                this.reload()
+                this.emitStructural()
+                return GLib.SOURCE_REMOVE
+            })
+        }
+
+        for (const path of dirs) {
+            if (!GLib.file_test(path, GLib.FileTest.IS_DIR)) continue
+            try {
+                const dir = Gio.File.new_for_path(path)
+                const monitor = dir.monitor_directory(Gio.FileMonitorFlags.NONE, null)
+                monitor.connect("changed", (_m: any, _file: any, _other: any, eventType: number) => {
+                    // Only react to structural changes (files appearing or disappearing)
+                    const ev = Gio.FileMonitorEvent
+                    if (eventType === ev.CREATED || eventType === ev.DELETED ||
+                        eventType === ev.RENAMED || eventType === ev.MOVED_IN ||
+                        eventType === ev.MOVED_OUT) {
+                        console.log(`[AppService] Desktop dir changed (${path}), reloading in 1.5s...`)
+                        debouncedReload()
+                    }
+                })
+                this.monitors.push(monitor) // hold reference to prevent GC
+            } catch (e) {
+                // dir exists but isn't monitorable (permissions, etc.) — skip silently
+            }
+        }
+    }
+
+    connect(callback: () => void) {
+        this.listeners.add(callback)
+        return () => this.listeners.delete(callback)
+    }
+
+    /** Fires only on structural changes (app install/uninstall via file watcher), not on boot scans or theme changes. */
+    connectStructural(callback: () => void) {
+        this.structuralListeners.add(callback)
+        return () => this.structuralListeners.delete(callback)
+    }
+
+    /**
+     * Fires once per USER launch — dock click, app grid, Prism, iPad tile, IPC
+     * `launchApp`. `recordLaunch` is the choke point: every launch site calls it
+     * exactly once, and the dock's focus/cycle/minimize paths never reach it, so
+     * a launch signal here is a launch and nothing else. Bar's iPad fullscreen
+     * handoff arms from it (a slow starter like Sober/Wine takes far longer than
+     * any fixed window to show a window, so the handoff keys on the launch, not
+     * the clock alone). The frequency record stays the only other thing
+     * `recordLaunch` does.
+     */
+    connectLaunch(callback: (id: string) => void) {
+        this.launchListeners.add(callback)
+        return () => this.launchListeners.delete(callback)
+    }
+
+    private emitLaunch(id: string) {
+        this.launchListeners.forEach(cb => cb(id))
+    }
+
+    private emit() {
+        this.listeners.forEach(cb => cb())
+    }
+
+    private emitStructural() {
+        this.structuralListeners.forEach(cb => cb())
+    }
+
+    /** Returns true if the app ID is currently installed and tracked in the registry. */
+    hasApp(id: string): boolean {
+        if (!id) return false
+        const k = id.toLowerCase().replace(/\.desktop$/, "").split("/").pop()!
+        return this.cache.has(k)
+    }
+
+    /** Resolves an icon name or path to what should be passed to Gtk.Image. Public for Settings UI. */
+    getCanonicalIconName(n: string): string | null { return this.getCanonicalName(n) }
+
+    /**
+     * Resolve an ordered icon-name chain with THEME-FIRST semantics. Plain
+     * getIconName(array) exhausts the full fallback depth per name (hicolor,
+     * pixmaps) before trying the next name; here a later name in the active
+     * theme always wins over an earlier name that only exists in deep
+     * fallbacks. Entries may be absolute paths: they act as the final custom
+     * fallback and are only reached in pass 2.
+     * Used by the dock's special items (Files / Launcher / Trash).
+     */
+    resolveIconChain(names: string[]): string | null {
+        const theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+        // Pass 1: explicit user overlay first (deliberate override), then the
+        // active icon theme (includes hicolor inherits).
+        for (const n of names) {
+            if (n.startsWith("/")) continue
+            const overlay = this.getIconOverridePath(this.iconOverlayKey(n))
+            if (overlay) return overlay
+            if (theme.has_icon(n)) {
+                // The other exit that hands back a themed NAME, so it needs the same
+                // guard as getCanonicalName's — see svgCarriesText.
+                const p = theme.lookup_icon(n, null, 48, 1, iconDirection(), 0)?.get_file()?.get_path()
+                return this.svgCarriesText(p) ? p! : n
+            }
+        }
+        // Pass 2: full per-name fallback chain (hicolor, pixmaps), and
+        // absolute-path entries as shipped-asset fallbacks.
+        for (const n of names) {
+            if (n.startsWith("/")) return GLib.file_test(n, GLib.FileTest.EXISTS) ? n : null
+            const res = this.getIconName(n)
+            if (res && res !== "image-missing") return res
+        }
+        return null
+    }
+
+    /** Extracts the overlay key from an icon name or absolute path. E.g. "/usr/share/pixmaps/foo.png" → "foo" */
+    private iconOverlayKey(n: string): string {
+        if (!n.startsWith("/")) return n
+        return n.split("/").pop()!.replace(/\.(svg|png|xpm|jpg)$/i, "")
+    }
+
+    /** tech-debt #90: handing GTK a themed icon NAME is what crashes the shell.
+     *
+     *  `Gtk.Image` + `icon_name` goes through GtkIconHelper, whose
+     *  `invalidate_for_change()` preloads once the CSS size settles — and preload
+     *  means `GTK_ICON_LOOKUP_PRELOAD`, which is the ONE flag that sends the load to
+     *  a GTask worker. If the file behind the name is an SVG containing `<text>`,
+     *  GTK 4.22's own SVG renderer rasterises that text through Pango on that
+     *  worker while the main thread is also in Pango, and Pango's font map and
+     *  Cairo's scaled-font cache are not thread-safe. It killed the whole shell
+     *  twice (cores 2026-08-24 and 2026-08-29, the second one 101 s after boot).
+     *
+     *  A PATH does not have that problem: callers turn a path into a `Gio.FileIcon`,
+     *  and `gtk_icon_theme_lookup_by_gicon()` answers a GFileIcon with
+     *  `gtk_icon_paintable_new_for_file()`, which never reaches the worker. That is
+     *  measured, not assumed — `scripts/dev/icon-text-race.js` in `MODE=file` drives
+     *  376k glyph draws through this exact path on ONE thread and survives, while
+     *  `MODE=name` crashes 5 runs out of 6.
+     *
+     *  ⚠️ So this diverts ONLY the icons that carry text, and every other icon keeps
+     *  its name and keeps the preload. Dropping the name path wholesale would move
+     *  dozens of icon loads back onto the main thread at grid-open, which is the
+     *  hitch that flag exists to hide.
+     *
+     *  Keyed by PATH rather than by icon name on purpose: a path means the same file
+     *  whatever the active icon theme is, so this cache cannot go stale when
+     *  `ThemeManager` switches themes — the name → path step is redone by the lookup
+     *  that was happening anyway. */
+    private svgTextCache = new Map<string, boolean>()
+    private svgCarriesText(path: string | null | undefined): boolean {
+        if (!path || !path.endsWith(".svg")) return false
+        const cached = this.svgTextCache.get(path)
+        if (cached !== undefined) return cached
+        let hit = false
+        try {
+            const [ok, bytes] = GLib.file_get_contents(path)
+            hit = ok && new TextDecoder().decode(bytes).includes("<text")
+        } catch (e) { /* unreadable icon: treat as safe and let GTK deal with it */ }
+        this.svgTextCache.set(path, hit)
+        return hit
+    }
+
+    private getCanonicalName(n: string): string | null {
+        if (!n || n === "void") return null
+
+        // For absolute paths, check overlay using basename before returning the path directly
+        if (n.startsWith("/") || n.startsWith("file://")) {
+            const key = this.iconOverlayKey(n)
+            const overlayHit = this.getIconOverridePath(key)
+            if (overlayHit) return overlayHit
+            return n
+        }
+
+        const theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+
+        // Veltrix icon overlay — checked before system theme
+        const overlayBase = `${GLib.get_home_dir()}/.local/share/icons/veltrix`
+        const extensions = [".svg", ".png", ""]
+        for (const ext of extensions) {
+            const path = `${overlayBase}/scalable/apps/${n}${ext}`.replace("//", "/")
+            if (GLib.file_test(path, GLib.FileTest.EXISTS)) return path
+            // Try flat fallback
+            const flat = `${overlayBase}/${n}${ext}`.replace("//", "/")
+            if (GLib.file_test(flat, GLib.FileTest.EXISTS)) return flat
+        }
+
+        // Native GTK theme resolution
+        if (theme.has_icon(n)) {
+            const paintable = theme.lookup_icon(n, null, 48, 1, iconDirection(), 0)
+            const path = paintable?.get_file()?.get_path()
+            // Pixmap icons: return the file path directly so callers can render them at any size
+            if (path?.includes("/usr/share/pixmaps")) return path
+            // An SVG carrying <text> must not travel as a NAME — see svgCarriesText.
+            if (this.svgCarriesText(path)) return path!
+            // Themed icon: return the name and let GTK resolve at whatever size is needed
+            return n
+        }
+
+        // No filesystem sweep here. There used to be one — the active theme's
+        // directory, hicolor and /usr/share/pixmaps, walked by hand over a fixed
+        // list of subdirectories — and it rescued NOTHING, because it re-asked a
+        // question GTK had already answered properly.
+        //
+        // Measured over the 71 distinct `Icon=` values of this host's .desktop
+        // files, against four installed themes: GTK's own lookup answers 71/71
+        // (Papirus, Colloid, MacTahoe) and 70/71 (Adwaita), and the sweep saved
+        // 0 in every run. `/usr/share/pixmaps` needs no help either — GTK 4 already
+        // carries it in the default search path, along with the Flatpak and Snap
+        // exports, so the four apps whose icon sits loose there (antigravity,
+        // nwg-look, pinentry, stoken-gui) resolve through `has_icon` above.
+        //
+        // 🔑 Why it could never have worked: a directory walk answers "is there a
+        // file at this path", and GTK answers "what does this theme resolve, via
+        // its Inherits chain". A theme that keeps app icons in 64x64/apps, or
+        // inherits the icon from another theme, is invisible to the walk and
+        // ordinary to GTK — so the sweep was both useless and quietly wrong about
+        // what "the active theme has no icon for this" means.
+        //
+        // Steam fallback: handles steam_icon_APPID (from .desktop Icon= field) and
+        // steam_app_APPID (Hyprland window class when no .desktop file exists).
+        // Steam stores per-game icons as hash-named JPEGs in its own appcache — outside
+        // the XDG icon theme, so the GTK lookup above never finds them for most games.
+        const steamMatch = n.match(/^steam_(icon|app)_(\d+)$/i)
+        if (steamMatch) {
+            const appId = steamMatch[2]
+            if (steamMatch[1].toLowerCase() === "app") {
+                // Re-enter with the standard icon name so the full chain runs for it
+                return this.getCanonicalName(`steam_icon_${appId}`)
+            }
+            // steam_icon_APPID: find the hash-named icon file in Steam's librarycache.
+            // Each APPID dir contains a small (≤10 KB) 40-char hex-named .jpg that is the
+            // dock/taskbar icon, plus large artwork files with fixed names.
+            const cacheBases = [
+                `${GLib.get_home_dir()}/.local/share/Steam/appcache/librarycache`,
+                `${GLib.get_home_dir()}/.steam/steam/appcache/librarycache`,
+            ]
+            const knownArtwork = new Set(["header.jpg", "library_600x900.jpg", "library_hero.jpg", "library_hero_blur.jpg", "logo.png"])
+            for (const base of cacheBases) {
+                const cacheDir = `${base}/${appId}`
+                if (!GLib.file_test(cacheDir, GLib.FileTest.EXISTS)) continue
+                try {
+                    const gDir = Gio.File.new_for_path(cacheDir)
+                    const enumerator = gDir.enumerate_children("standard::name,standard::type,standard::size", Gio.FileQueryInfoFlags.NONE, null)
+                    let info
+                    let best: { path: string; size: number } | null = null
+                    while ((info = enumerator.next_file(null))) {
+                        const fname = info.get_name()
+                        if (info.get_file_type() !== Gio.FileType.REGULAR) continue
+                        if (knownArtwork.has(fname)) continue
+                        if (!/^[0-9a-f]{40}\.(jpg|png)$/i.test(fname)) continue
+                        const size = info.get_size()
+                        if (!best || size < best.size) best = { path: `${cacheDir}/${fname}`, size }
+                    }
+                    if (best) return best.path
+                } catch (e) { }
+            }
+        }
+
+        return null
+    }
+
+    reload() {
+        if (this.isReloading) return // prevent concurrent reload
+        this.isReloading = true
+
+        console.log("[AppService] Synchronizing Registry...")
+        const start = Date.now()
+        this.cache.clear()
+        this.nameMap.clear()
+        this.wmMap.clear()
+
+        const apps = Gio.AppInfo.get_all()
+        const visitedIds = new Set<string>()
+
+        apps.forEach(app => {
+            // Canonical ID from GIO, fallback to desktop filename
+            const rawId = app.get_id() || (app as any).get_filename?.()?.split("/").pop() || ""
+            const id = rawId.replace(".desktop", "")
+            if (!id || visitedIds.has(id.toLowerCase())) return
+            visitedIds.add(id.toLowerCase())
+
+            const icon = app.get_icon()
+            let canonical: string | null = null
+            // The `Icon=` field as written. get_string() is a GDesktopAppInfo method:
+            // everything Gio.AppInfo.get_all() returns is one, but a defensive `?.`
+            // keeps a non-desktop entry from taking the whole registry down with it.
+            let rawIcon: string = (app as any).get_string?.("Icon") || ""
+
+            if (icon instanceof Gio.ThemedIcon) {
+                // Bypass nameMap (mid-build during reload) — resolve directly from GTK theme.
+                // Using getIconName here would pick up contaminated nameMap entries from
+                // apps processed earlier in this loop (e.g. a Steam game shortcut setting
+                // nameMap["steam"] before steam.desktop is reached).
+                for (const n of icon.get_names()) {
+                    const resolved = this.getCanonicalName(n)
+                    if (resolved) { canonical = resolved; break }
+                }
+            } else if (icon instanceof Gio.FileIcon) {
+                canonical = icon.get_file().get_path()
+            }
+            if (!rawIcon) {
+                // No keyfile to read it from: fall back to whatever the GIcon carries.
+                rawIcon = icon instanceof Gio.ThemedIcon ? (icon.get_names()[0] || "")
+                    : icon instanceof Gio.FileIcon ? (icon.get_file().get_path() || "")
+                    : ""
+            }
+
+            let wmClass: string | null = null
+            const desktopPath = (app as any).get_filename?.()
+            if (desktopPath) {
+                try {
+                    const content = readFile(desktopPath)
+                    const wmMatch = content.match(/^StartupWMClass=(.*)$/m)
+                    if (wmMatch) wmClass = wmMatch[1].trim().toLowerCase()
+                } catch (e) { }
+            }
+
+            const data: AppData = {
+                id: id, // V94.2: PRESERVE ORIGINAL CASE (Critical for gtk-launch)
+                name: app.get_name(),
+                // Extract the binary name from the executable string
+                exec: app.get_executable()?.split(" ")[0].split("/").pop()?.replace(/["']/g, "").toLowerCase() || "",
+                icon: canonical,
+                wmClass: wmClass,
+                rawIcon,
+                keywords: (app as any).get_keywords?.() || [],
+                visible: app.should_show(),
+            }
+
+            this.cache.set(id.toLowerCase(), data)
+            this.gAppCache.set(id.toLowerCase(), app as any)
+
+            if (data.wmClass) {
+                this.nameMap.set(data.wmClass, canonical!)
+                this.wmMap.set(data.wmClass, id.toLowerCase())
+            } else if (data.exec && !this.nameMap.has(data.exec)) {
+                // Don't overwrite: apps sharing the same executable (e.g. Steam game
+                // shortcuts all have exec="steam") would replace the real app's icon.
+                // wmClass entries (the branch above) always win and may overwrite later.
+                this.nameMap.set(data.exec, canonical!)
+            }
+
+            if (canonical) this.nameMap.set(id.toLowerCase(), canonical)
+        })
+
+        this.applyOverrides()
+        console.log(`[AppService] Registry synced. ${this.cache.size} apps, ${this.nameMap.size} names cached in ${Date.now() - start}ms.`)
+        this.isReloading = false
+        this.emit()
+    }
+
+    private applyOverrides() {
+        // Static overrides removed — configure via .desktop files instead
+    }
+
+    /**
+     * WHICH APP a Hyprland window belongs to — identity, nothing else.
+     *
+     * **Every surface that shows something per-window must normalize through this
+     * before asking for an icon, a name, or anything else.** A surface that skips
+     * the step silently renders the generic app glyph and disagrees with the dock
+     * about what the same window is; that is exactly what the workspace overview
+     * did until 2026-08-02.
+     *
+     * It used to carry a remap, and that remap is GONE rather than renamed. The
+     * shell's own regular windows arrived as `io.Astal.ags` — AGS's application
+     * id, which no icon theme has art for — so this function translated it to
+     * `veltrix-settings` and every caller that forgot to ask paid for it. Since
+     * the AGS host went, those windows declare `veltrix-settings` themselves
+     * (`ui/lib/veltrix-kit/platform/app-id.ts`), which is a real entry in the desktop registry, so
+     * there is nothing left to special-case. Keep going through this function
+     * anyway: the case folding is still load-bearing, and the day some other
+     * window needs translating this is where it goes.
+     *
+     * The remap took a latent bug with it. Its guard read
+     * `if (key.includes("ags") && rawClass !== "io.Astal.ags") return null` — a
+     * SUBSTRING test meant to hide our own surfaces (which are layer-shell and
+     * never appear in `hyprctl clients` anyway), so any third-party window whose
+     * class happened to contain those three letters was dropped from the dock and
+     * the overview entirely.
+     */
+    resolveWindowApp(rawClass: string): string | null {
+        if (!rawClass) return null
+        return rawClass.toLowerCase()
+    }
+
+    /**
+     * The NAME a window's app goes by: its desktop entry's `Name=`, in the user's
+     * language — exactly what the app grid labels it. The bar's app title says this and
+     * nothing else (the window's own title lives in its title bar).
+     *
+     * The class first, then the class it was born with: an app that renames its window
+     * class after mapping still has the entry it launched from. Same lookup as the dock
+     * (`getAppInfo`: id, then `StartupWMClass`, then variants), so the two never name one
+     * window differently. A window no entry claims shows its class, capitalised.
+     */
+    appNameForWindow(win: { class?: string; initialClass?: string }): string {
+        const id = this.appIdForWindow(win)
+        const name = id ? this.getAppInfo(id)?.get_name() : null
+        if (name) return name
+        const cls = win.class || win.initialClass || ""
+        return cls.charAt(0).toUpperCase() + cls.slice(1)
+    }
+
+    /** The desktop id (no `.desktop`) of the entry a window belongs to, or null when no
+     *  entry claims it — the lookup behind `appNameForWindow`. */
+    appIdForWindow(win: { class?: string; initialClass?: string }): string | null {
+        for (const cls of [win.class, win.initialClass]) {
+            const info = this.getAppInfo(this.resolveWindowApp(cls || "") || "")
+            const id = info?.get_id()
+            if (id) return id.replace(/\.desktop$/, "")
+        }
+        return null
+    }
+
+    /**
+     * Which DOCK SLOT a Hyprland window belongs to = `resolveWindowApp` plus the
+     * dock's own groupings. Deliberately NOT the same question as identity: the
+     * dock collapses every file manager into its single Home/Finder shortcut, so
+     * a Nautilus window answers "home-shortcut" here and "org.gnome.nautilus"
+     * above. Only the dock wants this; anything asking "what app is this?" wants
+     * `resolveWindowApp` (asking this one would draw Nautilus as the Home icon).
+     */
+    resolveHyprlandClass(rawClass: string): string | null {
+        const app = this.resolveWindowApp(rawClass)
+        if (!app) return null
+        return FILE_MANAGER_CLASSES.includes(app) ? "home-shortcut" : app
+    }
+
+    /**
+     * True for the placeholder glyphs a theme hands back when it does NOT know the
+     * app (`application-x-executable`, `image-missing`, the `*-x-generic` family…).
+     * Public because these arrive from OUTSIDE the icon theme too — PipeWire hands
+     * us `application-x-executable-symbolic` for a client that declared no icon —
+     * and a caller that treats one as a real answer stops looking and renders it.
+     */
+    isGenericIconName(name: string): boolean {
+        return !!name && BAD_ICONS.some(f => name.includes(f))
+    }
+
+    /**
+     * Resolves an icon name or GIcon to an absolute path or valid theme icon name.
+     */
+    getIconName(key: any): string | null {
+        if (!key) return null
+
+        // Safe handling for non-string GIcon inputs
+        if (typeof key !== "string" && !Array.isArray(key)) {
+            try {
+                if (key instanceof Gio.ThemedIcon) {
+                    return this.getIconName(key.get_names())
+                }
+                if (key instanceof Gio.FileIcon) {
+                    return key.get_file().get_path()
+                }
+                // Fallback for generic GIcon
+                if (key.to_string) return this.getIconName(key.to_string())
+            } catch (e) {
+                console.error("[AppService] GIcon resolution failed:", e)
+            }
+        }
+
+        // Handle array of fallbacks
+        if (Array.isArray(key)) {
+            for (const k of key) {
+                const res = this.getIconName(k)
+                if (res) return res
+            }
+            return null
+        }
+
+        if (key === "void") return null
+        const k = key.toLowerCase().replace(".desktop", "")
+        let hit = this.nameMap.get(k) || this.getCanonicalName(key)
+
+        // Deprioritize pixmaps — prefer themed icons
+        const isPixmap = hit && hit.includes("/usr/share/pixmaps")
+        const isGeneric = hit && BAD_ICONS.some(f => hit!.includes(f))
+
+        if (isPixmap || isGeneric) {
+            const deep = this.getCanonicalName(k)
+            if (deep && !deep.includes("/usr/share/pixmaps") && !BAD_ICONS.some(f => deep.includes(f))) {
+                hit = deep
+            }
+        }
+
+        if (hit && hit.includes("veltrix")) {
+            console.log(`[AppService] Resolved '${key}' -> overlay icon: ${hit}`)
+        }
+
+        if (hit) this.nameMap.set(k, hit)
+        return hit
+    }
+
+    /**
+     * Resolve an icon from a HUMAN-FACING app name — PipeWire's `application.name`,
+     * a notification's `app_name`, anything a third party typed for a person to read.
+     * Use this instead of `getIconName()` whenever the string is a display name
+     * rather than a desktop ID / WM_CLASS / icon name.
+     *
+     * REGISTRY FIRST, icon theme second — that order is the whole point. A display
+     * name is an ordinary word, and a theme will happily answer an ordinary word
+     * with something unrelated: on Colloid, `clocks` is a symlink to
+     * `preferences-system-time`, so a raw `has_icon("clocks")` returns the date &
+     * time settings gear. It does not fail — it SUCCEEDS with the wrong art, and
+     * nothing logs. The registry knows "Clocks" is `org.gnome.clocks.desktop` with
+     * `Icon=org.gnome.clocks`, which the theme also has. Ask it first.
+     */
+    iconForAppName(name: string): string | null {
+        if (!name) return null
+        const info = this.getAppInfo(name)
+        const entryIcon = info?.get_icon?.() ?? null
+        if (entryIcon) {
+            const resolved = this.getIconName(entryIcon)
+            if (resolved) return resolved
+        }
+        // No registry match (a stream from something with no desktop entry) —
+        // the raw name is all we have left, theme collisions and all.
+        return this.getIconName(name)
+    }
+
+    getAppData(id: string): AppData | null {
+        return this.cache.get(id.toLowerCase()) || null
+    }
+
+    /**
+     * Where an app comes from, read off its desktop entry — the question Settings →
+     * Apps answers with "Isolated" / "Not isolated" (#535).
+     *
+     * - `flatpak`: the entry carries `X-Flatpak` (Flatpak writes it into every export;
+     *   the launcher keys on the same field). The only origin that is SANDBOXED.
+     * - `snap`: the entry lives under snapd's export dir. Confinement varies per snap,
+     *   so it is reported as its own origin and never labelled isolated or not.
+     * - `user`: the entry lives in the user's own data dir (~/.local/share/applications)
+     *   — an app somebody put there by hand or with a per-user installer. Calling it a
+     *   "system package" would be wrong (this machine's Claude Desktop is one).
+     * - `system`: anywhere else — a distribution package.
+     */
+    getAppOrigin(lid: string): "flatpak" | "snap" | "user" | "system" | "unknown" {
+        const info = this.getAppInfo(lid)
+        if (!info) return "unknown"
+        try { if (info.get_string?.("X-Flatpak")) return "flatpak" } catch (e) { /* not keyfile-backed */ }
+        const file: string = info.get_filename?.() ?? ""
+        if (file.includes("/snapd/")) return "snap"
+        if (file.startsWith(GLib.get_user_data_dir())) return "user"
+        return file ? "system" : "unknown"
+    }
+
+    /** The Flatpak ref name an entry launches (`X-Flatpak`), or null for anything that is not a Flatpak. */
+    getFlatpakId(lid: string): string | null {
+        try { return this.getAppInfo(lid)?.get_string?.("X-Flatpak") || null } catch (e) { return null }
+    }
+
+    /**
+     * Finds the DesktopAppInfo for any identifier: desktop ID, WM_CLASS, or variant.
+     */
+    getAppInfo(lid: string): any | null {
+        if (!lid) return null
+
+        // Normalize to basename without .desktop extension
+        // We ensure that if we get a full path, we extract the ID (e.g. org.gnome.Nautilus)
+        const q = lid.toLowerCase()
+            .split("/").pop()! // Get filename
+            .replace(".desktop", "") // Remove extension
+
+        // 1. Exact ID match (case-insensitive)
+        let info = this.gAppCache.get(q)
+        if (info) return info
+
+        // 2. WM_CLASS match
+        const idFromWm = this.wmMap.get(q)
+        if (idFromWm) return this.gAppCache.get(idFromWm) || null
+
+        // 3. Search for best match in cache
+        let execMatch = null   // exec/name match — lower priority than id/wmClass
+        let fallbackMatch = null
+        for (const [id, data] of this.cache.entries()) {
+            // Handle prefixed IDs like "org.telegram" -> "org.telegram.desktop"
+            const match = id === q || id.startsWith(q + ".") || id.startsWith(q + "-")
+            if (match) return this.gAppCache.get(id) || null
+
+            // WM_CLASS is authoritative
+            if (data.wmClass === q) return this.gAppCache.get(id) || null
+
+            // exec/name matches: collect the first hit but prefer an exact id match above.
+            // Multiple apps can share the same executable (e.g. every Steam game shortcut
+            // has exec="steam"), so we don't return immediately — keep looking for a better id match.
+            if (!execMatch && (data.exec === q || data.name.toLowerCase() === q)) {
+                execMatch = this.gAppCache.get(id) || null
+            }
+
+            // Substring fallback (only if nothing better found)
+            if (id.includes(q) && !fallbackMatch) {
+                fallbackMatch = this.gAppCache.get(id) || null
+            }
+        }
+
+        return execMatch || fallbackMatch
+    }
+
+    /**
+     * Shell command that launches an app reliably regardless of install origin.
+     * Single source for every launch path (dock click, dock menu, app grid).
+     *
+     * - Flatpak (desktop entry has X-Flatpak): `flatpak run <id>`. gtk-launch is a
+     *   trap here — these entries are DBusActivatable and the session bus only
+     *   indexes flatpak's exported D-Bus .service files if it started with the
+     *   flatpak dirs in XDG_DATA_DIRS (false right after installing flatpak, and
+     *   login-order-fragile); the activation request then dies silently (exit 0,
+     *   no window). Verified live 2026-06-12.
+     * - Everything else: `gtk-launch <desktop-id>` (Gio handles field codes,
+     *   Terminal=, etc.). Never parse Exec= by hand.
+     */
+    getLaunchCommand(lid: string): string {
+        const info = this.getAppInfo(lid)
+        try {
+            const fpId = info?.get_string?.("X-Flatpak")
+            if (fpId) return `flatpak run ${GLib.shell_quote(fpId)}`
+        } catch (e) { /* not a keyfile-backed entry — fall through */ }
+        const entry = info?.get_id?.() || lid
+        return `gtk-launch ${GLib.shell_quote(entry)}`
+    }
+
+    /**
+     * The id the XDG portal will know this app by — its desktop-entry id without
+     * `.desktop`, or "" when there is no entry.
+     *
+     * 🔑 The portal does not ask an unsandboxed app who it is: it reads the systemd
+     * unit the process lives in, accepts only `app-<launcher>-<id>-<random>.scope`
+     * (or `…@<random>.service`), and only when `<id>.desktop` exists. Measured
+     * 2026-09-13 with a probe impl backend on a private bus, scope name → app_id:
+     *   app-Hyprland-sh-…                      → ''   (what every launch path produced)
+     *   app-Hyprland-kitty-…                   → 'kitty'
+     *   app-Hyprland-google\x2dchrome-…        → 'google-chrome'
+     *   app-Hyprland-nonexistent.app.Id-…      → ''   (no .desktop)
+     *   dbus-:1.1-org.gnome.Nautilus@….service → ''   (D-Bus activation)
+     * Every per-app portal decision — permissions, background, global shortcuts,
+     * which REQUIRE an id — is keyed by it.
+     */
+    portalAppId(lid: string): string {
+        const info = this.getAppInfo(lid)
+        return (info?.get_id?.() ?? "").replace(/\.desktop$/, "")
+    }
+
+    /**
+     * The argv that launches an app — THE launch, for every path that starts one
+     * (dock click, dock menu, app grid, Prism, `launchApp`).
+     *
+     * `uwsm app -- <id>.desktop` does three things the old
+     * `uwsm app -- sh -c "gtk-launch <id>"` did not:
+     *  - names the unit after the ENTRY (`app-Hyprland-<id>@<rand>.service`), so the
+     *    portal identifies the app (see `portalAppId`) — through `sh` it was anonymous;
+     *  - runs `Exec=` itself inside that scope and ignores `DBusActivatable=true`
+     *    (measured: `app-Hyprland-org.gnome.TextEditor-f94d831e.scope`). gtk-launch
+     *    activated such apps over D-Bus, which put the process in a
+     *    `dbus-:1.1-<id>@….service` the portal also reads as anonymous — 12 entries on
+     *    the maintainer's machine, Nautilus and Text Editor among them;
+     *  - for that same reason sidesteps the Flatpak trap `getLaunchCommand` documents
+     *    (a DBusActivatable flatpak entry whose activation dies silently), because
+     *    the entry's own `Exec=flatpak run …` is executed, not activated.
+     * `cd $HOME` so the app does not inherit the shell's CWD (ui/shell).
+     *
+     * 🔑 `-t service`, not uwsm's default scope (2026-09-27, #654). A scope runs the
+     * app IN PLACE: its parent was the shell, its environment the shell's (that is
+     * how `GTK_THEME=Empty` left every app unthemed, and how the shell's own
+     * `INVOCATION_ID`/`MEMORY_PRESSURE_WATCH`/`GDK_BACKEND=wayland` still reached
+     * them), and its stdout/stderr came back to the `execAsync` that launched it —
+     * which ACCUMULATES them in the shell's memory until the app exits. A service
+     * is started by systemd: the session's environment, the journal for output,
+     * systemd as parent, and `uwsm app` returns as soon as the app is running.
+     * Measured: +4 ms per launch (88 → 92), and the portal still gets the app id
+     * from `app-Hyprland-<id>@<rand>.service`. uwsm makes it `Type=exec` +
+     * `ExitType=cgroup`, so the unit lives while ANY process of the app does.
+     *
+     * An id with no desktop entry (a bare command) keeps the old path.
+     */
+    getLaunchArgv(lid: string): string[] {
+        const entry = this.getAppInfo(lid)?.get_id?.() ?? ""
+        const inner = entry.endsWith(".desktop")
+            ? `uwsm app -t service -- ${GLib.shell_quote(entry)}`
+            : `uwsm app -t service -- ${this.getLaunchCommand(lid)}`
+        return ["sh", "-c", `cd "$HOME" && exec ${inner}`]
+    }
+
+    /**
+     * Returns the launch command for the system's default file manager.
+     */
+    getDefaultFileManagerCommand(): string {
+        try {
+            const app = Gio.AppInfo.get_default_for_type("inode/directory", false)
+            if (app) {
+                const cmd = app.get_commandline()
+                if (cmd) return cmd.replace(/\s*["']?%[a-zA-Z]["']?/g, "").trim()
+            }
+        } catch (e) {
+            console.error("[AppService] Failed to get default file manager:", e)
+        }
+        return "xdg-open ." // Absolute fallback (Terminal-safe)
+    }
+
+    /**
+     * Resolves a full app record from any identifier.
+     * Combines getAppInfo, getAppData, and browser-specific ID normalization.
+     */
+    getResolvedApp(lid: string | null | undefined) {
+        if (!lid) return null
+        
+        const id = lid.toLowerCase().replace(".desktop", "").trim()
+        const info = this.getAppInfo(id)
+        const data = this.getAppData(id)
+
+        if (!info && !data) return null
+
+        // 1. Determine the Best Icon (The "Dock Logic")
+        let iconName: any = data?.icon || info?.get_icon() || "application-x-executable"
+        
+        // CHROME ID HACK (Synced with Dock)
+        if (typeof iconName === "string" && id.startsWith("chrome-") && id.endsWith("-default")) {
+            iconName = iconName.replace(/-default$/i, "-Default")
+        }
+
+        return {
+            id: data?.id || info?.get_id()?.replace(".desktop", "") || id,
+            name: data?.name || info?.get_name() || id,
+            icon_name: iconName,
+            get_id: () => data?.id || info?.get_id() || id,
+            get_name: () => data?.name || info?.get_name() || id,
+            get_icon: () => info?.get_icon(),
+            launch: () => {
+                const launchId = data?.id || info?.get_id() || id
+                appFrequency.recordLaunch(launchId)
+                const freshInfo = this.getAppInfo(launchId)
+                let command = freshInfo?.get_commandline() || data?.exec || launchId
+                // Absolute Isolation Sanitization
+                command = command.replace(/\s*["']?%[a-zA-Z]["']?/g, "").trim()
+                // `-a`: the unit name is what the XDG portal identifies the app by — see portalAppId;
+                // `-t service`: see getLaunchArgv.
+                const scopeId = (freshInfo?.get_id?.() ?? "").replace(/\.desktop$/, "")
+                const nameArg = scopeId ? `-a ${GLib.shell_quote(scopeId)} ` : ""
+                spawnCommandLine(`uwsm app -t service ${nameArg}-- sh -c ${GLib.shell_quote(command)}`)
+            }
+        }
+    }
+
+    /**
+     * Record a launch for frequency tracking with temporal decay.
+     * Also the launch signal's choke point (see `connectLaunch`).
+     */
+    recordLaunch(id: string): void {
+        appFrequency.recordLaunch(id)
+        this.emitLaunch(id)
+    }
+
+    /**
+     * The WHOLE registry, hidden entries included. This is the identity catalogue —
+     * use it to answer "what app is this window", not "what can I launch".
+     */
+    getAllApps(): AppData[] {
+        return Array.from(this.cache.values()).sort((a, b) => a.name.localeCompare(b.name))
+    }
+
+    /**
+     * What a launcher shows: `should_show()` entries only, sorted by name.
+     * The app grid's whole unfiltered list.
+     */
+    listApps(): AppData[] {
+        return Array.from(this.cache.values())
+            .filter(a => a.visible)
+            .sort((a, b) => a.name.localeCompare(b.name))
+    }
+
+    /**
+     * Launchable apps matching `query`, best first, uncapped. See `core/app-search`
+     * for the ranking — and for what AstalApps' `fuzzy_query` was doing instead.
+     */
+    queryApps(query: string): AppData[] {
+        return rankApps(query, this.listApps(), appFrequency.getFrequencies())
+    }
+
+    // ── Icon Overlay (per-app overrides) ──────────────────────────────────────
+
+    private get overlayAppsDir(): string {
+        return `${GLib.get_home_dir()}/.local/share/icons/veltrix/scalable/apps`
+    }
+
+    /**
+     * Shipped-default icons for the six iPad/Launchpad apps (v5, 2026-11-12),
+     * plus kitty (2026-11-14).
+     *
+     * The DRAWN SVGs are the apps' real icons: `ui/shell/assets/apps/`
+     * (`quran.svg` etc. for the Islamic apps, the Papirus SVGs for
+     * Notes/Photos). Launchpad, the dock and the app grid all resolve
+     * icons through this service, so the icons they show are the ones
+     * filed in the overlay store (`~/.local/share/icons/veltrix/…`),
+     * which `getIconOverridePath` checks before any theme — `.svg`
+     * before `.png`. This seeds that store from the shipped files —
+     * but ONLY where nothing is filed yet: a file the user placed
+     * there (their own override) is never clobbered, and a seed is
+     * never re-copied over it.
+     *
+     * Supersedes the v2–v4 AI-icon seed (dark `*-ai.png`, colorful
+     * `*-color.png`): both AI sets were rejected by Adnan and the
+     * PNGs are gone from the tree. If a machine still carries a
+     * seeded `veltrix-quran.png` from the AI era, the new `.svg`
+     * seed is filed alongside it and wins — `getIconOverridePath`
+     * checks `.svg` first.
+     *
+     * Keyed by the icon NAME the app's .desktop entry declares:
+     *   · Quran/Prayer/Dhikr/Dua — `veltrix-quran` etc. Those apps do not
+     *     exist yet (no .desktop entry, Phase 6/10); the seed is dormant
+     *     until they land, and their .desktop files MUST declare
+     *     `Icon=veltrix-quran` (etc.) for it to take effect — the desktop
+     *     id and the icon name are the same string on purpose.
+     *   · Notes/Photos — the icon names of the programs the iPad panel
+     *     launches (GNOME Notes/Photos, Bijiben, Gnote, Loupe, eog), so
+     *     whichever of them is installed shows the Papirus icon.
+     *   · kitty — the name kitty's own .desktop entry declares
+     *     (`Icon=kitty`). Without this seed the name resolves through
+     *     the icon theme to the cat the kitty package (and WhiteSur)
+     *     ships — an animal in an icon, banned (halal review BLOCKER;
+     *     Adnan, Nov 14 2026: "the cat would its haram logo"). The seed
+     *     files the drawn `>_` terminal glyph under that name, so the
+     *     dock, app grid, overview and Settings all show the plain
+     *     terminal instead of the cat. The iPad tile already drew the
+     *     same file directly (`IPadApps.ts`); this is the same glyph
+     *     everywhere else. Kitty itself is untouched — still the
+     *     default terminal (Super+T), only its picture changes.
+     * Runs in the constructor, before the first `reload()`, so the first
+     * registry scan already resolves the shipped icons.
+     */
+    private seedShippedIconDefaults(): void {
+        const shipped: Array<[string[], string]> = [
+            [["veltrix-quran"], "quran.svg"],
+            [["kitty"], "terminal.svg"],
+            [["veltrix-prayer"], "prayer.svg"],
+            [["veltrix-dhikr"], "dhikr.svg"],
+            [["veltrix-dua"], "dua.svg"],
+            [["org.gnome.Notes", "bijiben", "gnote"], "org.gnome.Notes.svg"],
+            [["org.gnome.Photos", "org.gnome.Loupe", "eog"], "org.gnome.Photos.svg"],
+        ]
+        for (const [names, file] of shipped) {
+            const src = `${SHELL_ROOT}/assets/apps/${file}`
+            if (!GLib.file_test(src, GLib.FileTest.EXISTS)) continue
+            // Keep the shipped extension: an SVG seed lands as `.svg`
+            // (which getIconOverridePath prefers over a stale `.png`).
+            const ext = file.endsWith(".svg") ? ".svg" : ".png"
+            for (const name of names) {
+                const dest = `${this.overlayAppsDir}/${name}${ext}`
+                if (GLib.file_test(dest, GLib.FileTest.EXISTS)) continue
+                try {
+                    GLib.mkdir_with_parents(this.overlayAppsDir, 0o755)
+                    Gio.File.new_for_path(src).copy(
+                        Gio.File.new_for_path(dest),
+                        Gio.FileCopyFlags.NONE, null, null,
+                    )
+                } catch (e) {
+                    console.warn(`[AppService] could not seed icon ${name}:`, e)
+                }
+            }
+        }
+    }
+
+    /**
+     * Returns the current override file path for the given icon name, or null if none.
+     * Normalizes via iconOverlayKey first: callers may pass a themed name, a raw
+     * desktop-file icon, OR an already-canonicalized absolute path (AppData.icon is
+     * canonicalized to the override path once one exists), and overrides are always
+     * stored under the basename key. iconOverlayKey is idempotent on keys, so internal
+     * callers that already pass a key are unaffected.
+     */
+    getIconOverridePath(iconName: string): string | null {
+        const key = this.iconOverlayKey(iconName)
+        for (const ext of [".svg", ".png"]) {
+            const p = `${this.overlayAppsDir}/${key}${ext}`
+            if (GLib.file_test(p, GLib.FileTest.EXISTS)) return p
+        }
+        return null
+    }
+
+    /**
+     * Sets a per-app icon override.
+     * @param originalIconName  The icon name from the app's .desktop file (e.g. "firefox")
+     * @param sourceIconOrPath  Either a themed icon name (e.g. "web-browser") or an absolute file path
+     * @returns true on success
+     */
+    setIconOverride(originalIconName: string, sourceIconOrPath: string): boolean {
+        GLib.mkdir_with_parents(this.overlayAppsDir, 0o755)
+
+        // Normalize: if originalIconName is an absolute path (FileIcon app), use the basename
+        const overlayKey = this.iconOverlayKey(originalIconName)
+
+        let sourcePath = sourceIconOrPath
+        if (!sourceIconOrPath.startsWith("/")) {
+            // Resolve themed icon name to file path
+            const theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+            const paintable = theme.lookup_icon(sourceIconOrPath, null, 64, 1, iconDirection(), 0)
+            sourcePath = paintable?.get_file()?.get_path() ?? ""
+            if (!sourcePath) return false
+        }
+
+        const ext = sourcePath.toLowerCase().endsWith(".svg") ? ".svg" : ".png"
+        const destPath = `${this.overlayAppsDir}/${overlayKey}${ext}`
+
+        // Remove any existing override first
+        this.removeIconOverride(overlayKey)
+
+        try {
+            Gio.File.new_for_path(sourcePath).copy(
+                Gio.File.new_for_path(destPath),
+                Gio.FileCopyFlags.OVERWRITE, null, null
+            )
+            // GTK4 invalidates icon theme cache automatically
+            this.reload()
+            return true
+        } catch (e) {
+            console.error("[AppService] setIconOverride failed:", e)
+            return false
+        }
+    }
+
+    /** Removes the per-app icon override for the given icon name. */
+    removeIconOverride(iconName: string): boolean {
+        // Same normalization as getIconOverridePath / setIconOverride: a caller may
+        // pass a canonicalized absolute path (AppData.icon), but the file is stored
+        // under the basename key. Without this, Restore silently no-ops on path icons.
+        const key = this.iconOverlayKey(iconName)
+        let removed = false
+        for (const ext of [".svg", ".png"]) {
+            const p = `${this.overlayAppsDir}/${key}${ext}`
+            if (GLib.file_test(p, GLib.FileTest.EXISTS)) {
+                try { Gio.File.new_for_path(p).delete(null); removed = true } catch {}
+            }
+        }
+        if (removed) {
+            // GTK4 invalidates icon theme cache automatically
+            this.reload()
+        }
+        return removed
+    }
+
+    /**
+     * Top matches for a query. Used by the search overlay (Prism) and by the
+     * agent's `launch_app`.
+     *
+     * Same ranking as the app grid (`core/app-search`), so the two surfaces can
+     * never disagree about what "files" means, and the rescue tier `launch_app`
+     * depends on — a query with a word too many — comes with it.
+     *
+     * Ranks the WHOLE registry, hidden entries included, which is the one place
+     * this deliberately differs from `queryApps`. A launcher grid must not put 24
+     * of this machine's 80 entries on screen (portals, URL handlers, pinentry),
+     * but a name someone TYPED is evidence they want that specific thing, and the
+     * agent run that motivated the rescue tier on 2026-08-01 was asking for GTK
+     * Widget Factory — a `NoDisplay=true` entry. Filtering here would have made
+     * the rescue unreachable for the case it was written for.
+     */
+    search(query: string): AppData[] {
+        const ranked = rankApps(query, this.cache.values(), appFrequency.getFrequencies())
+        // A hidden entry that shares its display name with a visible one is a
+        // duplicate, not a second app — `com.google.Chrome.desktop` sits next to
+        // `google-chrome.desktop` on this machine, and "chrom" listed "Google
+        // Chrome" twice, back to back. The visible one is the app; drop the twin.
+        // Only exact-name twins, so a hidden app with a name of its own survives.
+        const visibleNames = new Set(ranked.filter(a => a.visible).map(a => a.name))
+        return ranked.filter(a => a.visible || !visibleNames.has(a.name)).slice(0, 8)
+    }
+}
+
+export const appService = new AppService()
+export default appService

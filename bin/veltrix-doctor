@@ -1,0 +1,202 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-doctor — diagnostic snapshot of a Veltrix installation
+# Installed to /usr/bin/veltrix-doctor
+#
+# One command that gathers everything needed to diagnose a problem or to attach
+# as evidence to a bug report / PR: versions, hardware, compositor state, the
+# shell's own live state (via `veltrix-ipc dumpState`), and recent log errors.
+# Output is Markdown — paste it directly into a GitHub issue or PR body.
+#
+# This is also the agent entry point: an AI agent helping a user should run
+# this FIRST when something misbehaves, and include it when proposing a
+# hardware/compat fix upstream (see the veltrix skill,
+# references/agent-contribution.md — evidence IS the test).
+#
+# Every section degrades gracefully: a missing tool/daemon prints "n/a" instead
+# of aborting, so the report is useful even on a half-broken setup.
+#
+# Usage:  veltrix-doctor            # full report to stdout
+#         veltrix-doctor --log [file]  # only the shell log's warnings since the last
+#                                     # start, grouped and counted (also what CI's
+#                                     # smoke job prints)
+#         veltrix-doctor --report [args]  # collect a bug report and open a
+#                                     # pre-filled GitHub issue (see
+#                                     # bin/veltrix-bug-report; the user reviews
+#                                     # the file and taps send — nothing is
+#                                     # filed automatically)
+# ─────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/veltrix"
+LOG="${XDG_RUNTIME_DIR:-/tmp}/veltrix-ui.log"
+
+# `cmd args…` → run, indent as a code block; print "n/a (reason)" on failure.
+section() { printf '\n## %s\n\n' "$1"; }
+codeblock() {
+    local out
+    if out=$("$@" 2>&1) && [ -n "$out" ]; then
+        printf '```\n%s\n```\n' "$out"
+    else
+        printf '_n/a (`%s` failed or empty)_\n' "$*"
+    fi
+}
+
+# The shell log's CRITICAL/WARNING lines since the shell last started, grouped:
+# one line per kind, most frequent first. A raw tail shows whichever message
+# happened to fire last; a count shows what is actually broken. The log carries
+# every run since login, so it starts at the LAST start marker veltrix-ui wrote.
+# Numbers and addresses are masked to decide what counts as one kind, and the
+# FIRST real message of each kind is what gets printed.
+# Measured 2026-09-27: 2821 texture CRITICALs a day (chevrons broken for days)
+# and a game-mode push failing on every start — both invisible in a tail of 40.
+log_summary() {
+    local file="${1:-$LOG}"
+    [ -r "$file" ] || { echo "n/a (no log at $file)"; return 1; }
+    awk '
+        /veltrix-ui: (DEV mode|bundle)/ { split("", n); split("", shown); k = 0; since = $1 }
+        /(CRITICAL|WARNING) \*\*/ {
+            line = $0
+            sub(/^\([^)]*\): /, "", line)
+            sub(/ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]+:/, "", line)
+            key = line
+            gsub(/0x[0-9a-f]+/, "0x", key); gsub(/[0-9]+/, "N", key)
+            key = substr(key, 1, 160)
+            if (!(key in n)) { keys[++k] = key; shown[key] = substr(line, 1, 200) }
+            n[key]++
+        }
+        END {
+            printf "since %s — %d kind(s)\n", (since ? since : "the start of the log"), k
+            for (i = 1; i <= k; i++) for (j = i + 1; j <= k; j++)
+                if (n[keys[j]] > n[keys[i]]) { t = keys[i]; keys[i] = keys[j]; keys[j] = t }
+            for (i = 1; i <= k; i++) printf "%6d  %s\n", n[keys[i]], shown[keys[i]]
+        }' "$file"
+}
+
+if [ "${1:-}" = "--report" ]; then
+    shift
+    # Prefer the reporter next to this script (dev checkout), else PATH.
+    _here="$(cd "$(dirname "$0")" && pwd)"
+    if [ -x "$_here/veltrix-bug-report" ]; then
+        exec "$_here/veltrix-bug-report" "$@"
+    else
+        exec veltrix-bug-report "$@"
+    fi
+fi
+
+if [ "${1:-}" = "--log" ]; then
+    log_summary "${2:-$LOG}"
+    exit $?
+fi
+
+echo "# Veltrix — diagnostic report ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+
+section "Versions"
+{
+    ver="?"
+    if [ -f "$CONFIG_DIR/.dev" ] && [ -f "$(cat "$CONFIG_DIR/.dev")/VERSION" ]; then
+        ver="$(cat "$(cat "$CONFIG_DIR/.dev")/VERSION") (dev checkout: $(cat "$CONFIG_DIR/.dev"))"
+    elif [ -f /usr/share/veltrix/VERSION ]; then
+        ver="$(cat /usr/share/veltrix/VERSION) (system install)"
+    fi
+    echo '```'
+    echo "veltrix: $ver"
+    echo "hyprland:      $(hyprctl version 2>/dev/null | head -1 || echo n/a)"
+    echo "hyalo:         $(veltrix-hyalo --version 2>/dev/null || echo n/a)"
+    echo "gjs:           $(gjs --version 2>/dev/null || echo n/a)"
+    echo "esbuild:       $(esbuild --version 2>/dev/null || echo n/a)"
+    echo "gtk4:          $(pacman -Q gtk4 2>/dev/null || echo n/a)"
+    echo "kernel:        $(uname -r)"
+    echo "os:            $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo n/a)"
+    echo '```'
+}
+
+section "Content Safety & Audio Filter (halal protections)"
+# Read-only: the LIVE state of the two halal protections, so a report
+# shows drift the Settings toggles cannot — the GSettings bit saying ON
+# while the system layers are partial/off (a failed apply, a hand-edited
+# /etc/hosts, resolved never picking up the drop-in). `status` is the
+# unprivileged verb; the two gsettings reads degrade to n/a where the
+# schemas are not installed. Nothing here changes any protection.
+codeblock sh -c "veltrix-content-safety status 2>/dev/null || echo 'content-safety status: n/a (helper missing)'; echo \"content-filter (org.veltrix.safety): \$(gsettings get org.veltrix.safety content-filter 2>/dev/null || echo n/a)\"; echo \"audio-filter (org.veltrix.halal-audio): \$(gsettings get org.veltrix.halal-audio enabled 2>/dev/null || echo n/a)\""
+
+section "Hardware"
+codeblock sh -c "lspci -nn 2>/dev/null | grep -Ei 'vga|3d|display|network|wireless' ; lscpu 2>/dev/null | grep 'Model name' ; free -h 2>/dev/null | grep Mem"
+
+section "Monitors"
+codeblock sh -c "veltrix-wm monitors 2>/dev/null | head -100"
+
+section "Displays & GPUs (dual-screen)"
+# Each line degrades on its own: which DRM card owns which driver (the card
+# whose driver is nvidia_drm/nouveau owns the HDMI port on a hybrid laptop),
+# the AQ_DRM_DEVICES the session will read (from the uwsm env file, not this
+# shell's env — the doctor may run outside the session), and whether the
+# NVIDIA module is loaded. Without AQ_DRM_DEVICES listing both cards,
+# aquamarine opens only the first DRM device and Hyprland never sees the
+# NVIDIA-wired output at all — no monitor rule can enable what it never sees.
+# Single-quoted on purpose: nothing in the inner script needs the doctor's
+# shell to expand it first.
+codeblock sh -c 'echo "DRM cards (card -> bound driver):"; for c in /sys/class/drm/card[0-9]*; do case ${c##*/} in card[0-9]|card[0-9][0-9]) echo "  ${c##*/}: $(basename $(readlink -f $c/device/driver 2>/dev/null) 2>/dev/null || echo none)";; esac; done; echo "AQ_DRM_DEVICES (from ~/.config/uwsm/env-hyprland):"; aq=$(grep -h "^export AQ_DRM_DEVICES=" ~/.config/uwsm/env-hyprland 2>/dev/null | tail -1); echo "  ${aq:-<unset>}"; lsmod 2>/dev/null | grep -E "^(nvidia|nouveau)" || echo "nvidia/nouveau module: not loaded"'
+
+# Hyalo (#680), only when it is installed: its outputs when it is the running compositor,
+# and the newest crash report it left. A compositor crash ends the session, so the report
+# is all that is left of it by the time anybody runs this — from the next session.
+if command -v veltrix-hyalo >/dev/null 2>&1; then
+    if [ -n "${HYALO_SOCKET:-}" ]; then
+        section "Monitors (Hyalo)"
+        codeblock veltrix-hyalo msg outputs
+    fi
+    hyalo_crashes="${XDG_STATE_HOME:-$HOME/.local/state}/veltrix/hyalo"
+    hyalo_last="$(ls -1 "$hyalo_crashes"/crash-*.txt 2>/dev/null | sort | tail -1)"
+    if [ -n "$hyalo_last" ]; then
+        section "Hyalo: latest crash report ($(ls -1 "$hyalo_crashes"/crash-*.txt | wc -l) kept, $hyalo_last)"
+        codeblock head -60 "$hyalo_last"
+    fi
+fi
+
+section "Bluetooth & screen recording"
+# Each line degrades on its own so one missing tool does not hide the rest:
+# bluetoothd up? radio blocked? a VAAPI driver for wf-recorder's hardware
+# path? the recorder binaries? the render node the hardware gate checks?
+codeblock sh -c "{ if systemctl is-active --quiet bluetooth.service 2>/dev/null; then echo 'bluetooth.service: active'; else echo 'bluetooth.service: inactive'; fi; rfkill list bluetooth 2>/dev/null || echo 'rfkill: n/a'; _d=\$(ls /usr/lib/dri/*_drv_video.so 2>/dev/null | tr '\n' ' '); echo \"VAAPI drivers: \${_d:-none}\"; command -v wf-recorder slurp pactl 2>/dev/null; ls -l /dev/dri/renderD128 2>/dev/null || echo 'renderD128: absent'; } 2>&1"
+
+section "Shell service (systemd --user)"
+codeblock systemctl --user --no-pager status veltrix
+
+section "Shell live state (veltrix-ipc dumpState)"
+codeblock veltrix-ipc dumpState
+
+section "Idle wakeups (main thread, 4 s sample — healthy ≈ 0/s when idle)"
+{
+    # Match the shell's DECODED bundle, whatever named it: scripts/bundle.sh writes
+    # $XDG_RUNTIME_DIR/veltrix-<hash>.js and scripts/run.sh veltrix-run-app.js. (It was
+    # `…/ags.js` until 2026-08-18 — a pattern that silently matched nothing after the
+    # bundler changed, and this section would just print "shell process not found".)
+    SHELL_PID=$(pgrep -u "$(id -u)" -x veltrix-shell | head -1)
+    if [ -z "${SHELL_PID:-}" ]; then
+        # Compatibility with older shells; exclude independent Settings bundles.
+        SHELL_PID=$(pgrep -u "$(id -u)" -f 'gjs -m .*/veltrix-([0-9a-f]+|run-app)\.js' | head -1)
+    fi
+    if [ -n "${SHELL_PID:-}" ]; then
+        TS="/proc/$SHELL_PID/task/$SHELL_PID/status"
+        W1=$(awk '/voluntary/{s+=$2} END{print s}' "$TS" 2>/dev/null)
+        sleep 4
+        W2=$(awk '/voluntary/{s+=$2} END{print s}' "$TS" 2>/dev/null)
+        printf '```\n%s wakeups/s\n```\n' "$(( (W2-W1)/4 ))"
+    else
+        printf '_n/a (shell process not found)_\n'
+    fi
+}
+
+section "Shell log since the last start: warnings by kind"
+codeblock log_summary
+
+section "Recent log errors (last 40 matching lines of $LOG)"
+codeblock sh -c "grep -iE 'error|critical|warning|failed|exception' '$LOG' 2>/dev/null | tail -40"
+
+section "Config layer (what exists in $CONFIG_DIR)"
+codeblock sh -c "ls -la '$CONFIG_DIR' 2>/dev/null"
+
+echo
+echo "_Generated by veltrix-doctor. Personal values (wallpaper, pinned apps,"
+echo "accent) are not included beyond file names; review before posting publicly._"

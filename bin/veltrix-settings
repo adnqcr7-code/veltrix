@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Independent Settings application. No shell reload and no process-wide kill.
+set -euo pipefail
+export VELTRIX_SETTINGS_PROCESS=1 GDK_BACKEND=wayland
+repo="${VELTRIX_SETTINGS_REPO:-}"
+marker="${XDG_CONFIG_HOME:-$HOME/.config}/veltrix/.dev"
+if [ -z "$repo" ] && [ -f "$marker" ]; then repo=$(cat "$marker"); fi
+if [ -n "${VELTRIX_SETTINGS_EXECUTABLE:-}" ]; then
+    exec "$VELTRIX_SETTINGS_EXECUTABLE" "$@"
+elif [ -n "$repo" ] && [ -f "$repo/ui/settings/app.ts" ]; then
+    export VELTRIX_SHELL_ROOT="$repo/ui/shell" VELTRIX_SETTINGS_ROOT="$repo/ui/settings"
+    export VELTRIX_KIT_DIR="$repo/ui/lib/veltrix-kit"
+    # Rebuilding everything cost ~580 ms on EVERY launch (measured 2026-10-17: sass 263,
+    # host 161, bundle 94, kit 60) — more than half of what Settings itself takes to open.
+    # Now only when something changed: a source newer than the stamp, or another commit.
+    # Directories count too, so a deleted or renamed file is seen. Generated sheets are not
+    # sources. VELTRIX_SETTINGS_REBUILD=1 forces it.
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/veltrix/dev-settings"
+    out="$cache/veltrix-settings.js" stamp="$cache/stamp"
+    head=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo none)
+    if [ "${VELTRIX_SETTINGS_REBUILD:-0}" = 1 ] || [ ! -f "$out" ] || [ ! -f "$stamp" ] \
+        || [ "$(cat "$stamp")" != "$head" ] || [ ! -x "$repo/lib/veltrix-host/build/veltrix-settings" ] \
+        || [ -n "$(find "$repo/ui" "$repo/scripts/bundle.mjs" "$repo/scripts/bundle.sh" "$repo/lib/veltrix-host" \
+            \( -name node_modules -o -name @girs -o -name build \) -prune \
+            -o ! -name '*.css' ! -name '*.css.map' -newer "$stamp" -print -quit)" ]; then
+        mkdir -p "$cache"
+        # The stamp takes the time the build STARTS: an edit made during it is newer.
+        echo "$head" > "$stamp.next"
+        "$repo/ui/shell/node_modules/.bin/sass" --no-charset "$repo/ui/settings/style.scss" "$repo/ui/settings/style.css"
+        node "$repo/scripts/bundle.mjs" kit "$repo/ui/lib/veltrix-kit/build/js"
+        # Written aside and moved in: a Settings already running keeps reading a whole file.
+        next=$(mktemp "$cache/.veltrix-settings.XXXXXX.js")
+        "$repo/scripts/bundle.sh" --js "$repo/ui/settings/app.ts" "$next" --kit-external="$repo/ui/lib/veltrix-kit/build/js"
+        mv -f "$next" "$out"
+        "$repo/lib/veltrix-host/build.sh"
+        mv -f "$stamp.next" "$stamp"
+    fi
+    LD_PRELOAD="${VELTRIX_GTK4_LAYER_SHELL:-/usr/lib/libgtk4-layer-shell.so}" exec "$repo/lib/veltrix-host/build/veltrix-settings" "$out" "$@"
+else
+    export VELTRIX_SHELL_ROOT=/usr/share/veltrix/ui/shell VELTRIX_SETTINGS_ROOT=/usr/share/veltrix/ui/settings
+    exec /usr/share/veltrix/ui/settings/build/veltrix-settings "$@"
+fi

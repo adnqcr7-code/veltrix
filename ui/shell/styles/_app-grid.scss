@@ -1,0 +1,196 @@
+@use 'base' as *;
+
+/* ==========================================================================
+   APP GRID — Launchpad Style
+   ========================================================================== */
+
+/* ── Window ──
+   The app grid is a panel of the BAR's window since #708 point 3, like every
+   other panel. It was a child of the dock's window until 2026-08-09, then a layer
+   surface of its own (`#veltrix-app-grid`) — two moves, each of which had to carry
+   this file's scope with it, or every rule here would have stopped matching in
+   silence. The window's own transparency is `_bar.scss`'s. */
+
+#veltrix-bar,
+.veltrix-bar-window {
+    /* ── Search bar ── */
+    .app-grid-search-box {
+        background: var(--veltrix-surface-raised);
+        border: 1px solid var(--veltrix-border);
+        border-radius: var(--veltrix-radius-pill);
+        // Compact pill: the icon+text are small, so 44px felt like an oversized
+        // touch-target. ~36px reads tight, as a launcher's should.
+        padding: 7px 16px;
+        min-height: 36px;
+        transition: background 0.15s ease, border-color 0.15s ease;
+
+        &:focus-within,
+        &.search-active {
+            border-color: rgba(var(--veltrix-accent-rgb), 0.7);
+            background: var(--veltrix-surface);
+        }
+
+        /* NO accent tint on the icon when the box is focused, and the rule that
+           tried is gone rather than fixed (2026-08-10). It had been dead since
+           #102 anyway — written as `.app-grid-search-box:focus-within &` from
+           inside `.app-grid-search-icon`, which was correct while that rule was
+           top-level but, once the file went inside the window scope, expanded `&`
+           to `#veltrix-app-grid .app-grid-search-icon` and compiled to a window
+           nested inside a search box. Restoring it turned out to be the wrong fix:
+           `.nd-icon` glyphs took their colour from `-gtk-icon-filter: invert(1)`
+           then, so a `color` on them only ever flipped black↔white and an accent
+           token could not reach the pixels. Since #587 they are SYMBOLIC files and
+           `color` does reach them — so an accent magnifier is now possible, and was
+           left undone on its merits rather than blocked: the focus signal is the
+           box's own border and fill, above, which is enough.
+           (Parent-referencing `&` and a scope wrapper still do not mix: when a
+           rule needs an ancestor's state, nest it under that ancestor.) */
+    }
+
+    .app-grid-search-icon {
+        color: var(--veltrix-text-dim);
+    }
+
+    .app-grid-search-entry {
+        background: none;
+        color: var(--veltrix-text);
+        font-size: $fs-body;
+        caret-color: var(--veltrix-accent);
+    }
+
+    /* ── Scroll + FlowBox ── */
+    .app-grid-scroll,
+    .app-grid-flow,
+    .app-grid-scroll viewport,
+    .app-grid-scroll undershoot,
+    .app-grid-scroll overshoot {
+        @include veltrix-reset;
+    }
+
+    /* ── FlowBox children ── */
+    .app-grid-flow flowboxchild {
+        background: transparent;
+        border: none;
+        box-shadow: none;
+        outline: none;
+        padding: 0;
+        // Same rung as .app-grid-button below — the child has no inset from this box, so
+        // the two corners are coincident and must not be derived apart.
+        border-radius: $veltrix-radius-md;
+
+        &:active {
+            background: transparent;
+            outline: none;
+            box-shadow: none;
+        }
+
+        &:selected {
+            background: transparent;
+            outline: none;
+            box-shadow: none;
+
+            .app-grid-plate {
+                box-shadow: 0 0 0 3px rgba(var(--veltrix-accent-rgb), 0.6);
+            }
+        }
+
+        &:focus {
+            outline: none;
+            background: transparent;
+
+            .app-grid-button {
+                background: var(--veltrix-surface);
+            }
+        }
+    }
+
+    /* ── App button ── */
+    .app-grid-button {
+        @include veltrix-reset;
+        border-radius: $veltrix-radius-md;
+        padding: $space-3 $space-4;
+        transition: background 0.15s ease;
+
+        @include veltrix-tile-states;
+    }
+
+    /* ── Icon plate ── */
+    .app-grid-plate {
+        border-radius: var(--veltrix-radius-lg);
+        /* Black tile (v5, Adnan 2026-11-12 19:28, eye protection — the
+           same call as the iPad tiles): every Launchpad icon sits on
+           #000, the 72px icon centred in the 96px plate. The literal
+           #000 is the spec he named, not a theme token. The dock is
+           NOT tiled — the concept dock shows the plain icons. */
+        background: #000;
+    }
+
+    /* ── App item (icon + label) ── */
+    .app-grid-item {
+        min-width: 110px;
+    }
+
+    /* ── Label ── */
+    .app-grid-label {
+        color: var(--veltrix-text);
+        font-size: $fs-small;
+        font-weight: $fw-medium;
+        min-height: 2.5em; // Fixed height for 2 lines — keeps grid rows aligned
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+    }
+
+    /* ── Workspace strip ── */
+    .ws-strip {
+        padding: 0 $space-1;
+    }
+
+    .ws-strip-item {
+        // 6 + the 2px border below = an 8px inset to the schematic, i.e. $space-2 measured
+        // from the tile's visible edge (the border IS the edge). Derived, not free-hand.
+        padding: 6px;
+        border-radius: $veltrix-radius-md;
+        background: var(--veltrix-surface-back);
+        border: 2px solid var(--veltrix-border);
+        transition: background 0.15s ease, border-color 0.15s ease;
+
+        &.hover {
+            background: var(--veltrix-surface-hover);
+            box-shadow: inset 0 0 0 1px var(--veltrix-border);
+        }
+
+        &.active {
+            background: rgba(var(--veltrix-accent-rgb), 0.07);
+            border-color: rgba(var(--veltrix-accent-rgb), 0.55);
+        }
+
+        &.keyboard-focus {
+            background: rgba(var(--veltrix-accent-rgb), 0.15);
+            border-color: var(--veltrix-accent);
+        }
+    }
+
+    .ws-strip-label {
+        font-size: $fs-caption;
+        font-weight: $fw-semibold;
+        color: var(--veltrix-text-dim);
+        min-width: 110px;
+
+        // Active state shown by .ws-strip-item.active (accent bg + border); the
+        // label just brightens to full text colour (never accent on text).
+        &.active {
+            color: var(--veltrix-text);
+        }
+    }
+
+    /* ── No results ── */
+    .app-grid-no-results-icon {
+        color: var(--veltrix-text-disabled);
+        margin-bottom: 4px;
+    }
+
+    .app-grid-no-results-label {
+        color: var(--veltrix-text-dim);
+        font-size: $fs-body;
+        font-weight: $fw-regular;
+    }
+}

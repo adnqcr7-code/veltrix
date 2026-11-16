@@ -1,0 +1,682 @@
+//! The compositor's state: the Wayland globals, the space windows live in, the seat, and the
+//! backend that turns all of it into frames.
+
+use std::{ffi::OsString, sync::Arc, time::Instant};
+
+use smithay::{
+    desktop::{PopupManager, Space, Window, WindowSurfaceType},
+    input::{Seat, SeatState, keyboard::XkbConfig, pointer::CursorImageStatus},
+    output::Output,
+    reexports::{
+        calloop::{Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic},
+        wayland_server::{
+            Client, Display, DisplayHandle,
+            backend::{ClientData, ClientId, DisconnectReason},
+            protocol::wl_surface::WlSurface,
+        },
+    },
+    utils::{Clock, Logical, Monotonic, Point, Rectangle},
+    wayland::{
+        compositor::{CompositorClientState, CompositorState},
+        cursor_shape::CursorShapeManagerState,
+        output::OutputManagerState,
+        pointer_constraints::PointerConstraintsState,
+        presentation::PresentationState,
+        relative_pointer::RelativePointerManagerState,
+        selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
+        shell::{wlr_layer::WlrLayerShellState, xdg::XdgShellState},
+        shm::ShmState,
+        socket::ListeningSocketSource,
+    },
+};
+
+use crate::{
+    backend::Backend,
+    config::Config,
+    ipc::server::IpcState,
+    protocols::{focus_grab, material},
+};
+
+pub struct Hyalo {
+    pub start_time: Instant,
+    pub clock: Clock<Monotonic>,
+    pub socket_name: OsString,
+    pub display_handle: DisplayHandle,
+    pub loop_handle: LoopHandle<'static, Hyalo>,
+    pub loop_signal: LoopSignal,
+
+    pub backend: Backend,
+    pub config: Config,
+    /// The config layers' modification times as of the last (re)load: the watcher reloads when
+    /// they differ, and a reload Hyalo did itself (`settings`) does not happen twice.
+    pub config_stamps: Vec<Option<std::time::SystemTime>>,
+
+    pub space: Space<Window>,
+    pub popups: PopupManager,
+
+    pub compositor_state: CompositorState,
+    pub xdg_shell_state: XdgShellState,
+    pub layer_shell_state: WlrLayerShellState,
+    pub shm_state: ShmState,
+    pub output_manager_state: OutputManagerState,
+    pub seat_state: SeatState<Hyalo>,
+    pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
+    pub presentation_state: PresentationState,
+
+    pub seat: Seat<Self>,
+    pub cursor_status: CursorImageStatus,
+    /// The cursor the client under the pointer last asked for, kept while Hyalo shows its own
+    /// (`WindowManager::chrome_cursor`).
+    pub client_cursor: CursorImageStatus,
+    /// The picture a drag carries under the pointer (start_drag's icon), while one does.
+    pub dnd_icon: Option<crate::render::DndIcon>,
+    /// The serial the drag under way began with (handlers.rs `dnd_requested`).
+    pub dnd_started: Option<smithay::utils::Serial>,
+    /// What the client under a drag agreed to do with it (handlers.rs `action_choice`), and
+    /// the surface that agreed: the pointer shows it (`dnd_cursor`). Smithay takes the
+    /// pointer's focus away from every client during a drag, so the source can no longer set
+    /// its cursor, and the one it set as the drag began stayed — a "+" over everything, a
+    /// dock that refused the drop included (owner, 2026-11-04).
+    pub dnd_feedback: crate::protocols::drag_feedback::Feedback<smithay::reexports::wayland_server::backend::ObjectId>,
+    /// The drop just made: the client it landed in may raise what it starts (activation.rs).
+    pub drop_grant: Option<crate::activation::DropGrant>,
+    pub focus_grab: Option<focus_grab::ActiveGrab>,
+    /// The layer surface holding the keyboard because it asked for it exclusively
+    /// (shell/layer.rs, `exclusive_keyboard_layer`); handed back when it stops asking.
+    pub exclusive_keyboard: Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    /// Set when a frame has to be drawn on some output soon (see `queue_redraw`).
+    pub redraw_idle_queued: bool,
+    pub ipc: IpcState,
+    pub displays: crate::display::State,
+    pub mirrors: crate::mirror::State,
+    /// Workspaces and windows (wm/).
+    pub wm: crate::wm::Wm,
+    pub binds: Vec<crate::binds::Binding>,
+    /// Window capture for thumbnails (capture.rs).
+    pub foreign_toplevel_list: smithay::wayland::foreign_toplevel_list::ForeignToplevelListState,
+    pub toplevel_capture_source: smithay::wayland::image_capture_source::ToplevelCaptureSourceState,
+    pub image_copy_capture: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
+    /// Whole-output capture (capture.rs): screenshots (grim).
+    pub output_capture_source: smithay::wayland::image_capture_source::OutputCaptureSourceState,
+    /// Clipboard managers and `wl-paste --watch` (cliphist): both data-control protocols.
+    pub ext_data_control: smithay::wayland::selection::ext_data_control::DataControlState,
+    pub wlr_data_control: smithay::wayland::selection::wlr_data_control::DataControlState,
+    /// Screen recording (protocols/screencopy.rs): copies waiting for their output's next frame.
+    pub screencopy_pending: crate::protocols::screencopy::PendingCopies,
+    /// Capture sessions a client holds open (capture.rs: dropping one stops it).
+    pub capture_sessions: Vec<smithay::wayland::image_copy_capture::Session>,
+    /// Their frames waiting for something new to show: the output's next frame, the window's
+    /// next commit (capture.rs).
+    pub capture_pending: Vec<(smithay::wayland::image_copy_capture::SessionRef, smithay::wayland::image_copy_capture::Frame)>,
+    /// xdg-activation (activation.rs).
+    pub activation_state: smithay::wayland::xdg_activation::XdgActivationState,
+    /// Every app's window controls (protocols/window_controls.rs): told the side again when
+    /// it changes.
+    pub window_controls: Vec<crate::protocols::gen_window_controls::veltrix_window_controls_v1::VeltrixWindowControlsV1>,
+    /// KDE's server-decoration, for Qt apps (shell/decoration.rs).
+    pub kde_decoration_state: smithay::wayland::shell::kde::decoration::KdeDecorationState,
+    /// keyboard-shortcuts-inhibit (shortcuts.rs).
+    pub shortcuts_inhibit_state: smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState,
+    /// The window rules in force (wm/rules.rs).
+    pub rules: Vec<crate::wm::rules::Rule>,
+    pub keys: crate::input::KeyTracking,
+    /// The lock screen (lock.rs).
+    pub lock: crate::lock::LockState,
+    /// When nobody touches the computer (idle.rs).
+    pub idle: crate::idle::IdleState,
+    /// logind and the ScreenSaver API, in a real session (logind.rs).
+    pub login: Option<crate::logind::Login>,
+    /// The screen reader's keyboard, in a real session (a11y.rs).
+    pub a11y: Option<crate::a11y::A11y>,
+    /// X11 apps: Xwayland and its window manager (xwayland.rs).
+    pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
+    pub x11: crate::xwayland::XState,
+}
+
+impl Hyalo {
+    pub fn new(
+        display: Display<Self>,
+        loop_handle: LoopHandle<'static, Hyalo>,
+        loop_signal: LoopSignal,
+        backend: Backend,
+        config: Config,
+    ) -> Self {
+        let dh = display.handle();
+        let lock = crate::lock::LockState::new(&dh);
+        let dh_for_idle = dh.clone();
+        let loop_handle_for_idle = loop_handle.clone();
+        let clock = Clock::new();
+
+        let compositor_state = CompositorState::new_v6::<Self>(&dh);
+        let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        // The privileged globals are not advertised to a sandboxed client (sandbox.rs).
+        let unrestricted = crate::sandbox::unrestricted;
+        let layer_shell_state = WlrLayerShellState::new_with_filter::<Self, _>(&dh, unrestricted);
+        let shm_state = ShmState::new::<Self>(&dh, vec![]);
+        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
+        let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
+        let presentation_state = PresentationState::new::<Self>(&dh, clock.id() as u32);
+        // What every GTK client expects: smallvil leaves them out, and awww-daemon panics
+        // without a viewporter.
+        smithay::wayland::viewporter::ViewporterState::new::<Self>(&dh);
+        smithay::wayland::fractional_scale::FractionalScaleManagerState::new::<Self>(&dh);
+        smithay::wayland::single_pixel_buffer::SinglePixelBufferState::new::<Self>(&dh);
+        CursorShapeManagerState::new::<Self>(&dh);
+        RelativePointerManagerState::new::<Self>(&dh);
+        PointerConstraintsState::new::<Self>(&dh);
+        // Touchpad pinch, swipe and hold, for the apps (input.rs already hands them to the seat):
+        // pinch-to-zoom in a browser or an image viewer.
+        smithay::wayland::pointer_gestures::PointerGesturesState::new::<Self>(&dh);
+        // Which dialogs are modal: their parent gives way to them (wm::focus_window).
+        smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<Self>(&dh);
+        // The title bar is ours, as on Hyprland: apps that ask drop theirs (shell/decoration.rs).
+        smithay::wayland::shell::xdg::decoration::XdgDecorationState::new::<Self>(&dh);
+        let kde_decoration_state = smithay::wayland::shell::kde::decoration::KdeDecorationState::new::<Self>(
+            &dh,
+            smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode::Server,
+        );
+        // A surface may declare its content type (wp-content-type-v1: game, video, …).
+        // Nothing in Hyalo reads the value any more — game detection is deleted.
+        smithay::wayland::content_type::ContentTypeState::new::<Self>(&dh);
+        // Ours (protocols/ at the repo root).
+        focus_grab::init(&dh);
+        crate::protocols::window_controls::init(&dh);
+        // The Assistant's computer use: synthetic pointer (veltrix-input) and keyboard (wtype).
+        crate::protocols::virtual_pointer::init(&dh);
+        // Input methods (handlers.rs): apps speak text-input; the input method itself (fcitx5)
+        // reads every key, so a sandboxed client is not offered it.
+        smithay::wayland::text_input::TextInputManagerState::new::<Self>(&dh);
+        smithay::wayland::input_method::InputMethodManagerState::new::<Self, _>(&dh, unrestricted);
+        // The screen recorder (wf-recorder) speaks wlr-screencopy only.
+        crate::protocols::screencopy::init(&dh);
+        // ...and never while the session is locked (lock.rs: `locked_flag`).
+        let locked = lock.locked_flag();
+        smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState::new::<Self, _>(&dh, move |c| {
+            unrestricted(c) && !locked.load(std::sync::atomic::Ordering::Acquire)
+        });
+        // Window capture for the shell's thumbnails (capture.rs).
+        let foreign_toplevel_list =
+            smithay::wayland::foreign_toplevel_list::ForeignToplevelListState::new_with_filter::<Self>(&dh, unrestricted);
+        let toplevel_capture_source =
+            smithay::wayland::image_capture_source::ToplevelCaptureSourceState::new_with_filter::<Self, _>(&dh, unrestricted);
+        let image_copy_capture =
+            smithay::wayland::image_copy_capture::ImageCopyCaptureState::new_with_filter::<Self, _>(&dh, unrestricted);
+        let output_capture_source =
+            smithay::wayland::image_capture_source::OutputCaptureSourceState::new_with_filter::<Self, _>(&dh, unrestricted);
+        // Reading and setting the clipboard without a focused surface is a privilege too.
+        let ext_data_control = smithay::wayland::selection::ext_data_control::DataControlState::new::<Self, _>(
+            &dh,
+            Some(&primary_selection_state),
+            unrestricted,
+        );
+        let wlr_data_control = smithay::wayland::selection::wlr_data_control::DataControlState::new::<Self, _>(
+            &dh,
+            Some(&primary_selection_state),
+            unrestricted,
+        );
+        material::init(&dh);
+        crate::protocols::drag_feedback::init(&dh);
+        crate::protocols::layers::init(&dh);
+        // Flatpak's way to say "this client is sandboxed" — offered only to clients that are not.
+        smithay::wayland::security_context::SecurityContextState::new::<Self, _>(&dh, unrestricted);
+        // An app asking for its window to come to the front (activation.rs).
+        let activation_state = smithay::wayland::xdg_activation::XdgActivationState::new::<Self>(&dh);
+        // An app holding the keyboard's shortcuts while focused (shortcuts.rs).
+        let shortcuts_inhibit_state =
+            smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState::new::<Self>(&dh);
+        // Offered to Xwayland alone: how it ties an X11 window to its surface (xwayland.rs).
+        let xwayland_shell_state = smithay::wayland::xwayland_shell::XWaylandShellState::new::<Self>(&dh);
+
+        let mut seat_state = SeatState::new();
+        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, backend.seat_name());
+        let kb = &config.input.keyboard.with_system_defaults();
+        let xkb = XkbConfig {
+            rules: &kb.rules,
+            model: &kb.model,
+            layout: &kb.layout,
+            variant: &kb.variant,
+            options: (!kb.options.is_empty()).then(|| kb.options.clone()),
+        };
+        let keyboard = match seat.add_keyboard(xkb, kb.repeat_delay, kb.repeat_rate) {
+            Ok(k) => k,
+            Err(err) => {
+                tracing::warn!(?err, "keyboard config refused, falling back to the default keymap");
+                seat.add_keyboard(Default::default(), kb.repeat_delay, kb.repeat_rate)
+                    .expect("default keymap")
+            }
+        };
+        if kb.numlock {
+            crate::config::set_numlock(&keyboard);
+        }
+        seat.add_pointer();
+
+        let socket_name = Self::init_wayland_listener(display, &loop_handle);
+        let rules_config = config.rules.clone();
+        let binds = crate::binds::parse_binds(&config.binds).unwrap_or_else(|err| {
+            tracing::error!("key bindings not loaded: {err}");
+            Vec::new()
+        });
+
+        Self {
+            start_time: Instant::now(),
+            clock,
+            socket_name,
+            display_handle: dh,
+            loop_handle,
+            loop_signal,
+            backend,
+            config,
+            config_stamps: crate::config::stamps(),
+            space: Space::default(),
+            popups: PopupManager::default(),
+            compositor_state,
+            xdg_shell_state,
+            layer_shell_state,
+            shm_state,
+            output_manager_state,
+            seat_state,
+            data_device_state,
+            primary_selection_state,
+            presentation_state,
+            seat,
+            cursor_status: CursorImageStatus::default_named(),
+            client_cursor: CursorImageStatus::default_named(),
+            dnd_icon: None,
+            dnd_started: None,
+            dnd_feedback: Default::default(),
+            drop_grant: None,
+            focus_grab: None,
+            exclusive_keyboard: None,
+            redraw_idle_queued: false,
+            ipc: IpcState::default(),
+            displays: crate::display::State::default(),
+            mirrors: crate::mirror::State::default(),
+            wm: crate::wm::Wm::default(),
+            binds,
+            foreign_toplevel_list,
+            toplevel_capture_source,
+            image_copy_capture,
+            output_capture_source,
+            ext_data_control,
+            wlr_data_control,
+            screencopy_pending: Default::default(),
+            capture_sessions: Vec::new(),
+            capture_pending: Vec::new(),
+            activation_state,
+            kde_decoration_state,
+            window_controls: Vec::new(),
+            shortcuts_inhibit_state,
+            rules: crate::wm::rules::compile(&rules_config).unwrap_or_else(|err| {
+                tracing::error!("window rules not loaded: {err}");
+                Vec::new()
+            }),
+            keys: Default::default(),
+            lock,
+            idle: crate::idle::IdleState::new(&dh_for_idle, loop_handle_for_idle),
+            login: None,
+            a11y: None,
+            xwayland_shell_state,
+            x11: Default::default(),
+        }
+    }
+
+    fn init_wayland_listener(display: Display<Hyalo>, loop_handle: &LoopHandle<'static, Hyalo>) -> OsString {
+        // Every client connected from here on, the sandboxed ones too (sandbox.rs).
+        display.handle().set_default_max_buffer_size(CLIENT_BUFFER);
+        let listening_socket = ListeningSocketSource::new_auto().expect("a Wayland socket");
+        let socket_name = listening_socket.socket_name().to_os_string();
+
+        loop_handle
+            .insert_source(listening_socket, move |client_stream, _, state| {
+                match state.display_handle.insert_client(client_stream, Arc::new(ClientState::default())) {
+                    Ok(client) => ClientState::identify(&client, &state.display_handle),
+                    Err(err) => tracing::warn!(?err, "could not accept a client"),
+                }
+            })
+            .expect("the Wayland socket's event source");
+
+        loop_handle
+            .insert_source(Generic::new(display, Interest::READ, Mode::Level), |_, display, state| {
+                // Safety: the display is never dropped while the loop runs.
+                unsafe {
+                    display.get_mut().dispatch_clients(state).unwrap();
+                }
+                Ok(PostAction::Continue)
+            })
+            .expect("the display's event source");
+
+        socket_name
+    }
+
+    /// Something on `output` changed: draw it on its next opportunity. `None` = every output.
+    pub fn queue_redraw(&mut self, output: Option<&Output>) {
+        match output {
+            Some(o) => {
+                self.backend.queue_redraw(o);
+                for target in crate::backend::physical_outputs(self) {
+                    if crate::mirror::source(&target).as_ref() == Some(o) {
+                        self.backend.queue_redraw(&target);
+                    }
+                }
+            }
+            None => {
+                for o in crate::backend::physical_outputs(self) {
+                    self.backend.queue_redraw(&o);
+                }
+            }
+        }
+        if !self.redraw_idle_queued {
+            self.redraw_idle_queued = true;
+            self.loop_handle.insert_idle(|state| {
+                state.redraw_idle_queued = false;
+                crate::backend::redraw_queued(state);
+            });
+        }
+    }
+
+    /// The outputs a surface is shown on, for redrawing after its commit.
+    pub fn outputs_for_surface(&self, surface: &WlSurface) -> Vec<Output> {
+        let root = crate::shell::root_surface(self, surface);
+        if let Some(window) = self.window_for_surface(&root) {
+            return self.space.outputs_for_element(&window);
+        }
+        for output in self.space.outputs() {
+            let map = smithay::desktop::layer_map_for_output(output);
+            if map.layer_for_surface(&root, WindowSurfaceType::ALL).is_some() {
+                return vec![output.clone()];
+            }
+        }
+        Vec::new()
+    }
+
+    /// A window known to the window manager, shown or not.
+    pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
+        self.wm.by_surface(surface).map(|m| m.window.clone())
+    }
+
+    /// What the pointer is over, in the order things are drawn: overlay layers, a fullscreen
+    /// window (and whatever is shown above it), top layers, the other windows, then bottom
+    /// and background layers.
+    pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        use smithay::wayland::shell::wlr_layer::Layer;
+        // Locked: the lock screen is all the pointer can reach (lock.rs).
+        if self.lock.is_locked() {
+            return self.lock_surface_under(pos);
+        }
+        // A window's controls and its title bar are Hyalo's: no app gets the pointer there.
+        if self.chrome_under(pos).is_some() {
+            return None;
+        }
+        if let Some((_, s, p)) = self.layer_under(&[Layer::Overlay], pos) {
+            return Some((s, p));
+        }
+        // An X11 menu or tooltip, over everything but the overlay layers (xwayland.rs).
+        for x in self.wm.x11_overrides.iter().rev() {
+            let Some(surface) = x.wl_surface() else { continue };
+            let at = x.last_configure().loc;
+            if let Some((s, p)) =
+                smithay::desktop::utils::under_from_surface_tree(&surface, pos, at, WindowSurfaceType::ALL)
+            {
+                return Some((s, p.to_f64()));
+            }
+        }
+        let output = self.space.output_under(pos).next().cloned();
+        let (above, below) = match &output {
+            Some(o) => crate::render::windows_front_to_back(&self.space, &self.wm, o),
+            None => (Vec::new(), Vec::new()),
+        };
+        let hit = |windows: &[Window]| {
+            windows.iter().find_map(|window| {
+                // Where the surface is drawn: the geometry's origin less the decorations.
+                let location = self.space.element_location(window)? - window.geometry().loc;
+                let local = pos - location.to_f64();
+                let popup = window.surface_under(local, WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE)
+                    .map(|(s, p)| (s, p.to_f64()));
+                let root = || {
+                    let m = self.wm.by_window(window)?;
+                    let cell = Rectangle::new(self.space.element_location(window)?, m.visible_size());
+                    if !cell.to_f64().contains(pos) { return None; }
+                    // Layers a client handed Hyalo to animate are hit where they are shown
+                    // (protocols/layers.rs).
+                    crate::protocols::layers::window_under(window, local, WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+                        output.as_ref().and_then(crate::protocols::layers::presentation::shown_frame))
+                };
+                popup.or_else(root).map(|(s, p)| (s, p + location.to_f64()))
+            })
+        };
+        if let Some(h) = hit(&above) {
+            return Some(h);
+        }
+        if let Some((_, s, p)) = self.layer_under(&[Layer::Top], pos) {
+            return Some((s, p));
+        }
+        if let Some(h) = hit(&below) {
+            return Some(h);
+        }
+        self.layer_under(&[Layer::Bottom, Layer::Background], pos)
+            .map(|(_, s, p)| (s, p))
+    }
+}
+
+/// What of a window Hyalo itself draws, under the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chrome {
+    /// One of its controls (protocols/window_controls.rs).
+    Button(crate::protocols::window_controls::Button),
+    /// The rest of its title bar (render/title_bar.rs): dragged, it moves the window.
+    Bar,
+    /// Its edges, and whether the window is tiled (its edge is then a line shared with its
+    /// neighbour).
+    Resize(crate::wm::grabs::ResizeEdge, bool),
+}
+
+impl Hyalo {
+    /// What Hyalo draws of a window at `pos` — its controls, its title bar — of the first
+    /// window there, in the order things are drawn: a layer or another window over them covers
+    /// them.
+    pub fn chrome_under(&self, pos: Point<f64, Logical>) -> Option<(crate::wm::WindowId, Chrome)> {
+        use smithay::wayland::shell::wlr_layer::Layer;
+        if self.lock.is_locked() || self.layer_under(&[Layer::Overlay], pos).is_some() {
+            return None;
+        }
+        // An X11 menu over a title bar has the pointer, not the bar under it.
+        let on_x11_menu = self.wm.x11_overrides.iter().any(|x| {
+            let r = Rectangle::new(x.last_configure().loc, x.bbox().size).to_f64();
+            x.wl_surface().is_some() && r.contains(pos)
+        });
+        if on_x11_menu {
+            return None;
+        }
+        let output = self.space.output_under(pos).next().cloned()?;
+        let (above, below) = crate::render::windows_front_to_back(&self.space, &self.wm, &output);
+        let cfg = &self.config.windows.controls;
+        // The first window that has the point decides: its chrome, or none.
+        let first = |windows: &[Window]| {
+            windows.iter().find_map(|window| {
+                let origin = self.space.element_location(window)? - window.geometry().loc;
+                let local = pos - origin.to_f64();
+                let managed = self.wm.by_window(window)?;
+                if window.surface_under(local, WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE).is_some() {
+                    return Some(None);
+                }
+                if managed.fullscreen == crate::wm::Fullscreen::None {
+                    let inside = if window.x11_surface().is_some() {
+                        crate::wm::grabs::X11_INSIDE_STRIP
+                    } else {
+                        crate::wm::grabs::INSIDE_STRIP
+                    };
+                    let mut edges = crate::wm::grabs::border_edges(managed.frame(), pos, inside);
+                    if !managed.floating && let Some(ws) = self.wm.workspaces.get(&managed.workspace) {
+                        use crate::wm::{grabs::ResizeEdge, layout::Edge};
+                        for (bit, edge) in [(ResizeEdge::LEFT, Edge::Left), (ResizeEdge::RIGHT, Edge::Right),
+                                            (ResizeEdge::TOP, Edge::Top), (ResizeEdge::BOTTOM, Edge::Bottom)] {
+                            if !ws.layout.can_resize_edge(managed.id, edge) { edges.remove(bit); }
+                        }
+                    }
+                    let (min, max) = crate::wm::grabs::size_limits(window);
+                    if max.w > 0 && min.w == max.w {
+                        edges.remove(crate::wm::grabs::ResizeEdge::LEFT | crate::wm::grabs::ResizeEdge::RIGHT);
+                    }
+                    if max.h > 0 && min.h == max.h {
+                        edges.remove(crate::wm::grabs::ResizeEdge::TOP | crate::wm::grabs::ResizeEdge::BOTTOM);
+                    }
+                    if !edges.is_empty() {
+                        return Some(Some((managed.id, Chrome::Resize(edges, !managed.floating))));
+                    }
+                }
+                if managed.fullscreen != crate::wm::Fullscreen::Fullscreen
+                    && let Some((r, buttons)) = crate::protocols::window_controls::managed_rect(managed, cfg)
+                    && let Some(b) = crate::protocols::window_controls::button_at(r, local, &buttons)
+                {
+                    return Some(Some((managed.id, Chrome::Button(b))));
+                }
+                let bar = managed.bar();
+                if bar > 0 {
+                    let geo = window.geometry();
+                    let r = Rectangle::new((geo.loc.x, geo.loc.y - bar).into(), (managed.visible_size().w, bar).into()).to_f64();
+                    if r.contains(local) {
+                        return Some(Some((managed.id, Chrome::Bar)));
+                    }
+                }
+                let cell = Rectangle::new(self.space.element_location(window)?, managed.visible_size());
+                if !cell.to_f64().contains(pos) { return None; }
+                window.surface_under(local, WindowSurfaceType::ALL).map(|_| None)
+            })
+        };
+        if let Some(hit) = first(&above) {
+            return hit;
+        }
+        if self.layer_under(&[Layer::Top], pos).is_some() {
+            return None;
+        }
+        first(&below).flatten()
+    }
+
+    /// The window control at `pos` (protocols/window_controls.rs).
+    /// Which ways window `id` can still be resized, for its edge's cursor.
+    fn resize_room(&self, id: crate::wm::WindowId) -> crate::wm::grabs::Room {
+        self.wm.get(id).map_or(crate::wm::grabs::Room::ANY, |m| crate::wm::grabs::Room::of_window(&m.window))
+    }
+
+    pub fn controls_under(&self, pos: Point<f64, Logical>) -> Option<(crate::wm::WindowId, crate::protocols::window_controls::Button)> {
+        match self.chrome_under(pos)? {
+            (id, Chrome::Button(b)) => Some((id, b)),
+            (_, Chrome::Bar | Chrome::Resize(..)) => None,
+        }
+    }
+
+    /// The pointer moved (or what is under it did): which control it is over, drawn hovered,
+    /// with the arrow over Hyalo's chrome — the app under it set its own cursor last.
+    /// The pointer through a drag: a "+" only where the client under it takes a copy; the
+    /// plain arrow where nothing would happen, and for a move (the files stay files).
+    pub fn dnd_cursor(&self) -> CursorImageStatus {
+        CursorImageStatus::Named(self.dnd_feedback.cursor())
+    }
+
+    /// The drag is over: the plain arrow until the client under the pointer sets its own (it
+    /// is entered again with the next motion); whatever the source set before the drag is
+    /// stale.
+    pub fn end_dnd_cursor(&mut self) {
+        self.dnd_feedback.clear();
+        self.client_cursor = CursorImageStatus::default_named();
+        self.cursor_status = CursorImageStatus::default_named();
+        self.wm.chrome_cursor = false;
+        tracing::debug!(cursor = ?self.cursor_status, "drag destination ended");
+        self.queue_redraw(None);
+    }
+
+    pub fn update_controls_hover(&mut self, pos: Point<f64, Logical>, serial: smithay::utils::Serial) {
+        let chrome = self.chrome_under(pos);
+        let under = match chrome {
+            Some((window, Chrome::Button(button))) => Some((window, button)),
+            _ => None,
+        };
+        let was = self.wm.controls_hover;
+        let now = under.map(|(window, button)| crate::wm::ControlsHover {
+            window,
+            button,
+            // Held only while still over the button it was pressed on.
+            pressed: was.is_some_and(|h| h.pressed && h.window == window && h.button == button),
+        });
+        // Hyalo's cursor over its chrome and through a resize; the client's (`client_cursor`)
+        // everywhere else. The client under a resize edge still has the pointer and sets its own,
+        // which won: kitty showed its text cursor on its edge (owner, 2026-10-20).
+        // A drag: Hyalo's cursor, from what the client under it agreed to. A new surface under
+        // the drag has agreed to nothing yet: its offer starts with no action.
+        if self.dnd_started.is_some() {
+            use smithay::reexports::wayland_server::Resource;
+            let over = self.surface_under(pos).map(|(s, _)| s.id());
+            self.dnd_feedback.motion(over, serial);
+        }
+        let ours = match (self.wm.grab, chrome) {
+            _ if self.dnd_started.is_some() => Some(self.dnd_cursor()),
+            (Some(crate::wm::grabs::Active { id, kind: crate::wm::grabs::Kind::Resize(edges), tiled, .. }), _) => {
+                Some(CursorImageStatus::Named(edges.cursor(tiled, self.resize_room(id))))
+            }
+            (_, Some((id, Chrome::Resize(edges, tiled)))) => {
+                Some(CursorImageStatus::Named(edges.cursor(tiled, self.resize_room(id))))
+            }
+            (_, Some(_)) => Some(CursorImageStatus::default_named()),
+            (_, None) => None,
+        };
+        match ours {
+            Some(cursor) => {
+                self.cursor_status = cursor;
+                self.wm.chrome_cursor = true;
+            }
+            None if self.wm.chrome_cursor => {
+                self.cursor_status = self.client_cursor.clone();
+                self.wm.chrome_cursor = false;
+            }
+            None => {}
+        }
+        if now != was {
+            self.wm.controls_hover = now;
+            self.queue_redraw(None);
+        }
+    }
+}
+
+/// How many bytes of events Hyalo holds for a client that is not reading, beyond what its socket
+/// takes, before it drops the client. wayland-backend's own default is 4 KiB; with one `sendmsg`
+/// per flush the kernel counts far more than the bytes, so a window that stopped reading for a
+/// moment's work was gone after about 420 pointer motions (`hyalo-stalled-client-check.sh`) —
+/// the native Settings, busy for 6 s with the pointer over it, took Broken pipe (#915). A MiB
+/// is some 37 000 motions; a client that never reads again is still dropped, at that bound.
+const CLIENT_BUFFER: usize = 1 << 20;
+
+/// Per-client data.
+#[derive(Default)]
+pub struct ClientState {
+    pub compositor_state: CompositorClientState,
+    /// Set for a client that connected through a sandbox's socket (sandbox.rs).
+    pub security_context: Option<smithay::wayland::security_context::SecurityContext>,
+    /// "pid (command)", read when it connects: by its disconnection the process may be gone.
+    pub process: std::sync::OnceLock<String>,
+}
+
+impl ClientState {
+    /// Names a client just inserted, for the line its disconnection logs.
+    pub fn identify(client: &Client, display: &DisplayHandle) {
+        let Some(data) = client.get_data::<ClientState>() else { return };
+        let Ok(credentials) = client.get_credentials(display) else { return };
+        let command = std::fs::read_to_string(format!("/proc/{}/comm", credentials.pid)).unwrap_or_default();
+        let _ = data.process.set(format!("{} ({})", credentials.pid, command.trim()));
+    }
+}
+
+impl ClientData for ClientState {
+    fn initialized(&self, _client_id: ClientId) {}
+    /// Hyalo dropping a client says nothing to it (no wl_display.error when its buffer is full):
+    /// this line is the only trace of why a window vanished.
+    fn disconnected(&self, _client_id: ClientId, reason: DisconnectReason) {
+        let client = self.process.get().map_or("?", String::as_str);
+        match reason {
+            DisconnectReason::ProtocolError(error) => tracing::warn!(client, "client dropped: {error}"),
+            // Its own exit, or the buffer above full: the backend does not tell the two apart.
+            DisconnectReason::ConnectionClosed => tracing::info!(client, "client disconnected"),
+        }
+    }
+}

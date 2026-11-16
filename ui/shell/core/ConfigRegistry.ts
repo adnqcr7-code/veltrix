@@ -1,0 +1,217 @@
+// Typed registry of agent-readable/-writable shell settings — the data half of
+// the `getConfig`/`setConfig`/`describeConfig` IPC surface (see app.ts).
+// Same pattern as ShellActions: this module only defines the registry; the
+// entries are registered from config-entries.ts at main() time, so core/ never
+// imports widget code (dock settings live in surfaces/dock/state.ts).
+//
+// Every entry is self-describing (desc/type/constraints) — `describeConfig`
+// serves it as JSON, so agents discover the whole configurable surface without
+// reading source. Setters delegate to the owning service, which validates,
+// persists and notifies its consumers exactly as if Settings had been used.
+
+import type { VeltrixSliderRowOpts } from "../../lib/veltrix-kit"
+
+export type ConfigValue = boolean | number | string
+
+export interface ConfigEntryUi {
+    /** Clave de i18n de la etiqueta; el subtítulo es esta misma + ".desc". */
+    i18n: string
+    /** Por defecto se deduce del `type`: boolean→toggle, enum→dropdown, number→slider. */
+    control?: "toggle" | "dropdown" | "slider" | "preset" | "segmented"
+    /** enum: valor → clave de i18n de su etiqueta. Por defecto `<i18n sin "settings.">.opt.<valor>`. */
+    optI18n?: (value: string) => string
+    /** slider: lo que hoy va en el último argumento de `sliderRow` (iconos, `pct`, unidad). */
+    slider?: VeltrixSliderRowOpts
+    /** preset: valores numéricos discretos y unidad (p. ej. presets: [32, 48, 64, 80, 96], unit: "px"). */
+    presets?: number[]
+    presetUnit?: string
+}
+
+export interface ConfigEntry {
+    desc: string
+    type: "boolean" | "number" | "enum" | "string"
+    /** valid values when type === "enum" — a function is re-read on every use, so a catalogue
+     *  that changes while the shell runs (an icon theme installed) is current (#852 [A6]) */
+    enum?: readonly string[] | (() => readonly string[])
+    /** string keys: values OFFERED, not enforced (the bundled wallpapers) — `Describe` serves it */
+    catalogue?: () => readonly string[]
+    /** string keys: validate and canonicalise the raw value (a `file://` URI → its path) */
+    validate?: (raw: string) => ConfigResult
+    /** inclusive bounds when type === "number" */
+    min?: number
+    max?: number
+    /** false → setConfig refuses even when writes are allowed (e.g. the ai.* gate itself) */
+    writable?: boolean
+    /** false → the setting does not exist here (the compositor in use has nothing behind it):
+     *  no row in Settings, not in `describeConfig`, refused by `setConfig`. Absent = always. */
+    available?: () => boolean
+    get(): ConfigValue
+    set?(v: ConfigValue): void | Promise<void>
+    /** Suscripción del servicio dueño: aplica el valor y devuelve el desuscriptor.
+     *  Es lo que hoy escribe cada página a mano como `onCfg(...)`. */
+    subscribe?: (apply: (v: ConfigValue) => void) => (() => void)
+    /** Cómo se dibuja en Settings. Ausente = la clave no tiene fila (p. ej. las de sólo lectura). */
+    ui?: ConfigEntryUi
+}
+
+/** Dónde ve el usuario este ajuste: id de página de Ajustes y, si el grupo tiene
+ *  cabecera, su clave i18n. Lo deriva `surfaces/settings/configLocations.ts` del
+ *  manifiesto y lo inyecta `app.ts` — core/ no importa surfaces/. */
+export interface ConfigLocation {
+    page: string
+    group?: string
+}
+
+const entries: Record<string, ConfigEntry> = {}
+
+/** An entry's enum as it is NOW. */
+export function enumOf(e: ConfigEntry): readonly string[] | undefined {
+    return typeof e.enum === "function" ? e.enum() : e.enum
+}
+const locations: Record<string, ConfigLocation> = {}
+
+export function registerConfig(key: string, entry: ConfigEntry) {
+    entries[key] = entry
+}
+
+/**
+ * Inyecta el mapa clave → página. Se llama una vez en main(), después de
+ * `registerConfigEntries()`.
+ *
+ * 🔑 Una clave sin entrada aquí sale de `describeConfig` SIN `page`, y eso es la
+ * respuesta correcta: `recording.*` y `ai.brainBackend` existen y no los dibuja
+ * ninguna página. Inventarles una sería la mentira plausible que este campo viene
+ * a matar — la que producía adivinar la página por el prefijo de la clave, con la
+ * que `nightlight.*` "vivía" en una página que no existe en vez de en Apariencia.
+ */
+export function setConfigLocations(map: Record<string, ConfigLocation>) {
+    for (const [key, loc] of Object.entries(map)) locations[key] = loc
+}
+
+export function getConfigEntry(key: string): ConfigEntry | undefined {
+    return entries[key]
+}
+
+/** The entry, unless it is unavailable here (`available`): what the agent's surface sees. */
+function live(key: string): ConfigEntry | undefined {
+    const e = entries[key]
+    return e && e.available?.() !== false ? e : undefined
+}
+
+/** The keys that exist here — an unavailable one is left out, unless `all` (Config1 lists
+ *  those as `available: false`, so a client can hide a row on purpose). */
+export function configKeys(all = false): string[] {
+    return Object.keys(entries).filter(k => all || live(k)).sort()
+}
+
+/**
+ * How many enum values `describeConfig` inlines before it summarises instead.
+ *
+ * ⚠️ `input.keyboard.layout` alone carries 598 (#473 — the catalogue is xkb's, not
+ * a hand-written slice of it), which is ~7 KB of names. This response is what an
+ * agent reads BEFORE every get/set, so dumping them would spend that on every
+ * call for a list nobody reads to the end. The sample plus `valuesTotal` says
+ * what the shape is, the entry's own `desc` says how to build one, and
+ * validation still happens against the WHOLE set — a value past the sample is
+ * accepted exactly as before.
+ */
+const ENUM_INLINE_MAX = 40
+
+const enumField = (values?: readonly string[]) => {
+    if (!values) return {}
+    if (values.length <= ENUM_INLINE_MAX) return { values }
+    return { values: values.slice(0, ENUM_INLINE_MAX), valuesTotal: values.length }
+}
+
+/** Machine-readable schema + current values — what `describeConfig` serves. */
+export function describeConfig() {
+    const out: Record<string, object> = {}
+    for (const key of configKeys()) {
+        const e = entries[key]
+        out[key] = {
+            desc: e.desc,
+            type: e.type,
+            ...enumField(enumOf(e)),
+            ...(e.min !== undefined ? { min: e.min } : {}),
+            ...(e.max !== undefined ? { max: e.max } : {}),
+            writable: e.writable !== false && !!e.set,
+            value: e.get(),
+            ...(locations[key] ? locations[key] : {}),
+        }
+    }
+    return out
+}
+
+// Plain optional-field result (not a discriminated union): tsconfig has
+// strict:false, under which tsc does not narrow `r.ok ? r.value : r.error`.
+export interface ConfigResult {
+    ok: boolean
+    value?: ConfigValue
+    error?: string
+}
+
+export function getConfigValue(key: string): ConfigResult {
+    const e = live(key)
+    if (!e) return { ok: false, error: `unknown key: ${key} — try \`describeConfig\`` }
+    return { ok: true, value: e.get() }
+}
+
+export function getAllConfigValues(): Record<string, ConfigValue> {
+    const out: Record<string, ConfigValue> = {}
+    for (const key of configKeys()) out[key] = entries[key].get()
+    return out
+}
+
+/** Parse + validate a raw string against the entry's declared type/constraints. */
+function parseValue(e: ConfigEntry, raw: string): ConfigResult {
+    switch (e.type) {
+        case "boolean": {
+            const low = raw.toLowerCase()
+            if (["true", "on", "1", "yes"].includes(low)) return { ok: true, value: true }
+            if (["false", "off", "0", "no"].includes(low)) return { ok: true, value: false }
+            return { ok: false, error: `expected a boolean (true/false), got: ${raw}` }
+        }
+        case "number": {
+            const n = Number(raw)
+            if (Number.isNaN(n)) return { ok: false, error: `expected a number, got: ${raw}` }
+            if (e.min !== undefined && n < e.min) return { ok: false, error: `${n} is below the minimum (${e.min})` }
+            if (e.max !== undefined && n > e.max) return { ok: false, error: `${n} is above the maximum (${e.max})` }
+            return { ok: true, value: n }
+        }
+        case "enum": {
+            const values = enumOf(e)
+            if (!values?.includes(raw)) {
+                // Same cap as describeConfig, and for the same reason: an error
+                // that prints 598 names is not more helpful than one that prints
+                // forty and says how many there are.
+                const shown = values?.slice(0, ENUM_INLINE_MAX).join(", ")
+                const rest = (values?.length ?? 0) > ENUM_INLINE_MAX ? ` … (${values!.length} in total)` : ""
+                return { ok: false, error: `invalid value: ${raw} — valid: ${shown}${rest}` }
+            }
+            return { ok: true, value: raw }
+        }
+        case "string":
+            return e.validate ? e.validate(raw) : { ok: true, value: raw }
+    }
+}
+
+/**
+ * Validate and apply. Returns a human/agent-readable result string.
+ * NOTE: the allow-writes gate (AgentConfig) is enforced by the IPC layer in
+ * app.ts — this function is the trusted path Settings/internal code may use.
+ */
+export async function setConfigValue(key: string, raw: string): Promise<string> {
+    const e = live(key)
+    if (!e) return `unknown key: ${key} — try \`describeConfig\``
+    if (e.writable === false || !e.set)
+        return `read-only key: ${key} (changeable only from the Settings window)`
+    const parsed = parseValue(e, raw)
+    if (!parsed.ok) return `invalid value for ${key}: ${parsed.error}`
+    try {
+        await e.set(parsed.value as ConfigValue)
+        return JSON.stringify({ key, value: e.get() })
+    } catch (err) {
+        console.error(`[ConfigRegistry] set ${key} failed:`, err)
+        return `error applying ${key}: ${err}`
+    }
+}

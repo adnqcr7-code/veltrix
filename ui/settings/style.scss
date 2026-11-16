@@ -1,0 +1,10 @@
+// Settings is an application; its window styles and shared shell primitives keep
+// their existing scopes. The kit's base/component sheet is loaded at runtime.
+@use '../shell/styles/base';
+@use '../shell/styles/reset';
+@use '../shell/styles/components';
+@use '../shell/styles/settings';
+// RTL mirrors last: Settings is a separate process with its own sheet, so the
+// shell sheet's overrides never reach it — this sheet needs the shared partial
+// itself (bilingual v1 missed it: 0 `:dir(rtl)` rules in the Settings sheet).
+@use '../lib/rtl';

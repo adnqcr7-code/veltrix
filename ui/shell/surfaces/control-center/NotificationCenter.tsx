@@ -1,0 +1,756 @@
+import Gtk from "gi://Gtk?version=4.0"
+import Gdk from "gi://Gdk?version=4.0"
+import GLib from "gi://GLib"
+import GdkPixbuf from "gi://GdkPixbuf"
+import { execAsync } from "../../../lib/process"
+import compositor from "../../core/CompositorState"
+import { drawSquircle, squircleThumb } from "../../common/DrawingUtils"
+import { VeltrixScrolled } from "../../../lib/veltrix-kit"
+import SquircleContainer, { Shape } from "../../common/SquircleContainer"
+import { RADIUS } from "../../../lib/veltrix-kit/platform/tokens"
+import { ScaleRevealer, attachGhostSwipeDismiss } from "../../common/ScaleRevealer"
+import IconButton from "../../common/IconButton"
+import Theme from "../../core/ThemeManager"
+import Gio from "gi://Gio"
+import appService from "../../core/AppService"
+import status from "../../core/Status"
+import { dockSideState } from "../dock/state"
+import { UNIT, GAP, GRID_WIDTH } from "./CCLayoutManager"
+import { CC_PANEL_PAD } from "./ControlCenter"
+import { t } from "../../core/i18n"
+import { uiIcon } from "../../core/Icons"
+import { safeDisconnect } from "../../core/signals"
+import { type Notification, notifications as allNotifications, watchNotified, watchResolved } from "../../core/NotifService"
+import { cairoDraw } from "../../../lib/veltrix-kit/platform/cairo-draw"
+import { compositorPaintsGlass, trackGlass, type GlassShape } from "../../../lib/veltrix-kit/platform/material"
+import { glassAlphaFor, glassTintFor } from "../../common/ShellGlass"
+
+export function createIconWidget(n: Notification, size: number) {
+    const img = new Gtk.Image({ pixel_size: size, halign: Gtk.Align.START, valign: Gtk.Align.CENTER })
+    // An explicit absolute app_icon wins over registry resolution. The sender
+    // chose this art for THIS notification, and the daemon stores it verbatim
+    // — while getResolvedApp("Veltrix") prefix-matches the first veltrix-*
+    // desktop entry and draws ITS icon instead (fidelity v2: the nudge's
+    // V-mark path never reached the screen because a veltrix-* entry always
+    // resolved first). Only an absolute path (or file:// URL) to a regular
+    // image file qualifies: a bare icon name stays on the registry path below,
+    // where generic placeholders are filtered — a sender must not be able to
+    // steer this branch with a theme name.
+    const declared = n.app_icon || ""
+    // M4 (fix pass #3): the absolute-path branch used to take any existing
+    // file — a directory path drew a blank 44px slot, a `file://` URL with
+    // %20 never decoded, and a non-image file drew broken/nothing. Now the
+    // path is percent-decoded, must be a REGULAR file, and must look like
+    // an image (extension allowlist); anything else falls through to the
+    // registry path below, deliberately, instead of drawing a blank slot.
+    let declaredPath = declared.startsWith("file://") ? declared.slice("file://".length) : declared
+    const decoded = GLib.uri_unescape_string(declaredPath, null)
+    if (decoded) declaredPath = decoded
+    const IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp"]
+    const lowerPath = declaredPath.toLowerCase()
+    if (declaredPath.startsWith("/") && IMAGE_EXTS.some((ext) => lowerPath.endsWith(ext))
+        && GLib.file_test(declaredPath, GLib.FileTest.IS_REGULAR)) {
+        img.gicon = Gio.FileIcon.new(Gio.File.new_for_path(declaredPath))
+        return img
+    }
+    const entry = n.desktop_entry || n.app_name || ""
+    const appRes = appService.getResolvedApp(entry)
+    if (appRes) {
+        const icon = appRes.icon_name || appRes.get_icon()
+        if (typeof icon === "string") {
+            if (icon.startsWith("/") || icon.startsWith("file://")) img.gicon = Gio.FileIcon.new(Gio.File.new_for_path(icon.replace("file://", "")))
+            else img.icon_name = icon
+        } else if (icon) img.gicon = icon
+    } else {
+        // The registry doesn't know this sender (a script, a bare notify-send, an
+        // app with no .desktop entry). Both remaining sources are hostile in the
+        // same way the audio ones were, so neither is taken at face value:
+        //   - `app_icon` is whatever the sender typed. A PLACEHOLDER
+        //     (`dialog-information`, `application-x-executable`) is a "we didn't
+        //     say", not an icon — accepting one stops the search on a generic
+        //     glyph, which is how the CC audio rows ended up drawing a gear.
+        //   - `app_name` is a DISPLAY name, so it goes through iconForAppName
+        //     (registry before theme): the theme will answer an ordinary word
+        //     like "Music" with whatever it happens to alias.
+        const fromDeclared = declared && !appService.isGenericIconName(declared)
+            ? appService.getIconName(declared)
+            : null
+        const fallback = fromDeclared || appService.iconForAppName(n.app_name || "")
+        if (fallback?.startsWith("/") || fallback?.startsWith("file://")) img.gicon = Gio.FileIcon.new(Gio.File.new_for_path(fallback.replace("file://", "")))
+        else if (fallback) img.icon_name = fallback
+        // nd-icon ONLY on our own Lucide fallback art (black stroke → mode filter);
+        // app icons must never get the invert — it corrupted their colors once.
+        else { img.gicon = uiIcon("nd-dialog-information"); img.add_css_class("nd-icon") }
+    }
+    return img
+}
+
+// A "hero" image (image-path / image-data hint) — screenshot thumbnails, album art,
+// chat avatars sent as content rather than the app icon. Null when the hint is absent,
+// is an icon name (handled by the app icon), or points at a missing file.
+function heroImagePath(n: Notification): string | null {
+    const raw = n.image
+    if (!raw) return null
+    const path = raw.replace("file://", "")
+    if (!path.startsWith("/") || !GLib.file_test(path, GLib.FileTest.EXISTS)) return null
+    return path
+}
+
+export function createHeroWidget(n: Notification, size: number): Gtk.Widget | null {
+    const path = heroImagePath(n)
+    if (!path) return null
+    let pixbuf: any = null
+    try { pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, size * 2, size * 2, true) } catch { return null }
+    if (!pixbuf) return null
+    const da = squircleThumb(pixbuf, size, size, undefined, "nc-hero")
+    da.halign = Gtk.Align.END; da.valign = Gtk.Align.CENTER
+    return da
+}
+
+// Expanded NC rows show the image at full card width (the Android BigPicture
+// shape; otherwise the compact right thumb). Small sources — chat
+// avatars are typically 64-160px — are excluded: cover-fitting one to ~320px is mush,
+// so they keep the thumbnail even when expanded. Banners never take this path.
+const HERO_BIG_MIN_SOURCE = 240
+export function hasExpandedHero(n: Notification): boolean {
+    const path = heroImagePath(n)
+    if (!path) return false
+    const [format, pw] = GdkPixbuf.Pixbuf.get_file_info(path)   // header read only, no decode
+    return !!format && pw >= HERO_BIG_MIN_SOURCE
+}
+
+export function createExpandedHeroWidget(n: Notification, width: number): Gtk.Widget | null {
+    const path = heroImagePath(n)
+    if (!path) return null
+    const [format, pw, ph] = GdkPixbuf.Pixbuf.get_file_info(path)
+    if (!format || pw < HERO_BIG_MIN_SOURCE) return null
+    // Height follows the source aspect at full width, clamped so a portrait doesn't take
+    // over the card and a wide strip stays visible; cover-fit crops the difference.
+    const height = Math.max(72, Math.min(200, Math.round(width * ph / pw)))
+    let pixbuf: any = null
+    try { pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, width * 2, width * 2, true) } catch { return null }
+    if (!pixbuf) return null
+    return squircleThumb(pixbuf, width, height, undefined, "nc-hero-big")
+}
+
+// Relative timestamp for the NC cards. A helper (not inlined) so the per-minute
+// refresh can restamp the label text in place instead of rebuilding every card.
+export function timeAgo(time: number): string {
+    const d = Math.floor(Date.now() / 1000) - time
+    if (d < 60) return t("nc.time.now")
+    if (d < 3600) return `${Math.floor(d / 60)}m`
+    if (d < 86400) return `${Math.floor(d / 3600)}h`
+    return `${Math.floor(d / 86400)}d`
+}
+
+export function GroupControlHeader(props: { name: string, count: number, onToggle: () => void, onClearGroup: () => void }) {
+    const { name, count, onToggle, onClearGroup } = props
+    const box = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 8, valign: Gtk.Align.CENTER, hexpand: true, margin_start: 10, margin_end: 6, margin_top: 2, margin_bottom: 2 })
+    const labelBox = new Gtk.Box({ spacing: 8, hexpand: true, valign: Gtk.Align.CENTER })
+    labelBox.append(new Gtk.Label({ label: name, css_classes: ["nc-group-header-name"], halign: Gtk.Align.START, ellipsize: 3, lines: 1, max_width_chars: 24, xalign: 0 }))
+    labelBox.append(new Gtk.Label({ label: `${count}`, css_classes: ["nc-badge-header"], valign: Gtk.Align.CENTER }))
+    // captureClick: the header capsule below carries a release-phase tap (collapse) and
+    // a swipe gesture — the buttons claim on press so they beat both.
+    const collapseBtn = IconButton({ icon: uiIcon("nd-pan-up"), iconSize: 14, variant: "neutral", captureClick: true, onClick: onToggle })
+    const clearAllBtn = IconButton({ icon: uiIcon("nd-window-close"), iconSize: 14, variant: "danger", captureClick: true, onClick: onClearGroup })
+    box.append(labelBox); box.append(collapseBtn); box.append(clearAllBtn)
+    // Paint the background with the same shellOpacity squircle as the cards (the old CSS
+    // surface fill was fixed and didn't follow the Settings opacity). Tapping the header
+    // background collapses the group, same as the chevron — release-phase because the
+    // header is also a swipe target (see the NC row capsules for the pattern).
+    const header = SquircleContainer({ child: box, radius: RADIUS.md, useShellOpacity: true, gloss: true, borderColor: { r: 1, g: 1, b: 1, a: 0.05 }, css_classes: ["nc-group-ctrl-header"], onClick: onToggle, clickOnRelease: true })
+    // Hover-reveal via OPACITY (not `visible`): the header spans full width, so keeping
+    // the buttons allocated costs no text space and the row never reflows on hover.
+    const setShown = (shown: boolean) => [collapseBtn, clearAllBtn].forEach(b => { b.opacity = shown ? 1 : 0; b.can_target = shown })
+    setShown(false)
+    const motion = new Gtk.EventControllerMotion()
+    motion.connect("enter", () => setShown(true))
+    motion.connect("leave", () => setShown(false))
+    header.add_controller(motion)
+    return header
+}
+
+export function NotificationCapsule(props: { n: Notification, groupCount?: number, isExpanded?: boolean, onToggle?: () => void, onClearGroup?: () => void, isPopup?: boolean, itemExpanded?: boolean, onToggleItem?: () => void, onClose: () => void, onTimeLabel?: (label: Gtk.Label, time: number) => void, startHovered?: boolean }) {
+    const { n, groupCount = 1, isExpanded = false, onToggle, onClearGroup, isPopup = false, itemExpanded = false, onToggleItem, onClose, onTimeLabel, startHovered = false } = props
+    // Strip markup tags first, THEN decode entities (a decoded "<" must not read as a
+    // tag), with &amp; last so "&amp;lt;" stays a literal "&lt;". Labels are plain text
+    // (no use_markup), so decoded characters render as-is.
+    const decodeEntities = (s: string) => s
+        .replace(/&#x([0-9a-f]+);/gi, (m, h) => { const cp = parseInt(h, 16); return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m })
+        .replace(/&#(\d+);/g, (m, n) => { const cp = parseInt(n, 10); return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m })
+        .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"").replace(/&apos;/g, "'").replace(/&amp;/g, "&")
+    const sanitize = (text: string) => decodeEntities((text || "").replace(/<[^>]*>/g, "")).split("\n").join(" ").replace(/\s+/g, " ").trim()
+    const cleanSummary = sanitize(n.summary); const cleanBody = sanitize(n.body)
+
+    // The card is a vertical stack: the classic horizontal row on top and, when the item
+    // is expanded with a big-enough image, the full-width hero (+ actions) below it.
+    const outerV = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 12, margin_start: 14, margin_end: 14, margin_top: 10, margin_bottom: 10, valign: Gtk.Align.START, hexpand: true })
+    // Content top-aligned: title sits at the same height as the badge/chevron on the right.
+    const box = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 12, hexpand: true })
+    outerV.append(box)
+    box.append(createIconWidget(n, 44))   // app icon stays vertically centred (like the hero)
+
+    const textStack = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, valign: Gtk.Align.START, hexpand: true })
+    // height_request pins the title line so the hover reveal (21px buttons in, ~17px
+    // time out) can't nudge the card height by a pixel on rows taller than min-height.
+    const header = new Gtk.Box({ spacing: 8, valign: Gtk.Align.CENTER, hexpand: true, height_request: 22 })
+    // Title natural width capped a bit under the body's 30 (see the body note): the
+    // controls now share this line, and the popup window sizes to natural width.
+    header.append(new Gtk.Label({ label: cleanSummary, css_classes: ["veltrix-atomic-label-bold"], halign: Gtk.Align.START, ellipsize: 3, lines: 1, hexpand: true, max_width_chars: 24, xalign: 0 }))
+
+    let timeLabel: Gtk.Label | null = null
+    if (!isPopup) {
+        timeLabel = new Gtk.Label({ label: timeAgo(n.time), css_classes: ["nc-item-time"], halign: Gtk.Align.END })
+        header.append(timeLabel)
+        onTimeLabel?.(timeLabel, n.time)
+    }
+
+    textStack.append(header)
+
+    // Close button — collapsed groups clear the whole group, otherwise dismiss the one.
+    const isCollapsedGroup = !isPopup && groupCount > 1 && !isExpanded && !!onToggle
+    const clearBtn = IconButton({
+        icon: uiIcon("nd-window-close"), iconSize: 13, variant: "danger", captureClick: true,
+        onClick: () => { if (groupCount > 1 && !isExpanded && onClearGroup) onClearGroup(); else n.dismiss() },
+    })
+
+    // Two fixed sizes: 2 body lines (normal) / 4 (expanded). Reserve the height so all
+    // normals (and all expanded) share one height regardless of how long the body is.
+    const bodyLines = itemExpanded ? 4 : 2
+    let bodyLabel: Gtk.Label | null = null
+    if (cleanBody) {
+        // max_width_chars caps the NATURAL width only (a wrapping label otherwise
+        // requests the full unwrapped text width — the NC scroll clamps it, but the
+        // popup's layer window sizes to natural and would balloon with long bodies).
+        bodyLabel = new Gtk.Label({ label: cleanBody, css_classes: ["nc-notif-body"], halign: Gtk.Align.FILL, ellipsize: 3, lines: bodyLines, wrap: true, xalign: 0, hexpand: true, max_width_chars: 30 })
+        // Normal reserves its 2 lines (uniform height); expanded grows to content up to 4.
+        if (!isPopup && !itemExpanded) bodyLabel.height_request = bodyLines * 17   // ~17px @ fs-caption 12
+        textStack.append(bodyLabel)
+    }
+
+    // Action buttons (skip the implicit "default" action — that's the card tap).
+    // Only in the expanded size, so the normal size never grows/overflows.
+    const actions = (n.get_actions() || []).filter(a => a.id !== "default" && a.label)
+    let actionRow: Gtk.Box | null = null
+    if (actions.length > 0 && itemExpanded) {
+        actionRow = new Gtk.Box({ spacing: 8, halign: Gtk.Align.START, css_classes: ["nc-action-row"] })
+        actions.forEach(a => {
+            const btn = new Gtk.Button({ label: a.label, css_classes: ["nc-action-btn"], halign: Gtk.Align.START })
+            const stopProp = new Gtk.GestureClick(); stopProp.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            stopProp.connect("pressed", (gesture) => {
+                gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+                n.invoke(a.id)
+                if (onClose) onClose()
+            })
+            btn.add_controller(stopProp)
+            actionRow!.append(btn)
+        })
+    }
+
+    box.append(textStack)
+
+    // Expanded + big source → full-width hero below the row (replaces the thumb);
+    // otherwise the compact right thumb.
+    const bigHero = itemExpanded ? createExpandedHeroWidget(n, GRID_WIDTH - 28) : null
+    let thumb: Gtk.Widget | null = null
+    if (bigHero) outerV.append(bigHero)
+    else {
+        thumb = createHeroWidget(n, 44)
+        if (thumb) box.append(thumb)
+    }
+    if (actionRow) {
+        if (bigHero) outerV.append(actionRow)   // actions sit under the image (outerV spacing separates them)
+        else { actionRow.margin_top = 8; textStack.append(actionRow) }
+    }
+
+    // Banner actions: glass capsules OVERLAID on the right edge, revealed
+    // on hover — the banner never grows and the stack below it never shifts. Capped at 2
+    // (the expanded NC row shows them all). The thumb fades via opacity, not `visible`,
+    // so the text never rewraps under the pointer.
+    let bannerActions: Gtk.Box | null = null
+    if (isPopup && actions.length > 0) {
+        bannerActions = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 12, halign: Gtk.Align.END, valign: Gtk.Align.CENTER, margin_end: 12, visible: false, css_classes: ["nc-banner-actions"] })
+        actions.slice(0, 2).forEach(a => {
+            const lbl = new Gtk.Label({ label: a.label, css_classes: ["nc-banner-action-label"], margin_start: 12, margin_end: 12, margin_top: 3, margin_bottom: 3, ellipsize: 3, max_width_chars: 14 })
+            const btn = SquircleContainer({ child: lbl, shape: Shape.CAPSULE, useShellOpacity: true, gloss: true, borderColor: { r: 1, g: 1, b: 1, a: 0.10 } })
+            // Capture-claim like the expanded row's action buttons: beats the card's
+            // release-tap AND the swipe detector.
+            const g = new Gtk.GestureClick(); g.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            g.connect("pressed", (gesture) => { gesture.set_state(Gtk.EventSequenceState.CLAIMED); n.invoke(a.id); if (onClose) onClose() })
+            btn.add_controller(g)
+            bannerActions!.append(btn)
+        })
+    }
+
+    // An individual notification is expandable if it has actions, a body longer than the
+    // 2-line normal size can show, or an image worth the full-width treatment.
+    const expandable = !isPopup && groupCount === 1 && !!onToggleItem && (actions.length > 0 || cleanBody.length > 70 || hasExpandedHero(n))
+
+    // Title line: title · time · badge/chevron — a dedicated right column reserved its
+    // width across every text line, shortening the body too; only the title should cede
+    // space. The close is NOT here: it floats over the card's top-left corner (overlay
+    // below), hover-only — one position, identical on banners and NC rows.
+    // The chevron is hover-only too, swapped in for the timestamp (line stays put); the
+    // count badge is information, not a control — always visible.
+    let chevBtn: Gtk.Widget | null = null
+    if (isCollapsedGroup) {
+        header.append(new Gtk.Label({ label: `${groupCount}`, css_classes: ["nc-badge-header"], valign: Gtk.Align.CENTER }))
+    } else if (expandable) {
+        chevBtn = IconButton({ icon: itemExpanded ? uiIcon("nd-pan-up") : uiIcon("nd-pan-down"), iconSize: 13, variant: "neutral", captureClick: true, onClick: onToggleItem })
+        chevBtn.set_visible(false)
+        header.append(chevBtn)
+    }
+    clearBtn.set_visible(false)
+
+    const openApp = async () => {
+        const actions = n.get_actions() || []; const hasAction = (id: string) => actions.some(a => a.id === id)
+        const appName = n.desktop_entry || n.app_name || ""; const lowerApp = appName.toLowerCase()
+        if (lowerApp) {
+            // Derive candidate window classes from the app registry instead of per-app
+            // hardcoding: getAppInfo resolves desktop_entry/app_name however the sender
+            // spelled it (exact id, StartupWMClass, exec, name, prefixed ids), and the
+            // resolved desktop id + wmClass + exec are the class spellings Hyprland can
+            // report ("Telegram Desktop" → org.telegram.desktop, etc.).
+            const resolvedId = appService.getAppInfo(appName)?.get_id()?.replace(/\.desktop$/i, "").toLowerCase()
+            const appData = resolvedId ? appService.getAppData(resolvedId) : null
+            const classCandidates = new Set([lowerApp, resolvedId, appData?.wmClass, appData?.exec].filter(Boolean) as string[])
+            try {
+                // compositor.clients is the cached, always-current client list — no per-open
+                // `hyprctl -j clients` re-shell — and compositor.focusWindow centralizes the
+                // focus dispatch (same Lua dispatch string the dock uses).
+                const target = compositor.clients.find((c: any) => {
+                    const cls = c.class?.toLowerCase()
+                    return !!cls && (classCandidates.has(cls) || cls.includes(lowerApp))
+                })
+                if (target) {
+                    await compositor.focusWindow(target.address)
+                    if (hasAction("default")) n.invoke("default")
+                } else {
+                    if (hasAction("default")) n.invoke("default")
+                    else appService.getResolvedApp(appName)?.launch()
+                }
+            } catch (e) {
+                if (hasAction("default")) n.invoke("default")
+                else appService.getResolvedApp(appName)?.launch()
+            }
+        } else {
+            const urlMatch = n.body.match(/https?:\/\/[^\s<>"]+/g) || n.summary.match(/https?:\/\/[^\s<>"]+/g)
+            if (urlMatch) execAsync(["xdg-open", urlMatch[0]]).catch(e => console.error(e))
+            else if (hasAction("default")) n.invoke("default")
+        }
+        if (onClose) onClose()
+    }
+
+    const handleAction = async () => {
+        // Tapping a collapsed group expands it; individual notifs expand via the chevron only.
+        if (isCollapsedGroup && onToggle) { onToggle(); return }
+        await openApp()
+    }
+
+    // Release-phase click on every notification capsule (banner AND NC row):
+    // both are swipe-to-dismiss, and a press-phase tap would fire before the
+    // swipe can be recognised. See attachSwipeDismiss.
+    // Hover controls ride a Gtk.Overlay above the card content (they don't affect its
+    // size — overlay children aren't measured): the close floats over the top-left
+    // corner on EVERY card (banner and NC row — one position, no inconsistency),
+    // banner action capsules take the right edge.
+    const ov = new Gtk.Overlay({ child: outerV })
+    clearBtn.halign = Gtk.Align.START; clearBtn.valign = Gtk.Align.START
+    clearBtn.margin_start = 4; clearBtn.margin_top = 4
+    ov.add_overlay(clearBtn)
+    if (bannerActions) ov.add_overlay(bannerActions)
+    // CRITICAL urgency gets no visual decoration — GNOME doesn't mark it
+    // either: never auto-expiring IS the signal. The 1px inner edge is part of
+    // the glass sheen, not an indicator channel.
+    const capsule = SquircleContainer({ child: ov, radius: RADIUS.xl, useShellOpacity: true, gloss: true, hexpand: true, borderColor: { r: 1, g: 1, b: 1, a: 0.05 }, css_classes: ["nc-capsule-item"], onClick: handleAction, clickOnRelease: true })
+    // Hover ⇄ rest (leave restores). The timestamp only swaps out when a chevron takes
+    // its place — with the close in the corner, hiding it otherwise buys nothing.
+    // enter/leave fire on the capsule's whole territory — a child crossing is not a leave.
+    const applyHover = (h: boolean) => {
+        clearBtn.set_visible(h)
+        if (chevBtn) { timeLabel?.set_visible(!h); chevBtn.set_visible(h) }
+        if (bannerActions) { bannerActions.set_visible(h); if (thumb) thumb.opacity = h ? 0 : 1 }
+    }
+    const hoverMotion = new Gtk.EventControllerMotion()
+    hoverMotion.connect("enter", () => applyHover(true))
+    hoverMotion.connect("leave", () => applyHover(false))
+    capsule.add_controller(hoverMotion)
+    // A row rebuilt UNDER the pointer (its chevron was just clicked) starts in the hover
+    // state — GTK only re-synthesizes the crossing a beat later, and starting at rest
+    // makes the controls blink off/on across the rebuild. Leave still restores rest.
+    if (startHovered) applyHover(true)
+    return capsule
+}
+
+// Wrap an NC row so it can be swiped away like a banner. The row itself can't
+// slide — it lives in a clipping scroller — so the drag visual is a GHOST of
+// the row painted above the panel (see attachGhostSwipeDismiss); past threshold
+// the ghost flings off-screen while the real row COLLAPSES (height shrinks,
+// rows below close the gap), then dismisses. `content` is what's laid out (a
+// capsule, or a group stack); `target` is the widget the drag rides + whose
+// release-tap the swipe cancels (the capsule, which sits inside the stack for
+// collapsed groups).
+function wrapSwipe(content: Gtk.Widget, onDismiss: () => void, target: Gtk.Widget = content, morphFrom = 0): Gtk.Widget {
+    // animateLayout so the collapse shrinks the row's HEIGHT (siblings reflow);
+    // scaleFrom near 0 so it collapses essentially to nothing before it's gone.
+    const sr = new ScaleRevealer(content, { animateLayout: true, scaleFrom: 0.06, durationOut: 220, pivot: "center" })
+    sr.showInstant()
+    // morphFrom > 0: this wrapper REPLACES one that was morphFrom px tall (item
+    // expand/collapse, header ⇄ stacked-capsule swap) — ease the height over
+    // instead of snapping the column by the difference.
+    if (morphFrom > 0) sr.morphFromHeight(morphFrom)
+    attachGhostSwipeDismiss(target, sr, { onDismiss })
+    return sr
+}
+export function makeGroupStack(card: Gtk.Widget, groupCount: number): Gtk.Widget {
+    if (groupCount <= 1) return card
+
+    const CARD_H = 76          // the real card's least height (.nc-capsule-item)
+    const CARD_R = RADIUS.xl   // match the real card's corner radius
+    const PEEK   = 14          // how far the nearest ghost peeks below the card
+    const STEP   = 10          // extra peek per deeper layer (enough to show body, not just the rim)
+    const layers = groupCount >= 3 ? 2 : 1   // a second ghost only once there are 3+
+
+    card.add_css_class("nc-stack-card")
+
+    const wrapper = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 0 })
+    wrapper.append(card)
+
+    // A single DrawingArea paints all ghost layers — no negative margins on a thin area
+    // (those reported "min height < 0"). Layers are drawn back-to-front: each deeper one is
+    // narrower (more inset), peeks a bit lower, and is fainter, for a stacked-card look.
+    const stripH = PEEK + (layers - 1) * STEP
+    const da = new Gtk.DrawingArea({ height_request: stripH })
+    da.set_draw_func(cairoDraw((_da: any, cr: any, w: number, _h: number) => {
+        if (w <= 0 || _h <= 0) return
+        if (compositorPaintsGlass(da)) return   // the compositor paints these bands (#684)
+        const color = glassTintFor(da)   // the shell's skin, in its surface's tint
+        for (let i = layers - 1; i >= 0; i--) {
+            // Inset >= the card's corner radius − 2 so each ghost's straight top edge sits under the
+            // STRAIGHT part of the card's bottom (clear of the rounded corners) — no corner gap.
+            // (From the card's glass: CARD_R from its box, 2 px wider each side, until #762.)
+            const inset = CARD_R - 2 + i * 16
+            const bottomY = PEEK + i * STEP
+            // Clip to this layer's band, overlapping the previous layer by ~2px of BODY. The
+            // card→ghost1 seam overlaps 4px but the card's inner inset (~2.5) eats most of it,
+            // leaving ~1.5px of body; ghosts draw with inset 0, so 2px matches that seam weight.
+            const bandTop = i === 0 ? 0 : PEEK + (i - 1) * STEP - 2
+            // Body stays nearly as solid as the front; just a hair fainter — except on SOLID
+            // glass (reduce transparency, #674), where fainter would mean see-through again.
+            const alpha = glassAlphaFor(da, "overlay")
+            const depth = alpha >= 1 ? 1 : 1 - i * 0.12
+            cr.save()
+            cr.rectangle(0, bandTop, w, bottomY - bandTop)
+            cr.clip()
+            cr.translate(inset, bottomY - CARD_H)
+            // inset 0 so the squircle's bottom edge lands exactly at bottomY (no gap between bands).
+            drawSquircle(cr, w - inset * 2, CARD_H, undefined, alpha * depth, false, color, CARD_R, false, { r: 1, g: 1, b: 1, a: 0.07 * depth }, 3.2, 1.0, 0)
+            cr.restore()
+        }
+    }))
+    // The same bands as glass a compositor of our own paints (#684), back to front.
+    trackGlass(da, () => {
+        const w = da.get_width()
+        const out: GlassShape[] = []
+        for (let i = layers - 1; i >= 0; i--) {
+            const inset = CARD_R - 2 + i * 16
+            const bottomY = PEEK + i * STEP
+            const bandTop = i === 0 ? 0 : PEEK + (i - 1) * STEP - 2
+            const solid = glassAlphaFor(da, "overlay") >= 1
+            out.push({ x: inset, y: bottomY - CARD_H, w: w - inset * 2, h: CARD_H, radius: CARD_R, exponent: 3.2,
+                opacity: solid ? 1 : 1 - i * 0.12, clip: { x: 0, y: bandTop, w, h: bottomY - bandTop } })
+        }
+        return out
+    })
+    const themeConn = Theme.connect("changed", () => { if (da.get_mapped()) da.queue_draw() })
+    da.connect("destroy", () => safeDisconnect(Theme, themeConn))
+    wrapper.append(da)
+
+    return wrapper
+}
+
+export default function NotificationCenter() {
+    const expandedGroups = new Set<string>()
+    const expandedItems = new Set<number>()   // individual notifs (by n.id) in expanded size
+    // The row whose chevron was just clicked — its rebuilt capsule starts in the hover
+    // state (the pointer is on it by definition). See startHovered in NotificationCapsule.
+    let hoverSeed: number | null = null
+    const toggleItem = (nid: number) => { if (expandedItems.has(nid)) expandedItems.delete(nid); else expandedItems.add(nid); hoverSeed = nid; updateNotifs(); hoverSeed = null }
+    const groupCache = new Map<string, { container: Gtk.Box, headerBox: Gtk.Box, revealer: any, subBox: Gtk.Box, sig: string, timeLabels: { label: Gtk.Label, time: number }[], expanded: boolean, subClearTimer: number | null }>()
+
+    // The NC is a PANEL like the CC (ControlCenter.tsx, CC_PANEL_PAD — the same margin, so
+    // the two columns line up): its cards sit 16 in from every edge and 16 apart (owner,
+    // 2026-09-30; 12 apart and flush with an 8px side gap until then).
+    // The content keeps its full width (GRID_WIDTH); LANE is extra space ADDED on the right
+    // to host the scrollbar, and it lives INSIDE the panel's right margin (so that margin
+    // is PAD − LANE of box + the lane). The overlay scrollbar floats in that lane only when
+    // there's overflow — so it never reflows the cards. Must match the .nc-content-box
+    // padding-right.
+    const LANE = 8
+    const PAD = CC_PANEL_PAD
+    const outer = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL, spacing: GAP, width_request: GRID_WIDTH + LANE, css_classes: ["nc-outer"],
+        margin_top: PAD, margin_bottom: PAD, margin_start: PAD, margin_end: PAD - LANE,
+    })
+
+    // propagate_natural_height: the panel hugs its visible content (calendar +
+    // cards) instead of filling the bar→dock gap — empty column space would go
+    // into the Bar's input region, and the compositor would read the presses
+    // below the last card as INSIDE the grab instead of dismissing the NC.
+    // max_content_height (set via setMaxHeight below) is the cap: past it the
+    // list scrolls.
+    // The scroll forces its child to the full viewport width (GRID_WIDTH + LANE). A
+    // padding-right of LANE (in .nc-content-box) keeps the cards at GRID_WIDTH and leaves
+    // the lane free on the right for the indicator — no reflow, no overlap.
+    const listContainer = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: GAP, css_classes: ["nc-content-box"], margin_top: 0, margin_bottom: 0 })
+    // VeltrixScrolled retires tech-debt #15: GTK's overlay slider grew on pointer
+    // PROXIMITY (it sets .hovering itself, Adwaita's rule beat every override) and ate
+    // the right edge of each card's close ✕. The replacement indicator is can_target
+    // false, so there is nothing left to grow into the button.
+    const { widget: scrollWidget, scrolled: scroll } = VeltrixScrolled({
+        child: listContainer,
+        propagateNaturalHeight: true,
+        // .nc-content-box already pads the lane in CSS — don't reserve it twice.
+        lane: LANE, reserveLane: false,
+        cssClasses: ["nc-scroll"],
+    })
+    scroll.vexpand = true; scroll.hexpand = true
+    scrollWidget.vexpand = true; scrollWidget.hexpand = true
+
+    const CAL_H = 3 * UNIT + 2 * GAP      // 3 rows = 264px
+    const calendarIsland = SquircleContainer({
+        child: new Gtk.Calendar({ hexpand: true, vexpand: true, css_classes: ["nc-calendar-widget"] }),
+        radius: RADIUS.xl, gloss: true, useShellOpacity: true,
+        borderColor: { r: 1, g: 1, b: 1, a: 0.05 },
+        css_classes: ["cc-island", "nc-calendar-island"],
+    })
+    // Calendar fixed to GRID_WIDTH and left-aligned, so its right edge lines up with the cards
+    // (the LANE sits to the right of both).
+    calendarIsland.set_size_request(GRID_WIDTH, CAL_H)
+    calendarIsland.set_halign(Gtk.Align.START)
+    // The empty state rides the same glass capsule as the clear-all pill — bare text sat
+    // straight on the wallpaper and washed out on light backgrounds.
+    // 18 above its glass, like the CC's Edit pill, and nothing below: the panel's margin closes it.
+    const emptyBox = new Gtk.Box({ halign: Gtk.Align.CENTER, margin_top: 18, margin_bottom: 0, visible: false })
+    emptyBox.append(SquircleContainer({ child: new Gtk.Label({ label: t("nc.empty"), css_classes: ["nc-empty"], margin_start: 30, margin_end: 30, margin_top: 10, margin_bottom: 10 }), shape: Shape.CAPSULE, useShellOpacity: true, gloss: true, borderColor: { r: 0, g: 0, b: 0, a: 0 } }))
+    const pillBox = new Gtk.Box({ halign: Gtk.Align.CENTER, margin_top: 16, margin_bottom: 2, visible: false })
+    const clearAllBtn = SquircleContainer({ child: new Gtk.Label({ label: t("nc.clear-all"), margin_start: 30, margin_end: 30, margin_top: 10, margin_bottom: 10 }), shape: Shape.CAPSULE, useShellOpacity: true, gloss: true, borderColor: { r: 0, g: 0, b: 0, a: 0 }, hoverBorderColor: { r: 0, g: 0, b: 0, a: 0 }, onClick: () => clearAllAnimated(), css_classes: ["nc-clear-all-pill"] })
+    pillBox.append(clearAllBtn)
+
+    const notificationItemsBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: GAP, hexpand: true })
+    listContainer.append(emptyBox)
+    listContainer.append(notificationItemsBox)
+    listContainer.append(pillBox)
+
+    outer.append(calendarIsland)
+    outer.append(scrollWidget)
+
+    const updateNotifs = () => {
+        // `transient` (freedesktop) = excluded from persistence: banner only, never
+        // an NC row. The popups side dismisses them when their banner retires.
+        const notifs = allNotifications().filter(n => !n.transient); const groups = new Map<string, Notification[]>()
+        notifs.forEach(n => {
+            const id = appService.getResolvedApp(n.desktop_entry || n.app_name)?.id || n.app_name || "unknown"
+            const list = groups.get(id) || []; list.push(n); groups.set(id, list)
+        })
+        // Drop expand state for notifications that no longer exist.
+        const liveIds = new Set(notifs.map(n => n.id))
+        expandedItems.forEach(eid => { if (!liveIds.has(eid)) expandedItems.delete(eid) })
+        const sortedIds = Array.from(groups.keys()).sort((a,b) => {
+            const timeA = Math.max(...groups.get(a)!.map(x => x.time)); const timeB = Math.max(...groups.get(b)!.map(x => x.time))
+            return timeB - timeA || Math.max(...groups.get(b)!.map(x => x.id)) - Math.max(...groups.get(a)!.map(x => x.id))
+        })
+        emptyBox.set_visible(notifs.length === 0); pillBox.set_visible(notifs.length > 0)
+        groupCache.forEach((cache, id) => { if (!Array.from(groups.keys()).includes(id)) { if (cache.subClearTimer !== null) GLib.source_remove(cache.subClearTimer); if (cache.container.get_parent()) notificationItemsBox.remove(cache.container); groupCache.delete(id) } })
+
+        sortedIds.forEach((id, index) => {
+            const gl = groups.get(id)!; const sortedGroup = gl.sort((a, b) => b.time - a.time || b.id - a.id)
+            const isExpanded = expandedGroups.has(id)
+            // Content (summary/body/time) is part of the signature so a REPLACED
+            // notification (same id, new content — progress updates) rebuilds its card.
+            // The old minute-bucket term is gone: timestamps restamp via refreshTimes()
+            // instead of tearing down every card each minute.
+            const sig = `${gl.length}:${isExpanded}:${sortedGroup.map(n => `${n.id}~${n.time}~${n.summary}~${n.body}`).join("|")}:${sortedGroup.map(n => expandedItems.has(n.id) ? '1' : '0').join('')}`
+            let cache = groupCache.get(id)
+            if (!cache) {
+                const subBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 12, margin_top: 8 })
+                const revealer = new (Gtk as any).Revealer({ child: subBox, transition_type: (Gtk as any).RevealerTransitionType.SLIDE_DOWN, transition_duration: 350 })
+                const headerBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL })
+                const container = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 0, hexpand: true })
+                container.append(headerBox); container.append(revealer)
+                cache = { container, headerBox, revealer, subBox, sig: "", timeLabels: [], expanded: false, subClearTimer: null }
+                groupCache.set(id, cache); notificationItemsBox.append(container)
+            }
+            if (cache.sig !== sig) {
+                // Rows (and the expanded-group header) are ScaleRevealer wrappers —
+                // dismantle so the wrapped card unparents too (no "still has
+                // children" on GC).
+                const disownRow = (c: Gtk.Widget) => { if (typeof (c as any).dismantle === "function") (c as any).dismantle(); c.unparent() }
+                // Choreography inputs, captured BEFORE teardown: the old height of the
+                // headerBox content (the header ⇄ stacked-capsule swap morphs instead of
+                // snapping ±50px) and of the row whose chevron was just toggled.
+                const wasExpanded = cache.expanded
+                const expandToggled = isExpanded !== wasExpanded
+                const headerOldH = expandToggled ? (cache.headerBox.get_first_child()?.get_height() ?? 0) : 0
+                let seedOldH = 0
+                if (hoverSeed !== null) {
+                    if (gl.length === 1 && sortedGroup[0].id === hoverSeed) seedOldH = cache.headerBox.get_first_child()?.get_height() ?? 0
+                    else if (isExpanded && wasExpanded) {
+                        const idx = sortedGroup.findIndex(m => m.id === hoverSeed)
+                        let c = cache.subBox.get_first_child()
+                        for (let i = 0; i < idx && c; i++) c = c.get_next_sibling()
+                        if (idx >= 0) seedOldH = c?.get_height() ?? 0
+                    }
+                }
+                if (cache.subClearTimer !== null) { GLib.source_remove(cache.subClearTimer); cache.subClearTimer = null }
+                while (cache.headerBox.get_first_child()) disownRow(cache.headerBox.get_first_child()!)
+                // Collapsing (expanded → collapsed/single): KEEP the old rows in the
+                // revealer so its slide-up animates over real content — the wholesale
+                // teardown emptied it first, which snapped the whole column up in one
+                // frame. They're disowned once the 350ms transition has landed.
+                const collapsing = wasExpanded && !isExpanded
+                if (!collapsing) { while (cache.subBox.get_first_child()) disownRow(cache.subBox.get_first_child()!) }
+                else cache.subClearTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 380, () => {
+                    cache!.subClearTimer = null
+                    while (cache!.subBox.get_first_child()) disownRow(cache!.subBox.get_first_child()!)
+                    return GLib.SOURCE_REMOVE
+                })
+                cache.timeLabels = []   // rebuilt capsules register fresh labels below
+                const regTime = (label: Gtk.Label, time: number) => cache!.timeLabels.push({ label, time })
+                const closeNC = () => { status.nc_open = false }
+                const onToggle = () => { if (expandedGroups.has(id)) expandedGroups.delete(id); else expandedGroups.add(id); updateNotifs() }
+                const appName = appService.getResolvedApp(sortedGroup[0].desktop_entry || sortedGroup[0].app_name)?.name || sortedGroup[0].app_name || "App"
+                if (gl.length > 1) {
+                    if (isExpanded) {
+                        cache.container.remove_css_class("nc-group-with-ghost")
+                        // Swiping the header clears the whole group (its X): the header
+                        // flings out by hand, then its remaining rows cascade after it.
+                        cache.headerBox.append(wrapSwipe(
+                            GroupControlHeader({ name: appName, count: gl.length, onToggle, onClearGroup: () => gl.forEach(m => m.dismiss()) }),
+                            () => cascadeOut(collectRows(cache!.subBox), gl),
+                            undefined, headerOldH,
+                        ))
+                        sortedGroup.forEach(n => {
+                            const cap = NotificationCapsule({ n, groupCount: 1, isExpanded: true, onToggle: undefined, onClearGroup: () => n.dismiss(), itemExpanded: expandedItems.has(n.id), onToggleItem: () => toggleItem(n.id), onClose: closeNC, onTimeLabel: regTime, startHovered: hoverSeed === n.id })
+                            cache!.subBox.append(wrapSwipe(cap, () => n.dismiss(), undefined, n.id === hoverSeed ? seedOldH : 0))   // swipe an expanded item → dismiss just it
+                        })
+                    } else {
+                        cache.container.add_css_class("nc-group-with-ghost")
+                        const capsule = NotificationCapsule({ n: sortedGroup[0], groupCount: gl.length, isExpanded: false, onToggle, onClearGroup: () => gl.forEach(m => m.dismiss()), onClose: closeNC, onTimeLabel: regTime })
+                        // Swipe a collapsed group → clear the whole group (like its
+                        // X). The gesture rides the capsule; the whole stack slides.
+                        cache.headerBox.append(wrapSwipe(makeGroupStack(capsule, gl.length), () => gl.forEach(m => m.dismiss()), capsule, headerOldH))
+                    }
+                    cache.revealer.reveal_child = isExpanded
+                } else {
+                    cache.container.remove_css_class("nc-group-with-ghost")
+                    const cap = NotificationCapsule({ n: sortedGroup[0], groupCount: 1, isExpanded: false, onToggle: undefined, onClearGroup: () => sortedGroup[0].dismiss(), itemExpanded: expandedItems.has(sortedGroup[0].id), onToggleItem: () => toggleItem(sortedGroup[0].id), onClose: closeNC, onTimeLabel: regTime, startHovered: hoverSeed === sortedGroup[0].id })
+                    cache.headerBox.append(wrapSwipe(cap, () => sortedGroup[0].dismiss(), undefined, seedOldH || headerOldH))
+                    expandedGroups.delete(id); cache.revealer.reveal_child = false
+                }
+                cache.expanded = isExpanded && gl.length > 1
+                cache.sig = sig
+            }
+            if (!cache.container.get_parent()) notificationItemsBox.append(cache.container)
+        })
+
+        // Containers persist across updates, so append order alone goes stale: a
+        // brand-new group lands at the end and an old group that just received the
+        // newest notification stays put. Re-apply the recency order to the tree.
+        let prev: Gtk.Widget | null = null
+        sortedIds.forEach(id => {
+            const c = groupCache.get(id)?.container
+            if (!c || !c.get_parent()) return
+            notificationItemsBox.reorder_child_after(c, prev)
+            prev = c
+        })
+    }
+
+    // "Clear notifications" replays the swipe-dismiss fling on every row, top to bottom
+    // with a small stagger (a clear cascade) instead of vaporizing the list. The
+    // real dismissals run once the last row lands — `resolved`/`notified` are suppressed
+    // meanwhile so the tree isn't rebuilt mid-flight (notifications arriving during the
+    // cascade survive: only the snapshot taken at click time is dismissed). Rows clip at
+    // the panel wall like any translate in the scroller — exiting through the edge IS
+    // the look, no ghosts needed. Expanded-group control headers are swipe rows too
+    // (their swipe clears the group), so they fling out in sequence like any row.
+    let pendingClear: Notification[] | null = null
+    const finishClear = () => {
+        const list = pendingClear; pendingClear = null
+        list?.forEach(n => n.dismiss())
+        updateNotifs()
+    }
+    // The ScaleRevealer swipe rows under `root` in visual order; skips unmapped ones
+    // (sub-rows of a collapsed group's hidden revealer). Never descends INTO a row —
+    // none nest.
+    const collectRows = (root: Gtk.Widget): ScaleRevealer[] => {
+        const rows: ScaleRevealer[] = []
+        const visit = (w: Gtk.Widget | null) => {
+            for (; w; w = w.get_next_sibling()) {
+                if (w instanceof ScaleRevealer) { if (w.get_mapped()) rows.push(w) }
+                else visit(w.get_first_child())
+            }
+        }
+        visit(root.get_first_child())
+        return rows
+    }
+    // Fling `rows` out top to bottom with the stagger, then dismiss `snapshot` once the
+    // last row lands. Shared by clear-all (every row) and the group-header swipe (that
+    // group's remaining rows).
+    const cascadeOut = (rows: ScaleRevealer[], snapshot: Notification[]) => {
+        if (pendingClear || snapshot.length === 0) return
+        if (rows.length === 0) { snapshot.forEach(n => n.dismiss()); return }
+        pendingClear = snapshot
+        let done = 0
+        rows.forEach((sr, i) => {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, i * 45, () => {
+                sr.swipeOut(GRID_WIDTH + 60, () => sr.collapseAway(() => { if (++done === rows.length && pendingClear) finishClear() }))
+                return GLib.SOURCE_REMOVE
+            })
+        })
+    }
+    const clearAllAnimated = () => cascadeOut(collectRows(notificationItemsBox), allNotifications())
+
+    // Restamp the relative timestamps ("2m" → "3m") in place. A full updateNotifs()
+    // used to do this via a minute bucket in the cache signature — tearing down and
+    // recreating EVERY card (and re-reading hero images from disk) each minute.
+    const refreshTimes = () => groupCache.forEach(c => c.timeLabels.forEach(tl => tl.label.set_label(timeAgo(tl.time))))
+
+    let timestampTimer: number | null = null
+
+    status.connect("notify::nc-open", () => {
+        if (status.nc_open) {
+            updateNotifs()
+            refreshTimes()   // groups with an unchanged signature keep their old labels
+            // Refresh relative timestamps ("2m", "1h") while NC is visible.
+            timestampTimer = GLib.timeout_add(GLib.PRIORITY_LOW, 60_000, () => {
+                if (!status.nc_open) { timestampTimer = null; return GLib.SOURCE_REMOVE }
+                refreshTimes()
+                return GLib.SOURCE_CONTINUE
+            })
+        } else {
+            if (timestampTimer !== null) { GLib.source_remove(timestampTimer); timestampTimer = null }
+            // NC closed mid-cascade: unmapped rows stop ticking, so settle the clear
+            // immediately (dismiss the snapshot, one rebuild).
+            if (pendingClear) finishClear()
+            // Fresh slate on reopen: groups AND individual rows come back collapsed.
+            expandedGroups.clear()
+            expandedItems.clear()
+            updateNotifs()
+        }
+    })
+    // Only rebuild when NC is open — opening NC always calls updateNotifs() above;
+    // a running clear cascade defers rebuilds to finishClear.
+    watchNotified(() => { if (status.nc_open && !pendingClear) updateNotifs() })
+    watchResolved(() => { if (status.nc_open && !pendingClear) updateNotifs() })
+    updateNotifs()
+
+    // Bar owns the panel geometry and pushes the vertical budget (bar→dock gap)
+    // here; the scroller absorbs it as its cap — see the note on `scroll`.
+    // Attached to the returned widget like WorkspaceOverview's onOpen.
+    ;(outer as any).setMaxHeight = (px: number) => {
+        // Minus the calendar, the gap under it and the panel's own margin above and below.
+        scroll.max_content_height = Math.max(UNIT, Math.round(px - CAL_H - GAP - PAD * 2))
+    }
+    return outer
+}

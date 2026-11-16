@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Veltrix — Hyalo preview
+Comment=Veltrix on Hyalo, its own compositor — a preview while it reaches parity with Hyprland
+Exec=/usr/bin/veltrix-hyalo-session
+Type=Application
+DesktopNames=Veltrix

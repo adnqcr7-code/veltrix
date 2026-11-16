@@ -1,0 +1,3 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.veltrix
+Interfaces=org.freedesktop.impl.portal.Settings;org.freedesktop.impl.portal.Wallpaper;org.freedesktop.impl.portal.Access;

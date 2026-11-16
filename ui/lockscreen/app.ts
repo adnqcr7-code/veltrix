@@ -1,0 +1,122 @@
+import app from "../lib/veltrix-kit/platform/host"
+import Gdk from "gi://Gdk?version=4.0"
+import GLib from "gi://GLib"
+// @ts-ignore
+import Gtk4SessionLock from "gi://Gtk4SessionLock"
+import { Lock, LockOverlay } from "./widget/Lock"
+import { getLocale } from "./lib/i18n"
+import { applyLocaleDirection } from "../lib/rtl"
+import { initAppearance } from "../lib/veltrix-kit/platform/appearance-css"
+import { withKitSheet } from "../lib/veltrix-kit/platform/kit-css"
+import { applyCrispFontRendering } from "../lib/veltrix-kit/platform/font-rendering"
+import { useNoGtkTheme } from "../lib/veltrix-kit/platform/gtk-theme"
+import { registerGlassMaterial } from "../lib/veltrix-kit/platform/glass-material"
+import { GLASS_BLUR } from "../lib/veltrix-kit/platform/theme-tokens"
+import { kitAppearance } from "../lib/veltrix-kit/appearance"
+
+// No GTK theme at all — the greeter's sheet is the only CSS there is (commandment 11).
+useNoGtkTheme()
+
+const cssPath = GLib.file_test("/usr/share/veltrix/ui/greeter/style.css", GLib.FileTest.EXISTS)
+  ? "/usr/share/veltrix/ui/greeter/style.css"
+  : "../greeter/style.css"
+
+
+function startFallback(display: Gdk.Display) {
+  console.log("[Lock] Starting OVERLAY layer fallback")
+  const monitors: any = display.get_monitors()
+  const n = monitors.get_n_items()
+  for (let i = 0; i < n; i++) {
+    try {
+      LockOverlay(monitors.get_item(i) as Gdk.Monitor)
+    } catch (e) {
+      console.error(`[Lock] Overlay fallback failed on monitor ${i}:`, e)
+    }
+  }
+}
+
+app.start({
+  applicationId: "org.veltrix.lock",
+  applicationName: "Veltrix Lock Screen",
+  processName: "veltrix-lock",
+  logDomain: "veltrix-lock",
+  css: withKitSheet(cssPath),
+
+  main() {
+    // First: the process-wide text direction, from the session language
+    // (LANG) the lockscreen resolved at module load. See ui/lib/rtl.ts.
+    applyLocaleDirection(getLocale())
+    // Before any window exists: put glyph baselines on the pixel grid. The lock
+    // screen has no ThemeManager, so without this it renders text the shell would not.
+    applyCrispFontRendering()
+
+    const display = Gdk.Display.get_default()
+    if (!display) { console.error("[Lock] No display"); return }
+
+    // The token ramp, the kit's Cairo seam and the glass rim — read from the Settings
+    // portal like any application: the lock runs inside the user's own session, so the
+    // portal there answers for exactly the person it is locking. See ui/lib/veltrix-kit/platform/appearance.ts.
+    // See the greeter's app.ts for why the login screens pin their ink (#612).
+    initAppearance({ fixedDarkInk: true })
+    // The desktop's one glass material (#705): on Hyalo the card's capsules are Hyalo's glass.
+    registerGlassMaterial({
+      reduceTransparency: () => kitAppearance().reduceTransparency?.() === true,
+      panelBlur: () => ({ ...GLASS_BLUR }),
+      onChange: (cb) => kitAppearance().onChange(cb),
+    })
+
+    try {
+      const supported = Gtk4SessionLock.is_supported()
+      console.log(`[Lock] ext-session-lock-v1 supported: ${supported}`)
+
+      if (!supported) {
+        startFallback(display)
+        return
+      }
+
+      const lockInst = new Gtk4SessionLock.Instance()
+      const lockWindows: any[] = []
+      console.log("[Lock] Instance created, calling lock()")
+
+      lockInst.connect("locked", () => {
+        console.log("[Lock] Session locked successfully")
+      })
+
+      lockInst.connect("monitor", (_: any, monitor: Gdk.Monitor) => {
+        console.log("[Lock] monitor signal — assigning window")
+        try {
+          const win = Lock(lockInst, monitor)
+          lockWindows.push(win)
+          console.log("[Lock] Window assigned to monitor")
+        } catch (e) {
+          console.error("[Lock] assign_window_to_monitor failed:", e)
+        }
+      })
+
+      lockInst.connect("unlocked", () => {
+        console.log("[Lock] Session unlocked — destroying windows")
+        for (const w of lockWindows) {
+          try { w.destroy() } catch (e) { console.warn("[Lock] destroy:", e) }
+        }
+        lockWindows.length = 0
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+          console.log("[Lock] Quitting")
+          app.quit()
+          return GLib.SOURCE_REMOVE
+        })
+      })
+
+      lockInst.connect("failed", () => {
+        console.error("[Lock] Session lock failed — falling back to overlay")
+        startFallback(display)
+      })
+
+      lockInst.lock()
+      console.log("[Lock] lock() called")
+
+    } catch (e) {
+      console.error("[Lock] Session lock init error:", e)
+      startFallback(display)
+    }
+  },
+})

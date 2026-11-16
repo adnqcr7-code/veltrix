@@ -1,0 +1,341 @@
+import GObject from "gi://GObject"
+
+/**
+ * Veltrix UI Status Engine
+ * 
+ * Centralized GObject-based state for overlays.
+ * Allows reactive binding without App-level signal collision.
+ */
+export class UIStatus extends GObject.Object {
+    static {
+        GObject.registerClass({
+            GTypeName: "Veltrix_ShellUIStatus",
+            Properties: {
+                "cc-open": GObject.ParamSpec.boolean("cc-open", "CC Open", "Control Center visibility", GObject.ParamFlags.READWRITE, false),
+                "nc-open": GObject.ParamSpec.boolean("nc-open", "NC Open", "Notification Center visibility", GObject.ParamFlags.READWRITE, false),
+                "prism-open": GObject.ParamSpec.boolean("prism-open", "Prism Open", "Prism Search visibility", GObject.ParamFlags.READWRITE, false),
+                "app-grid-open": GObject.ParamSpec.boolean("app-grid-open", "App Grid Open", "App grid visibility", GObject.ParamFlags.READWRITE, false),
+                "notif-active": GObject.ParamSpec.boolean("notif-active", "Notif Active", "Popups visibility", GObject.ParamFlags.READWRITE, false),
+                "cc-edit-mode": GObject.ParamSpec.boolean("cc-edit-mode", "CC Edit Mode", "CC edit mode active", GObject.ParamFlags.READWRITE, false),
+                "system-menu-open": GObject.ParamSpec.boolean("system-menu-open", "System Menu Open", "System Menu visibility", GObject.ParamFlags.READWRITE, false),
+                "island-mode": GObject.ParamSpec.string("island-mode", "Island Mode", "Active Activity Island mode id, empty = collapsed", GObject.ParamFlags.READWRITE, ""),
+                "about-open": GObject.ParamSpec.boolean("about-open", "About Open", "About window visibility", GObject.ParamFlags.READWRITE, false),
+                "recording": GObject.ParamSpec.boolean("recording", "Recording", "Screen recording active", GObject.ParamFlags.READWRITE, false),
+                "bar-expanded-id": GObject.ParamSpec.string("bar-expanded-id", "Bar Expanded ID", "ID of the expanded bar widget, empty = none", GObject.ParamFlags.READWRITE, ""),
+                "bar-overflow-open": GObject.ParamSpec.boolean("bar-overflow-open", "Bar Overflow Open", "Bar widgets hidden for lack of room are unfolded in line", GObject.ParamFlags.READWRITE, false),
+                "dock-keyboard": GObject.ParamSpec.boolean("dock-keyboard", "Dock Keyboard", "The dock's icons are being walked with the keyboard (Super+Ctrl+D)", GObject.ParamFlags.READWRITE, false),
+                "bar-keyboard": GObject.ParamSpec.boolean("bar-keyboard", "Bar Keyboard", "The bar's items are being walked with the keyboard (Super+Ctrl+B)", GObject.ParamFlags.READWRITE, false),
+                "bar-edit-mode": GObject.ParamSpec.boolean("bar-edit-mode", "Bar Edit Mode", "The bar's right group is being reordered in place", GObject.ParamFlags.READWRITE, false),
+                "cc-detail-id": GObject.ParamSpec.string("cc-detail-id", "CC Detail ID", "Widget ID to open in CC detail view, empty = none", GObject.ParamFlags.READWRITE, ""),
+            },
+        }, this)
+    }
+
+    private _cc_open = false
+    private _nc_open = false
+    private _prism_open = false
+    private _app_grid_open = false
+    private _notif_active = false
+    private _cc_edit_mode  = false
+    private _system_menu_open = false
+    private _island_mode = ""
+    private _about_open = false
+    private _recording = false
+    private _recording_started_at = 0
+    private _bar_expanded_id = ""
+    private _cc_detail_id = ""
+    private _bar_overflow_open = false
+    private _bar_edit_mode = false
+    private _bar_keyboard = false
+    private _dock_keyboard = false
+
+    // The boolean mutually-exclusive overlays. Opening one closes the rest —
+    // plus the Activity Island, whose state is a mode STRING (island_mode),
+    // handled explicitly inside closeExclusive. Maps the snake-cased backing
+    // field to its GObject notify name.
+    private static readonly EXCLUSIVE: Record<string, string> = {
+        _cc_open: "cc-open",
+        _nc_open: "nc-open",
+        _prism_open: "prism-open",
+        _app_grid_open: "app-grid-open",
+        _system_menu_open: "system-menu-open",
+        _bar_edit_mode: "bar-edit-mode",
+    }
+
+    /**
+     * Close every mutually-exclusive overlay except `keep`, plus optionally clear
+     * the popup/bar-expanded state. Only emits notify for fields that actually
+     * changed. Single source of truth for the exclusion logic the setters share.
+     */
+    private closeExclusive(keep: string, opts: { notif?: boolean; barExpanded?: boolean } = {}) {
+        const self = this as any
+        for (const [field, name] of Object.entries(UIStatus.EXCLUSIVE)) {
+            if (field === keep) continue
+            if (self[field]) {
+                self[field] = false
+                this.notify(name)
+            }
+        }
+        if (keep !== "_island_mode" && this._island_mode !== "") {
+            this._island_mode = ""
+            this.notify("island-mode")
+        }
+        if (opts.notif && this._notif_active) {
+            this._notif_active = false
+            this.notify("notif-active")
+        }
+        if (opts.barExpanded && this._bar_expanded_id !== "") {
+            this._bar_expanded_id = ""
+            this.notify("bar-expanded-id")
+        }
+        // The unfolded overflow folds for every OTHER surface — the island above all,
+        // which it pushed out of the way. Its one survivor is a bar panel, which never
+        // comes through here with `barExpanded` (see bar_expanded_id and
+        // bar_overflow_open).
+        if (opts.barExpanded && this._bar_overflow_open) {
+            this._bar_overflow_open = false
+            this.notify("bar-overflow-open")
+        }
+    }
+
+    public get notif_active() { return this._notif_active }
+    public set notif_active(v: boolean) {
+        if (this._notif_active === v) return
+        this._notif_active = v
+        this.notify("notif-active")
+    }
+
+    public get cc_open() { return this._cc_open }
+    public set cc_open(v: boolean) {
+        if (this._cc_open === v) return
+        this._cc_open = v
+        if (v) this.closeExclusive("_cc_open", { notif: true, barExpanded: true })
+        this.notify("cc-open")
+    }
+
+    public get nc_open() { return this._nc_open }
+    public set nc_open(v: boolean) {
+        if (this._nc_open === v) return
+        this._nc_open = v
+        if (v) this.closeExclusive("_nc_open", { notif: true, barExpanded: true })
+        this.notify("nc-open")
+    }
+
+    public get prism_open() { return this._prism_open }
+    public set prism_open(v: boolean) {
+        if (this._prism_open === v) return
+        this._prism_open = v
+        // Note: opening Prism does not dismiss active popups (preserves prior behavior).
+        if (v) this.closeExclusive("_prism_open", { barExpanded: true })
+        this.notify("prism-open")
+    }
+
+    // The app grid was NOT an overlay here until 2026-08-09: it lived inside the
+    // dock's window as a closure flag, because opening it also REVEALED the dock.
+    // That coupling was traded away for a surface of its own (a panel of the bar's
+    // window since #708 point 3), and with it gone there was nothing left
+    // keeping the grid outside the exclusion — it could sit open behind the Control
+    // Center, which was listed as an accepted wart rather than a decision.
+    public get app_grid_open() { return this._app_grid_open }
+    public set app_grid_open(v: boolean) {
+        if (this._app_grid_open === v) return
+        this._app_grid_open = v
+        if (v) this.closeExclusive("_app_grid_open", { notif: true, barExpanded: true })
+        this.notify("app-grid-open")
+    }
+
+    public get cc_edit_mode() { return this._cc_edit_mode }
+    public set cc_edit_mode(v: boolean) {
+        if (this._cc_edit_mode === v) return
+        this._cc_edit_mode = v
+        this.notify("cc-edit-mode")
+    }
+
+    public get system_menu_open() { return this._system_menu_open }
+    public set system_menu_open(v: boolean) {
+        if (this._system_menu_open === v) return
+        this._system_menu_open = v
+        if (v) this.closeExclusive("_system_menu_open", { barExpanded: true })
+        this.notify("system-menu-open")
+    }
+
+    /** Activity Island state: the id of the expanded mode (ISLAND_OVERVIEW,
+     *  future "player"/"agent"/…), "" = collapsed to the compact capsule.
+     *  Replaces the old overview_open boolean — the overview is now just the
+     *  island's first mode (see surfaces/island/ActivityIsland.tsx). */
+    public get island_mode() { return this._island_mode }
+    public set island_mode(v: string) {
+        if (this._island_mode === v) return
+        this._island_mode = v
+        if (v !== "") this.closeExclusive("_island_mode", { barExpanded: true })
+        this.notify("island-mode")
+    }
+
+    // "Is the user looking at something of ours right now." The app grid counts
+    // (added 2026-08-09 with the rest of its move into Status), and leaving it out
+    // was not cosmetic: it is the FIRST line of the bar's empty-strip dismissal
+    // handler, so the strip silently stopped dismissing the grid while it dismissed
+    // every other overlay from the same pixel. Its other caller is AgentService,
+    // which used it to avoid popping the island over something the user opened —
+    // and had been popping it over an open app grid all along.
+    public get isAnyOverlayOpen(): boolean {
+        return this._cc_open || this._nc_open || this._prism_open || this._app_grid_open || this._system_menu_open || this._island_mode !== "" || this._bar_expanded_id !== "" || this._bar_overflow_open || this._bar_edit_mode
+    }
+
+    public get about_open() { return this._about_open }
+    public set about_open(v: boolean) {
+        if (this._about_open === v) return
+        this._about_open = v
+        if (v) this._system_menu_open = false
+        this.notify("about-open")
+        if (v) this.notify("system-menu-open")
+    }
+
+    public get recording() { return this._recording }
+    public set recording(v: boolean) {
+        if (this._recording === v) return
+        this._recording = v
+        if (v) this._recording_started_at = Date.now()
+        this.notify("recording")
+    }
+
+    // When the CURRENT capture started (ms epoch), stamped by the setter above.
+    // The single source of truth for every elapsed timer — the island pill, the
+    // CC tile, the CC detail page. Each used to stamp its OWN start inside its
+    // `notify::recording` handler, which broke twice: a surface BUILT while
+    // already recording never sees the signal (the bar panel is constructed
+    // fresh on open → frozen at 0:00), and one rebuilt mid-capture restarted
+    // the count from zero. Not a GObject property: it only ever changes
+    // together with `recording`, so subscribers watch that one signal.
+    public get recordingStartedAt() { return this._recording_started_at }
+
+    public get bar_expanded_id() { return this._bar_expanded_id }
+    public set bar_expanded_id(v: string) {
+        if (this._bar_expanded_id === v) return
+        this._bar_expanded_id = v
+        // A pill expansion is exclusive with the big overlays too — reachable
+        // since the bar strip stays clickable while an overlay is open.
+        if (v !== "") this.closeExclusive("")
+        this.notify("bar-expanded-id")
+    }
+
+    // The bar's widgets that did not fit, unfolded IN LINE (the `»` capsule): the
+    // island rises out of the way and the row grows leftwards. Opening it closes
+    // everything else; everything else closes it EXCEPT a bar panel, because the
+    // panel of an unfolded widget hangs from an icon that only exists while this is
+    // true — folding under it would leave the panel pointing at nothing.
+    public get bar_overflow_open() { return this._bar_overflow_open }
+    public set bar_overflow_open(v: boolean) {
+        if (this._bar_overflow_open === v) return
+        // Kept: the bar's edit mode, which unfolds the overflow itself so every item
+        // can be placed.
+        if (v) this.closeExclusive("_bar_edit_mode", { barExpanded: true })
+        this._bar_overflow_open = v
+        this.notify("bar-overflow-open")
+    }
+
+    // The bar's items walked with the KEYBOARD (Super+Ctrl+B — on the desktop's modifier:
+    // in Linux Ctrl belongs to the apps). Not exclusive: the panel an
+    // item opens is part of the walk, and closing it hands the focus back to its item.
+    // Ends on Esc with no panel open, or when the bar loses its focus grab.
+    public get bar_keyboard() { return this._bar_keyboard }
+    public set bar_keyboard(v: boolean) {
+        if (this._bar_keyboard === v) return
+        this._bar_keyboard = v
+        this.notify("bar-keyboard")
+    }
+
+    // The dock's icons walked with the KEYBOARD (Super+Ctrl+D — Super for the same
+    // reason as bar_keyboard). The dock on the FOCUSED monitor answers it.
+    // Ends on Esc, on an icon's Enter (what it starts needs the keys), or when the
+    // dock loses its focus grab.
+    public get dock_keyboard() { return this._dock_keyboard }
+    public set dock_keyboard(v: boolean) {
+        if (this._dock_keyboard === v) return
+        this._dock_keyboard = v
+        this.notify("dock-keyboard")
+    }
+
+    // The bar's right group being REORDERED in place (core/BarOrder.ts): items drag,
+    // arrows move the selected one, Esc / Enter / "Done" / a click outside end it.
+    // Exclusive like an overlay — opening it closes the rest, and anything else
+    // opening ends it.
+    public get bar_edit_mode() { return this._bar_edit_mode }
+    public set bar_edit_mode(v: boolean) {
+        if (this._bar_edit_mode === v) return
+        if (v) this.closeExclusive("_bar_edit_mode", { barExpanded: true })
+        this._bar_edit_mode = v
+        this.notify("bar-edit-mode")
+    }
+
+    public get cc_detail_id() { return this._cc_detail_id }
+    public set cc_detail_id(v: string) {
+        if (this._cc_detail_id === v) return
+        this._cc_detail_id = v
+        this.notify("cc-detail-id")
+    }
+
+    /**
+     * Close every overlay, the island's expanded modes and a bar expansion — for a
+     * WINDOW that needs the keyboard now. An open overlay holds the compositor's focus
+     * grab, and a toplevel that appears beneath it paints on top but never receives a
+     * keystroke: the Wi-Fi password dialog opened from the Control Centre swallowed
+     * the whole password that way (2026-09-14).
+     */
+    closeOverlays() { this.closeExclusive("", { notif: true, barExpanded: true }); this.bar_keyboard = false; this.dock_keyboard = false }
+
+    /**
+     * Set just before a panel is opened FROM THE KEYBOARD (a Super+… bind), read and
+     * cleared by the surface that shows it. It is not a property on purpose: nothing
+     * should re-render when it flips, and it is only ever true for the one turn
+     * between the IPC call and the panel's open handler.
+     *
+     * Why a surface needs to know at all: GTK draws the focus ring only while the
+     * window is "focus-visible", and it turns that on from a KEY it receives. The
+     * Super+C that opened the panel went to Hyprland, never to us, so without this the
+     * first control would hold the focus with no ring — the user would press Tab once
+     * just to find out where they are.
+     */
+    keyboardEntry = false
+
+    /**
+     * The CC's edit mode was entered FROM THE KEYBOARD. Plain field, set by IslandGrid
+     * with `cc_edit_mode`. Edit mode deliberately releases the bar's focus grab, so
+     * the desktop stays usable while tiles are dragged — but a keyboard user who
+     * entered it that way would lose the keyboard the moment they did (measured
+     * 2026-09-27: the focus went to nothing). While this is true, the bar keeps it.
+     */
+    ccEditFromKeyboard = false
+
+    toggleCC(fromKeyboard = false) { this.keyboardEntry = fromKeyboard && !this.cc_open; this.cc_open = !this.cc_open }
+    toggleNC(fromKeyboard = false) { this.keyboardEntry = fromKeyboard && !this.nc_open; this.nc_open = !this.nc_open }
+    togglePrism() { this.prism_open = !this.prism_open }
+    toggleSystemMenu() { this.system_menu_open = !this.system_menu_open }
+    toggleIsland(id: string) { this.island_mode = this.island_mode === id ? "" : id }
+    toggleOverview() { this.toggleIsland(ISLAND_OVERVIEW) }
+    toggleBarOverflow() { this.bar_overflow_open = !this.bar_overflow_open }
+    toggleAbout() { this.about_open = !this.about_open }
+}
+
+// Island mode ids live here (core) so surfaces and IPC share one vocabulary
+// without surface-to-surface imports.
+export const ISLAND_OVERVIEW = "overview"
+export const ISLAND_PLAYER = "player"
+export const ISLAND_BATTERY = "battery"
+export const ISLAND_RECORDING = "recording"
+export const ISLAND_AGENT = "agent"
+
+export const status = new UIStatus()
+
+// The live capture's elapsed time as m:ss, derived from recordingStartedAt.
+// Lives here for the same reason as the mode ids above: the island's compact and
+// the screenrecord widget both paint it, and having the island import the widget
+// would close a cycle (widgets/ imports the CC factories, which import the
+// registry). One stamp, one formatter, no clock disagreeing with another.
+export function recordingElapsed(): string {
+    if (!status.recording) return "0:00"
+    const s = Math.max(0, Math.floor((Date.now() - status.recordingStartedAt) / 1000))
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
+}
+
+export default status

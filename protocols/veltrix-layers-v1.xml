@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="veltrix_layers_v1">
+  <copyright>
+    SPDX-License-Identifier: MIT
+  </copyright>
+  <description summary="layers the compositor animates for the client">
+    A layer is a wl_subsurface whose position, scale and opacity the
+    compositor animates on its own: the client says where the layer ends and
+    how it gets there, and the compositor moves it, frame by frame, whatever
+    the client is doing — also while it commits nothing at all.
+
+    Only what has to move by itself is a layer. A widget is not a surface:
+    static content is painted together into its parent's buffer.
+
+    The compositor owns the PRESENTED values (where a layer is on screen),
+    the client the MODEL values (where it ends). Input is delivered where a
+    layer is presented: the compositor hit-tests layers at their presented
+    transform and gives pointer coordinates in the layer's own space, and
+    maps a text-input cursor rectangle of the layer's surface the same way.
+
+    Unpublished draft (#818, toolkit/CONTRACT.md). Requests are appended into
+    version 1 without since attributes. Hyalo and its clients ship together;
+    there is no per-request capability negotiation or mixed-version support.
+  </description>
+
+  <interface name="veltrix_layers_manager_v1" version="1">
+    <enum name="error">
+      <entry name="not_subsurface" value="0" summary="the surface has no wl_subsurface role"/>
+      <entry name="already_layer" value="1" summary="the surface already has a layer object"/>
+      <entry name="too_many_layers" value="2" summary="more than 64 layers under one toplevel"/>
+      <entry name="invalid_cursor" value="3" summary="cursor layer is not under the root or rectangle has non-positive size"/>
+    </enum>
+
+    <request name="destroy" type="destructor"/>
+
+    <request name="get_layer">
+      <description summary="make a subsurface a layer">
+        The surface must have the wl_subsurface role. Its position as a
+        layer replaces wl_subsurface.set_position, which is ignored while
+        the layer object exists.
+      </description>
+      <arg name="id" type="new_id" interface="veltrix_layer_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+    <request name="set_text_input_cursor_rectangle">
+      <description summary="pending: associate a text cursor with an animated layer">
+        root is the text-input-v3 focused root surface, which has no subsurface
+        parent. layer must be a live layer below root, owned by the same client.
+        x, y, width and height describe the cursor in layer-local logical pixels;
+        width and height must be positive. The keyboard/text-input focus remains
+        on root. This does not enable text input or transmit surrounding text.
+
+        Applied with root's wl_surface.commit. While text input is active on
+        root, this rectangle overrides text-input-v3's cursor rectangle: Hyalo
+        maps it through the layer's presented transform every frame and updates
+        the input-method popup and its text_input_rectangle event accordingly.
+        The client must not send layer-local coordinates to text-input-v3.
+
+        A null layer clears the association (the rectangle arguments are ignored),
+        restoring text-input-v3's latest root-local rectangle. Destruction of the
+        layer also clears it; a replacement layer object does not inherit it.
+        The client clears it when focus changes to a field outside that layer.
+        Like the rest of this draft, clients and Hyalo must be updated together.
+      </description>
+      <arg name="root" type="object" interface="wl_surface"/>
+      <arg name="layer" type="object" interface="veltrix_layer_v1" allow-null="true"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+  </interface>
+
+  <interface name="veltrix_layer_v1" version="1">
+    <description summary="one animated layer">
+      Every request is double-buffered and applied with the surface's
+      commit — for a subsurface in sync mode, with its parent's, so a
+      window's layers, their materials and its buffer change in one commit.
+    </description>
+
+    <enum name="property">
+      <entry name="position" value="0"/>
+      <entry name="scale" value="1"/>
+      <entry name="opacity" value="2"/>
+    </enum>
+
+    <enum name="error">
+      <entry name="invalid_value" value="0" summary="a non-finite, negative scale, opacity outside 0..1, or a curve that cannot end"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="the surface stops being a layer">
+        It stays where it was presented; its running transitions are
+        cancelled.
+      </description>
+    </request>
+
+    <request name="set_spring_transition">
+      <description summary="pending: the next change of a property moves on a spring">
+        Applies to the next set_position, set_scale or set_opacity of that
+        property only. A spring retargeted mid-flight keeps its presented
+        velocity; initial_velocity is used only when it starts from rest,
+        in the property's units per second.
+      </description>
+      <arg name="property" type="uint" enum="property"/>
+      <arg name="serial" type="uint" summary="echoed in done and cancelled"/>
+      <arg name="mass" type="fixed"/>
+      <arg name="stiffness" type="fixed"/>
+      <arg name="damping" type="fixed"/>
+      <arg name="initial_velocity" type="fixed"/>
+    </request>
+
+    <request name="set_curve_transition">
+      <description summary="pending: the next change of a property moves on a cubic Bézier">
+        A timing curve from (0,0) to (1,1) through (x1,y1) and (x2,y2),
+        over duration_ms. Retargeted mid-flight, it starts again from the
+        presented value.
+      </description>
+      <arg name="property" type="uint" enum="property"/>
+      <arg name="serial" type="uint" summary="echoed in done and cancelled"/>
+      <arg name="x1" type="fixed"/>
+      <arg name="y1" type="fixed"/>
+      <arg name="x2" type="fixed"/>
+      <arg name="y2" type="fixed"/>
+      <arg name="duration_ms" type="uint"/>
+    </request>
+
+    <request name="set_position">
+      <description summary="pending: the model position, relative to the parent surface">
+        Logical coordinates of the layer's top-left corner. With no
+        transition pending for position, the change is immediate.
+      </description>
+      <arg name="x" type="fixed"/>
+      <arg name="y" type="fixed"/>
+    </request>
+
+    <request name="set_scale">
+      <description summary="pending: the model scale, uniform, about an anchor">
+        anchor_x and anchor_y are layer-local logical coordinates; they
+        change at once, never animated.
+      </description>
+      <arg name="scale" type="fixed"/>
+      <arg name="anchor_x" type="fixed"/>
+      <arg name="anchor_y" type="fixed"/>
+    </request>
+
+    <request name="set_opacity">
+      <description summary="pending: the model opacity, 0..1"/>
+      <arg name="opacity" type="fixed"/>
+    </request>
+
+    <request name="set_parent_clip">
+      <description summary="pending: clip the subtree in its parent's space">
+        x, y, width and height are parent-local logical pixels. Positive sizes
+        clip this layer and every descendant's ink, glass, shadow and input.
+        The clip follows the parent's presented transform, independently of
+        this layer's position and scale. Ancestor clips intersect. Both sizes
+        zero clear it; a negative size or exactly one zero is invalid_value.
+        The clip is initially absent and is double buffered with the surface.
+      </description>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+
+    <event name="done">
+      <description summary="a transition reached its model value">
+        tv_sec_hi, tv_sec_lo and tv_nsec are the presentation time of the
+        frame that showed its end, as in wp_presentation.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="tv_sec_hi" type="uint"/>
+      <arg name="tv_sec_lo" type="uint"/>
+      <arg name="tv_nsec" type="uint"/>
+    </event>
+
+    <event name="cancelled">
+      <description summary="a transition was replaced by a new model value before it ended"/>
+      <arg name="serial" type="uint"/>
+    </event>
+  </interface>
+</protocol>

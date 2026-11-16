@@ -1,0 +1,446 @@
+@use 'base' as *;
+
+/* Everything here is the Settings window and nothing else. */
+window.veltrix-settings-window {
+    /* ==========================================================================
+       VELTRIX SETTINGS WINDOW
+       ========================================================================== */
+
+    // The window glass, header and toolbar chrome are the universal VeltrixWindow
+    // (.veltrix-window-* in _components.scss). Only settings-specific chrome below.
+
+    // ── Shared controls scale WITH the font-size picker (Settings only) ───────────
+    // button.veltrix-btn / seg-btn / combo carry the fixed $fs-* px ramp for the
+    // chrome. Inside Settings we want everything to scale uniformly with the picker,
+    // so re-anchor their text to the relative $fse-* em ramp. Scoped 2-level override
+    // (not a long chain); the chrome keeps the fixed sizes untouched.
+    & {
+        button.veltrix-btn,
+        button.veltrix-seg-btn,
+        dropdown > button {
+            font-size: $fse-small;
+        }
+        // The dropdown's popover list too (its rows pin $fs-small px in _components).
+        // Scoped to the Settings window only — the popover is a descendant of the
+        // dropdown in the CSS tree, so this matches. Bar and widget lists are not native
+        // dropdowns at all (GlassBubble menus and `.linked` button groups), so they are
+        // untouched by this and stay on the fixed px ramp.
+        dropdown popover listview > row,
+        popover.combo listview > row {
+            font-size: $fse-small;
+        }
+    }
+
+    // The window glass, header, sidebar capsule, split view and sidebar toggle
+    // are the universal VeltrixWindow chrome (.veltrix-window-*, .veltrix-sidebar-capsule,
+    // button.veltrix-icon-btn in _components.scss). Only settings-specific chrome below.
+
+    // ── Navigation capsule (back / forward) ───────────────────────────────────────
+    // The rule of every capsule of icon buttons (owner, 2026-10-06 — the window controls
+    // Hyalo draws follow it too, protocols/window_controls.rs): each button's hover a 24 px
+    // circle, 4 from the capsule's edge and 4 from the next, no rule between them. 60 × 32,
+    // as the sidebar toggle is 32 beside it: a 1 px border, 3 px inside it, two 24 px
+    // buttons (14 px glyph + 5 + 5) 4 apart (the box's spacing, Settings.tsx).
+    .navigation-capsule {
+        background: var(--veltrix-surface);
+        border: 1px solid var(--veltrix-border);
+        border-radius: $veltrix-radius-pill;
+        padding: 3px;
+        min-height: 24px;
+
+        > button.nav-btn { padding: 5px; }
+    }
+
+    // ── Header title / breadcrumb ─────────────────────────────────────────────────
+    // Header chrome → fixed px ramp (must NOT reflow with the Settings font-size picker).
+    .veltrix-window-breadcrumb {
+        margin-left: 2px;
+    }
+    .veltrix-window-title {
+        font-size: $fs-title-3;
+        font-weight: $fw-semibold;
+        color: var(--veltrix-text);
+    }
+    button.veltrix-breadcrumb-link {
+        @include veltrix-reset;
+        padding: 2px 6px;
+        border-radius: $veltrix-radius-sm;
+        font-size: $fs-title-3;
+        font-weight: $fw-medium;
+        color: var(--veltrix-text-dim);
+
+        &:hover { color: var(--veltrix-text); background: var(--veltrix-surface-hover); }
+        &:focus-visible { @include veltrix-focus-ring; }
+    }
+    .veltrix-breadcrumb-sep {
+        font-size: $fs-title-3;
+        color: var(--veltrix-text-disabled);
+    }
+
+    // ── Sidebar search slot (search box pinned above the nav list) ─────────────────
+    .veltrix-sidebar-top {
+        padding: $space-2 $space-2 $space-1;
+    }
+
+    // ── Search entry ──────────────────────────────────────────────────────────────
+    .settings-search {
+        background: var(--veltrix-surface-back);
+        border: 1px solid var(--veltrix-border);
+        border-radius: $veltrix-radius-pill;
+        padding: 0 12px;
+        min-height: 32px;
+        outline: none;
+        box-shadow: none;
+
+        &:focus, &:focus-within {
+            border-color: var(--veltrix-surface-raised);
+            box-shadow: none;
+            outline: none;
+        }
+
+        // Our own nd-icon magnifier (a Gtk.Image), dimmed at rest.
+        .settings-search-icon {
+            color: var(--veltrix-text-dim);
+        }
+
+        > text {
+            background: transparent;
+            color: var(--veltrix-text);
+            caret-color: var(--veltrix-text);
+        }
+    }
+
+    // ── Stack + scroll ────────────────────────────────────────────────────────────
+    stack.settings-stack {
+        @include veltrix-reset;
+        padding: 0;
+    }
+
+    .settings-page-scroll {
+        @include veltrix-reset;
+
+        > viewport { @include veltrix-reset; }
+    }
+
+
+    // ── Page typography ───────────────────────────────────────────────────────────
+    .settings-page {
+        background: transparent;
+        // Bottom > top on purpose: the last card needs room to clear the window's own
+        // rounded bottom corners, the first one starts under a header that already has its own.
+        padding: $space-8 $space-10 $space-10;
+    }
+
+    // Page titles now live in the window header breadcrumb (Settings.tsx), so the
+    // in-body .settings-page-title/-subtitle were removed along with pageHeader().
+
+    // Page-level "there is no hardware here at all" banner — Bluetooth (no adapter),
+    // Sound (no devices), Display (no monitors), search (no results). It stands
+    // OUTSIDE the list cards, which is what separates it from VeltrixEmptyRow: that
+    // one says a list is empty, this one says the page has nothing to be about.
+    //
+    // ⚠️ This rule is a RESTORATION, not a new style. `.settings-placeholder` was
+    // styled until `0307adf2` (2026-03-25) renamed it to `.settings-page-subtitle`
+    // in the stylesheet ONLY, leaving every TSX call site asking for a class that
+    // no longer existed; the renamed rule was then deleted with pageHeader() (see
+    // the comment above). So from March to 2026-08-11 all six banners rendered as
+    // plain default labels — full body size, undimmed — while the empty-list rows
+    // built with `veltrix-row-subtitle` beside them rendered small and dim. Nothing
+    // errored: a CSS class GTK cannot resolve is silently no-op.
+    .settings-placeholder {
+        font-size: $fse-subtitle;
+        color: var(--veltrix-text-dim);
+    }
+
+    // List card, group title and row label/subtitle are now the universal
+    // .veltrix-list / .veltrix-list-title / .veltrix-row-title / .veltrix-row-subtitle
+    // components in _components.scss (single source). Settings only keeps geometry
+    // exceptions below.
+
+    // ── Time spin buttons ─────────────────────────────────────────────────────
+    // (spinbutton.time-spin moved to _components.scss on 2026-08-07 — the CC's
+    //  night-light widget renders it too, so a Settings-scoped rule would have
+    //  silently unstyled it in the bar's window.)
+
+    // ── Accent color pickers ──────────────────────────────────────────────────────
+    // REMOVED (cyan-only, owner decision 2026-11-12): the picker and its
+    // `button.accent-circle-btn` swatches are gone. The accent itself is cyan
+    // #00E5FF, carried by `--veltrix-accent`, not by per-key `--accent-<key>`
+    // tokens (those are no longer emitted either — see theme-tokens.ts).
+
+    // ── App Icons — scrollable boxed list ─────────────────────────────────────────
+    // The list scrolls INSIDE the card, so the card chrome (bg/border/radius) lives
+    // on the fixed ScrolledWindow and clips the rows at its rounded corners. If
+    // .veltrix-list sat on the ListBox instead, its own rounded top/bottom would
+    // scroll out of the viewport, showing a cut-off rectangle (the bug this fixes).
+    scrolledwindow.apps-list-scroll {
+        @include material-card;
+        padding: 3px;   // same card inset as .veltrix-list — see the note there before changing it
+
+        // GtkListBox is scrollable → no GtkViewport; the list is a direct child.
+        // Reset it (and a viewport defensively) so the card is the only painted
+        // surface and the rows scroll transparently over it.
+        > viewport, list.apps-list {
+            @include veltrix-reset;
+            background: transparent;
+        }
+
+    }
+
+    // ── An app's own page: the header card (#535) ─────────────────────────────────
+    // Who the app is, not a control: no hover, a taller row, the name one step up
+    // the scale. Relative ramp ($fse-*), like every other text inside Settings.
+    row.settings-app-header {
+        min-height: 88px;
+        &:hover, &:active { background-color: transparent; }
+        .veltrix-row-title {
+            font-size: $fse-title-3;
+            font-weight: $fw-semibold;
+        }
+    }
+
+    // ── Search results ────────────────────────────────────────────────────────────
+    .search-result-chip {
+        font-size: $fse-caption;
+        font-weight: $fw-medium;
+        color: var(--veltrix-text);
+        background: var(--veltrix-accent-10);
+        border-radius: $veltrix-radius-pill;
+        padding: 2px 10px;
+        margin-left: 4px;
+    }
+
+    // ── Region page ───────────────────────────────────────────────────────────────
+    .region-preview-box {
+        background: var(--veltrix-surface-back);
+        border: 1px solid var(--veltrix-border);
+        border-radius: $veltrix-radius-md;
+        padding: $space-6 $space-8 $space-5;
+        margin-bottom: $space-2;
+    }
+
+    .region-clock-preview {
+        font-size: $fse-title-1;
+        font-weight: $fw-regular;
+        color: var(--veltrix-text);
+        letter-spacing: -0.5px;
+    }
+
+    // ── Button focus ring ─────────────────────────────────────────────────────────
+    // veltrix-btn handles its own outline; this covers any remaining plain buttons.
+    & button:focus-visible {
+        @include veltrix-focus-ring;
+    }
+
+    // …with ONE exception, and it has to live here rather than in the component.
+    // A dropdown trigger is styled as an INPUT (_components.scss): its keyboard focus
+    // is the 2px border going accent, and that block already says `outline: none` to
+    // keep a ring off it. That declaration loses — same provider, and
+    // `& button` (0,2,2) out-specifies `dropdown > button`
+    // (0,1,2) — so the trigger wore BOTH: an accent border and an accent outline 2px
+    // outside it. Two concentric accent rings on one control, which is exactly what
+    // tabbing showed. Measured 2026-08-03 with a stand-alone GTK probe
+    // (scripts/dev/gtk-probe.js) using the same two selectors at the same priority.
+    //
+    // 🔑 A blanket `window.X <element>:focus-visible` reaches INSIDE every composed
+    // widget in the window and out-specifies that widget's own opt-out. When a
+    // component says `outline: none` on purpose, the exception belongs next to the
+    // blanket, not in the component — the component already tried.
+    & dropdown > button:focus-visible {
+        outline: none;
+    }
+
+    // ── User avatar ───────────────────────────────────────────────────────────────
+    // Large circular profile avatar (Gtk.Picture, COVER-cropped). Pill radius on the
+    // square picture = a circle; surface background shows behind the fallback glyph.
+    // Avatar + change-button rows: no row hover, a touch of breathing room on top.
+    row.users-avatar-row {
+        &:hover { background-color: transparent; }
+        &:first-child { padding-top: $space-4; }
+    }
+
+    .users-avatar {
+        border-radius: $veltrix-radius-pill;
+        border: 2px solid var(--veltrix-border);
+        background: var(--veltrix-surface);
+    }
+
+    .users-avatar-fallback {
+        color: var(--veltrix-text-dim);
+    }
+
+    .avatar-cropper-canvas {
+        border-radius: $veltrix-radius-md;
+        background-color: var(--veltrix-surface-back);
+    }
+
+    image.users-avatar-sm {
+        border-radius: $veltrix-radius-pill;
+        border: 1px solid var(--veltrix-border);
+        background: var(--veltrix-surface);
+    }
+
+    // Flat full-width button used inside a ListBoxRow to make the whole row clickable
+    // Flat full-width click target inside a .veltrix-row. Stays fully
+    // transparent — the parent row provides the (rounded) hover/active background, so
+    // the button must NOT paint its own (square) one, or the two overlap with mismatched
+    // corners and colours.
+    button.settings-action-row {
+        background: transparent;
+        background-image: none;
+        border: none;
+        box-shadow: none;
+        border-radius: 0;
+        padding: 0;
+
+        &:hover, &:active { background: transparent; }
+    }
+
+    // The per-surface "Advanced" glass sliders reveal as a continuation of the Veltrix
+    // card. Their wrapper is passive scaffolding (holds the Gtk.Revealer that slides the
+    // sliders down inside the card), so it must add no chrome of its own — the .veltrix-row
+    // sliders inside are the real rows.
+    row.settings-adv-revealer-row {
+        padding: 0;
+        min-height: 0;
+        background: transparent;
+        box-shadow: none;
+
+        &:hover, &:active, &:selected { background: transparent; box-shadow: none; }
+    }
+
+    // ── Preset / segmented control buttons ───────────────────────────────────────
+    // Used in linked groups: Dock size presets.
+    // A segment is a Gtk.Button and its selected state is the .veltrix-btn--primary
+    // class, added/removed by `segmentedGroup` (SettingsHelpers). The `:checked`
+    // branch that used to live here was for the deleted Gaming page's own ToggleButton
+    // group — the one whose active segment could be clicked OFF, leaving the
+    // control empty. There are no ToggleButtons in a segmented group any more.
+    button.settings-preset-btn {
+        background-image: none;
+        box-shadow: none;
+        border-radius: $veltrix-radius-sm;
+        padding: 5px 14px;
+        min-height: 0;
+        font-size: $fse-small;
+        font-weight: $fw-medium;
+        background-color: var(--veltrix-surface);
+        border: 1px solid var(--veltrix-border);
+        color: var(--veltrix-text);
+        transition: background 0.15s ease;
+
+        &:hover   { background-color: var(--veltrix-surface-hover);   background-image: none; box-shadow: none; }
+        &:active  { background-color: var(--veltrix-surface-active); background-image: none; box-shadow: none; }
+        &:disabled { opacity: 0.45; }
+
+        // ── Active / selected state ───────────────────────────────────────────────
+        &.veltrix-btn--primary {
+            background-color: var(--veltrix-accent);
+            border-color: transparent;
+            color: var(--veltrix-accent-fg);
+            background-image: none;
+            box-shadow: none;
+
+            &:hover  { background-color: color-mix(in srgb, var(--veltrix-accent) 85%, white 15%); }
+            &:active { background-color: color-mix(in srgb, var(--veltrix-accent) 70%, black 30%); }
+        }
+    }
+
+    // Linked-group shape overrides: collapse inner borders + adjust end-cap radii
+    .linked > button.settings-preset-btn {
+        border-radius: 0;
+        border-right-width: 0; // collapse adjacent border
+
+        &:first-child {
+            border-radius: $veltrix-radius-sm 0 0 $veltrix-radius-sm;
+        }
+        &:last-child {
+            border-radius: 0 $veltrix-radius-sm $veltrix-radius-sm 0;
+            border-right-width: 1px; // restore trailing edge
+        }
+    }
+
+    // ── Wallpaper preview & gallery ─────────────────────────────────────────────
+    row.wallpaper-preview-row {
+        padding: $space-3;
+        &:hover { background-color: transparent; }
+
+        picture.wallpaper-preview {
+            border-radius: $veltrix-radius-md;
+            border: 2px solid var(--veltrix-border);
+            background-color: var(--veltrix-surface);
+        }
+    }
+
+    row.wallpaper-gallery-row {
+        padding: $space-1 $space-3 $space-3;
+        &:hover { background-color: transparent; }
+
+        // Slanted-panel gallery: one Cairo-painted DrawingArea (the panels
+        // overlap, so no row of buttons could own the clicks). The widget
+        // draws its own dark separators and the cyan ring on the active
+        // panel; the stylesheet only keeps its background transparent.
+        // (The old .wallpaper-thumbnails-box button rules went with the
+        // rectangular thumbnails, 2026-11-14.)
+        drawingarea.wallpaper-slanted-gallery {
+            background-color: transparent;
+        }
+    }
+
+    // (VeltrixAlertDialog moved to _alert.scss on 2026-08-10. It is its own
+    // toplevel Gtk.Window — a transient, not a child — so nothing rooted at this
+    // window has ever been able to reach it. It sat here because Settings is the
+    // only caller, which is exactly the trap: the caller's window is not the
+    // widget's window. See the header of _alert.scss.)
+}
+
+// ── Content Safety interstitial (surfaces/settings/custom/safety.ts) ────────
+// Column 0 ON PURPOSE: the dialog is its own toplevel Gtk.Window (see the
+// VeltrixAlertDialog note at the end of window.veltrix-settings-window above),
+// so nothing rooted at that window can reach it. These rules are scoped to
+// the dialog's own class instead — and to that class only, so no other
+// dialog inherits verse styling it did not ask for.
+// The halal interstitial (surfaces/settings/halal-interstitial.ts) shares
+// these verse rules: same dialog, same verse, only the note differs.
+window.veltrix-alert-dialog.veltrix-safety-interstitial,
+window.veltrix-alert-dialog.veltrix-halal-interstitial {
+    .veltrix-safety-cite {
+        font-size: $fse-small;
+        color: var(--veltrix-text-dim);
+    }
+
+    // Arabic first, larger than the English, in the Quranic font — Noto Naskh
+    // Arabic (ARCHITECTURE.md §5 I5: Quranic text needs a proper Quranic
+    // font, never a generic sans). Amiri was listed second and has been
+    // dropped: Noto is first, it is a declared package dependency
+    // (noto-fonts-extra), and its render of this verse is verified — Amiri
+    // could only ever have rendered if Noto were absent, which the package
+    // guarantees it is not. The tall line height is load-bearing: full
+    // tashkeel needs the vertical room or diacritics clip.
+    .veltrix-safety-verse-ar {
+        font-family: "Noto Naskh Arabic", serif;
+        font-size: 30px;
+        line-height: 1.9;
+        color: var(--veltrix-text);
+    }
+
+    // The English, directly underneath: the interface font, smaller, dimmer.
+    .veltrix-safety-verse-en {
+        font-size: $fse-small;
+        color: var(--veltrix-text-dim);
+    }
+
+    // Who translated the English (halal rubric 4.4.5): same size and tone
+    // as the English line, one breath below it.
+    .veltrix-safety-attrib {
+        font-size: $fse-small;
+        color: var(--veltrix-text-dim);
+    }
+
+    // Informational, not a selected state — so dim text, never the accent
+    // (the accent is only for active/selected state).
+    .veltrix-safety-countdown {
+        font-size: $fse-small;
+        color: var(--veltrix-text-dim);
+    }
+}

@@ -1,0 +1,362 @@
+#!/bin/sh
+# hyalo-minimize-check.sh — minimizing (#724, hyalo/compositor/src/wm/minimize.rs): a window
+# hidden on its workspace, shrunk into its place in the dock and grown back out of it. Run
+# INSIDE a Hyalo session started with HYALO_CONTROL and a settings layer (the Hyalo smoke;
+# locally, a nested Hyalo), with the real shell on it (its dock gives the places) and
+# `hyalo-window-controls-probe` in PATH.
+#
+#   1. the minimize button is shown — a 72 px box — and not on the window's dialog (48);
+#   2. a dialog is not minimized by itself;
+#   3. the capsule's minimize hides the window and its dialog: listed minimized, not visible,
+#      neither focused; the app saw no click;
+#   4. the dock gives it a place, inside the dock's layer;
+#   5. it is DRAWN shrinking (the animation made 12 s long), all of it read from ONE picture,
+#      the one that catches it crossing the dock's glass: the pixel at the centre of where Hyalo
+#      says it is drawn is the probe's grey, its dialog's grey in front of it, and the one where
+#      it was is not —
+#      which also proves the place came within Hyalo's wait (wm/minimize.rs `WAIT`): a window
+#      whose place comes later goes without an animation, and is drawn nowhere; beside it,
+#      inside the box it had at full size, the pixel is what is there once it has gone; and it is
+#      OVER the dock's glass beside its place (`over_dock`). Nothing is captured before that
+#      picture: on the nightly runs of 2026-10-22 and 23 a capture taken "a second in" came back
+#      when the window was already into the dock, and no poll after it could see it cross;
+#   6. a click on its place in the dock brings it back, over the dock too, with its dialog,
+#      focused;
+#   7. the app's own minimize (xdg_toplevel.set_minimized) minimizes it; `unminimize` brings it
+#      back without the focus;
+#   8. on a tiling workspace a minimized window leaves the layout — the other takes its room —
+#      and comes back into it;
+#   9. reduce motion (`[animations] enabled = false`): it goes at once, nothing drawn moving;
+#  10. the user's buttons without minimize (the settings layer, which the shell keeps equal to
+#      button-layout): a 48 px box.
+# Controls seen failing nested: the installed Hyalo before #724 (step 1: "LAYOUT right 48 24", in today's capsule);
+# one whose window surfaces are not sized at the animation's scale (step 5: its full-size box
+# drawn around the small window); one whose focus does not restore (step 6); the Hyalo of #736,
+# which drew it under the dock (step 5: "just inside its edge, is '76 72 77'", the blurred edge;
+# and with step 5's crossing skipped, step 6: "'255 255 255'"); one that drew its dialog behind
+# it (step 5: "'64 64 64', not the dialog's grey").
+#
+# Exits 1 on failure. MSG overrides `veltrix-hyalo msg`.
+set -eu
+here=$(dirname "$(realpath "$0")")
+MSG=${MSG:-veltrix-hyalo msg}
+C=${HYALO_CONTROL:?HYALO_CONTROL is not set — Hyalo must be started with it}
+log=${MINIMIZE_LOG:-/tmp/hyalo-minimize}
+mkdir -p "$log"
+out="$log/probe.log"
+out2="$log/probe2.log"
+fail() { echo "FAIL: $*"; cat "$out" 2>/dev/null; $MSG windows | jq -c '.ok.windows[] | select(.app_id == "hyalo-window-controls-probe")' 2>/dev/null; exit 1; }
+pids=""
+ws=""
+# Keep a known icon-free strip in the dock's top padding. Hover magnification can
+# otherwise lift a neighbour into it as the restoring click enters the dock.
+# A restoring window initially crosses only the top of the neighbouring Trash
+# icon. Theme art can be neutral there (e.g. a white bin lid), so arbitrary colour
+# is not evidence that the icon is missing. Give the REAL dock a known full-slot
+# foreground through its ordinary theme resolver; restore the user's theme too.
+icon_theme=$(gsettings get org.gnome.desktop.interface icon-theme)
+icons="${XDG_DATA_HOME:-$HOME/.local/share}/icons"
+mkdir -p "$icons"
+fixture_theme=$(mktemp -d "$icons/hyalo-minimize.XXXXXX")
+magnification=$(gsettings get org.veltrix.dock magnification)
+gsettings set org.veltrix.dock magnification false
+trap 'gsettings set org.gnome.desktop.interface icon-theme "$icon_theme" 2>/dev/null || true; rm -rf "$fixture_theme"; gsettings set org.veltrix.dock magnification "$magnification" 2>/dev/null || true; kill $pids 2>/dev/null || true; $MSG settings "{\"windows\":null,\"animations\":null}" >/dev/null 2>&1 || true; [ -n "$ws" ] && $MSG do set-workspace-mode "$ws" default >/dev/null 2>&1 || true' EXIT
+mkdir -p "$fixture_theme/64x64/places"
+parent_theme=$(python3 -c 'import ast,sys; print(ast.literal_eval(sys.argv[1]))' "$icon_theme")
+cat >"$fixture_theme/index.theme" <<EOF
+[Icon Theme]
+Name=Hyalo minimize foreground fixture
+Inherits=$parent_theme
+Directories=64x64/places
+[64x64/places]
+Size=64
+Type=Fixed
+Context=Places
+EOF
+for name in user-trash user-trash-full; do
+    printf '%s\n' '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><path fill="#11ad53" d="M0 0h64v64H0z"/></svg>' >"$fixture_theme/64x64/places/$name.svg"
+done
+gsettings set org.gnome.desktop.interface icon-theme "$(basename "$fixture_theme")"
+probe_pixel() { gjs -m "$here/hyalo-window-look-probe.js" pixel "$@"; }
+# The probe's main window (the dialog is titled …-dialog), and its dialog.
+win() { $MSG windows | jq -c '.ok.windows[] | select(.title == "window-controls-probe")' | head -n 1; }
+dialog() { $MSG windows | jq -c '.ok.windows[] | select(.title == "window-controls-probe-dialog")'; }
+field() { echo "$1" | jq -r ".$2"; }
+at() { win | jq -r --argjson f "$1" '.controls | "\(.[0] + .[2] * $f) \(.[1] + .[3] / 2)"'; }
+wait_line() { for _ in $(seq 1 40); do grep -q "$1" "$2" && return 0; sleep 0.25; done; return 1; }
+# The probe's greys: its window 64, its dialog 96 (drawn in front of it, moving with it).
+grey() { set -- $1; [ "$1" -ge 56 ] && [ "$1" -le 104 ] && [ $(($1 - $2)) -le 4 ] && [ $(($2 - $1)) -le 4 ] && [ $(($1 - $3)) -le 4 ] && [ $(($3 - $1)) -le 4 ]; }
+# Over the dock's glass, under its icons (#1003). The icon-free top padding is
+# six logical pixels above the icon slot (PAD=10, four pixels inside the glass,
+# beyond its 2 px edge sheen): sampling eight pixels INSIDE the slot
+# mistook a blue icon correctly covering the moving window for glass over it
+# (#958). Magnification is disabled for this fixture and restored on exit.
+# Read the moving edge from the capture's own metadata, never adjacent polls.
+# A pixel six pixels inside that edge must be the probe's grey; glass over it
+# blurs the edge, even though a pixel deep inside a uniform window stays grey.
+# $1 is the screenshot name, $2 its place (read before restoring drops the target),
+# $3 a further condition on the drawn box (jq, with $y and $dx).
+over_dock() {
+    shot=$1
+    y=$(echo "$2" | jq '.[1] - 6')
+    dx=$(echo "$dock" | jq '.[0]')
+    inside='select(. != null and .[1] < $y - 12 and .[1] + .[3] > $y + 12 and .[0] > $dx + 2 and .[2] > 60 and ('"${3:-true}"'))'
+    seen=""
+    at=""
+    # How late the watch began, after the click: what was slow, if it fails.
+    echo "$(($(date +%s%N) / 1000000)) watching, $(( ($(date +%s%N) - t0) / 1000000 )) ms after the click" >>"$log/$shot-polled.log"
+    for _ in $(seq 1 400); do
+        drawn=$(win | jq -c .drawn)
+        # When each poll was, ms: what was slow, if it fails.
+        echo "$(($(date +%s%N) / 1000000)) $drawn" >>"$log/$shot-polled.log"
+        # Gone into the dock (or fully out of it) after it was seen moving: it will not cross now.
+        [ "$drawn" = null ] && [ -n "$seen" ] && break
+        [ "$drawn" != null ] && seen=1
+        [ -n "$(echo "$drawn" | jq -c --argjson y "$y" --argjson dx "$dx" "$inside")" ] || { sleep 0.02; continue; }
+        t=$(date +%s%N)
+        $MSG screenshot "$log/$shot-crossing.ppm" >/dev/null || fail "no screenshot"
+        at=$(jq -c --arg id "$id" --argjson y "$y" --argjson dx "$dx" ".drawn[\$id] | $inside" "$log/$shot-crossing.capture.json")
+        echo "$(($(date +%s%N) / 1000000)) screenshot $(( ($(date +%s%N) - t) / 1000000 )) ms, drawn in it: $(jq -c --arg id "$id" '.drawn[$id]' "$log/$shot-crossing.capture.json")" >>"$log/$shot-polled.log"
+        [ -n "$at" ] && break
+    done
+    [ -n "${at:-}" ] || $MSG stats >>"$log/$shot-polled.log" 2>&1
+    [ -n "${at:-}" ] || fail "($shot) no screenshot caught it crossing the dock's glass (at y $y, the dock from x $dx; where it was drawn: $log/$shot-polled.log)"
+    px=$(jq -rn --argjson a "$at" --argjson y "$y" --argjson s "$scale" '"\($a[0] + 6 | . * $s | ceil) \($y * $s | floor)"')
+    got=$(probe_pixel "$log/$shot-crossing.ppm" $px)
+    # The window's grey or its dialog's, each channel within 2: the glass's blur gives greys
+    # too, not neutral ones (measured '76 72 77').
+    set -- $got
+    for g in 64 96; do
+        ok=1
+        for c in "$1" "$2" "$3"; do [ $((c - g)) -le 2 ] && [ $((g - c)) -le 2 ] || ok=0; done
+        [ $ok = 1 ] && return 0
+    done
+    fail "($shot) crossing the dock (drawn at $at in the screenshot) the pixel at $px, in the icon-free padding, just inside its edge, is '$got', not its own grey: the dock's glass is drawn over it"
+}
+# The other half of #1003: the dock's coloured icon must still cover the probe's
+# neutral-grey body. Search its overlap, not one fixed pixel: restoring removes a
+# minimized slot and neighbouring icons slide. Exclude each window's actual
+# controls, projected into the capture (the dialog's controls are coloured too).
+# Stay inside the moving frame and in the icon row.
+# A window incorrectly drawn above the whole dock leaves only grey here.
+icon_over_window() {
+    python3 - "$log/back-crossing.ppm" "$log/back-crossing.capture.json" "$log/back-windows.json" "$id" "$target" "$scale" <<'PYICON' || fail "the dock's coloured icon is not in front of the restoring window"
+import json, math, sys
+from pathlib import Path
+picture, metadata, windows, ident, target, scale = sys.argv[1:]
+scale = float(scale)
+drawn = json.loads(Path(metadata).read_text())["drawn"]
+x, y, w, h = drawn[ident]
+windows = json.loads(Path(windows).read_text())
+assert any(str(window["id"]) == ident for window in windows), "missing probe geometry"
+controls = []
+for window in windows:
+    rect = drawn.get(str(window["id"]))
+    box = window["controls"]
+    if rect is None or box is None:
+        continue
+    dx, dy, dw, dh = rect
+    kx, ky = dw / window["width"], dh / window["height"]
+    cx = dx + (box[0] - window["x"]) * kx
+    cy = dy + (box[1] - window["y"]) * ky
+    # Round outward and leave one device pixel for antialiasing at the capsule edge.
+    controls.append((math.floor(cx * scale) - 1, math.floor(cy * scale) - 1,
+                     math.ceil((cx + box[2] * kx) * scale) + 1,
+                     math.ceil((cy + box[3] * ky) * scale) + 1))
+tx, ty, tw, th = json.loads(target)
+header = Path(picture).read_bytes().split(b"\n", 3)
+assert header[0] == b"P6" and header[2] == b"255", "expected Hyalo RGB capture"
+width, height = map(int, header[1].split())
+rgb = header[3]
+assert len(rgb) == width * height * 3
+left, right = math.ceil((x + 6) * scale), math.floor((x + w - 6) * scale)
+top = math.ceil(max(y + 6, ty + 8) * scale)
+bottom = math.floor(min(y + h - 6, ty + th - 8) * scale)
+assert 0 <= left < right <= width and 0 <= top < bottom <= height, "no icon/body overlap captured"
+for py in range(top, bottom):
+    for px in range(left, right):
+        if any(cx <= px < cr and cy <= py < cb for cx, cy, cr, cb in controls):
+            continue
+        colour = rgb[(py * width + px) * 3:(py * width + px) * 3 + 3]
+        if all(abs(c - want) <= 3 for c, want in zip(colour, (17, 173, 83))):
+            print(f"ok    dock icon over the restoring grey body at {px} {py}: {tuple(colour)}")
+            sys.exit(0)
+raise SystemExit("the known Trash foreground is absent in the icon/body overlap")
+PYICON
+}
+scale=$($MSG outputs | jq '.ok.outputs[0].scale')
+
+# Wait for the theme change to reach Applications1 and the real dock. Keep the
+# picture as proof the foreground was present before testing its stacking.
+fixture_ready=""
+for _ in $(seq 1 20); do
+    $MSG screenshot "$log/foreground.ppm" >/dev/null || fail "no foreground screenshot"
+    if python3 - "$log/foreground.ppm" 2>/dev/null <<'PYART'
+from pathlib import Path
+import sys
+header = Path(sys.argv[1]).read_bytes().split(b"\n", 3)
+assert header[0] == b"P6" and header[2] == b"255"
+rgb = header[3]
+assert sum(rgb[i:i+3] == bytes((17, 173, 83)) for i in range(0, len(rgb), 3)) >= 64
+PYART
+    then fixture_ready=1; break; fi
+    sleep 0.1
+done
+[ -n "$fixture_ready" ] || fail "the real dock did not load the known Trash foreground"
+
+# From the shipped buttons, whatever the shell carried from button-layout before.
+$MSG settings '{"windows":null,"animations":{"minimize":12000}}' >/dev/null \
+    || fail "Hyalo refused [animations] (a Hyalo that does not minimize)"
+HYALO_PROBE_DIALOG=1 hyalo-window-controls-probe >"$out" 2>&1 &
+pid=$!; pids="$pids $pid"
+wait_line '^CHILD PLACED' "$out" || fail "the probe never opened its dialog"
+sleep 0.6
+
+# 1. The minimize button, not on the dialog.
+grep -q '^LAYOUT right 72 24' "$out" || fail "the window was told '$(grep '^LAYOUT' "$out" | tail -n 1)', not 'LAYOUT right 72 24'"
+grep -q '^CHILD LAYOUT right 48 24' "$out" || fail "the dialog was told '$(grep '^CHILD LAYOUT' "$out" | tail -n 1)', not 'CHILD LAYOUT right 48 24'"
+echo "ok    minimize is shown (72 px), and not on the window's dialog (48 px)"
+
+# 2. A dialog alone.
+did=$(field "$(dialog)" id)
+$MSG do minimize "$did" >/dev/null 2>&1 && fail "the dialog was minimized by itself"
+echo "ok    a dialog is not minimized by itself"
+
+# 3. The capsule's minimize. The dialog covers the middle of the window's controls: the top
+#    edge of the minimize button is clear of it.
+w=$(win)
+id=$(field "$w" id)
+cx=$(echo "$w" | jq -r '.controls[0] + .controls[2] / 6')
+cy=$(echo "$w" | jq -r '.controls[1] + 3')
+centre=$(echo "$w" | jq -r --argjson s "$scale" '"\((.x + .width / 2) * $s | floor) \((.y + .height / 2) * $s | floor)"')
+t0=$(date +%s%N)
+echo "click $cx $cy" >"$C"
+sleep 0.15
+w=$(win); d=$(dialog)
+[ "$(field "$w" minimized)" = true ] && [ "$(field "$w" minimized_order)" -gt 0 ] || fail "minimize did not minimize: $w"
+[ "$(field "$d" minimized)" = true ] && [ "$(field "$d" minimized_order)" = 0 ] || fail "the dialog was not hidden with its window: $d"
+[ "$(field "$w" visible)$(field "$d" visible)" = falsefalse ] || fail "a minimized window is still visible"
+[ "$(field "$w" focused)$(field "$d" focused)" = falsefalse ] || fail "a minimized window kept the focus"
+grep -q '^BUTTON' "$out" && fail "the app got a click meant for the controls"
+echo "ok    minimize hides the window and its dialog, and takes the focus from them"
+
+# 4. Its place in the dock.
+target=null
+for _ in $(seq 1 100); do
+    target=$(win | jq -c .minimize_target)
+    [ "$target" != null ] && break
+    sleep 0.02
+done
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$target" != null ] || fail "the dock gave the window no place"
+dock=$($MSG layers | jq -c '[.ok.layers[] | select(.namespace == "veltrix-dock")][0] | [.x, .y, .width, .height]')
+echo "$target $dock" | jq -e -s '.[0] as $t | .[1] as $d | $t[0] >= $d[0] and $t[1] >= $d[1] and $t[0] + $t[2] <= $d[0] + $d[2] + 1 and $t[1] + $t[3] <= $d[1] + $d[3] + 1' >/dev/null \
+    || fail "its place $target is not inside the dock $dock"
+echo "ok    the dock gives it a place, inside the dock (listed after ${ms} ms, this script's polling included)"
+
+# 5. Drawn shrinking toward it. Watching starts at once, and every check of this step reads the
+#    picture that caught it crossing the dock, with where Hyalo drew each window IN it
+#    (capture.json). Its top must be clear of the dock's glass, 20 above its place, for the
+#    point beside it (below) to be over the wallpaper; reading pixels (gjs, seconds on CI) waits
+#    until nothing moves.
+over_dock shrinking "$target" '.[1] < $y - 14'
+pic="$log/shrinking-crossing.ppm"
+drawn=$(jq -c --arg id "$id" '.drawn[$id]' "$log/shrinking-crossing.capture.json")
+ddrawn=$(jq -c --arg id "$did" '.drawn[$id]' "$log/shrinking-crossing.capture.json")
+mid=$(echo "$drawn" | jq -r --argjson s "$scale" '"\((.[0] + .[2] / 2) * $s | floor) \((.[1] + .[3] / 2) * $s | floor)"')
+k=$(echo "$drawn" | jq -r '.[2] / 400 * 100 | floor')
+[ "$k" -lt 90 ] || fail "crossing the dock, it is still ${k}% of its size"
+[ "$ddrawn" != null ] || fail "crossing the dock, its dialog is not drawn moving"
+dmid=$(echo "$ddrawn" | jq -r --argjson s "$scale" '"\((.[0] + .[2] / 2) * $s | floor) \((.[1] + .[3] / 2) * $s | floor)"')
+# Beside the small window, inside the box it had at full size (which grows right and down from
+# where it is drawn), above the dock: what is there once it has gone. A window whose surfaces
+# kept their full size from the scaled origin drew that box too.
+beside=$(echo "$drawn" | jq -r --argjson s "$scale" '"\((.[0] + .[2] + 24) * $s | floor) \((.[1] + 2) * $s | ceil)"')
+for _ in $(seq 1 80); do [ "$(win | jq -c .drawn)" = null ] && break; sleep 0.25; done
+sleep 0.3
+$MSG screenshot "$log/gone.ppm" >/dev/null || fail "no screenshot"
+grey "$(probe_pixel "$pic" $mid)" || fail "where it is drawn ($drawn) the pixel is $(probe_pixel "$pic" $mid), not its grey"
+grey "$(probe_pixel "$pic" $centre)" && fail "where it was, the pixel is still its grey"
+# Its dialog moves with it, in front of it: the dialog's own grey at its middle.
+set -- $(probe_pixel "$pic" $dmid)
+[ "$1" -ge 92 ] && [ "$1" -le 100 ] && grey "$1 $2 $3" || fail "where its dialog is drawn ($ddrawn) the pixel is '$*', not the dialog's grey (96): the dialog is not in front"
+now=$(probe_pixel "$pic" $beside); then=$(probe_pixel "$log/gone.ppm" $beside)
+set -- $now $then
+[ $(($1 - $4)) -le 6 ] && [ $(($4 - $1)) -le 6 ] && [ $(($2 - $5)) -le 6 ] && [ $(($5 - $2)) -le 6 ] \
+    || fail "beside the small window ($beside) the pixel is '$now' while it shrinks and '$then' once it has gone: its full-size box is drawn too"
+echo "ok    it is drawn shrinking toward its place (${k}% of its size crossing the dock), over the dock, and nothing else of it"
+
+# 6. Back from the dock: a click on its place.
+sleep 0.3
+# Resting controls, before the click starts movement. Their size/offset is projected
+# using each window's drawn box IN the capture; do not query a later animation frame.
+$MSG windows | jq '[.ok.windows[] | select(.app_id == "hyalo-window-controls-probe")]' >"$log/back-windows.json"
+target=$(jq -c '.[] | select(.title == "window-controls-probe") | .minimize_target' "$log/back-windows.json")
+place=$(echo "$target" | jq -r '"\(.[0] + .[2] / 2) \(.[1] + .[3] / 2)"')
+# Coming back, the curve is fast out: it leaves the dock in the first 1% of its time (15 ms of
+# 6 s, missed in CI). Ten minutes give that part a second; step 7 minimizes it again, which
+# replaces the animation.
+$MSG settings '{"animations":{"minimize":600000}}' >/dev/null
+t0=$(date +%s%N)
+echo "click $place" >"$C"
+over_dock back "$target"
+icon_over_window
+$MSG settings '{"animations":null}' >/dev/null
+sleep 0.3
+w=$(win); d=$(dialog)
+[ "$(field "$w" minimized)$(field "$d" minimized)" = falsefalse ] || fail "a click on its place in the dock did not bring it back: $w"
+[ "$(field "$w" visible)$(field "$d" visible)" = truetrue ] || fail "back from the dock, it is not visible"
+[ "$(field "$w" focused)" = true ] || fail "back from the dock, it does not have the focus"
+echo "ok    a click on its place in the dock brings it back over the dock, with its dialog, focused"
+
+# 7. The app's own minimize; back without the focus.
+kill -URG "$pid"
+wait_line '^ASKED 23' "$out" || fail "the probe did not ask"
+sleep 0.5
+[ "$(win | jq -r .minimized)" = true ] || fail "the app's own minimize (set_minimized) did not minimize it"
+$MSG do unminimize "$id" >/dev/null || fail "unminimize refused"
+sleep 0.5
+w=$(win)
+[ "$(field "$w" minimized)$(field "$w" visible)" = falsetrue ] || fail "unminimize did not bring it back: $w"
+[ "$(field "$w" focused)" = false ] || fail "unminimize gave it the focus"
+echo "ok    the app's own minimize minimizes it, and unminimize brings it back without the focus"
+
+# 8. A tiling workspace: out of the layout, and back into it.
+kill "$pid" 2>/dev/null; sleep 0.5
+ws=$($MSG workspaces | jq -r '.ok.workspaces[] | select(.active and .focused and (.special | not)) | .id' | head -n 1)
+$MSG do set-workspace-mode "$ws" tiling >/dev/null
+hyalo-window-controls-probe >"$out" 2>&1 &
+pid=$!; pids="$pids $pid"
+wait_line '^PLACED' "$out" || fail "the tiled probe never placed its box"
+hyalo-window-controls-probe >"$out2" 2>&1 &
+pids="$pids $!"
+wait_line '^PLACED' "$out2" || fail "the second tiled probe never placed its box"
+sleep 0.8
+ids=$($MSG windows | jq -r '[.ok.windows[] | select(.title == "window-controls-probe") | .id] | sort | join(" ")')
+set -- $ids; a=$1; b=$2
+width_of() { $MSG windows | jq -r --argjson i "$1" '.ok.windows[] | select(.id == $i) | .width'; }
+half=$(width_of "$b")
+$MSG do minimize "$a" >/dev/null
+sleep 0.8
+whole=$(width_of "$b")
+[ "$whole" -gt $((half * 3 / 2)) ] || fail "the other window kept its tile ($half → $whole px) when its neighbour was minimized"
+$MSG do focus-window "$a" >/dev/null
+sleep 0.8
+[ "$(width_of "$b")" -lt $((whole * 2 / 3)) ] || fail "the minimized window came back outside the layout (the other is $(width_of "$b") px)"
+echo "ok    tiled: it leaves the layout ($half → $whole px for the other) and comes back into it"
+$MSG do set-workspace-mode "$ws" default >/dev/null; ws=""
+
+# 9. Reduce motion: at once.
+$MSG settings '{"animations":{"enabled":false}}' >/dev/null
+$MSG do minimize "$a" >/dev/null
+[ "$($MSG windows | jq -c --argjson i "$a" '.ok.windows[] | select(.id == $i) | .drawn')" = null ] || fail "with reduce motion it is still drawn moving"
+$MSG do focus-window "$a" >/dev/null
+$MSG settings '{"animations":null}' >/dev/null
+echo "ok    reduce motion: it goes at once"
+
+# 10. The user's buttons without minimize.
+: >"$out"
+$MSG settings '{"windows":{"controls":{"buttons":["maximize","close"]}}}' >/dev/null
+wait_line '^LAYOUT right 48 24' "$out" || fail "without minimize in the user's buttons, the app was told '$(grep '^LAYOUT' "$out" | tail -n 1)'"
+$MSG settings '{"windows":null}' >/dev/null
+echo "ok    the user's buttons without minimize: a 48 px box"

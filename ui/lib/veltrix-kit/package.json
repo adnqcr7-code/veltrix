@@ -1,0 +1,6 @@
+{
+  "name": "veltrix-kit",
+  "version": "0.1.0",
+  "description": "Veltrix's platform library: GTK4 widgets, the application host, the appearance engine and the stylesheet every Veltrix application wears",
+  "license": "LGPL-3.0-or-later"
+}

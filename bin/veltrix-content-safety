@@ -1,0 +1,1034 @@
+#!/usr/bin/env python3
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-content-safety — the system side of Settings → Safety ("Block adult
+# websites"). Run as root, via pkexec, by the shell — never by hand as a user.
+#
+#   veltrix-content-safety on      enable both layers (DNS + hosts)
+#   veltrix-content-safety off     remove both layers, restore prior state
+#   veltrix-content-safety status  print JSON state (unprivileged, no root)
+#
+# Two layers, because neither alone is enough on a real machine:
+#
+#   1. DNS — the system resolver is pointed at CleanBrowsing Family
+#      (185.228.168.168 and 185.228.169.168, https://cleanbrowsing.org —
+#      their free Family filter blocks adult content; no account, no key).
+#      Queries go over DNS-over-TLS (port 853) to
+#      family-filter-dns.cleanbrowsing.org — the drop-in sets
+#      DNSOverTLS=yes with the TLS hostname on each server, and the
+#      dispatcher does the same per-link. Strict mode: if TLS cannot be
+#      established (e.g. a network blocking port 853), name lookup fails
+#      rather than falling back to plaintext — disclosed in the Settings
+#      page, and the hosts layer still blocks the most-visited domains.
+#      Three pieces, all persistent across reboots:
+#        a. a systemd-resolved drop-in, /etc/systemd/resolved.conf.d/
+#           20-veltrix-content-safety.conf, with DNS= + Domains=~. (the
+#           default-route domain, so these servers answer every query);
+#        b. a NetworkManager dispatcher script,
+#           /etc/NetworkManager/dispatcher.d/20-veltrix-content-safety, which
+#           sets the same servers per-link with `resolvectl dns` whenever a
+#           link comes up — per-link DNS from DHCP would otherwise win over
+#           the drop-in for that link's queries;
+#        c. /etc/resolv.conf pointed at resolved's stub, so the system
+#           actually uses resolved (stock Arch + NetworkManager writes
+#           /etc/resolv.conf directly and resolved may not even be running).
+#           The previous /etc/resolv.conf is backed up once and restored on
+#           `off`; if resolved was not running before, it is stopped again.
+#   2. Hosts — a managed block in /etc/hosts between the markers
+#        # BEGIN VELTRIX CONTENT SAFETY ... # END VELTRIX CONTENT SAFETY
+#      mapping every domain in the bundled blocklist to 0.0.0.0. This layer
+#      blocks even when DNS is bypassed (DNS-over-HTTPS in the browser, a
+#      hard-coded resolver). The blocklist is a curated subset of
+#      StevenBlack/hosts "porn-only" (MIT) — see
+#      defaults/content-safety/blocklist.txt for the source, licence and
+#      derivation; CleanBrowsing covers the long tail.
+#
+# Honest limits (also stated in the Settings page, never hidden here):
+#   - This is a helper, not a guarantee. A determined user can bypass it
+#     (a VPN, DNS-over-HTTPS in the browser, editing /etc/hosts as root).
+#   - Using CleanBrowsing Family DNS means DNS queries go to CleanBrowsing's
+#     servers, over DNS-over-TLS — never plaintext. That is disclosed in
+#     the Settings page.
+#   - Browser SafeSearch is a browser setting; this feature does not enforce it.
+#
+# Safety rules for this helper itself:
+#   - `on`/`off` refuse to run as non-root (exit 1). `status` needs no root.
+#   - /etc/hosts is only ever touched inside the marked block; everything
+#     else in the file is preserved byte-for-byte. A backup is taken once
+#     (/etc/hosts.veltrix-backup) and never overwritten — and never from a
+#     hosts file that still contains a managed block (on a machine upgraded
+#     from Masjid OS the backup would otherwise be a copy of the file WITH
+#     the old block in it). An orphaned marker
+#     (BEGIN without END, or END without BEGIN) is corruption, not an
+#     empty block: `on` refuses to write over it, `status` reports
+#     "partial", and `off` fails honestly naming the hosts block — a
+#     stray marker can never read as a clean "off" or gain a second block.
+#   - Idempotent: `on` twice is the same as `on` once; `off` twice is a no-op.
+#   - No network access: the blocklist is bundled, never downloaded at apply
+#     time, so this works fully offline.
+#   - Prior system state (was resolved running? what was /etc/resolv.conf?)
+#     is recorded in /etc/veltrix/content-safety/state.json and honoured on
+#     `off`. Nothing is deleted that this helper did not create.
+#
+# Testing (no systemd, no root, no Dell): every path below honours an
+# VELTRIX_CS_* environment override, so the whole apply can run against a
+# scratch tree — see the harness in docs/content-safety-report.md. The
+# pre-rename locations have VELTRIX_CS_*_LEGACY overrides of the same
+# (test-only) kind, so the Masjid OS → VELTRIX adoption can be exercised
+# against fixtures — see scripts/dev/content-safety-probe.sh §12.
+# Rename adoption (1.3): a machine upgraded from Masjid OS still has the
+# old block (# BEGIN MASJID CONTENT SAFETY), the old state file
+# (/etc/masjid/content-safety/state.json), the old backups
+# (/etc/hosts.masjid-backup, /etc/resolv.conf.masjid-backup) and the old
+# drop-in/dispatcher (20-masjid-content-safety.*). `on` adopts all of
+# them — the old block is replaced by exactly one VELTRIX block, the
+# three files are MOVED to the new locations (a file that already exists
+# at the new location wins), and the old DNS artifacts are removed once
+# the new layers are verified. `off` removes both names' artifacts, so
+# protection never survives an `off` under the old name.
+# VELTRIX_CS_NO_SYSTEMD=1 is the harness mode: systemctl/resolvectl calls are
+# stubbed and the apply runs against the scratch tree. Without it, `on`
+# refuses where systemd is not running (see systemd_is_running), and step 4
+# is verified against real (or PATH-faked) systemctl/resolvectl.
+# Exit codes: 0 ok; 1 usage / not root; 2 blocklist missing or unusable;
+# 3 a system write failed (message on stderr naming what remains, and
+# `status` reports "partial") — or `on` refused because systemd is not
+# running. Failure behaviour, in the order it is guaranteed: the state file
+# is written BEFORE any destructive step, so a state-write failure aborts
+# before anything is mutated; a later failure rolls back, best-effort, what
+# THIS run created (a re-`on` never deletes pre-existing artifacts); `off`
+# attempts every removal even if one fails, and its exit code comes from the
+# FINAL state, re-checked after all removals, not from the first error.
+#
+# Known limitation (fix pass #3, 2026-11-12): the /run/systemd/system guard
+# is defeatable in an arch-chroot session — arch-chroot bind-mounts the
+# host's /run, so the live ISO's marker is visible inside the chroot and
+# the guard passes there. The R3 load check is the backstop (`on` then
+# fails honestly and rolls the layers back), and step 4 now enables
+# resolved WITHOUT --now and rolls the enablement back on failure, so a
+# failed arch-chroot `on` leaves no enablement side effect — but the guard
+# itself still passes there, and the install-path evidence is Dell-gated
+# (see docs/content-safety-fix-report-3.md).
+#
+# `off` is deliberately NOT guarded the way `on` is: when a state file
+# exists it is a recovery path (a prior `on` cycle on this root), and `off`
+# must work to remove layers even where systemd is not running. When there
+# is no state to honour and systemd is not running here, `off` skips its
+# systemctl calls — there is nothing of ours running to restart in that
+# case, and the calls would talk to a possibly-foreign systemd.
+# ─────────────────────────────────────────────────────────────────────────────
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+CLEANBROWSING_DNS = ["185.228.168.168", "185.228.169.168"]
+# CleanBrowsing Family's DNS-over-TLS hostname (their own docs:
+# https://cleanbrowsing.org/learn/what-is-dns-over-tls-dot — Family Filter:
+# family-filter-dns.cleanbrowsing.org, port 853). The `#hostname` suffix is
+# how systemd-resolved verifies the TLS certificate (SNI); without it,
+# strict DNSOverTLS=yes cannot authenticate the server.
+CLEANBROWSING_DOT_HOST = "family-filter-dns.cleanbrowsing.org"
+# Single source of truth (N2, fix pass #2): the IPs above are spelled out in
+# exactly one place — the drop-in, the dispatcher and the per-link resolvectl
+# calls below all derive from CLEANBROWSING_DNS + CLEANBROWSING_DOT_HOST, so
+# editing one literal can never leave the layers disagreeing.
+CLEANBROWSING_DNS_WITH_HOST = " ".join(f"{ip}#{CLEANBROWSING_DOT_HOST}"
+                                       for ip in CLEANBROWSING_DNS)
+BLOCK_BEGIN = "# BEGIN VELTRIX CONTENT SAFETY"
+BLOCK_END = "# END VELTRIX CONTENT SAFETY"
+# The pre-rename (Masjid OS) markers and artifact names. The 1.3 install
+# adopts them — see _adopt_legacy: a machine upgraded from Masjid OS still
+# has the old block in /etc/hosts, the old state file, the old backups and
+# the old drop-in/dispatcher, and `on` must fold all of them into the new
+# names instead of leaving a second block (or a polluted backup) behind.
+LEGACY_BLOCK_BEGIN = "# BEGIN MASJID CONTENT SAFETY"
+LEGACY_BLOCK_END = "# END MASJID CONTENT SAFETY"
+LEGACY_DROPIN_NAME = "20-masjid-content-safety.conf"
+LEGACY_DISPATCHER_NAME = "20-masjid-content-safety"
+DROPIN_NAME = "20-veltrix-content-safety.conf"
+DISPATCHER_NAME = "20-veltrix-content-safety"
+STATE_NAME = "state.json"
+
+DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+
+
+def _env(name, default):
+    return os.environ.get(name, default)
+
+
+def paths():
+    """All filesystem locations, overridable for the test harness.
+
+    The VELTRIX_CS_*_LEGACY overrides point the pre-rename locations at a
+    scratch tree (test-only, same convention as the other overrides). The
+    legacy drop-in/dispatcher derive from the (possibly overridden)
+    resolved/dispatcher directories, so one override moves both names."""
+    helper_dir = os.path.dirname(os.path.abspath(__file__))
+    resolved_dir = _env("VELTRIX_CS_RESOLVED_DIR", "/etc/systemd/resolved.conf.d")
+    dispatcher = _env("VELTRIX_CS_DISPATCHER",
+                      "/etc/NetworkManager/dispatcher.d/" + DISPATCHER_NAME)
+    return {
+        "hosts": _env("VELTRIX_CS_HOSTS", "/etc/hosts"),
+        "hosts_backup": _env("VELTRIX_CS_HOSTS_BACKUP", "/etc/hosts.veltrix-backup"),
+        "resolved_dir": resolved_dir,
+        "dispatcher": dispatcher,
+        "resolv_conf": _env("VELTRIX_CS_RESOLV_CONF", "/etc/resolv.conf"),
+        "resolv_backup": _env("VELTRIX_CS_RESOLV_BACKUP", "/etc/resolv.conf.veltrix-backup"),
+        "state_dir": _env("VELTRIX_CS_STATE_DIR", "/etc/veltrix/content-safety"),
+        "blocklist": _env("VELTRIX_CS_BLOCKLIST", _find_blocklist(helper_dir)),
+        "legacy_hosts_backup": _env("VELTRIX_CS_HOSTS_BACKUP_LEGACY",
+                                     "/etc/hosts.masjid-backup"),
+        "legacy_state_dir": _env("VELTRIX_CS_STATE_DIR_LEGACY",
+                                 "/etc/masjid/content-safety"),
+        "legacy_resolv_backup": _env("VELTRIX_CS_RESOLV_BACKUP_LEGACY",
+                                     "/etc/resolv.conf.masjid-backup"),
+        "legacy_dropin": os.path.join(resolved_dir, LEGACY_DROPIN_NAME),
+        "legacy_dispatcher": os.path.join(os.path.dirname(dispatcher),
+                                          LEGACY_DISPATCHER_NAME),
+    }
+
+
+def _find_blocklist(helper_dir):
+    candidates = [
+        "/usr/share/veltrix/content-safety/blocklist.txt",
+        "/usr/local/share/veltrix/content-safety/blocklist.txt",
+        os.path.join(helper_dir, "..", "defaults", "content-safety", "blocklist.txt"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return candidates[0]
+
+
+def no_systemd():
+    return os.environ.get("VELTRIX_CS_NO_SYSTEMD") == "1"
+
+
+def systemd_is_running():
+    """True when THIS root was actually booted with systemd as PID 1.
+
+    The check is /run/systemd/system, not /proc/1/comm: across a chroot
+    /proc still shows the HOST's init (same PID namespace), so the PID-1
+    name lies — the target of a pacstrap install looks "systemd" while
+    resolved never ran there. /run/systemd/system only exists where
+    systemd itself booted, so it is absent in a chroot and in a container.
+    (S1, fix pass #2: `on` used to exit 0 in a chroot having rewritten
+    /etc/resolv.conf to a stub resolved would never serve.)"""
+    return os.path.isdir("/run/systemd/system")
+
+
+def _load_state(p):
+    """The recorded pre-first-`on` system state, or None when there is none
+    usable. An empty dict, a non-dict, or an unparseable file all mean "no
+    state": the record is only ever written once, as a dict, by dns_on — so
+    anything else is corruption, and treating it as a state would strand
+    `off` (S4: a corrupt/empty state + backup + stub must still be
+    recoverable by re-running `off`, via the no-state backup fallback)."""
+    try:
+        with open(os.path.join(p["state_dir"], STATE_NAME), encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or not state:
+        return None
+    return state
+
+
+def _adopt_legacy(p):
+    """Adopt a pre-rename (Masjid OS) Content Safety install, once.
+
+    On a machine upgraded from Masjid OS, the old helper left three
+    files behind, all taken BEFORE the old block was added, so all clean:
+    the state file (/etc/masjid/content-safety/state.json), the hosts
+    backup (/etc/hosts.masjid-backup) and the resolv.conf backup
+    (/etc/resolv.conf.masjid-backup). Each is MOVED to the new location
+    when the new one does not exist yet — a move, not a copy, so there
+    is one source of truth afterwards and no stale legacy file left to
+    confuse a later run. A file that already exists at the new location
+    wins and the legacy file is left alone (a backup is never
+    overwritten, and a state written since the rename is newer than the
+    legacy one). Best-effort: a failed move is reported on stderr but
+    does not fail the verb — the legacy files stay where they are and
+    the next run retries. Called at the start of `on` (after the
+    systemd guard) and `off`, before any mutation: `dns_on` reads the
+    state BEFORE writing a new one, so adopting afterwards would record
+    the already-protected system as the "before" state and `off` would
+    never restore resolv.conf."""
+    try:
+        os.makedirs(p["state_dir"], exist_ok=True)
+    except OSError as e:
+        print(f"veltrix-content-safety: cannot create {p['state_dir']}: {e}",
+              file=sys.stderr)
+        return
+    for legacy, new in ((os.path.join(p["legacy_state_dir"], STATE_NAME),
+                         os.path.join(p["state_dir"], STATE_NAME)),
+                        (p["legacy_hosts_backup"], p["hosts_backup"]),
+                        (p["legacy_resolv_backup"], p["resolv_backup"])):
+        if os.path.exists(new) or not os.path.exists(legacy):
+            continue
+        try:
+            shutil.move(legacy, new)
+            print(f"veltrix-content-safety: adopted legacy file {legacy} -> {new}")
+        except OSError as e:
+            print(f"veltrix-content-safety: cannot adopt {legacy}: {e}", file=sys.stderr)
+    # Best-effort: drop the now-empty legacy state dir.
+    try:
+        os.rmdir(p["legacy_state_dir"])
+    except OSError:
+        pass
+
+
+def _resolved_loaded(p):
+    """True when resolved is actually serving with our servers, False when it
+    is running but has not picked up the drop-in, None when that cannot be
+    checked (harness mode, or resolvectl unavailable/failed).
+
+    Checked against `resolvectl status` output: both CleanBrowsing IPs must
+    appear. The IPs only get there from our drop-in (global) or our
+    dispatcher (per-link) — DHCP hands out the router, not CleanBrowsing.
+    (R3, fix pass #2: `status` used to be file-presence-only, so `on` could
+    report success while resolved never read the drop-in.)"""
+    if no_systemd():
+        return None
+    rc, out, _ = run(["resolvectl", "status", "--no-pager"])
+    if rc != 0:
+        return None
+    return all(ip in out for ip in CLEANBROWSING_DNS)
+
+
+def load_blocklist(path):
+    try:
+        domains = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if not DOMAIN_RE.match(line):
+                    print(f"veltrix-content-safety: bad domain in blocklist: {line!r}", file=sys.stderr)
+                    return None
+                domains.append(line)
+    except OSError as e:
+        print(f"veltrix-content-safety: cannot read blocklist {path}: {e}", file=sys.stderr)
+        return None
+    if not domains:
+        print(f"veltrix-content-safety: blocklist {path} is empty", file=sys.stderr)
+        return None
+    return domains
+
+
+# ── hosts file ───────────────────────────────────────────────────────────────
+
+def _count_block(inner):
+    return sum(1 for line in inner.splitlines() if line.strip().startswith("0.0.0.0 "))
+
+
+def _cut_block(text, begin, end):
+    """Cut out one matched marker pair, preserving the rest. Returns
+    (new_text, removed). Assumes the pair is matched (both markers present);
+    callers check that first — an orphaned marker is corruption, not an
+    empty block, and is refused by the callers, never cut."""
+    before, rest = text.split(begin, 1)
+    _old, after = rest.split(end, 1)
+    return before.rstrip("\n") + "\n" + after.lstrip("\n"), True
+
+
+def read_hosts_block(p):
+    """Return (present, count) of the managed block(s) in the hosts file.
+    The legacy MASJID block counts as present too: on a machine upgraded
+    from Masjid OS the protection is on under the old name until the first
+    `on` adopts it, and `status` must not read that as a clean "off".
+    When both blocks are present the counts add — `status` then says
+    "partial" (count != total), which is honest: two blocks is a state
+    `on` collapses to one.
+    An ORPHANED marker — BEGIN without END, or END without BEGIN, in
+    either marker set, the shape a hand-edit or a truncated write leaves
+    behind — counts as PRESENT with count 0: `status` then says
+    "partial", never a clean "off" over a stray marker, and `off`'s
+    verdict names the hosts block instead of claiming success. (Before
+    this, the orphan read as absent, so `off` could exit 0 with a BEGIN
+    marker still in the file and a later `on` would append a second block
+    after it.)"""
+    try:
+        text = open(p["hosts"], encoding="utf-8").read()
+    except OSError:
+        return False, 0
+    present = False
+    count = 0
+    for begin, end in ((BLOCK_BEGIN, BLOCK_END),
+                       (LEGACY_BLOCK_BEGIN, LEGACY_BLOCK_END)):
+        has_begin = begin in text
+        has_end = end in text
+        if has_begin != has_end:
+            return True, 0
+        if has_begin:
+            present = True
+            inner = text.split(begin, 1)[1].split(end, 1)[0]
+            count += _count_block(inner)
+    return present, count
+
+
+def write_hosts_block(p, domains):
+    """(Re)write the managed block, preserving everything else byte-for-byte.
+    Atomic: write temp in the same directory, then rename over.
+    Refuses on an orphaned marker (BEGIN without END, or END without
+    BEGIN, in either marker set): the cut-out below can only parse a
+    matched pair, and appending a second block after a stray BEGIN would
+    leave two BEGINs and one END in the file. `on` then fails honestly
+    with rollback (main() removes the block only when this run created
+    it — here it did not — so the stray marker is left for a human to
+    clear, and `status` reports partial until then).
+    Rename adoption: a legacy MASJID block is cut out as part of the same
+    write, so exactly ONE managed block (the VELTRIX one) is left in the
+    file — a second block is never added alongside the old one.
+    The backup is taken from the block-free text, never from a hosts file
+    that still contains a managed block: on a machine upgraded from
+    Masjid OS the backup would otherwise be a copy of the hosts file
+    WITH the old block in it, and a later `off` would restore a file
+    that still blocks. (When a legacy backup was adopted by
+    _adopt_legacy it already exists at the new path, so no backup is
+    taken here at all — the "never overwritten" guard.)"""
+    try:
+        text = open(p["hosts"], encoding="utf-8").read()
+    except OSError as e:
+        print(f"veltrix-content-safety: cannot read {p['hosts']}: {e}", file=sys.stderr)
+        return False
+    for begin, end in ((BLOCK_BEGIN, BLOCK_END),
+                       (LEGACY_BLOCK_BEGIN, LEGACY_BLOCK_END)):
+        if (begin in text) != (end in text):
+            print(f"veltrix-content-safety: {p['hosts']} has an orphaned content-safety "
+                  "marker (BEGIN without END, or END without BEGIN) — refusing to "
+                  "write a second block. Remove the stray marker by hand, then "
+                  "re-run `veltrix-content-safety on`.", file=sys.stderr)
+            return False
+    # Cut out any previous managed block (idempotence), keeping the rest —
+    # the VELTRIX block and, on a machine upgraded from Masjid OS, the
+    # legacy MASJID block too.
+    removed = False
+    for begin, end in ((LEGACY_BLOCK_BEGIN, LEGACY_BLOCK_END),
+                       (BLOCK_BEGIN, BLOCK_END)):
+        if begin in text and end in text:
+            text, _ = _cut_block(text, begin, end)
+            removed = True
+    if not os.path.exists(p["hosts_backup"]):
+        try:
+            if removed:
+                with open(p["hosts_backup"], "w", encoding="utf-8") as f:
+                    f.write(text)
+            else:
+                shutil.copyfile(p["hosts"], p["hosts_backup"])
+        except OSError as e:
+            print(f"veltrix-content-safety: cannot back up {p['hosts']}: {e}", file=sys.stderr)
+            return False
+    block = [BLOCK_BEGIN]
+    block += [f"0.0.0.0 {d}" for d in domains]
+    block.append(BLOCK_END)
+    new_text = text.rstrip("\n") + "\n" + "\n".join(block) + "\n"
+    tmp = p["hosts"] + ".veltrix-tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        os.replace(tmp, p["hosts"])
+    except OSError as e:
+        print(f"veltrix-content-safety: cannot write {p['hosts']}: {e}", file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def remove_hosts_block(p):
+    """Remove the managed block(s), preserving everything else byte-for-byte.
+    Removes the VELTRIX block and, on a machine upgraded from Masjid OS,
+    the legacy MASJID block too — `off` must never leave either behind.
+    An orphaned marker (BEGIN without END, or END without BEGIN, in
+    either marker set) cannot be parsed safely — cutting from a lone
+    BEGIN to end-of-file could delete the user's own lines after it — so
+    it returns False and the marker is left in place. `off`'s verdict
+    comes from _off_remaining, which (via read_hosts_block) counts the
+    orphan as present, so `off` still fails honestly naming the hosts
+    block instead of exiting 0."""
+    try:
+        text = open(p["hosts"], encoding="utf-8").read()
+    except OSError:
+        return True  # nothing to remove
+    for begin, end in ((BLOCK_BEGIN, BLOCK_END),
+                       (LEGACY_BLOCK_BEGIN, LEGACY_BLOCK_END)):
+        if (begin in text) != (end in text):
+            return False
+    new_text = text
+    for begin, end in ((LEGACY_BLOCK_BEGIN, LEGACY_BLOCK_END),
+                       (BLOCK_BEGIN, BLOCK_END)):
+        if begin in new_text and end in new_text:
+            new_text, _ = _cut_block(new_text, begin, end)
+    if new_text == text:
+        return True  # nothing to remove
+    if not new_text.endswith("\n"):
+        new_text += "\n"
+    tmp = p["hosts"] + ".veltrix-tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        os.replace(tmp, p["hosts"])
+    except OSError as e:
+        print(f"veltrix-content-safety: cannot write {p['hosts']}: {e}", file=sys.stderr)
+        return False
+    return True
+
+
+# ── DNS layer ────────────────────────────────────────────────────────────────
+
+DROPIN_TEXT = f"""# Managed by veltrix-content-safety (Settings → Safety). Do not edit by hand:
+# `veltrix-content-safety off` removes this file again.
+# DNS goes to CleanBrowsing Family over DNS-over-TLS (port 853); the
+# #hostname suffix is the TLS hostname resolved verifies the certificate
+# against. DNSOverTLS=yes is strict: if TLS cannot be established, name
+# lookup fails rather than falling back to plaintext.
+[Resolve]
+DNS={CLEANBROWSING_DNS_WITH_HOST}
+DNSOverTLS=yes
+Domains=~.
+"""
+
+DISPATCHER_TEXT = f"""#!/bin/sh
+# Managed by veltrix-content-safety (Settings → Safety). Do not edit by hand:
+# `veltrix-content-safety off` removes this file again.
+# NetworkManager runs dispatcher scripts as root on link events. Per-link DNS
+# from DHCP would otherwise win over the resolved drop-in for that link's
+# queries, so every link that comes up is pointed at CleanBrowsing Family —
+# over DNS-over-TLS, like the drop-in (the #hostname suffix is the TLS
+# hostname; `dnsovertls yes` makes the per-link setting strict too).
+if [ "$2" = "up" ] || [ "$2" = "dhcp4-change" ] || [ "$2" = "dhcp6-change" ]; then
+    /usr/bin/resolvectl dns "$1" {CLEANBROWSING_DNS_WITH_HOST} 2>/dev/null || true
+    /usr/bin/resolvectl dnsovertls "$1" yes 2>/dev/null || true
+fi
+"""
+
+
+def run(cmd, check=False):
+    if no_systemd():
+        print(f"veltrix-content-safety: [no-systemd harness] would run: {' '.join(cmd)}")
+        return 0, "", ""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"veltrix-content-safety: failed to run {' '.join(cmd)}: {e}", file=sys.stderr)
+        return 1, "", ""
+    if check and r.returncode != 0:
+        print(f"veltrix-content-safety: {' '.join(cmd)} failed: {r.stderr.strip()}", file=sys.stderr)
+    return r.returncode, r.stdout, r.stderr
+
+
+def systemctl_active(unit):
+    if no_systemd():
+        return False
+    rc, out, _ = run(["systemctl", "is-active", "--quiet", unit])
+    return rc == 0
+
+
+def systemctl_enabled(unit):
+    """True when the unit is enabled (a symlink exists for it). Used by
+    step 4 so a failed `on` only ever disables resolved when THIS run
+    enabled it — a pre-existing enablement is left exactly as it was."""
+    if no_systemd():
+        return False
+    rc, _, _ = run(["systemctl", "is-enabled", "--quiet", unit])
+    return rc == 0
+
+
+def resolv_conf_kind(p):
+    """What /etc/resolv.conf is right now."""
+    try:
+        if os.path.islink(p["resolv_conf"]):
+            target = os.readlink(p["resolv_conf"])
+            if target in ("/run/systemd/resolve/stub-resolv.conf", "stub-resolv.conf"):
+                return "stub"
+            return "symlink-other:" + target
+        if os.path.isfile(p["resolv_conf"]):
+            return "regular"
+    except OSError:
+        pass
+    return "missing"
+
+
+def _dns_on_rollback(p, made, state, wrote_state):
+    """Best-effort undo of a failed `dns_on`, in reverse order, so a failed
+    `on` leaves the system as it was instead of half-protected. Only what
+    THIS run created is removed (R4): a pre-existing drop-in, dispatcher or
+    stub — the working layers of an earlier successful `on`, rewritten by a
+    failed re-`on` — are left in place, as is a pre-existing state file (left
+    for `off` to honour). Only the state file this run wrote is removed."""
+    if "resolv" in made:
+        try:
+            was = state.get("resolv_conf_was")
+            if was == "regular" and not os.path.isfile(p["resolv_backup"]):
+                # S4 (fix pass #3): the backup vanished mid-run. Unlinking
+                # the stub here would leave resolv.conf ABSENT — worse than
+                # before the run. Leave the stub in place and say so loudly:
+                # the next `on`/`off` (or a hand restore) can still fix it,
+                # but a silently missing resolv.conf breaks name lookup
+                # outright with no clue why.
+                print("veltrix-content-safety: rollback: resolv.conf backup "
+                      f"{p['resolv_backup']} is missing; leaving the stub "
+                      "symlink in place instead of deleting resolv.conf — "
+                      "restore it by hand or re-run `veltrix-content-safety off`",
+                      file=sys.stderr)
+            else:
+                if os.path.islink(p["resolv_conf"]):
+                    os.unlink(p["resolv_conf"])
+                if was == "regular" and os.path.isfile(p["resolv_backup"]):
+                    shutil.copyfile(p["resolv_backup"], p["resolv_conf"])
+                elif isinstance(was, str) and was.startswith("symlink-other:"):
+                    os.symlink(was.split(":", 1)[1], p["resolv_conf"])
+                # "missing": leave /etc/resolv.conf absent, as it was.
+        except OSError as e:
+            print(f"veltrix-content-safety: rollback: cannot restore {p['resolv_conf']}: {e}", file=sys.stderr)
+    if "enabled" in made:
+        # Fix pass #3 (§3.1): this run enabled resolved and then failed —
+        # undo the enablement, so a failed `on` leaves no side effect
+        # behind (the arch-chroot case: the guard passed, the load check
+        # failed, and the old `enable --now` had already written the
+        # symlink). Plain `disable`, no --now: stopping anything is not
+        # this rollback's job.
+        rc, _, _ = run(["systemctl", "disable", "systemd-resolved"])
+        if rc != 0:
+            print("veltrix-content-safety: rollback: cannot disable "
+                  "systemd-resolved again; it was enabled by this failed run",
+                  file=sys.stderr)
+    for artifact, path in (("dispatcher", p["dispatcher"]),
+                           ("dropin", os.path.join(p["resolved_dir"], DROPIN_NAME))):
+        if artifact in made:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    if wrote_state:
+        try:
+            os.unlink(os.path.join(p["state_dir"], STATE_NAME))
+        except OSError:
+            pass
+
+
+def dns_on(p):
+    # The state file records the system BEFORE THE FIRST `on` — a second `on`
+    # must not overwrite it with the already-changed state, or `off` would
+    # read "resolv.conf was already the stub" and leave our symlink in place.
+    # (Caught by scripts/dev/content-safety-probe.sh, 2026-11-12.)
+    #
+    # The state is written BEFORE anything is mutated (fix pass, 2026-11-12):
+    # a failed `on` used to repoint /etc/resolv.conf and only then fail to
+    # record what it was, leaving `off` with nothing to restore from. Now a
+    # state-write failure aborts before any destructive step, and a later
+    # failure rolls back what was already changed (see _dns_on_rollback).
+    prior_state = _load_state(p)
+    state = prior_state or {"resolved_was_active": systemctl_active("systemd-resolved"),
+                            "resolv_conf_was": resolv_conf_kind(p)}
+    wrote_state = False
+    if prior_state is None:
+        try:
+            os.makedirs(p["state_dir"], exist_ok=True)
+            with open(os.path.join(p["state_dir"], STATE_NAME), "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+            wrote_state = True
+        except OSError as e:
+            print(f"veltrix-content-safety: cannot write state: {e}", file=sys.stderr)
+            return False
+    made = []  # layers this run CREATED, for rollback (hosts is main()'s).
+    # R4: rollback removes only what THIS run created. On a re-`on` the
+    # drop-in, dispatcher and stub already exist and are working — a failed
+    # re-`on` must not delete them and leave the system with LESS protection
+    # than before. (The rewritten content is identical either way: the texts
+    # are deterministic, so leaving a pre-existing file is leaving it as it
+    # was.)
+    dropin_path = os.path.join(p["resolved_dir"], DROPIN_NAME)
+    dropin_existed = os.path.lexists(dropin_path)
+    dispatcher_existed = os.path.lexists(p["dispatcher"])
+    resolv_was_stub = resolv_conf_kind(p) == "stub"
+
+    def fail(msg):
+        print(f"veltrix-content-safety: {msg}", file=sys.stderr)
+        _dns_on_rollback(p, made, state, wrote_state)
+        return False
+
+    # 1. The drop-in (persistent across reboots).
+    try:
+        os.makedirs(p["resolved_dir"], exist_ok=True)
+        with open(dropin_path, "w", encoding="utf-8") as f:
+            f.write(DROPIN_TEXT)
+        if not dropin_existed:
+            made.append("dropin")
+    except OSError as e:
+        return fail(f"cannot write resolved drop-in: {e}")
+    # 2. The dispatcher script (persistent; per-link DNS on every link-up).
+    try:
+        os.makedirs(os.path.dirname(p["dispatcher"]), exist_ok=True)
+        with open(p["dispatcher"], "w", encoding="utf-8") as f:
+            f.write(DISPATCHER_TEXT)
+        os.chmod(p["dispatcher"], 0o755)
+        if not dispatcher_existed:
+            made.append("dispatcher")
+    except OSError as e:
+        return fail(f"cannot write dispatcher script: {e}")
+    # 3. Point /etc/resolv.conf at resolved's stub, backing up what was there.
+    #    The previous shape is recorded in the state file (written above): a
+    #    regular file is copied to the backup path, a foreign symlink's TARGET
+    #    is kept as text in the state — never as a file that could be mistaken
+    #    for one.
+    kind = state["resolv_conf_was"]
+    made_backup = False
+    if kind != "stub":
+        try:
+            if kind == "regular" and not os.path.exists(p["resolv_backup"]):
+                shutil.copyfile(p["resolv_conf"], p["resolv_backup"])
+                made_backup = True
+            if os.path.islink(p["resolv_conf"]) or os.path.isfile(p["resolv_conf"]):
+                os.unlink(p["resolv_conf"])
+            os.symlink("/run/systemd/resolve/stub-resolv.conf", p["resolv_conf"])
+            if not resolv_was_stub:
+                made.append("resolv")
+        except OSError as e:
+            if made_backup:
+                try:
+                    os.unlink(p["resolv_backup"])
+                except OSError:
+                    pass
+            return fail(f"cannot repoint {p['resolv_conf']}: {e}")
+    # 4. (Re)start resolved so the drop-in takes effect, then set per-link DNS now.
+    # R3: every call's result is checked — a restart that fails, or a
+    # drop-in resolved never picks up, used to exit 0 here while `status`
+    # (file-presence-only) reported "on". Now a failed step fails `on`
+    # honestly, with rollback, and the drop-in load is verified, not assumed.
+    # Fix pass #3 (§3.1): `enable` runs WITHOUT --now. Enablement is a
+    # filesystem write to this root; starting is the part that talks to a
+    # possibly-foreign systemd (arch-chroot bind-mounts the host's /run, so
+    # the guard above passes there and --now would restart the LIVE system's
+    # resolved). The restart below is the only step that talks to systemd,
+    # and a later failure rolls the enablement back ("enabled" in `made`,
+    # undone by _dns_on_rollback).
+    if not no_systemd():
+        resolved_was_enabled = systemctl_enabled("systemd-resolved")
+        rc, _, _ = run(["systemctl", "enable", "systemd-resolved"])
+        if rc != 0:
+            return fail(f"systemctl enable systemd-resolved failed (exit {rc}); "
+                        "systemd-resolved did not start")
+        if not resolved_was_enabled:
+            made.append("enabled")
+        for cmd in (["systemctl", "restart", "systemd-resolved"],
+                    ["resolvectl", "flush-caches"]):
+            rc, _, _ = run(cmd)
+            if rc != 0:
+                return fail(f"{' '.join(cmd)} failed (exit {rc}); systemd-resolved did not start")
+        rc, out, _ = run(["resolvectl", "status", "--no-pager"])
+        if rc != 0:
+            return fail("resolvectl status failed; cannot verify resolved picked up the drop-in")
+        for line in out.splitlines():
+            m = re.match(r"^\s*Link \d+ \(([^)]+)\)", line)
+            if m:
+                for cmd in (["resolvectl", "dns", m.group(1)]
+                            + [f"{ip}#{CLEANBROWSING_DOT_HOST}" for ip in CLEANBROWSING_DNS],
+                            ["resolvectl", "dnsovertls", m.group(1), "yes"]):
+                    rc, _, _ = run(cmd)
+                    if rc != 0:
+                        return fail(f"{' '.join(cmd)} failed (exit {rc})")
+        if _resolved_loaded(p) is not True:
+            return fail("systemd-resolved did not pick up the CleanBrowsing servers")
+    # Rename adoption: the old helper's drop-in and dispatcher point at
+    # the same CleanBrowsing servers, so leaving them would duplicate the
+    # layer — and `off` would have to know about them. Remove them once
+    # the new layers are verified live (this is the last step, so a
+    # failure here cannot strand a half-applied `on`). A removal failure
+    # is not fatal: the files are harmless duplicates and `off` removes
+    # both names anyway.
+    for path in (p["legacy_dropin"], p["legacy_dispatcher"]):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"veltrix-content-safety: cannot remove legacy artifact {path}: {e}",
+                  file=sys.stderr)
+    return True
+
+
+def _off_remaining(p):
+    """What `off` left behind, for an honest failure message. A stub
+    resolv.conf only counts when we were the ones who put it there — a
+    state file saying it was not the stub, or a backup proving it. A stub
+    that predates us (no state, no backup) is the machine's own resolver
+    setup, not something `off` owes anyone."""
+    remaining = []
+    present, count = read_hosts_block(p)
+    if present:
+        remaining.append(f"hosts block still present ({count} domains)")
+    if os.path.lexists(os.path.join(p["resolved_dir"], DROPIN_NAME)):
+        remaining.append("resolved drop-in still present")
+    if os.path.lexists(p["dispatcher"]):
+        remaining.append("dispatcher script still present")
+    if os.path.lexists(p["legacy_dropin"]):
+        remaining.append("legacy resolved drop-in still present")
+    if os.path.lexists(p["legacy_dispatcher"]):
+        remaining.append("legacy dispatcher script still present")
+    if resolv_conf_kind(p) == "stub":
+        state = _load_state(p)
+        if (state is not None and state.get("resolv_conf_was") not in (None, "stub")) \
+                or os.path.isfile(p["resolv_backup"]):
+            remaining.append("resolv.conf still points at the resolved stub")
+    # R4: a state file `off` could not remove is part of the verdict, not a
+    # silent leftover — the next `on` would reuse its stale pre-first-on
+    # record instead of the current system.
+    if os.path.lexists(os.path.join(p["state_dir"], STATE_NAME)):
+        remaining.append("state file still present")
+    return remaining
+
+
+def dns_off(p):
+    # A corrupt/empty state counts as NO state (S4, via _load_state): the
+    # backup fallback below then applies, so a corrupt state + backup + stub
+    # is recoverable by re-running `off` instead of failing forever.
+    loaded_state = _load_state(p)
+    had_state = loaded_state is not None
+    state = loaded_state or {}
+    state_path = os.path.join(p["state_dir"], STATE_NAME)
+    # Best-effort (fix pass, 2026-11-12): every removal is attempted even if
+    # an earlier one fails — a single damaged artifact (e.g. the drop-in
+    # replaced by a directory) must never strand the dispatcher, the
+    # resolv.conf restore, or the state file. The verdict comes from the
+    # FINAL state, re-checked below, not from the first error.
+    errors = []
+    # Both names: a machine upgraded from Masjid OS may still carry the
+    # legacy drop-in/dispatcher if `on` never ran since the rename, and
+    # `off` must remove those too — otherwise resolved keeps serving
+    # CleanBrowsing after "off".
+    for path in (os.path.join(p["resolved_dir"], DROPIN_NAME), p["dispatcher"],
+                 p["legacy_dropin"], p["legacy_dispatcher"]):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            errors.append(f"cannot remove {path}: {e}")
+    # Restore /etc/resolv.conf ONLY if this helper repointed it — i.e. the state
+    # file says it was not already the stub symlink. If it was already the stub,
+    # it stays: removing it would break a resolver setup that was never ours.
+    # If there is no state file at all but a backup exists and resolv.conf is
+    # still our stub (a failed `on` from before the state-first fix), restore
+    # from the backup instead of silently leaving the stub.
+    was = state.get("resolv_conf_was") if had_state else None
+    restore_from_backup = (not had_state and os.path.isfile(p["resolv_backup"])
+                           and resolv_conf_kind(p) == "stub")
+    if (was is not None and was != "stub" and resolv_conf_kind(p) == "stub") or restore_from_backup:
+        try:
+            os.unlink(p["resolv_conf"])
+            if restore_from_backup or was == "regular":
+                if os.path.isfile(p["resolv_backup"]):
+                    shutil.copyfile(p["resolv_backup"], p["resolv_conf"])
+                else:
+                    errors.append(f"resolv.conf backup {p['resolv_backup']} is missing; "
+                                  "the original resolv.conf cannot be restored")
+            elif isinstance(was, str) and was.startswith("symlink-other:"):
+                os.symlink(was.split(":", 1)[1], p["resolv_conf"])
+            # "missing": leave /etc/resolv.conf absent, as it was.
+        except OSError as e:
+            errors.append(f"cannot restore {p['resolv_conf']}: {e}")
+    # M2 (fix pass #3): every systemctl/resolvectl result here is checked —
+    # a restart that fails used to exit 0 while resolved kept serving
+    # CleanBrowsing from memory until its next restart. A failed restart
+    # (or disable, or flush) now fails `off` honestly — see the verdict
+    # below and main(), which honours this return value (exit 3, `partial`).
+    #
+    # §3.2: `off` is deliberately not guarded the way `on` is — when a state
+    # file exists it is a recovery path, and `off` must work to remove
+    # layers even where systemd is not running. But when there is no state
+    # to honour (no prior `on` cycle on this root) and systemd is not
+    # running here, there is nothing of ours running to restart, so the
+    # systemctl calls are skipped instead of talking to a possibly-foreign
+    # systemd (arch-chroot bind-mounts the host's /run).
+    systemctl_ok = True
+    if not no_systemd() and (systemd_is_running() or had_state):
+        if had_state and not state.get("resolved_was_active"):
+            cmds = [["systemctl", "disable", "--now", "systemd-resolved"]]
+        else:
+            # Was already running, or no state to say otherwise: restart so the
+            # removed drop-in stops applying, but do not change enablement.
+            cmds = [["systemctl", "restart", "systemd-resolved"],
+                    ["resolvectl", "flush-caches"]]
+        for cmd in cmds:
+            rc, _, _ = run(cmd)
+            if rc != 0:
+                errors.append(f"{' '.join(cmd)} failed (exit {rc}); "
+                              "systemd-resolved may still be serving the old configuration")
+                systemctl_ok = False
+    try:
+        os.unlink(state_path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        errors.append(f"cannot remove {state_path}: {e}")
+    # Verdict from the final state: the DNS layer is clean when neither
+    # artifact exists (as a file OR a damaged directory) and resolv.conf is
+    # no longer our stub when a restore was due — and the state file is gone
+    # too (R4: a failed state unlink used to be invisible to this verdict).
+    # Errors on artifacts that are in fact gone do not fail the run — but a
+    # failed systemctl call DOES (M2): the files are gone while resolved
+    # may still be serving the old configuration from memory, and that must
+    # not read as a clean `off`.
+    dropin_gone = not os.path.lexists(os.path.join(p["resolved_dir"], DROPIN_NAME))
+    dispatcher_gone = not os.path.lexists(p["dispatcher"])
+    legacy_dropin_gone = not os.path.lexists(p["legacy_dropin"])
+    legacy_dispatcher_gone = not os.path.lexists(p["legacy_dispatcher"])
+    state_gone = not os.path.lexists(state_path)
+    restore_due = (was is not None and was != "stub") or restore_from_backup
+    resolv_ok = (not restore_due) or resolv_conf_kind(p) != "stub"
+    if dropin_gone and dispatcher_gone and legacy_dropin_gone and legacy_dispatcher_gone and resolv_ok and state_gone and systemctl_ok:
+        for e in errors:
+            print(f"veltrix-content-safety: {e}", file=sys.stderr)
+        return True
+    if not errors:
+        errors.append("DNS layer still present after off (drop-in, dispatcher, or resolv.conf)")
+    for e in errors:
+        print(f"veltrix-content-safety: {e}", file=sys.stderr)
+    return False
+
+
+# ── verbs ────────────────────────────────────────────────────────────────────
+
+def need_root():
+    if os.geteuid() != 0:
+        print("veltrix-content-safety: 'on'/'off' change the system and must run as root (via pkexec)", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_status(p):
+    present, count = read_hosts_block(p)
+    # lexists, not isfile: a damaged artifact (the drop-in replaced by a
+    # directory) is still present, and status must say so — isfile would
+    # read it as absent and report a clean "off" over a stranded layer.
+    dropin = os.path.lexists(os.path.join(p["resolved_dir"], DROPIN_NAME))
+    dispatcher = os.path.lexists(p["dispatcher"])
+    # Presence (lexists) is what the JSON reports — damage still counts as
+    # present, so a stranded layer can never read as a clean "off". But the
+    # "on" verdict needs the layers to be WORKING, not merely present: a
+    # directory sitting at the drop-in/dispatcher path is damage, not a
+    # layer (a failed re-`on` leaves exactly this shape when it keeps the
+    # pre-existing artifacts, and the dispatcher must also be executable —
+    # NetworkManager will not run it otherwise).
+    dropin_ok = os.path.isfile(os.path.join(p["resolved_dir"], DROPIN_NAME))
+    dispatcher_ok = os.path.isfile(p["dispatcher"]) and os.access(p["dispatcher"], os.X_OK)
+    state = _load_state(p)
+    total = 0
+    domains = load_blocklist(p["blocklist"])
+    if domains is not None:
+        total = len(domains)
+    layers = sum([dropin, dispatcher, present])
+    # A stub resolv.conf with nothing backing it is not a clean "off": either
+    # a restore never happened (the state says it was not the stub) or a
+    # failed `on` from before the state-first fix left the stub behind with
+    # only the backup to prove it. A stub that predates us (no state, no
+    # backup) is just the machine's own resolver setup, and still reads "off".
+    resolv_kind = resolv_conf_kind(p)
+    dangling_stub = resolv_kind == "stub" and (
+        (state is not None and state.get("resolv_conf_was") not in (None, "stub") and not dropin)
+        or (state is None and not dropin and os.path.isfile(p["resolv_backup"])))
+    # R3: `status` verifies resolved actually picked up the drop-in, where
+    # that is checkable. `resolved_loaded` is null when it is not (harness
+    # mode, or resolvectl unavailable/failed) — the old file-presence
+    # verdict then stands, and the limitation is visible in the output
+    # instead of silently assumed. False (resolved is running but serving
+    # without our servers) downgrades an otherwise-complete install to
+    # "partial": the files exist but the DNS layer is not live.
+    resolved_loaded = _resolved_loaded(p)
+    on = "on" if (dropin_ok and dispatcher_ok and present and count == total and total > 0
+                  and resolved_loaded is not False) \
+        else ("partial" if (layers > 0 or dangling_stub) else "off")
+    print(json.dumps({
+        "on": on,
+        "dns": {
+            "servers": CLEANBROWSING_DNS,
+            "dropin": dropin,
+            "dispatcher": dispatcher,
+            "resolved_active": (None if no_systemd() else systemctl_active("systemd-resolved")),
+            "resolved_loaded": resolved_loaded,
+            "resolv_conf": resolv_conf_kind(p),
+        },
+        "hosts": {"blocked": count, "total": total, "present": present},
+        "state": state,
+    }, indent=2))
+    return 0
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in ("on", "off", "status"):
+        print("usage: veltrix-content-safety {on|off|status}", file=sys.stderr)
+        return 1
+    verb = argv[1]
+    p = paths()
+    if verb == "status":
+        return cmd_status(p)
+    if not need_root():
+        return 1
+    domains = load_blocklist(p["blocklist"])
+    if domains is None:
+        return 2
+    if verb == "on":
+        # S1: refuse honestly where systemd is not running — in a pacstrap
+        # chroot or a container, `on` used to exit 0 having rewritten
+        # /etc/resolv.conf to a stub resolved would never serve. The check
+        # runs BEFORE any mutation (no hosts block, no state file), and the
+        # installers treat the failure as "offer at first login" instead.
+        # The harness (VELTRIX_CS_NO_SYSTEMD=1) is the deliberate exception:
+        # there the systemctl calls are stubbed and the scratch tree is the
+        # whole point, so the apply still runs.
+        if not no_systemd() and not systemd_is_running():
+            print("veltrix-content-safety: systemd is not running in this system "
+                  "(chroot or container?) — Content Safety cannot be applied "
+                  "here; it will be offered at first login instead", file=sys.stderr)
+            return 3
+        # Rename adoption first (after the guard, before any mutation):
+        # a Masjid OS state/backup must be the new paths before dns_on
+        # reads the state — otherwise it records the already-protected
+        # system as the "before" state.
+        _adopt_legacy(p)
+        hosts_existed, _ = read_hosts_block(p)
+        if not write_hosts_block(p, domains):
+            return 3
+        if not dns_on(p):
+            # Roll the hosts layer back — but only if this run created it
+            # (R4): on a re-`on` the block pre-existed and is working, and a
+            # failed re-apply must not delete it. (The rewritten content is
+            # identical either way: the block is deterministic.)
+            if not hosts_existed and not remove_hosts_block(p):
+                print("veltrix-content-safety: rollback failed: hosts block still present; "
+                      "status reports partial", file=sys.stderr)
+            return 3
+        print(f"veltrix-content-safety: on — {len(domains)} domains in /etc/hosts, "
+              f"DNS {', '.join(CLEANBROWSING_DNS)} (CleanBrowsing Family, DNS-over-TLS)")
+        return 0
+    # off — attempt BOTH layers even if one fails, and let the final state
+    # decide the exit code: a single damaged artifact must not strand the
+    # rest, and a success message must never cover what is still there.
+    # M2 (fix pass #3): dns_off's own return is honoured too — it can fail
+    # honestly with nothing left behind (a failed resolved restart), and
+    # that failure must reach the exit code, not just stderr.
+    # Rename adoption first, so `off` honours a legacy state/backup even
+    # when `on` never ran since the rename.
+    _adopt_legacy(p)
+    remove_hosts_block(p)
+    dns_ok = dns_off(p)
+    remaining = _off_remaining(p)
+    if not remaining and dns_ok:
+        print("veltrix-content-safety: off — hosts block and CleanBrowsing DNS removed")
+        return 0
+    details = list(remaining)
+    if not dns_ok and not remaining:
+        details.append("systemd-resolved restart failed (see above)")
+    print("veltrix-content-safety: off incomplete — " + "; ".join(details), file=sys.stderr)
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

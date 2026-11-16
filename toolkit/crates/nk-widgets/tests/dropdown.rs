@@ -1,0 +1,1127 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+//! ComboBox's retained model, not acceptance of popup rendering or Orca speech.
+use nk_a11y::{Action, Relation, Role};
+use nk_text::{FontSet, ParleyBackend, Point, Size, TextStyle};
+use nk_widgets::{Command, DropdownStyle, Effect, Kind, Metrics, Tree};
+use std::sync::Arc;
+
+fn style() -> DropdownStyle {
+    let color = |v| nk_render::rgba(v, v, v, 255);
+    DropdownStyle {
+        padding_x: 14.,
+        padding_y: 4.,
+        border: 2.,
+        min_content_height: 20.,
+        radius: 10.,
+        text_scale: 0.93,
+        weight: 500.,
+        label_margin: 8.,
+        arrow_size: 16.,
+        arrow_gap: 6.,
+        arrow: "nd-pan-down".into(),
+        background: color(30),
+        hover: color(60),
+        pressed: color(90),
+        text: color(240),
+        arrow_color: color(160),
+        focus: nk_render::rgba(0, 100, 255, 255),
+        disabled_opacity: 0.45,
+    }
+}
+
+fn metrics() -> Metrics {
+    Metrics {
+        sidebar: 120.,
+        content: 480.,
+        form_width: 480.,
+        content_floor: 280.,
+        titlebar: 48.,
+        padding: 8.,
+        gap: 4.,
+        row: 48.,
+        control: 24.,
+        switch_width: 44.,
+        radius: 8.,
+        group_radius: 12.,
+        focus_width: 2.,
+        highlight_inset: 4.,
+        hover_opacity: 0.08,
+        separator_width: 1.,
+    }
+}
+
+fn fixture() -> (Tree, u64, u64, u64) {
+    fixture_with_style(true)
+}
+
+fn fixture_with_style(with_style: bool) -> (Tree, u64, u64, u64) {
+    let mut tree = Tree::new(
+        "Window",
+        metrics(),
+        TextStyle {
+            size: 14.,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    if with_style {
+        tree.set_dropdown_style(style()).unwrap();
+    }
+    let scroll = tree.append(tree.root(), Kind::Scroll, "Content").unwrap();
+    let group = tree.append(scroll, Kind::Group, "Options").unwrap();
+    let (row, combo) = tree
+        .dropdown(group, "Language", &["English", "Español", "日本語"], 1)
+        .unwrap();
+    (tree, group, row, combo)
+}
+
+#[test]
+fn collapsed_selection_remains_named_and_has_one_tab_stop_and_no_hit_area_for_options() {
+    let (mut tree, _, row, combo) = fixture();
+    let mut text = ParleyBackend::new(Arc::new(FontSet::discover_required().unwrap())).unwrap();
+    tree.layout(
+        Size {
+            width: 640.,
+            height: 480.,
+        },
+        false,
+        &mut text,
+    )
+    .unwrap();
+    let semantics = tree.semantics();
+    semantics.validate().unwrap();
+    let model = &semantics.nodes[&combo];
+    assert_eq!(model.role, Role::ComboBox);
+    assert_eq!(model.name, "Language");
+    assert!(model.states.expandable && !model.states.expanded);
+    let label = tree.node(row).unwrap().children()[0];
+    assert!(model.relations.contains(&Relation::LabelledBy(label)));
+    let ids = tree.node(combo).unwrap().children().to_vec();
+    assert_eq!(semantics.selected_children(combo), vec![ids[1]]);
+    assert_eq!(semantics.nodes[&ids[1]].name, "Español");
+    assert_eq!(tree.focus_order(), vec![combo]);
+    for id in &ids {
+        let option = &semantics.nodes[id];
+        assert_eq!(option.role, Role::Option);
+        assert_eq!(option.actions, vec![Action::Activate]);
+        assert!(option.states.offscreen);
+        assert_eq!(tree.node(*id).unwrap().bounds().width, 0.);
+        assert!(tree.focus(*id).is_err());
+    }
+    let bounds = tree.node(combo).unwrap().bounds();
+    let point = Point {
+        x: bounds.x + bounds.width / 2.,
+        y: bounds.y + bounds.height / 2.,
+    };
+    assert_eq!(tree.hit_test(point), Some(combo));
+    tree.pointer_press(point).unwrap();
+    assert_eq!(
+        tree.pointer_release(point).unwrap(),
+        Effect::Activated(combo)
+    );
+    assert_eq!(
+        tree.dropdown_selected(combo).unwrap(),
+        1,
+        "opening must not change the choice"
+    );
+}
+
+#[test]
+fn selecting_through_the_same_action_path_changes_once_and_cancel_preserves_it() {
+    let (mut tree, _, _, combo) = fixture();
+    let target = tree.node(combo).unwrap().children()[2];
+    tree.set_dropdown_expanded(combo, true).unwrap();
+    let before = tree.semantics();
+    assert_eq!(
+        tree.dispatch(tree.target(target), Command::Activate)
+            .unwrap(),
+        Effect::Changed(combo)
+    );
+    assert_eq!(tree.dropdown_selected(combo).unwrap(), 2);
+    assert_eq!(tree.node(combo).unwrap().name(), "日本語");
+    let after = tree.semantics();
+    assert_eq!(
+        nk_a11y::diff(Some(&before), &after)
+            .unwrap()
+            .iter()
+            .filter(|e| **e == nk_a11y::Event::SelectionChanged(combo))
+            .count(),
+        1
+    );
+    assert!(
+        !nk_a11y::diff(Some(&after), &after)
+            .unwrap()
+            .contains(&nk_a11y::Event::SelectionChanged(combo))
+    );
+
+    assert_eq!(
+        tree.dispatch(tree.target(target), Command::Activate)
+            .unwrap(),
+        Effect::None
+    );
+    tree.set_dropdown_expanded(combo, false).unwrap();
+    assert_eq!(tree.dropdown_selected(combo).unwrap(), 2);
+    assert!(!tree.semantics().nodes[&combo].states.expanded);
+    // Selection remains actionable while collapsed; no popup is opened.
+    assert_eq!(
+        tree.dispatch(
+            tree.target(tree.node(combo).unwrap().children()[1]),
+            Command::Activate
+        )
+        .unwrap(),
+        Effect::Changed(combo)
+    );
+    assert!(!tree.semantics().nodes[&combo].states.expanded);
+    tree.set_dropdown_selected(combo, 0).unwrap();
+    assert_eq!(tree.dropdown_selected(combo).unwrap(), 0);
+    assert_eq!(
+        tree.semantics().selected_children(combo),
+        vec![tree.node(combo).unwrap().children()[0]]
+    );
+}
+
+#[test]
+fn invalid_arguments_are_atomic_and_unavailable_or_stale_options_cannot_edit() {
+    let (mut tree, group, row, combo) = fixture();
+    let before = tree.semantics();
+    for options in [vec![], vec!["one"]] {
+        assert!(tree.dropdown(group, "Bad", &options, 1).is_err());
+    }
+    assert_eq!(tree.semantics().nodes.len(), before.nodes.len());
+    assert_eq!(tree.focus_order(), vec![combo]);
+    assert!(
+        tree.append(combo, Kind::DropdownOption { selected: true }, "Duplicate")
+            .is_err()
+    );
+    assert!(tree.set_dropdown_selected(combo, 3).is_err());
+    assert_eq!(tree.dropdown_selected(combo).unwrap(), 1);
+    let option = tree.node(combo).unwrap().children()[2];
+    let old = tree.target(option);
+    tree.set_disabled(row, true).unwrap();
+    assert!(
+        tree.dispatch(tree.target(option), Command::Activate)
+            .is_err()
+    );
+    tree.set_disabled(row, false).unwrap();
+    assert!(tree.dispatch(old, Command::Activate).is_err());
+    tree.set_hidden(row, true).unwrap();
+    assert!(
+        tree.dispatch(tree.target(option), Command::Activate)
+            .is_err()
+    );
+    tree.set_hidden(row, false).unwrap();
+    tree.remove(row).unwrap();
+    assert!(tree.dispatch(old, Command::Activate).is_err());
+}
+
+fn palette() -> nk_widgets::Palette {
+    let c = |v| nk_render::rgba(v, v, v, 255);
+    nk_widgets::Palette {
+        background: c(20),
+        surface: c(100),
+        text: c(240),
+        disabled: c(120),
+        selected: c(60),
+        accent: c(200),
+        track: c(40),
+        thumb: c(255),
+        focus: c(200),
+        separator: c(90),
+    }
+}
+fn paint(tree: &Tree) -> Vec<u8> {
+    tree.paint(
+        nk_wayland::Frame {
+            width: 640,
+            height: 480,
+            pixel_width: 640,
+            pixel_height: 480,
+            scale: 1.,
+            material: false,
+        },
+        nk_widgets::Surface::Content,
+        palette(),
+    )
+    .unwrap()
+}
+fn pixel(image: &[u8], x: f32, y: f32) -> [u8; 3] {
+    let at = (y.floor() as usize * 640 + x.floor() as usize) * 4;
+    [image[at + 2], image[at + 1], image[at]]
+}
+#[test]
+fn trigger_uses_exported_geometry_arrow_and_states_without_a_hover_or_focus_size_jump() {
+    let (mut tree, _, _, combo) = fixture();
+    let reference = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../ui/shell/assets/icons/veltrix");
+    tree.set_icon_theme(nk_icons::Icons::new("", &[], &reference).unwrap());
+    let mut text = ParleyBackend::new(Arc::new(FontSet::discover_required().unwrap())).unwrap();
+    tree.layout(
+        Size {
+            width: 640.,
+            height: 480.,
+        },
+        false,
+        &mut text,
+    )
+    .unwrap();
+    let r = tree.node(combo).unwrap().bounds();
+    assert_eq!(r.height, 32., "20 content + twice(4 padding + 2 border)");
+    let point = Point {
+        x: r.x + r.width / 2.,
+        y: r.y + r.height / 2.,
+    };
+    let sample = (r.x + r.width / 2., r.y + r.height - 3.);
+    let idle = paint(&tree);
+    assert_eq!(pixel(&idle, sample.0, sample.1), [30; 3]);
+    // Shared vector chevron, in the exported arrow ink, inside its reserved box.
+    let left = r.x + r.width - 2. - 14. - 16.;
+    assert!((left as usize..(left + 16.) as usize).any(|x| {
+        (r.y as usize..(r.y + r.height) as usize)
+            .any(|y| pixel(&idle, x as f32, y as f32) == [160; 3])
+    }));
+    tree.pointer_motion(point);
+    assert_eq!(pixel(&paint(&tree), sample.0, sample.1), [60; 3]);
+    tree.pointer_press(point).unwrap();
+    assert_eq!(pixel(&paint(&tree), sample.0, sample.1), [90; 3]);
+    tree.pointer_release(point).unwrap();
+    tree.tab(false).unwrap();
+    assert_eq!(pixel(&paint(&tree), r.x + r.width / 2., r.y), [0, 100, 255]);
+    assert_eq!(tree.node(combo).unwrap().bounds(), r);
+    tree.set_disabled(combo, true).unwrap();
+    let disabled = pixel(&paint(&tree), sample.0, sample.1);
+    assert!(
+        disabled[0] > 30 && disabled[0] < 100,
+        "disabled opacity must blend the control with its backing card"
+    );
+    assert_eq!(disabled, [disabled[0]; 3]);
+    tree.set_disabled(combo, false).unwrap();
+    tree.set_text_style(TextStyle {
+        size: 28.,
+        ..Default::default()
+    });
+    tree.layout(
+        Size {
+            width: 640.,
+            height: 480.,
+        },
+        false,
+        &mut text,
+    )
+    .unwrap();
+    assert!(
+        tree.node(combo).unwrap().bounds().height > r.height,
+        "text scale must remeasure the trigger"
+    );
+}
+#[test]
+fn missing_or_invalid_trigger_style_is_an_error_instead_of_button_fallback() {
+    let (mut tree, _, _, _) = fixture_with_style(false);
+    let mut text = ParleyBackend::new(Arc::new(FontSet::discover_required().unwrap())).unwrap();
+    assert!(
+        tree.layout(
+            Size {
+                width: 640.,
+                height: 480.
+            },
+            false,
+            &mut text
+        )
+        .unwrap_err()
+        .contains("dropdown style")
+    );
+    let mut invalid = style();
+    invalid.border = f32::NAN;
+    assert!(tree.set_dropdown_style(invalid).is_err());
+    let mut invalid = style();
+    invalid.disabled_opacity = 2.;
+    assert!(tree.set_dropdown_style(invalid).is_err());
+    let mut invalid = style();
+    invalid.arrow.clear();
+    assert!(tree.set_dropdown_style(invalid).is_err());
+}
+
+fn menu_style() -> nk_widgets::MenuStyle {
+    let c = |v| nk_render::rgba(v, v, v, 255);
+    nk_widgets::MenuStyle {
+        border: 1.,
+        radius: 16.,
+        inset: 6.,
+        padding_x: 9.,
+        padding_y: 6.,
+        row_radius: 10.,
+        text_scale: 0.93,
+        weight: 400.,
+        check_size: 14.,
+        check_gap: 8.,
+        check_stroke: 2.2,
+        background: c(30),
+        border_color: c(90),
+        text: c(240),
+        accent: nk_render::rgba(0, 100, 255, 255),
+        accent_text: c(240),
+        pressed_black: 0.15,
+    }
+}
+fn menu_fixture(height: f32) -> (Tree, Vec<u64>, ParleyBackend) {
+    let (mut tree, ids) = Tree::menu_list(
+        "Language",
+        metrics(),
+        TextStyle {
+            size: 14.,
+            ..Default::default()
+        },
+        menu_style(),
+        &["English", "Español", "日本語", "Arabic"],
+        0,
+    )
+    .unwrap();
+    let mut text = ParleyBackend::new(Arc::new(FontSet::discover_required().unwrap())).unwrap();
+    tree.layout(
+        Size {
+            width: 640.,
+            height,
+        },
+        false,
+        &mut text,
+    )
+    .unwrap();
+    (tree, ids, text)
+}
+#[test]
+fn menu_layout_uses_one_inset_and_keyboard_focus_reveals_without_changing_the_choice() {
+    let (mut tree, ids, _) = menu_fixture(80.);
+    let viewport = tree.content_viewport();
+    assert_eq!(viewport.x, 1.);
+    assert_eq!(viewport.width, 638.);
+    let first = tree.node(ids[0]).unwrap().bounds();
+    assert_eq!((first.x, first.y, first.width), (7., 7., 626.));
+    assert!(
+        ids.iter()
+            .all(|id| tree.semantics().nodes[id].role == Role::Option)
+    );
+    tree.focus(ids[0]).unwrap();
+    tree.set_disabled(ids[3], true).unwrap();
+    assert_eq!(
+        tree.control_key(0xff57).unwrap(),
+        Some(Effect::Focused(ids[2]))
+    );
+    assert!(
+        tree.node(tree.node(tree.root()).unwrap().children()[0])
+            .unwrap()
+            .scroll()
+            .y
+            > 0.
+    );
+    assert!(tree.semantics().nodes[&ids[2]].states.focused);
+    assert_eq!(
+        tree.node(ids[0]).unwrap().kind(),
+        Kind::MenuOption { selected: true }
+    );
+    assert_eq!(
+        tree.node(ids[2]).unwrap().kind(),
+        Kind::MenuOption { selected: false }
+    );
+    assert_eq!(
+        tree.dispatch(tree.target(ids[2]), Command::Activate)
+            .unwrap(),
+        Effect::Activated(ids[2])
+    );
+    assert_eq!(
+        tree.node(ids[0]).unwrap().kind(),
+        Kind::MenuOption { selected: true }
+    );
+    tree.control_key(0xff50).unwrap();
+    assert_eq!(tree.focused(), Some(ids[0]));
+    tree.control_key(0xff52).unwrap();
+    assert_eq!(
+        tree.focused(),
+        Some(ids[2]),
+        "wrap must skip disabled options"
+    );
+}
+#[test]
+fn menu_highlight_and_chosen_check_remain_independent_in_pixels_and_semantics() {
+    let (mut tree, ids, _) = menu_fixture(480.);
+    let r = |tree: &Tree, id| tree.node(id).unwrap().bounds();
+    let selected = r(&tree, ids[0]);
+    let other = r(&tree, ids[1]);
+    tree.pointer_motion(Point {
+        x: other.x + other.width / 2.,
+        y: other.y + other.height / 2.,
+    });
+    let hover = paint(&tree);
+    assert_eq!(
+        pixel(&hover, 300., other.y + other.height / 2.),
+        [0, 100, 255]
+    );
+    assert_eq!(
+        pixel(&hover, 300., selected.y + selected.height / 2.),
+        [30; 3]
+    );
+    let check_x = selected.x + selected.width - 9. - 14.;
+    let bright_in_check = |image: &[u8], row: nk_text::Rect| {
+        (check_x as usize..(check_x + 14.) as usize).any(|x| {
+            (row.y as usize..(row.y + row.height) as usize).any(|y| {
+                let p = pixel(image, x as f32, y as f32);
+                p[0] > 180 && p[0] == p[1] && p[1] == p[2]
+            })
+        })
+    };
+    assert!(bright_in_check(&hover, selected));
+    assert!(!bright_in_check(&hover, other));
+    assert!(tree.semantics().nodes[&ids[0]].states.selected);
+    assert!(!tree.semantics().nodes[&ids[1]].states.selected);
+    // A stationary pointer must yield its highlight to keyboard navigation.
+    tree.focus(ids[1]).unwrap();
+    tree.control_key(0xff54).unwrap();
+    let keyboard = paint(&tree);
+    let next = r(&tree, ids[2]);
+    assert_eq!(
+        pixel(&keyboard, 300., other.y + other.height / 2.),
+        [30; 3],
+        "keyboard navigation must retire the stationary pointer highlight"
+    );
+    assert_eq!(
+        pixel(&keyboard, 300., next.y + next.height / 2.),
+        [0, 100, 255]
+    );
+    assert_eq!(tree.focused(), Some(ids[2]));
+    assert!(tree.semantics().nodes[&ids[0]].states.selected);
+    assert!(!tree.semantics().nodes[&ids[2]].states.selected);
+    tree.focus(ids[0]).unwrap();
+    tree.control_key(0xff54).unwrap();
+    tree.pointer_motion(Point {
+        x: r(&tree, ids[2]).x + 300.,
+        y: r(&tree, ids[2]).y + 5.,
+    });
+    assert_eq!(
+        pixel(&paint(&tree), 300., other.y + other.height / 2.),
+        [30; 3],
+        "pointer mode must not leave a second focused fill behind"
+    );
+}
+
+#[test]
+fn menu_style_update_keeps_focus_and_chosen_ids_and_refuses_invalid_or_wrong_tree() {
+    let (mut tree, ids, mut text) = menu_fixture(80.);
+    tree.focus(ids[1]).unwrap();
+    let old = tree.node(ids[1]).unwrap().bounds().height;
+    let mut changed = menu_style();
+    changed.padding_y += 4.;
+    tree.set_menu_style(changed).unwrap();
+    tree.layout(
+        Size {
+            width: 640.,
+            height: 80.,
+        },
+        false,
+        &mut text,
+    )
+    .unwrap();
+    assert_eq!(tree.focused(), Some(ids[1]));
+    assert_eq!(tree.node(ids[1]).unwrap().bounds().height, old + 8.);
+    assert_eq!(
+        tree.node(ids[0]).unwrap().kind(),
+        Kind::MenuOption { selected: true }
+    );
+    let mut invalid = menu_style();
+    invalid.check_size = f32::NAN;
+    assert!(tree.set_menu_style(invalid).is_err());
+    let (mut ordinary, _, _, _) = fixture();
+    assert!(ordinary.set_menu_style(menu_style()).is_err());
+}
+
+#[test]
+fn popup_projects_focus_geometry_and_selection_onto_parent_ids() {
+    use nk_widgets::DropdownPopup;
+    let (mut parent, _, _, combo) = fixture();
+    let before = parent.semantics();
+    let options = before.nodes[&combo].children.clone();
+    parent.focus(combo).unwrap();
+    let mut popup = DropdownPopup::new(&mut parent, combo, menu_style()).unwrap();
+    let mut text = ParleyBackend::new(Arc::new(FontSet::discover_required().unwrap())).unwrap();
+    popup
+        .menu_mut()
+        .layout(
+            Size {
+                width: 200.,
+                height: 140.,
+            },
+            false,
+            &mut text,
+        )
+        .unwrap();
+    let items = popup.menu().focus_order();
+    assert_ne!(items, options);
+    let published = popup.snapshot(Point { x: 300., y: 90. }).unwrap();
+    assert_eq!(published.tree.root, before.root);
+    assert_eq!(
+        published.tree.nodes.keys().collect::<Vec<_>>(),
+        before.nodes.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(published.tree.selected_children(combo), vec![options[1]]);
+    assert!(published.tree.nodes[&combo].states.expanded);
+    assert_eq!(
+        published.tree.nodes[&combo].relations,
+        before.nodes[&combo].relations
+    );
+    assert!(published.tree.nodes[&combo].actions.is_empty());
+    assert_eq!(
+        published
+            .tree
+            .nodes
+            .values()
+            .filter(|n| n.states.focused)
+            .map(|n| n.id)
+            .collect::<Vec<_>>(),
+        vec![options[1]]
+    );
+    assert_eq!(
+        published.tree.nodes[&options[1]].bounds.x,
+        f64::from(popup.menu().node(items[1]).unwrap().bounds().x + 300.)
+    );
+    assert!(
+        popup
+            .request(published.revision, nk_a11y::Request::Activate(combo))
+            .is_err()
+    );
+    assert_eq!(
+        popup
+            .request(published.revision, nk_a11y::Request::Focus(options[2]))
+            .unwrap(),
+        Effect::Focused(items[2])
+    );
+    let next = popup.snapshot(Point { x: 300., y: 90. }).unwrap();
+    assert!(
+        popup
+            .request(published.revision, nk_a11y::Request::Activate(options[2]))
+            .is_err()
+    );
+    assert_eq!(next.tree.selected_children(combo), vec![options[1]]);
+    let Effect::Activated(item) = popup
+        .request(next.revision, nk_a11y::Request::Activate(options[2]))
+        .unwrap()
+    else {
+        panic!("expected activation")
+    };
+    let index = popup.index(item).unwrap();
+    assert_eq!(popup.finish(Some(index)).unwrap(), Effect::Changed(combo));
+    assert_eq!(parent.dropdown_selected(combo).unwrap(), 2);
+    assert_eq!(parent.focused(), Some(combo));
+    assert!(!parent.semantics().nodes[&combo].states.expanded);
+}
+
+#[test]
+fn popup_reopening_rejects_old_requests_and_errors_preserve_choice() {
+    use nk_widgets::DropdownPopup;
+    let (mut parent, _, _, combo) = fixture();
+    let options = parent.semantics().nodes[&combo].children.clone();
+    let mut first = DropdownPopup::new(&mut parent, combo, menu_style()).unwrap();
+    let old = first.snapshot(Point::default()).unwrap().revision;
+    first.finish(None).unwrap();
+    let mut second = DropdownPopup::new(&mut parent, combo, menu_style()).unwrap();
+    let fresh = second.snapshot(Point::default()).unwrap().revision;
+    assert_ne!(old, fresh);
+    assert!(
+        second
+            .request(old, nk_a11y::Request::Activate(options[0]))
+            .is_err()
+    );
+    let item = second.menu().focus_order()[0];
+    second.menu_mut().set_disabled(item, true).unwrap();
+    assert!(
+        second
+            .request(fresh, nk_a11y::Request::Activate(options[0]))
+            .is_err()
+    );
+    let revision = second.snapshot(Point::default()).unwrap().revision;
+    assert!(
+        second
+            .request(revision, nk_a11y::Request::Activate(options[0]))
+            .is_err()
+    );
+    assert!(second.snapshot(Point { x: f32::NAN, y: 0. }).is_err());
+    second.menu_mut().set_hidden(item, true).unwrap();
+    let hidden = second.snapshot(Point::default()).unwrap();
+    assert!(hidden.tree.nodes[&options[0]].states.hidden);
+    assert!(
+        second
+            .request(hidden.revision, nk_a11y::Request::Activate(options[0]))
+            .is_err()
+    );
+    assert!(second.finish(Some(0)).is_err());
+    assert_eq!(parent.dropdown_selected(combo).unwrap(), 1);
+    assert!(!parent.semantics().nodes[&combo].states.expanded);
+    let mut removed = DropdownPopup::new(&mut parent, combo, menu_style()).unwrap();
+    let item = removed.menu().focus_order()[0];
+    removed.menu_mut().remove(item).unwrap();
+    assert!(removed.snapshot(Point::default()).is_err());
+    drop(removed);
+    assert_eq!(parent.dropdown_selected(combo).unwrap(), 1);
+    assert_eq!(parent.focused(), Some(combo));
+}
+
+#[test]
+fn popup_unavailable_chosen_option_preserves_selection_and_uses_available_focus() {
+    use nk_widgets::DropdownPopup;
+    let (mut parent, _, _, combo) = fixture();
+    let options = parent.semantics().nodes[&combo].children.clone();
+    assert_eq!(parent.dropdown_selected(combo).unwrap(), 1);
+    parent.set_disabled(options[1], true).unwrap();
+    assert!(parent.semantics().nodes[&options[1]].states.disabled);
+    let opened = DropdownPopup::new(&mut parent, combo, menu_style());
+    assert!(
+        opened.is_ok(),
+        "an unavailable chosen option must not prevent opening"
+    );
+    let mut popup = opened.ok().unwrap();
+    let snapshot = popup.snapshot(Point::default()).unwrap();
+    assert_eq!(snapshot.tree.selected_children(combo), vec![options[1]]);
+    assert!(snapshot.tree.nodes[&options[0]].states.focused);
+    assert!(!snapshot.tree.nodes[&options[1]].states.focused);
+    assert!(snapshot.tree.nodes[&options[1]].states.disabled);
+    popup.finish(None).unwrap();
+    assert_eq!(parent.dropdown_selected(combo).unwrap(), 1);
+    for option in &options {
+        parent.set_disabled(*option, true).unwrap();
+    }
+    let opened = DropdownPopup::new(&mut parent, combo, menu_style());
+    assert!(
+        opened.is_ok(),
+        "an all-unavailable menu must still open for dismissal"
+    );
+    let mut popup = opened.ok().unwrap();
+    assert_eq!(popup.menu().focused(), None);
+    let snapshot = popup.snapshot(Point::default()).unwrap();
+    assert_eq!(snapshot.tree.selected_children(combo), vec![options[1]]);
+    assert!(
+        snapshot
+            .tree
+            .nodes
+            .values()
+            .all(|node| !node.states.focused)
+    );
+    popup.finish(None).unwrap();
+    assert_eq!(parent.dropdown_selected(combo).unwrap(), 1);
+}
+
+#[test]
+fn invalidated_popup_cannot_publish_act_choose_or_restore_a_stale_trigger() {
+    let (mut parent, _, _, combo) = fixture();
+    parent.focus(combo).unwrap();
+    let option = parent.semantics().nodes[&combo].children[0];
+    let mut popup = nk_widgets::DropdownPopup::new(&mut parent, combo, menu_style()).unwrap();
+    let revision = popup.snapshot(Point::default()).unwrap().revision;
+    popup.invalidate();
+    assert!(popup.snapshot(Point::default()).is_err());
+    assert!(
+        popup
+            .request(revision, nk_a11y::Request::Activate(option))
+            .is_err()
+    );
+    assert!(popup.finish(Some(0)).is_err());
+    assert_eq!(parent.dropdown_selected(combo).unwrap(), 1);
+    assert_eq!(parent.focused(), None);
+    assert!(!parent.semantics().nodes[&combo].states.expanded);
+}
+
+#[test]
+fn dropdown_reorder_keeps_option_ids_and_selection_and_rejects_nonpermutations_atomically() {
+    let (mut tree, _, _, combo) = fixture();
+    let old = tree.node(combo).unwrap().children().to_vec();
+    let target = tree.target(old[0]);
+    for order in [
+        vec![old[0]],
+        vec![old[0], old[0], old[2]],
+        vec![old[0], old[1], tree.root()],
+    ] {
+        assert!(tree.reorder_dropdown_options(combo, &order).is_err());
+        assert_eq!(tree.node(combo).unwrap().children(), old);
+    }
+    let order = vec![old[1], old[2], old[0]];
+    tree.reorder_dropdown_options(combo, &order).unwrap();
+    assert_eq!(tree.node(combo).unwrap().children(), order);
+    assert_eq!(tree.dropdown_selected(combo).unwrap(), 0);
+    assert_eq!(tree.semantics().selected_children(combo), vec![old[1]]);
+    assert!(tree.dispatch(target, Command::Activate).is_err());
+}
+
+fn embedded_list_fixture() -> (Tree, u64, Vec<u64>, u64, u64, ParleyBackend) {
+    let mut tree = Tree::new(
+        "Fonts",
+        metrics(),
+        TextStyle {
+            size: 14.,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let scroll = tree.append(tree.root(), Kind::Scroll, "Content").unwrap();
+    let (_, before) = tree.row(scroll, "Before", Kind::Button).unwrap();
+    let list = tree
+        .list(scroll, "Font families", 80., menu_style())
+        .unwrap();
+    let ids = ["Noto Sans", "DejaVu Sans", "日本語", "العربية"]
+        .iter()
+        .enumerate()
+        .map(|(at, name)| {
+            tree.append(list, Kind::MenuOption { selected: at == 0 }, *name)
+                .unwrap()
+        })
+        .collect();
+    let (_, after) = tree.row(scroll, "After", Kind::Button).unwrap();
+    let mut text = ParleyBackend::new(Arc::new(FontSet::discover_required().unwrap())).unwrap();
+    tree.layout(
+        Size {
+            width: 640.,
+            height: 480.,
+        },
+        false,
+        &mut text,
+    )
+    .unwrap();
+    (tree, list, ids, before, after, text)
+}
+
+#[test]
+fn embedded_list_has_real_selection_one_tab_stop_and_independent_reveal() {
+    let (mut tree, list, ids, before, after, _) = embedded_list_fixture();
+    let semantics = tree.semantics();
+    assert_eq!(semantics.nodes[&list].role, Role::List);
+    assert_eq!(semantics.nodes[&list].children, ids);
+    assert!(semantics.nodes[&ids[3]].states.offscreen);
+    assert!(!semantics.nodes[&ids[3]].states.hidden);
+    assert_eq!(tree.focus_order(), vec![before, ids[0], after]);
+    tree.focus(before).unwrap();
+    tree.tab(false).unwrap();
+    assert_eq!(tree.focused(), Some(ids[0]));
+    tree.set_disabled(ids[2], true).unwrap();
+    assert_eq!(
+        tree.control_key(0xff57).unwrap(),
+        Some(Effect::Focused(ids[3]))
+    );
+    assert!(tree.node(list).unwrap().scroll().y > 0.);
+    assert!(tree.showing(ids[3]));
+    assert!(tree.semantics().nodes[&ids[0]].states.selected);
+    assert_eq!(
+        tree.dispatch(tree.target(ids[3]), Command::Activate)
+            .unwrap(),
+        Effect::Changed(list)
+    );
+    assert!(!tree.semantics().nodes[&ids[0]].states.selected);
+    assert!(tree.semantics().nodes[&ids[3]].states.selected);
+    assert_eq!(
+        tree.dispatch(tree.target(ids[3]), Command::Activate)
+            .unwrap(),
+        Effect::None
+    );
+    tree.tab(false).unwrap();
+    assert_eq!(tree.focused(), Some(after));
+    tree.tab(true).unwrap();
+    assert_eq!(tree.focused(), Some(ids[3]));
+}
+
+#[test]
+fn embedded_list_reuses_menu_pixels_and_clips_hit_testing_and_scroll() {
+    let (mut tree, list, ids, _, after, _) = embedded_list_fixture();
+    let first = tree.node(ids[0]).unwrap().bounds();
+    let viewport = tree.node(list).unwrap().bounds();
+    let below = tree.node(ids[3]).unwrap().bounds();
+    assert_eq!(first.x, viewport.x + 7.);
+    assert_eq!(first.y, viewport.y + 7.);
+    let center = Point {
+        x: first.x + first.width / 2.,
+        y: first.y + first.height / 2.,
+    };
+    tree.pointer_motion(center);
+    assert_eq!(pixel(&paint(&tree), center.x, center.y), [0, 100, 255]);
+    assert_ne!(
+        tree.hit_test(Point {
+            x: below.x + 2.,
+            y: below.y + 2.
+        }),
+        Some(ids[3])
+    );
+    let outside = tree.node(after).unwrap().bounds();
+    assert!(outside.y >= viewport.y + viewport.height);
+    let before = paint(&tree);
+    tree.scroll_to(list, Point { x: 0., y: 10000. }).unwrap();
+    let scrolled = paint(&tree);
+    // A change in the list's scroll cannot alter pixels outside its own rectangle.
+    for y in 0..480 {
+        for x in 0..640 {
+            if (x as f32) < viewport.x
+                || (x as f32) >= viewport.x + viewport.width
+                || (y as f32) < viewport.y
+                || (y as f32) >= viewport.y + viewport.height
+            {
+                let at = (y * 640 + x) * 4;
+                assert_eq!(
+                    &before[at..at + 4],
+                    &scrolled[at..at + 4],
+                    "list scroll escaped its viewport at {x},{y}"
+                );
+            }
+        }
+    }
+    assert_eq!(tree.node(after).unwrap().bounds(), outside);
+}
+
+#[test]
+fn embedded_list_style_filtering_and_invalid_updates_preserve_identity() {
+    let (mut tree, list, ids, before, _, mut text) = embedded_list_fixture();
+    tree.focus(ids[3]).unwrap();
+    let stale = tree.target(ids[3]);
+    let selected = tree.semantics().nodes[&ids[0]].states.selected;
+    assert!(tree.set_list_selected(list, Some(before)).is_err());
+    assert_eq!(tree.semantics().nodes[&ids[0]].states.selected, selected);
+    let mut invalid = menu_style();
+    invalid.border = f32::NAN;
+    assert!(tree.set_list_style(list, invalid).is_err());
+    tree.set_list_selected(list, None).unwrap();
+    for id in &ids {
+        tree.set_hidden(*id, true).unwrap();
+    }
+    tree.layout(
+        Size {
+            width: 640.,
+            height: 480.,
+        },
+        false,
+        &mut text,
+    )
+    .unwrap();
+    assert!(tree.semantics().nodes[&list].children.is_empty());
+    assert_eq!(tree.node(list).unwrap().scroll().y, 0.);
+    assert!(tree.dispatch(stale, Command::Activate).is_err());
+    for id in &ids {
+        tree.set_hidden(*id, false).unwrap();
+    }
+    tree.set_disabled(ids[2], false).unwrap();
+    let mut style = menu_style();
+    style.padding_y += 4.;
+    tree.set_list_style(list, style).unwrap();
+    tree.layout(
+        Size {
+            width: 640.,
+            height: 480.,
+        },
+        false,
+        &mut text,
+    )
+    .unwrap();
+    assert_eq!(tree.semantics().nodes[&list].children, ids);
+    assert_eq!(tree.node(list).unwrap().bounds().height, 80.);
+    tree.focus(ids[3]).unwrap();
+    tree.set_list_height(list, 240.).unwrap();
+    assert!(tree.set_list_height(list, f32::NAN).is_err());
+    tree.layout(
+        Size {
+            width: 640.,
+            height: 480.,
+        },
+        false,
+        &mut text,
+    )
+    .unwrap();
+    assert_eq!(tree.node(list).unwrap().bounds().height, 240.);
+    assert_eq!(tree.node(list).unwrap().scroll().y, 0.);
+    assert_eq!(tree.focused(), Some(ids[3]));
+    let count = tree.semantics().nodes.len();
+    assert!(tree.list(list, "Bad parent", 80., menu_style()).is_err());
+    assert!(
+        tree.list(tree.root(), "Bad height", f32::NAN, menu_style())
+            .is_err()
+    );
+    assert_eq!(tree.semantics().nodes.len(), count);
+}
+
+#[test]
+fn embedded_lists_keep_styles_and_wheel_offsets_independent() {
+    let (mut tree, list, ids, _, after, mut text) = embedded_list_fixture();
+    let scroll = tree.node(tree.root()).unwrap().children()[0];
+    let mut other_style = menu_style();
+    other_style.padding_y += 10.;
+    let other = tree
+        .list(scroll, "Other families", 60., other_style)
+        .unwrap();
+    let other_row = tree
+        .append(other, Kind::MenuOption { selected: false }, "Other font")
+        .unwrap();
+    tree.layout(
+        Size {
+            width: 640.,
+            height: 480.,
+        },
+        false,
+        &mut text,
+    )
+    .unwrap();
+    assert_eq!(
+        tree.node(other_row).unwrap().bounds().height,
+        tree.node(ids[0]).unwrap().bounds().height + 20.
+    );
+    let r = tree.node(list).unwrap().bounds();
+    let root_offset = tree.node(scroll).unwrap().scroll();
+    let mut composition = nk_widgets::window::Composition::default();
+    // A blank inset has no hovered option; the viewport itself still consumes scrolling.
+    composition.pointer = Point {
+        x: r.x + 2.,
+        y: r.y + 2.,
+    };
+    composition
+        .event(
+            &mut tree,
+            &nk_wayland::Event::Scroll(nk_wayland::ScrollAmount::pixels(30.)),
+        )
+        .unwrap();
+    assert_eq!(tree.node(list).unwrap().scroll().y, 30.);
+    assert_eq!(tree.node(other).unwrap().scroll().y, 0.);
+    assert_eq!(tree.node(scroll).unwrap().scroll(), root_offset);
+    let after_bounds = tree.node(after).unwrap().bounds();
+    assert!(after_bounds.y > r.y);
+    tree.set_list_selected(other, Some(other_row)).unwrap();
+    assert!(tree.semantics().nodes[&ids[0]].states.selected);
+    assert!(tree.semantics().nodes[&other_row].states.selected);
+}
+
+#[test]
+fn dialog_projects_one_root_and_retires_ids_and_requests_after_close() {
+    use nk_a11y::Request;
+    use nk_widgets::DialogTree;
+    let (mut parent, _, _, launcher) = fixture();
+    let mut text = ParleyBackend::new(Arc::new(FontSet::discover_required().unwrap())).unwrap();
+    parent
+        .layout(
+            Size {
+                width: 640.,
+                height: 480.,
+            },
+            false,
+            &mut text,
+        )
+        .unwrap();
+    parent.focus(launcher).unwrap();
+    let root = parent.root();
+    let max = *parent.semantics().nodes.keys().max().unwrap();
+    let (old_publication, button, dialog_root);
+    {
+        let mut dialog = DialogTree::new(&mut parent, launcher, "Choose font").unwrap();
+        let view = dialog.view_mut();
+        dialog_root = view.root();
+        let scroll = view.append(view.root(), Kind::Scroll, "Families").unwrap();
+        let (_, action) = view.row(scroll, "Select", Kind::Button).unwrap();
+        button = action;
+        view.layout(
+            Size {
+                width: 640.,
+                height: 480.,
+            },
+            false,
+            &mut text,
+        )
+        .unwrap();
+        assert_eq!(
+            view.content_viewport().x,
+            0.,
+            "dialog must not reserve a phantom sidebar"
+        );
+        view.focus(button).unwrap();
+        let inactive = dialog.snapshot().unwrap();
+        assert!(
+            inactive
+                .tree
+                .nodes
+                .values()
+                .all(|node| !node.states.focused),
+            "inactive dialog cannot publish focus before activation"
+        );
+        dialog.view_mut().set_active(true);
+        let snapshot = dialog.snapshot().unwrap();
+        old_publication = snapshot.revision;
+        assert_eq!(snapshot.tree.root, root);
+        assert!(dialog_root > max && button > max);
+        assert_eq!(snapshot.tree.nodes[&dialog_root].role, Role::Dialog);
+        assert!(snapshot.tree.nodes[&root].children.contains(&dialog_root));
+        assert!(snapshot.tree.nodes[&launcher].actions.is_empty());
+        assert!(snapshot.tree.nodes[&launcher].states.disabled);
+        assert_eq!(
+            snapshot
+                .tree
+                .nodes
+                .values()
+                .filter(|n| n.states.focused)
+                .count(),
+            1
+        );
+        assert!(snapshot.tree.nodes[&button].states.focused);
+        assert!(
+            dialog
+                .request(old_publication, Request::Activate(launcher))
+                .is_err()
+        );
+        assert_eq!(
+            dialog
+                .request(old_publication, Request::Activate(button))
+                .unwrap(),
+            Effect::Activated(button)
+        );
+        let new = dialog.snapshot().unwrap();
+        assert!(
+            dialog
+                .request(old_publication, Request::Activate(button))
+                .is_err()
+        );
+        assert_eq!(
+            dialog
+                .request(new.revision, Request::Activate(button))
+                .unwrap(),
+            Effect::Activated(button)
+        );
+    }
+    assert_eq!(parent.focused(), Some(launcher));
+    let restored = parent.semantics();
+    assert!(!restored.nodes.contains_key(&dialog_root));
+    let mut reopened = DialogTree::new(&mut parent, launcher, "Choose font").unwrap();
+    assert!(
+        reopened.view().root() > button,
+        "all transient IDs must be retired on close"
+    );
+    assert!(
+        reopened
+            .request(old_publication, Request::Activate(button))
+            .is_err()
+    );
+}
+
+#[test]
+fn invalidated_dialog_rejects_publication_and_never_restores_launcher_focus() {
+    use nk_widgets::DialogTree;
+    let (mut parent, _, _, launcher) = fixture();
+    let mut text = ParleyBackend::new(Arc::new(FontSet::discover_required().unwrap())).unwrap();
+    parent
+        .layout(
+            Size {
+                width: 640.,
+                height: 480.,
+            },
+            false,
+            &mut text,
+        )
+        .unwrap();
+    parent.focus(launcher).unwrap();
+    let stale = parent.target(launcher);
+    {
+        let mut dialog = DialogTree::new(&mut parent, launcher, "Choose font").unwrap();
+        let snapshot = dialog.snapshot().unwrap();
+        dialog.invalidate();
+        assert!(dialog.snapshot().is_err());
+        assert!(
+            dialog
+                .request(snapshot.revision, nk_a11y::Request::Focus(launcher))
+                .is_err()
+        );
+    }
+    assert_eq!(parent.focused(), None);
+    assert!(parent.dispatch(stale, Command::Activate).is_err());
+}

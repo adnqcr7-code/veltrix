@@ -1,0 +1,596 @@
+import Gdk from "gi://Gdk?version=4.0"
+import Gtk from "gi://Gtk?version=4.0"
+import GLib from "gi://GLib"
+import Gio from "gi://Gio"
+import GdkPixbuf from "gi://GdkPixbuf"
+import { execAsync, spawn } from "../../../../lib/process"
+import { showVeltrixAlert, showVeltrixFormDialog, VeltrixButton, VeltrixRow, VeltrixEmptyRow, ROW_H_SINGLE, attachTooltip } from "../../../../lib/veltrix-kit"
+import { getUsers, getCurrentUser, type User } from "../../../../lib/users"
+import { listGroup, createRow, createStackedRow, fieldWithActions, pageBox, onPageShown } from "../SettingsHelpers"
+import { showAvatarCropper } from "../../../common/AvatarCropper"
+import { t } from "../../../core/i18n"
+import { uiIcon } from "../../../core/Icons"
+
+// ── Data helpers ──────────────────────────────────────────────────────────────
+// User enumeration + avatar resolution come from the shared ui/lib/users.ts
+// (same source the greeter and lockscreen use), so all three surfaces agree on
+// the displayed name — including the GECOS→username fallback.
+
+function isInWheel(username: string): boolean {
+    try {
+        const [ok, bytes] = GLib.file_get_contents("/etc/group")
+        if (!ok) return false
+        const text = new TextDecoder().decode(bytes as Uint8Array)
+        for (const line of text.split("\n")) {
+            const p = line.split(":")
+            if (p[0] === "wheel") return (p[3] ?? "").split(",").includes(username)
+        }
+    } catch {}
+    return false
+}
+
+// Register the written ~/.face with AccountsService so the greeter / other DEs pick
+// it up too (best-effort — fine if the service isn't running).
+function applyFaceToAccounts(face: string) {
+    try {
+        const bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, null)
+        const res = bus.call_sync(
+            "org.freedesktop.Accounts", "/org/freedesktop/Accounts",
+            "org.freedesktop.Accounts", "FindUserByName",
+            new GLib.Variant("(s)", [GLib.get_user_name()]),
+            new GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 2000, null,
+        )
+        const userPath = res.get_child_value(0).get_string()[0]
+        bus.call_sync(
+            "org.freedesktop.Accounts", userPath,
+            "org.freedesktop.Accounts.User", "SetIconFile",
+            new GLib.Variant("(s)", [face]),
+            null, Gio.DBusCallFlags.NONE, 5000, null,
+        )
+    } catch { /* AccountsService not available */ }
+}
+
+// Save an already-cropped square pixbuf as the user's avatar.
+function saveAvatarPixbuf(pixbuf: any) {
+    const face = `${GLib.get_home_dir()}/.face`
+    try { pixbuf.savev(face, "png", [], []) } catch (e) { console.error("[Users] save avatar:", e); return }
+    applyFaceToAccounts(face)
+}
+
+// Set the user's full name (GECOS) via AccountsService, same path as the avatar.
+// chfn(1) can't be used non-interactively — it requires a PAM password prompt and
+// fails with no tty. AccountsService.SetRealName goes through polkit's
+// change-own-user-data action, which the active user is allowed to do.
+function setRealName(name: string): boolean {
+    try {
+        const bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, null)
+        const res = bus.call_sync(
+            "org.freedesktop.Accounts", "/org/freedesktop/Accounts",
+            "org.freedesktop.Accounts", "FindUserByName",
+            new GLib.Variant("(s)", [GLib.get_user_name()]),
+            new GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 2000, null,
+        )
+        const userPath = res.get_child_value(0).get_string()[0]
+        bus.call_sync(
+            "org.freedesktop.Accounts", userPath,
+            "org.freedesktop.Accounts.User", "SetRealName",
+            new GLib.Variant("(s)", [name]),
+            null, Gio.DBusCallFlags.NONE, 5000, null,
+        )
+        return true
+    } catch (e) {
+        console.error("[Users] SetRealName:", e)
+        return false
+    }
+}
+
+// Resolve the window a widget lives in AT INTERACTION TIME. Rows are built
+// before the page is realized, so a window captured at build time is null —
+// and GJS refuses `transient_for: undefined` outright (the dialog then never
+// opens: the constructor throws before present()).
+function windowOf(w: Gtk.Widget): Gtk.Window | null {
+    const root = w.get_root()
+    return root instanceof Gtk.Window ? (root as unknown as Gtk.Window) : null
+}
+
+function spawnTerminalWithCommand(cmd: string) {
+    const map: Record<string, string[]> = {
+        kitty:          ["kitty", "--", "bash", "-c", cmd],
+        alacritty:      ["alacritty", "-e", "bash", "-c", cmd],
+        wezterm:        ["wezterm", "start", "--", "bash", "-c", cmd],
+        "gnome-terminal": ["gnome-terminal", "--", "bash", "-c", cmd],
+        xterm:          ["xterm", "-e", "bash", "-c", cmd],
+    }
+    for (const term of Object.keys(map)) {
+        if (GLib.find_program_in_path(term)) {
+            execAsync(map[term]).catch(e => console.error("[Users]", e))
+            return
+        }
+    }
+    console.error("[Users] No terminal found")
+}
+
+// ── "Add user" dialog ─────────────────────────────────────────────────────────
+
+function showAddUserDialog(parentWin: Gtk.Window | null, onCreated: () => void) {
+    const box = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        spacing: 12,
+    })
+
+    const field = (label: string, widget: Gtk.Widget) => {
+        const vbox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 4 })
+        vbox.append(new Gtk.Label({ label, halign: Gtk.Align.START, css_classes: ["veltrix-row-title"] }))
+        vbox.append(widget)
+        return vbox
+    }
+
+    const nameEntry  = new Gtk.Entry({ placeholder_text: t("settings.users.other.fullname.placeholder"), hexpand: true })
+    const unameEntry = new Gtk.Entry({ placeholder_text: t("settings.users.other.username.placeholder"), hexpand: true })
+    const pwEntry    = new Gtk.PasswordEntry({ show_peek_icon: true, hexpand: true,
+        placeholder_text: t("settings.users.other.pw.placeholder") })
+    const pw2Entry   = new Gtk.PasswordEntry({ show_peek_icon: true, hexpand: true,
+        placeholder_text: t("settings.users.other.pw2.placeholder") })
+
+    const adminRow = new Gtk.Box({ spacing: 12, margin_top: 4 })
+    adminRow.append(new Gtk.Label({ label: t("settings.users.other.admin"), hexpand: true, halign: Gtk.Align.START }))
+    const adminSwitch = new Gtk.Switch({ valign: Gtk.Align.CENTER })
+    adminSwitch.update_property([Gtk.AccessibleProperty.LABEL], [t("settings.users.other.admin")])   // #615
+    adminRow.append(adminSwitch)
+
+    const statusLabel = new Gtk.Label({
+        label: "", css_classes: ["veltrix-row-subtitle"], visible: false,
+        // Wrapping prose FILLS its column (design-system.md): a halign START label is
+        // allocated its NATURAL width, which for a wrapping GtkLabel is a line-balancing
+        // heuristic — so a two-line error broke at its own column, not the form's.
+        halign: Gtk.Align.FILL, hexpand: true, xalign: 0, wrap: true,
+    })
+
+    box.append(field(t("settings.users.other.fullname"), nameEntry))
+    box.append(field(t("settings.users.other.username"), unameEntry))
+    box.append(field(t("settings.users.other.pw"),  pwEntry))
+    box.append(field(t("settings.users.other.pw2"), pw2Entry))
+    box.append(adminRow)
+    box.append(statusLabel)
+
+    // useradd succeeded but chpasswd is still pending/failed — a re-click must
+    // retry only the password step, never a second useradd.
+    let created = false
+
+    const handle = showVeltrixFormDialog({
+        parent: parentWin,
+        heading: t("settings.users.other.add"),
+        width: 380,
+        content: box,
+        responses: [
+            { id: "cancel", label: t("settings.users.other.cancel") },
+            { id: "create", label: t("settings.users.other.create"), suggested: true, sensitive: false },
+        ],
+        onResponse: (id, h) => {
+            if (id === "cancel") { h.close(); return }
+            if (id === "create") {
+                const uname = unameEntry.text.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "")
+                // ':' and newlines would corrupt the passwd GECOS entry — useradd rejects
+                // them with an unhelpful generic error, so strip them up front.
+                const fname = nameEntry.text.trim().replace(/[:\n\r]/g, "")
+                const pw    = pwEntry.text
+
+                h.setResponseSensitive("create", false)
+                statusLabel.visible = false
+
+                const setPassword = () => {
+                    const proc = spawn(["pkexec", "chpasswd"], Gio.SubprocessFlags.STDIN_PIPE)
+                    proc.communicate_utf8_async(`${uname}:${pw}\n`, null, (_: any, res: any) => {
+                        // finish() only throws on IO errors — a non-zero exit (e.g. the
+                        // pkexec prompt was cancelled) must be read from get_successful().
+                        let ok = false
+                        try { proc.communicate_utf8_finish(res); ok = proc.get_successful() }
+                        catch (e) { console.error("[Users] chpasswd:", e) }
+                        if (ok) { h.close(); return }
+                        statusLabel.label = t("settings.users.other.err.pw-set")
+                        statusLabel.visible = true
+                        h.setResponseSensitive("create", true)
+                    })
+                }
+
+                if (created) { setPassword(); return }
+
+                const addCmd = ["pkexec", "useradd", "-m",
+                    ...(adminSwitch.active ? ["-G", "wheel"] : []),
+                    ...(fname ? ["-c", fname] : []),
+                    uname]
+
+                execAsync(addCmd).then(() => {
+                    created = true
+                    // The account exists now whatever happens to the password — freeze
+                    // its identity fields and refresh the list behind the dialog.
+                    nameEntry.sensitive = false
+                    unameEntry.sensitive = false
+                    adminSwitch.sensitive = false
+                    onCreated()
+                    if (pw.length === 0) { h.close(); return }
+                    setPassword()
+                }).catch(e => {
+                    console.error("[Users] useradd:", e)
+                    statusLabel.label = String(e?.message ?? e).includes("already exists")
+                        ? t("settings.users.other.err.exists")
+                        : t("settings.users.other.err.create")
+                    statusLabel.visible = true
+                    h.setResponseSensitive("create", true)
+                })
+            }
+        },
+    })
+
+    const validateCreate = () => {
+        const uname = unameEntry.text.trim()
+        const pw  = pwEntry.text
+        const pw2 = pw2Entry.text
+        // A blank password is allowed: the account is created locked, as the
+        // password placeholder promises.
+        const isValid = uname.length > 0 && pw === pw2
+        handle.setResponseSensitive("create", isValid)
+        if (pw2.length > 0 && pw !== pw2) {
+            statusLabel.label = t("settings.users.other.err.pwmatch"); statusLabel.visible = true
+        } else { statusLabel.visible = false }
+    }
+    unameEntry.connect("notify::text", validateCreate)
+    pwEntry.connect("notify::text",    validateCreate)
+    pw2Entry.connect("notify::text",   validateCreate)
+}
+
+// ── "Change password" dialog ──────────────────────────────────────────────────
+
+function showChangePasswordDialog(user: User, parentWin: Gtk.Window | null) {
+    const box = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        spacing: 12,
+    })
+
+    const field = (label: string, widget: Gtk.Widget) => {
+        const vbox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 4 })
+        vbox.append(new Gtk.Label({ label, halign: Gtk.Align.START, css_classes: ["veltrix-row-title"] }))
+        vbox.append(widget)
+        return vbox
+    }
+
+    const pwEntry  = new Gtk.PasswordEntry({ show_peek_icon: true, hexpand: true })
+    const pw2Entry = new Gtk.PasswordEntry({ show_peek_icon: true, hexpand: true })
+
+    const statusLabel = new Gtk.Label({
+        label: "", css_classes: ["veltrix-row-subtitle"], visible: false,
+        // Wrapping prose FILLS its column (design-system.md): a halign START label is
+        // allocated its NATURAL width, which for a wrapping GtkLabel is a line-balancing
+        // heuristic — so a two-line error broke at its own column, not the form's.
+        halign: Gtk.Align.FILL, hexpand: true, xalign: 0, wrap: true,
+    })
+
+    box.append(field(t("settings.users.other.pw"),  pwEntry))
+    box.append(field(t("settings.users.other.pw2"), pw2Entry))
+    box.append(statusLabel)
+
+    const handle = showVeltrixFormDialog({
+        parent: parentWin,
+        heading: `${t("settings.users.other.pw.change")} — ${user.displayName}`,
+        width: 360,
+        content: box,
+        responses: [
+            { id: "cancel", label: t("settings.users.other.cancel") },
+            { id: "apply", label: t("settings.users.other.pw.apply"), suggested: true, sensitive: false },
+        ],
+        onResponse: (id, h) => {
+            if (id === "cancel") { h.close(); return }
+            if (id === "apply") {
+                const pw = pwEntry.text
+                h.setResponseSensitive("apply", false)
+                statusLabel.visible = false
+
+                const proc = spawn(["pkexec", "chpasswd"], Gio.SubprocessFlags.STDIN_PIPE)
+                proc.communicate_utf8_async(`${user.username}:${pw}\n`, null, (_: any, res: any) => {
+                    // finish() only throws on IO errors — a non-zero exit (e.g. the
+                    // pkexec prompt was cancelled) must be read from get_successful().
+                    let ok = false
+                    try { proc.communicate_utf8_finish(res); ok = proc.get_successful() }
+                    catch (e) { console.error("[Users] chpasswd:", e) }
+                    if (ok) { h.close(); return }
+                    statusLabel.label = t("settings.users.other.err.pw")
+                    statusLabel.visible = true
+                    h.setResponseSensitive("apply", true)
+                })
+            }
+        },
+    })
+
+    const validate = () => {
+        const pw = pwEntry.text; const pw2 = pw2Entry.text
+        const isValid = pw.length > 0 && pw === pw2
+        handle.setResponseSensitive("apply", isValid)
+        if (pw2.length > 0 && pw !== pw2) {
+            statusLabel.label = t("settings.users.other.err.pwmatch"); statusLabel.visible = true
+        } else { statusLabel.visible = false }
+    }
+    pwEntry.connect("notify::text",  validate)
+    pw2Entry.connect("notify::text", validate)
+}
+
+// ── Other-user row ─────────────────────────────────────────────────────────────
+
+function buildUserRow(user: User, onRefresh: () => void): Gtk.ListBoxRow {
+    const admin = isInWheel(user.username)
+
+    const avatarImg = new Gtk.Image({ pixel_size: 36, css_classes: ["users-avatar-sm"], valign: Gtk.Align.CENTER })
+    // The glyph fallback needs .nd-icon (dark-mode invert filter) — but only the
+    // glyph: the same filter would invert a real photo.
+    const showGlyph = () => { avatarImg.gicon = uiIcon("nd-avatar-default"); avatarImg.add_css_class("nd-icon") }
+    if (user.avatarPath) { try { avatarImg.set_from_file(user.avatarPath) } catch { showGlyph() } }
+    else showGlyph()
+
+    // Always-visible label for the switch — an unlabeled toggle in the row reads
+    // as a mystery control (VM pass feedback). It also replaces the old "Admin"
+    // badge, which duplicated what the switch position already says.
+    const adminLabel = new Gtk.Label({
+        label: t("settings.users.other.admin"),
+        css_classes: ["veltrix-row-subtitle"],
+        valign: Gtk.Align.CENTER,
+    })
+
+    const adminToggle = new Gtk.Switch({ active: admin, valign: Gtk.Align.CENTER })
+    adminToggle.update_property([Gtk.AccessibleProperty.LABEL], [t("settings.users.other.admin")])   // #615
+    attachTooltip(adminToggle, t("settings.users.other.admin.tip"), { chrome: false })
+    let reverting = false
+    adminToggle.connect("state-set", (_: any, state: boolean) => {
+        // The programmatic revert below re-enters this handler; without the guard
+        // it fired the OPPOSITE pkexec prompt, and cancelling that reverted again —
+        // an endless auth-prompt loop once the user dismissed the first dialog.
+        if (reverting) return false
+        const cmd = state
+            ? ["pkexec", "usermod", "-aG", "wheel", user.username]
+            : ["pkexec", "gpasswd", "-d", user.username, "wheel"]
+        execAsync(cmd).catch(e => {
+            console.error("[Users] admin toggle:", e)
+            reverting = true
+            adminToggle.active = !state
+            reverting = false
+        })
+        return false
+    })
+
+    const pwBtn = new Gtk.Button({
+        child: new Gtk.Image({ gicon: uiIcon("nd-dialog-password"), pixel_size: 14 , css_classes: ["nd-icon"] }),
+        css_classes: ["veltrix-icon-btn"],
+        valign: Gtk.Align.CENTER,
+    })
+    attachTooltip(pwBtn, t("settings.users.other.pw.change"), { chrome: false })
+    pwBtn.connect("clicked", () => showChangePasswordDialog(user, windowOf(pwBtn)))
+
+    const deleteBtn = new Gtk.Button({
+        child: new Gtk.Image({ gicon: uiIcon("nd-user-trash"), pixel_size: 14 , css_classes: ["nd-icon"] }),
+        css_classes: ["veltrix-icon-btn"],
+        valign: Gtk.Align.CENTER,
+    })
+    attachTooltip(deleteBtn, t("settings.users.other.delete"), { chrome: false })
+    deleteBtn.connect("clicked", () => {
+        showVeltrixAlert({
+            parent: windowOf(deleteBtn),
+            heading: t("settings.users.other.delete.confirm.title"),
+            body: `${t("settings.users.other.delete.confirm.body")} "${user.displayName}" (${user.username})?`,
+            responses: [
+                { id: "cancel", label: t("settings.users.other.cancel") },
+                { id: "delete", label: t("settings.users.other.delete"), destructive: true },
+            ],
+            onResponse: (id) => {
+                if (id !== "delete") return
+                execAsync(["pkexec", "userdel", "-r", user.username])
+                    .then(onRefresh)
+                    .catch(e => console.error("[Users] userdel:", e))
+            },
+        })
+    })
+
+    // The trailing cluster keeps its own 12px spacing; only the row's outer metrics
+    // move into the component.
+    const trailing = new Gtk.Box({ spacing: 12, valign: Gtk.Align.CENTER })
+    trailing.append(adminLabel)
+    trailing.append(adminToggle)
+    trailing.append(pwBtn)
+    trailing.append(deleteBtn)
+
+    // VeltrixRow, not createRow: these are the machine's accounts, not settings.
+    // ⚠️ The title matters here more than anywhere else on this page — `displayName`
+    // is free text the user types into the field above, so it is the one row title in
+    // Settings with no upper bound at all. Hand-rolled it had no ellipsize.
+    return VeltrixRow(user.displayName, user.username, trailing, [], undefined, avatarImg)
+}
+
+// ── Page ──────────────────────────────────────────────────────────────────────
+
+export default function UsersPage() {
+    const page = pageBox("users-page")
+
+    const me = getCurrentUser()
+    const { username, displayName } = me
+    const avatarPath = me.avatarPath
+
+    // ── Your Account ─────────────────────────────────────────────────────────
+    const profileGroup = listGroup(t("settings.users.group.profile"))
+
+    // Large circular avatar: Gtk.Picture (COVER crops to fill the square, then the
+    // pill border-radius clips it to a circle) — same approach as the wallpaper
+    // preview in Appearance. A user-glyph overlay shows on the surface circle when
+    // there's no photo.
+    const AVATAR_SIZE = 112
+    const avatarPicture = new Gtk.Picture({
+        width_request: AVATAR_SIZE,
+        height_request: AVATAR_SIZE,
+        // SCALE_DOWN (not COVER) is the fix: COVER's height-for-width grows with the
+        // proposed width — the row measures the Picture at the full card width, so
+        // COVER reported a ~720px natural height and the row became that tall (the
+        // avatar then sat 96px-centered in it). SCALE_DOWN never upscales, so the
+        // natural stays the paintable's size (we pre-crop it to 96²). No growth.
+        content_fit: Gtk.ContentFit.SCALE_DOWN,
+        // can_shrink defaults TRUE, letting the Picture compress below 96 when the
+        // window gets short (instead of the page scrolling). Pin it so the avatar
+        // keeps its size and the ScrolledWindow takes over.
+        can_shrink: false,
+        halign: Gtk.Align.CENTER,
+        valign: Gtk.Align.CENTER,
+        hexpand: false,
+        vexpand: false,
+        css_classes: ["users-avatar"],
+    })
+    // Glyph placeholder when there's no photo — same circular footprint.
+    const avatarFallback = new Gtk.Image({
+        gicon: uiIcon("nd-avatar-default"),
+        pixel_size: 60,
+        width_request: AVATAR_SIZE,
+        height_request: AVATAR_SIZE,
+        halign: Gtk.Align.CENTER,
+        css_classes: ["nd-icon", "users-avatar", "users-avatar-fallback"],
+    })
+
+    // The avatar lives DIRECTLY as a ListBoxRow child, exactly like the wallpaper
+    // preview in Appearance. A Gtk.Picture wrapped in a halign:CENTER box reports a
+    // height-for-width natural that the page's clamp over-allocates (opening a big
+    // vertical gap); as the row's direct child, its width/height_request pin it.
+    const avatarRow = new Gtk.ListBoxRow({ activatable: false, selectable: false, css_classes: ["users-avatar-row"] })
+    profileGroup.listBox.append(avatarRow)
+
+    const setAvatar = (path: string | null) => {
+        if (path && GLib.file_test(path, GLib.FileTest.EXISTS)) {
+            try {
+                let pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+                // Center-crop to a square, then scale to AVATAR_SIZE so the paintable
+                // is exactly 96² (keeps SCALE_DOWN from leaving the avatar at the
+                // image's own size, and crops non-square photos into the circle).
+                const w = pixbuf.get_width(), h = pixbuf.get_height()
+                const side = Math.min(w, h)
+                if (w !== h) pixbuf = pixbuf.new_subpixbuf((w - side) >> 1, (h - side) >> 1, side, side)
+                pixbuf = pixbuf.scale_simple(AVATAR_SIZE, AVATAR_SIZE, GdkPixbuf.InterpType.BILINEAR)!
+                avatarPicture.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
+                avatarRow.set_child(avatarPicture)
+                return
+            } catch (_) { /* fall through to placeholder */ }
+        }
+        avatarRow.set_child(avatarFallback)
+    }
+    setAvatar(avatarPath)
+
+    const changeAvatarBtn = VeltrixButton({ label: t("settings.users.avatar.change"), variant: "secondary", pill: true, valign: Gtk.Align.CENTER, halign: Gtk.Align.CENTER })
+    changeAvatarBtn.connect("clicked", () => {
+        const dialog = new Gtk.FileDialog({ title: t("settings.users.avatar.pick"), modal: true })
+        const filter = new Gtk.FileFilter()
+        filter.add_mime_type("image/jpeg"); filter.add_mime_type("image/png"); filter.add_mime_type("image/webp")
+        filter.set_name(t("settings.users.avatar.filter"))
+        const filters = new Gio.ListStore({ item_type: Gtk.FileFilter.$gtype })
+        filters.append(filter)
+        dialog.set_filters(filters)
+        const win = changeAvatarBtn.get_root() as Gtk.Window
+        dialog.open(win, null, (_: any, result: any) => {
+            try {
+                const file = dialog.open_finish(result)
+                const src = file?.get_path()
+                if (!src) return
+                // Let the user frame/zoom the photo into the circle before saving.
+                showAvatarCropper(win, src, (cropped) => {
+                    saveAvatarPixbuf(cropped)
+                    setAvatar(`${GLib.get_home_dir()}/.face`)
+                })
+            } catch { /* cancelled */ }
+        })
+    })
+
+    // Change-avatar button — its own centered row, directly under the avatar row.
+    // (Kept out of a wrapping box so nothing reintroduces the Picture stretch.)
+    changeAvatarBtn.margin_top = 4
+    changeAvatarBtn.margin_bottom = 10
+    const changeRow = new Gtk.ListBoxRow({ activatable: false, selectable: false, css_classes: ["users-avatar-row"] })
+    changeRow.set_child(changeAvatarBtn)
+    profileGroup.listBox.append(changeRow)
+
+    const nameEntry = new Gtk.Entry({ text: displayName, placeholder_text: username, valign: Gtk.Align.CENTER })
+    const nameApplyBtn = VeltrixButton({ label: t("settings.users.name.apply"), variant: "primary", pill: true, valign: Gtk.Align.CENTER })
+    const applyName = () => {
+        const n = nameEntry.text.trim(); if (!n) return
+        nameApplyBtn.sensitive = false
+        setRealName(n)
+        nameApplyBtn.sensitive = true
+    }
+    nameApplyBtn.connect("clicked", applyName); nameEntry.connect("activate", applyName)
+
+    // Everything on this page is READ from /etc/passwd, /etc/group and ~/.face —
+    // no signals, no service. The page is cached and the window hides rather than
+    // closes, so all of it was answered once per shell lifetime: your own photo and
+    // full name, and (below) the whole other-users list with each account's admin
+    // flag. `getUsers()` re-reads the file on every call, so a visit is the right
+    // moment to ask again.
+    let shownName = displayName
+    onPageShown(() => {
+        const now = getCurrentUser()
+        setAvatar(now.avatarPath)
+        // ⚠️ The entry is only re-synced while it still holds what WE put there. A
+        // half-typed name the user has not applied yet is theirs, and a re-read
+        // that clobbers it would lose work just for closing the window.
+        if (nameEntry.text === shownName && now.displayName !== shownName) {
+            nameEntry.text = now.displayName
+        }
+        shownName = now.displayName
+    })
+    // Stacked, not trailing: an entry plus its Apply button is two controls, and the
+    // trailing slot holds one. Squeezed in there the entry had to be pinned to a
+    // fixed `width_chars` and the pair still read as a clump against the right edge.
+    const nameRow = fieldWithActions(nameEntry, nameApplyBtn)
+    profileGroup.listBox.append(createStackedRow(t("settings.users.name"), t("settings.users.name.desc"), nameRow))
+    profileGroup.listBox.append(createRow(
+        t("settings.users.username"), "",
+        new Gtk.Label({ label: username, css_classes: ["veltrix-row-subtitle"], valign: Gtk.Align.CENTER }),
+    ))
+    page.append(profileGroup.box)
+
+    // ── Security ──────────────────────────────────────────────────────────────
+    const secGroup = listGroup(t("settings.users.group.security"))
+    const pwBtn = VeltrixButton({ label: t("settings.users.password.change"), variant: "secondary", pill: true, valign: Gtk.Align.CENTER })
+    pwBtn.connect("clicked", () => spawnTerminalWithCommand(`passwd; read -p "${t("settings.users.password.done")}"`) )
+    secGroup.listBox.append(createRow(t("settings.users.password"), t("settings.users.password.desc"), pwBtn))
+    page.append(secGroup.box)
+
+    // ── Other Users ───────────────────────────────────────────────────────────
+    const otherGroup = listGroup(t("settings.users.group.other"))
+    const otherList  = otherGroup.listBox
+
+    const rebuildOtherUsers = () => {
+        // Rows must be removed through the ListBox (remove_all), never unparent()ed
+        // directly: that leaves the box's internal row bookkeeping stale and every
+        // later append() dies on a gtk_widget_insert_after assertion (empty list).
+        otherList.remove_all()
+
+        const others = getUsers().filter(u => u.username !== username)
+        if (others.length === 0) {
+            otherList.append(VeltrixEmptyRow(t("settings.users.other.empty")))
+        } else {
+            others.forEach(u => otherList.append(buildUserRow(u, rebuildOtherUsers)))
+        }
+
+        // Add User row — uses a flat Button so click always works regardless of SelectionMode
+        const addBtn = new Gtk.Button({
+            css_classes: ["settings-action-row"],
+            hexpand: true,
+        })
+        const addInner = new Gtk.Box({ spacing: 12, margin_start: 16, margin_end: 16, margin_top: 12, margin_bottom: 12 })
+        addInner.append(new Gtk.Image({ gicon: uiIcon("nd-contact-new"), pixel_size: 20, opacity: 0.7 , css_classes: ["nd-icon"] }))
+        addInner.append(new Gtk.Label({ label: t("settings.users.other.add"), css_classes: ["veltrix-row-title"], halign: Gtk.Align.START }))
+        addBtn.set_child(addInner)
+        addBtn.connect("clicked", () => showAddUserDialog(windowOf(addBtn), rebuildOtherUsers))
+        const addRow = new Gtk.ListBoxRow({ css_classes: ["veltrix-row", ROW_H_SINGLE] })
+        addRow.set_child(addBtn)
+        otherList.append(addRow)
+    }
+    // Same reason as the profile above: an account created or deleted anywhere else
+    // — `useradd` in a terminal, another admin's session, `veltrix-setup --user` on a
+    // fresh login — and every row's admin switch (which reads /etc/group at row
+    // build) was frozen at whatever the world looked like the first time this page
+    // was opened. Synchronous, so unlike the VPN list it needs no overlap guard.
+    onPageShown(rebuildOtherUsers)
+    page.append(otherGroup.box)
+
+    return page
+}

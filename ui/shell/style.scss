@@ -1,0 +1,20 @@
+// The kit's sheet — the base layer (#107 step 5) and the kit's components — is
+// NOT compiled in here any more (tech-debt #108 phase 2): it is `kit.css`, loaded
+// at runtime in the SAME provider, before this file (`withKitSheet()`, called by
+// core/ThemeManager.ts). So everything below still out-orders it at equal
+// specificity, as when Sass emitted it at the top of this file.
+@use 'styles/base';
+@use 'styles/reset';
+@use 'styles/components';
+@use 'styles/dock';
+@use 'styles/bar';
+@use 'styles/about';
+@use 'styles/screenshare';
+@use 'styles/control-center';
+@use 'styles/app-grid';
+@use 'styles/ipad-mode';
+@use 'styles/workspace';
+@use 'styles/settings';
+@use 'styles/prism';
+@use 'styles/agent-pointer';
+@use '../lib/rtl';

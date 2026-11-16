@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+[package]
+name = "veltrix-shell"
+description = "The Rust shell process: the dock first (#959 D1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+gio = "0.22"
+glib = "0.22"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+serde = "1"
+serde_json = "1"
+zbus = "5.19"
+png = "0.18"
+resvg = { version = "0.45", default-features = false }
+veltrix-shell-ipc = { path = "../../crates/veltrix-shell-ipc" }
+nk-a11y = { path = "../crates/nk-a11y" }
+nk-icons = { path = "../crates/nk-icons" }
+nk-render = { path = "../crates/nk-render" }
+nk-view = { path = "../crates/nk-view" }
+nk-platform = { path = "../crates/nk-platform" }
+nk-text = { path = "../crates/nk-text", features = ["system-fonts"] }
+nk-wayland = { path = "../crates/nk-wayland" }
+nk-widgets = { path = "../crates/nk-widgets" }
+unicode-segmentation = "1.12"

@@ -1,0 +1,21 @@
+{
+  "$comment": [
+    "The switch of the native toolkit (#915): taken from the current Settings, which is the spec — `switch, .veltrix-switch` in ui/lib/veltrix-kit/styles/_components.scss. Final values require owner live review.",
+    "Default applies to every dark/reduceTransparency variant; variants override whole fields like list.json. Exported once as switch in each components.json mode variant.",
+    "Not carried: the kit's inset shadow, the checked glow and the thumb's drop shadow (nk-render draws no shadows yet), and the 0.3 s colour transition."
+  ],
+  "default": {
+    "width": 44,
+    "height": 24,
+    "border": 1,
+    "borderColor": "--veltrix-border",
+    "checkedBorderColor": "rgba(0, 0, 0, 0.1)",
+    "trackColor": "--veltrix-surface",
+    "checkedColor": "--veltrix-accent",
+    "thumbColor": "--veltrix-thumb",
+    "thumbMargin": 3,
+    "disabledOpacity": 0.45,
+    "source": "min-width 44, min-height 24, border 1px var(--veltrix-border) (checked: rgba(0,0,0,0.1)), background var(--veltrix-surface) (checked: var(--veltrix-accent)); slider margin 3, 18×18, var(--veltrix-thumb), pill; :disabled opacity 0.45."
+  },
+  "variants": []
+}

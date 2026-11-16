@@ -1,0 +1,856 @@
+#!/usr/bin/env python3
+"""veltrix-update-helper — the privileged half of the background updater.
+
+Runs as root through pkexec (action org.veltrix.update.apply, allowed
+without a password for the active local session by the polkit policy in
+config/polkit/org.veltrix.update.policy) and does exactly ONE thing:
+install the release the unprivileged downloader already staged and
+verified. It never takes a URL, a path, a version or a hash from its
+caller — every fact it trusts it re-derives itself from the pinned
+GitHub API, and it fails closed on any mismatch.
+
+THREAT MODEL — what a compromised unprivileged updater can and cannot do:
+  * There is NO credential anywhere for it to steal. No sudo password is
+    saved, in any file, keyring entry or environment variable, not even
+    briefly — that is the whole point of this design. The helper runs as
+    root because polkit authorises the action, not because it knows a
+    secret.
+  * The helper's only input from the unprivileged side is the staged
+    release.json + tarball in ~/.local/share/veltrix-update/staged/. It
+    re-verifies the tarball's SHA-256 against the pinned GitHub API
+    (digest, or the .sha256 sidecar fetched by the helper itself) and
+    refuses a tarball GitHub did not publish for that exact version.
+    A compromised downloader can therefore at most make the helper
+    install a release GitHub already published — it cannot substitute
+    its own tarball, cannot point the helper at another host, cannot
+    pass a path, and cannot run an arbitrary command.
+  * The helper cannot downgrade: the staged version must be strictly
+    newer than the installed one.
+  * The helper cannot defend against the publisher being evil: a
+    malicious published release is a repo-compromise event, visible and
+    auditable in the release history. That is out of scope here — the
+    same is true of the terminal updater (bin/veltrix-update).
+  * The helper never writes the sudo password (there is none), never
+    touches a keyring, and its only network call is a read of the
+    pinned releases/latest endpoint.
+
+What it does, in order (each step fail-closed; the installed system is
+untouched until install.sh runs):
+  1. Resolve the caller from PKEXEC_UID (test-only override
+     VELTRIX_UPDATE_TEST_UID, honoured only when euid == 0).
+  2. Read + validate the staged release.json and tarball.
+  3. Re-verify the tarball against GitHub (API digest or sidecar) and
+     its size against the API asset size.
+  4. Require the staged version to be strictly newer than installed.
+  5. Pre-checks: the new tree's package list must match the pins file
+     (otherwise a system upgrade would be needed and the update goes to
+     the terminal — see below); the apps choice must be recorded
+     (otherwise install.sh would silently record "none"); a git
+     checkout is never updated by tarball; a delta needs rsync.
+  6. Consume the apply-on-login flag, so a restarted shell cannot
+     re-apply the same update in a loop.
+  7. Run the new tree's bootstrap.sh AS THE USER (--local-file + --no-
+     install): it syncs the tree into place and stops before install.sh.
+  8. Run install.sh --dev AS ROOT (SUDO_USER=<caller>, SYNC_PACMAN=no):
+     install.sh is designed to run under sudo; run_user() drops to the
+     caller for user-side work. SYNC_PACMAN=no skips the interactive
+     `pacman -Syu` in §1 — that skip is only allowed because step 5
+     proved the package list is unchanged (the pins file records it).
+     A mismatch is NOT papered over with a silent full upgrade: an
+     unattended kernel upgrade once left the running kernel with no
+     modules dir until reboot (#378's lesson).
+  9. Record .release, restart only the shell service (never the
+     machine), reload the compositor config, fire update-completed.
+
+Exit codes: 0 applied (or already up to date), 1 failed,
+2 needs-interactive (the terminal flow must take it), 3 already-running.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+REPO = "adnqcr7-code/veltrix"
+API_URL = "https://api.github.com/repos/%s/releases/latest" % REPO
+DOWNLOAD_BASE = "https://github.com/%s/releases/download" % REPO
+
+
+def _test_override(name):
+    """A test-only environment override, honoured only when NOT running
+    under pkexec (the real path sets PKEXEC_UID, and the override is
+    ignored there — the helper must never let its caller choose the
+    source it trusts). The shell never sets these; the probes do, to
+    point the helper at a local fixture server."""
+    if os.environ.get("PKEXEC_UID") is not None:
+        return None
+    return os.environ.get(name)
+
+
+def api_url():
+    return _test_override("VELTRIX_UPDATE_API_URL") or API_URL
+
+
+def download_base():
+    return _test_override("VELTRIX_UPDATE_DOWNLOAD_BASE") or DOWNLOAD_BASE
+
+VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+)*(-v[0-9]+)?$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+FILENAME_RE = re.compile(r"^veltrix-[0-9][0-9A-Za-z.\-]*\.tar\.gz$")
+TOPDIR_RE = re.compile(r"^veltrix-[0-9][0-9A-Za-z.\-]*$")
+
+UPDATE_DIR_NAME = ".local/share/veltrix-update"
+STAGED_DIR_NAME = "staged"
+STATUS_FILE_NAME = "status.json"
+RELEASE_FILE_NAME = "release.json"
+FLAG_FILE_NAME = "apply-on-login"
+LOCK_FILE_NAME = "update.lock"
+LOG_FILE_NAME = "apply.log"
+
+# The deps-list pins, recorded by install.sh at install time
+# (PACMAN_SHA_FILE in install.sh). A mismatch means the new release wants
+# different system packages, which needs the interactive `pacman -Syu`
+# in install.sh §1 — the one thing a background apply must never do.
+PINS_FILE = "/usr/share/veltrix/pins-pacman"
+SYSTEM_TREE = "/usr/share/veltrix"
+
+USER_AGENT = "veltrix-update-helper/1.0"
+REQUEST_TIMEOUT_S = 30
+
+# The deps-list sha computation, copied verbatim from install.sh
+# (§1, _pkgbuild_array + the PACMAN_DEPS assembly). Keep in step: it must
+# produce the same string install.sh compares against the pins file.
+# REPO_DIR is set to the tree being checked.
+DEPS_SHA_SNIPPET = r"""
+_pkgbuild_array() {
+    local _key="$1" _in=0 _line
+    while IFS= read -r _line; do
+        case "$_line" in
+            "$_key"=*) _in=1; _line="${_line#*=}";;
+            *) [ "$_in" = 1 ] || continue ;;
+        esac
+        _line="${_line#\(}"; _line="${_line%\)}"
+        [ -n "$_line" ] || continue
+        for _tok in $_line; do
+            _tok="${_tok%\"}"; _tok="${_tok#\"}"
+            _tok="${_tok%\'}"; _tok="${_tok#\'}"
+            _tok="${_tok%%[<>=]*}"
+            [ -n "$_tok" ] && printf '%s ' "$_tok"
+        done
+        case "$_line" in *")") break ;; esac
+    done < "$REPO_DIR/packaging/veltrix/PKGBUILD"
+}
+PACMAN_DEPS="$(_pkgbuild_array depends) $(_pkgbuild_array makedepends) base-devel glib2-devel"
+printf '%s' "$PACMAN_DEPS" | sha256sum | awk '{print $1}'
+"""
+
+
+class HelperError(Exception):
+    """A failure that maps to an exit code (1 failed, 2 needs-interactive)."""
+
+    def __init__(self, message, exit_code=1):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+class NeedsInteractive(HelperError):
+    def __init__(self, message):
+        super().__init__(message, exit_code=2)
+
+
+# ── Version comparison ────────────────────────────────────────────────────
+# Twin of veltrix_release_newer in bin/veltrix-update, isNewerVersion in
+# ui/shell/core/UpdateCheck.ts and About.tsx, and the downloader's copy.
+# Keep the four in step.
+
+def _split_version(v):
+    clean = v.strip()
+    if clean.startswith("v"):
+        clean = clean[1:]
+    m = re.match(r"^(.*?)-v([0-9]+)$", clean)
+    base = m.group(1) if m else clean
+    rel = int(m.group(2)) if m else 0
+    parts = [int(x) if x.isdigit() else 0 for x in base.split(".")]
+    return parts, rel
+
+
+def is_newer(latest, current):
+    a, a_rel = _split_version(latest)
+    b, b_rel = _split_version(current)
+    for i in range(max(len(a), len(b))):
+        x = a[i] if i < len(a) else 0
+        y = b[i] if i < len(b) else 0
+        if x != y:
+            return x > y
+    return a_rel > b_rel
+
+
+def valid_version(v):
+    return isinstance(v, str) and bool(VERSION_RE.match(v))
+
+
+# ── Caller ────────────────────────────────────────────────────────────────
+
+class Caller:
+    def __init__(self, uid, name, home):
+        self.uid = uid
+        self.name = name
+        self.home = home
+        self.gid = pwd.getpwuid(uid).pw_gid
+
+    @property
+    def runtime_dir(self):
+        return "/run/user/%d" % self.uid
+
+    @property
+    def update_dir(self):
+        return os.path.join(self.home, UPDATE_DIR_NAME)
+
+    @property
+    def staged_dir(self):
+        return os.path.join(self.update_dir, STAGED_DIR_NAME)
+
+    @property
+    def config_dir(self):
+        return os.path.join(self.home, ".config/veltrix")
+
+
+def resolve_caller():
+    """The user who invoked us through pkexec. Never $USER/$HOME: pkexec
+    runs as root, so those are root's. The test override exists only so
+    the probe can run the helper as root without a polkit session — it is
+    honoured only when euid == 0, and the uid is still validated below."""
+    raw = os.environ.get("PKEXEC_UID")
+    if raw is None and os.geteuid() == 0:
+        raw = os.environ.get("VELTRIX_UPDATE_TEST_UID")
+    if raw is None:
+        raise HelperError("no PKEXEC_UID — run through pkexec, not directly")
+    try:
+        uid = int(raw)
+    except ValueError:
+        raise HelperError("PKEXEC_UID %r is not a uid" % raw)
+    if uid == 0:
+        raise HelperError("refusing to run an update for uid 0")
+    if uid < 1000:
+        raise HelperError("refusing uid %d (system user, not a login user)" % uid)
+    try:
+        entry = pwd.getpwuid(uid)
+    except KeyError:
+        raise HelperError("uid %d has no passwd entry" % uid)
+    if not entry.pw_dir or not os.path.isdir(entry.pw_dir):
+        raise HelperError("uid %d has no home directory" % uid)
+    return Caller(uid, entry.pw_name, entry.pw_dir)
+
+
+# ── Status + log ──────────────────────────────────────────────────────────
+# status.json is the same file the downloader writes (same schema — see
+# its header). Writes are atomic and chowned to the caller, so the shell
+# (running as the caller) can always read them.
+
+def _utcnow():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def write_status(caller, state, **fields):
+    st = {"state": state, "updated_at": _utcnow()}
+    st.update(fields)
+    path = os.path.join(caller.update_dir, STATUS_FILE_NAME)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+    try:
+        os.chown(path, caller.uid, caller.gid)
+    except OSError:
+        pass
+    return st
+
+
+def read_status(caller):
+    try:
+        with open(os.path.join(caller.update_dir, STATUS_FILE_NAME),
+                  "r", encoding="utf-8") as f:
+            st = json.load(f)
+        if isinstance(st, dict) and isinstance(st.get("state"), str):
+            return st
+    except (OSError, ValueError):
+        pass
+    return {"state": "idle"}
+
+
+def log_line(caller, message):
+    path = os.path.join(caller.update_dir, LOG_FILE_NAME)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("[%s] %s\n" % (_utcnow(), message))
+    try:
+        os.chown(path, caller.uid, caller.gid)
+    except OSError:
+        pass
+
+
+# ── Staged release ────────────────────────────────────────────────────────
+
+def read_staged_release(caller):
+    path = os.path.join(caller.staged_dir, RELEASE_FILE_NAME)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rel = json.load(f)
+    except OSError:
+        raise HelperError("no staged release — run the downloader first")
+    except ValueError:
+        raise HelperError("staged release.json is not valid JSON")
+    if not isinstance(rel, dict):
+        raise HelperError("staged release.json is not an object")
+    version = rel.get("version")
+    kind = rel.get("kind")
+    filename = rel.get("filename")
+    sha = rel.get("sha256")
+    size = rel.get("size")
+    if not valid_version(version):
+        raise HelperError("staged version %r is not a version" % version)
+    if kind not in ("full", "delta"):
+        raise HelperError("staged kind %r is not full/delta" % kind)
+    if not isinstance(filename, str) or not FILENAME_RE.match(filename):
+        raise HelperError("staged filename %r is not a veltrix tarball" % filename)
+    if not isinstance(sha, str) or not SHA256_RE.match(sha):
+        raise HelperError("staged sha256 is not a sha256 hex digest")
+    if not isinstance(size, int) or size <= 0:
+        raise HelperError("staged size %r is not a positive byte count" % size)
+    tarball = os.path.join(caller.staged_dir, filename)
+    if not os.path.isfile(tarball):
+        raise HelperError("staged tarball %s is missing" % filename)
+    if os.path.getsize(tarball) != size:
+        raise HelperError("staged tarball is %d bytes, release.json says %d"
+                          % (os.path.getsize(tarball), size))
+    return {"version": version, "kind": kind, "filename": filename,
+            "sha256": sha, "size": size, "path": tarball}
+
+
+# ── GitHub verification (the helper's own, never the caller's word) ──────
+
+def _get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
+                                              "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise HelperError("GitHub API: HTTP %d" % e.code)
+    except urllib.error.URLError as e:
+        raise HelperError("cannot reach GitHub (%s) — offline?" % e.reason)
+    except (ValueError, TimeoutError, OSError) as e:
+        raise HelperError("GitHub API failed: %s" % e)
+
+
+def _get_text(url):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as r:
+            return r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise HelperError("sidecar %s: HTTP %d" % (url, e.code))
+    except urllib.error.URLError as e:
+        raise HelperError("cannot fetch sidecar (%s)" % e.reason)
+    except (TimeoutError, OSError) as e:
+        raise HelperError("sidecar fetch failed: %s" % e)
+
+
+def verify_against_github(staged):
+    """The tarball's SHA-256 and size must match the pinned API's asset
+    for that exact filename. The API digest is primary; the .sha256
+    sidecar (fetched by the helper, from the release page) is the
+    fallback. Any mismatch is a hard refusal."""
+    rel = _get_json(api_url())
+    if not isinstance(rel, dict) or not rel.get("tag_name"):
+        raise HelperError("GitHub releases/latest returned no tag_name")
+    tag = rel["tag_name"]
+    version = tag[1:] if tag.startswith("v") else tag
+    if version != staged["version"]:
+        raise HelperError("GitHub's latest is %s, staged is %s — refusing"
+                          % (version, staged["version"]))
+    assets = rel.get("assets") or []
+    asset = None
+    for a in assets:
+        if isinstance(a, dict) and a.get("name") == staged["filename"]:
+            asset = a
+            break
+    if asset is None:
+        raise HelperError("GitHub release %s has no asset %s"
+                          % (tag, staged["filename"]))
+    size = asset.get("size")
+    if isinstance(size, int) and size != staged["size"]:
+        raise HelperError("GitHub says %s is %d bytes, staged file is %d"
+                          % (staged["filename"], size, staged["size"]))
+    digest = (asset.get("digest") or "")
+    published = digest[7:] if digest.startswith("sha256:") else None
+    if published is None or not SHA256_RE.match(published):
+        url = "%s/%s/%s.sha256" % (download_base(), tag, staged["filename"])
+        text = _get_text(url)
+        first = text.strip().split()[0] if text.strip() else ""
+        if not SHA256_RE.match(first):
+            raise HelperError("no published hash for %s (no API digest, "
+                              "no valid sidecar)" % staged["filename"])
+        published = first
+    sha = hashlib.sha256()
+    with open(staged["path"], "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            sha.update(chunk)
+    if sha.hexdigest() != published:
+        raise HelperError("SHA-256 MISMATCH for %s — staged %s, published %s"
+                          % (staged["filename"], sha.hexdigest(), published))
+    if sha.hexdigest() != staged["sha256"]:
+        raise HelperError("staged sha256 in release.json does not match the "
+                          "tarball — the staging dir was tampered with")
+    return tag
+
+
+# ── Installed version + registered tree ───────────────────────────────────
+
+def installed_version(caller):
+    marker = os.path.join(caller.config_dir, ".release")
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+        if valid_version(v):
+            return v
+    except OSError:
+        pass
+    tree = registered_tree(caller, allow_missing=True)
+    if tree:
+        try:
+            with open(os.path.join(tree, "VERSION"), "r", encoding="utf-8") as f:
+                v = f.read().strip()
+            if valid_version(v):
+                return v
+        except OSError:
+            pass
+    raise HelperError("cannot determine the installed version "
+                      "(no .release marker and no readable tree)")
+
+
+def registered_tree(caller, allow_missing=False):
+    """The tree install.sh --dev registered in .dev — or the system tree
+    /usr/share/veltrix for a release install with no .dev marker. A git
+    checkout is a dev install and is never updated by tarball."""
+    marker = os.path.join(caller.config_dir, ".dev")
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            cand = f.read().strip()
+    except OSError:
+        cand = ""
+    if cand:
+        if os.path.isdir(os.path.join(cand, ".git")):
+            raise HelperError("registered tree %s is a git checkout — "
+                              "a dev install updates through install.sh "
+                              "--update, never through a tarball" % cand)
+        if os.path.isdir(cand) and os.path.isfile(os.path.join(cand, "install.sh")):
+            return cand
+        # A .dev marker pointing at a deleted dir is stale, not fatal:
+        # bootstrap treats it the same way (fresh-install path).
+    if os.path.isfile(os.path.join(SYSTEM_TREE, "VERSION")):
+        return SYSTEM_TREE
+    if allow_missing:
+        return None
+    raise HelperError("no registered tree and no system tree — "
+                      "nothing to update")
+
+
+# ── Deps pre-check ────────────────────────────────────────────────────────
+
+def deps_sha_of_tree(tree):
+    """The deps-list sha install.sh compares against the pins file,
+    computed from this tree's PKGBUILD (the snippet is install.sh's own)."""
+    pkgbuild = os.path.join(tree, "packaging/veltrix/PKGBUILD")
+    if not os.path.isfile(pkgbuild):
+        raise HelperError("tree %s has no packaging/veltrix/PKGBUILD" % tree)
+    env = dict(os.environ)
+    env["REPO_DIR"] = tree
+    proc = subprocess.run(["bash", "-c", DEPS_SHA_SNIPPET],
+                          stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, env=env, timeout=60)
+    out = proc.stdout.strip()
+    if proc.returncode != 0 or not SHA256_RE.match(out):
+        raise HelperError("could not compute the deps sha for %s: %s"
+                          % (tree, proc.stderr.strip()[:200]))
+    return out
+
+
+def check_deps(caller, staged, extract_dir):
+    """The new release's package list must match the pins file recorded
+    at install time. If it does not, install.sh §1's interactive
+    `pacman -Syu` would be needed — and a background apply must never
+    run that (see the module docstring). Route to the terminal instead.
+    For a delta, the PKGBUILD is in the delta only when it changed;
+    otherwise it is byte-identical to the registered tree's, so the
+    registered tree's PKGBUILD is the right source."""
+    if staged["kind"] == "full":
+        top = os.path.join(extract_dir, "veltrix-%s" % staged["version"])
+        tree = top
+    else:
+        delta_top = os.path.join(extract_dir, "veltrix-%s" % staged["version"])
+        delta_pkgbuild = os.path.join(delta_top, "packaging/veltrix/PKGBUILD")
+        if os.path.isfile(delta_pkgbuild):
+            tree = delta_top
+        else:
+            tree = registered_tree(caller)
+    new_sha = deps_sha_of_tree(tree)
+    try:
+        with open(PINS_FILE, "r", encoding="utf-8") as f:
+            pinned = f.read().strip()
+    except OSError:
+        raise NeedsInteractive(
+            "no deps pins file (%s) — the first background update needs "
+            "the terminal flow, which records it" % PINS_FILE)
+    if new_sha != pinned:
+        raise NeedsInteractive(
+            "this update changes the system packages (deps list differs "
+            "from the installed pins) — run it in a terminal to review "
+            "the upgrade")
+
+
+def check_apps_choice():
+    """install.sh records the user's extra-apps choice in
+    /etc/veltrix/apps.json. If it is missing, install.sh would silently
+    record "none" on a non-interactive run and the user would never be
+    asked again — so a background apply refuses and the terminal flow
+    (which asks) takes it."""
+    path = "/etc/veltrix/apps.json"
+    if not os.path.isfile(path):
+        raise NeedsInteractive(
+            "no recorded apps choice (/etc/veltrix/apps.json) — run the "
+            "update in a terminal once so the apps question is asked")
+
+
+# ── Tarball layout validation ─────────────────────────────────────────────
+
+def extract_staged(caller, staged, extract_dir):
+    """Extract the staged tarball to a scratch dir (as root — the helper
+    only READS it here; bootstrap re-extracts it as the user). Validate
+    the layout: exactly one veltrix-<version> top dir; a full tarball
+    must carry install.sh + VERSION; a delta must carry MANIFEST +
+    DELETED at its root. Returns the top dir path."""
+    os.makedirs(extract_dir, exist_ok=True)
+    try:
+        with tarfile.open(staged["path"], "r:gz") as tf:
+            members = tf.getmembers()
+            topdirs = {m.name.split("/")[0] for m in members if "/" in m.name}
+            if len(topdirs) != 1:
+                raise HelperError("tarball has %d top-level dirs, expected one"
+                                  % len(topdirs))
+            top = next(iter(topdirs))
+            if not TOPDIR_RE.match(top) or top != "veltrix-%s" % staged["version"]:
+                raise HelperError("tarball top dir %r is not veltrix-%s"
+                                  % (top, staged["version"]))
+            tf.extractall(extract_dir)
+    except tarfile.TarError as e:
+        raise HelperError("staged tarball is not a valid tar.gz: %s" % e)
+    topdir = os.path.join(extract_dir, "veltrix-%s" % staged["version"])
+    if staged["kind"] == "full":
+        if not (os.path.isfile(os.path.join(topdir, "install.sh"))
+                and os.path.isfile(os.path.join(topdir, "VERSION"))):
+            raise HelperError("full tarball %s has no install.sh/VERSION"
+                              % staged["filename"])
+    else:
+        if not (os.path.isfile(os.path.join(extract_dir, "MANIFEST"))
+                and os.path.isfile(os.path.join(extract_dir, "DELETED"))):
+            raise HelperError("delta tarball %s has no MANIFEST/DELETED"
+                              % staged["filename"])
+        if not shutil.which("rsync"):
+            raise HelperError("a delta needs rsync to apply, and rsync is "
+                              "not installed")
+    return topdir
+
+
+# ── Running things ────────────────────────────────────────────────────────
+
+def _run(caller, argv, env_extra, stdin_devnull=True):
+    """Run a command, streaming stdout+stderr to apply.log. Returns the
+    exit code. stdin is /dev/null so an unexpected prompt fails fast
+    instead of hanging the background update."""
+    log_path = os.path.join(caller.update_dir, LOG_FILE_NAME)
+    env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           "HOME": caller.home, "USER": caller.name, "LOGNAME": caller.name,
+           "XDG_RUNTIME_DIR": caller.runtime_dir,
+           "DBUS_SESSION_BUS_ADDRESS": "unix:path=%s/bus" % caller.runtime_dir}
+    env.update(env_extra or {})
+    with open(log_path, "a", encoding="utf-8") as logf:
+        logf.write("[%s] $ %s\n" % (_utcnow(), " ".join(argv)))
+        logf.flush()
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL if stdin_devnull else None,
+            stdout=logf, stderr=subprocess.STDOUT, env=env,
+            # Never inherit pkexec's CWD: tools like find(1) restore the
+            # initial working directory when they finish, and a CWD the
+            # caller cannot traverse makes them fail for no reason.
+            cwd=caller.home)
+        rc = proc.wait()
+    try:
+        os.chown(log_path, caller.uid, caller.gid)
+    except OSError:
+        pass
+    return rc
+
+
+def _run_as_user(caller, argv, env_extra=None):
+    return _run(caller, ["runuser", "-u", caller.name, "--"] + argv,
+                env_extra)
+
+
+def _run_as_user_quiet(caller, argv, env_extra=None):
+    """Best-effort user-side command (shell restart, WM reload, hook):
+    failures are logged, never fatal."""
+    env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           "HOME": caller.home, "USER": caller.name, "LOGNAME": caller.name,
+           "XDG_RUNTIME_DIR": caller.runtime_dir,
+           "DBUS_SESSION_BUS_ADDRESS": "unix:path=%s/bus" % caller.runtime_dir}
+    env.update(env_extra or {})
+    try:
+        proc = subprocess.run(
+            ["runuser", "-u", caller.name, "--"] + argv,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            env=env, timeout=120, cwd=caller.home)
+        return proc.returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log_line(caller, "best-effort command failed: %s (%s)" % (" ".join(argv), e))
+        return 1
+
+
+def _systemctl_user_is_active(caller, unit):
+    return _run_as_user_quiet(
+        caller, ["systemctl", "--user", "is-active", "--quiet", unit]) == 0
+
+
+def restart_shell(caller, old_version, new_version):
+    """Restart ONLY the shell service — never the machine. Hyalo's Rust
+    shell first (the current target), then the TS shell service. Open
+    apps are separate processes and survive; the bar/dock flicker and
+    come back. Best-effort: if neither service is active (headless
+    machine, or the shell was never started), there is nothing to
+    restart and the update still counts as applied — the next login
+    picks it up."""
+    restarted = None
+    for unit in ("veltrix-rust-shell.service", "veltrix.service"):
+        if _systemctl_user_is_active(caller, unit):
+            rc = _run_as_user_quiet(
+                caller, ["systemctl", "--user", "restart", unit])
+            if rc == 0:
+                restarted = unit
+            else:
+                log_line(caller, "restart of %s failed (exit %d)" % (unit, rc))
+            break
+    if restarted:
+        log_line(caller, "restarted %s" % restarted)
+    else:
+        log_line(caller, "no shell service active — nothing to restart")
+    # WM reload: Hyalo polls its files (no reload needed); Hyprland
+    # needs one. veltrix-wm knows which; best-effort either way.
+    rc = _run_as_user_quiet(caller, ["veltrix-wm", "reload"])
+    if rc != 0:
+        log_line(caller, "veltrix-wm reload exited %d (best-effort)" % rc)
+    # Tell the user's own scripts the update landed.
+    rc = _run_as_user_quiet(
+        caller, ["veltrix-hook", "update-completed", old_version, new_version])
+    if rc != 0:
+        log_line(caller, "update-completed hook exited %d (best-effort)" % rc)
+
+
+# ── Apply ─────────────────────────────────────────────────────────────────
+
+def cmd_apply():
+    caller = resolve_caller()
+    os.makedirs(caller.update_dir, exist_ok=True)
+    lock_path = os.path.join(caller.update_dir, LOCK_FILE_NAME)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        print("an update is already running", file=sys.stderr)
+        return 3
+    try:
+        return _apply_locked(caller)
+    finally:
+        os.close(fd)
+
+
+def _apply_locked(caller):
+    staged = None
+    current = None
+    try:
+        staged = read_staged_release(caller)
+        current = installed_version(caller)
+        write_status(caller, "applying", current=current, latest=staged["version"],
+                     kind=staged["kind"], filename=staged["filename"],
+                     sha256=staged["sha256"], size=staged["size"])
+        log_line(caller, "apply started: %s -> %s (%s)"
+                 % (current, staged["version"], staged["kind"]))
+        _apply(caller, staged, current)
+    except NeedsInteractive as e:
+        fields = {}
+        if current is not None:
+            fields["current"] = current
+        if staged is not None:
+            fields.update(latest=staged["version"], kind=staged["kind"],
+                          filename=staged["filename"])
+        write_status(caller, "needs-interactive", reason=str(e), **fields)
+        log_line(caller, "needs-interactive: %s" % e)
+        print("needs-interactive: %s" % e, file=sys.stderr)
+        return 2
+    except HelperError as e:
+        fields = {}
+        if current is not None:
+            fields["current"] = current
+        if staged is not None:
+            fields.update(latest=staged["version"], kind=staged["kind"],
+                          filename=staged["filename"])
+        write_status(caller, "failed", reason=str(e), **fields)
+        log_line(caller, "failed: %s" % e)
+        print("failed: %s" % e, file=sys.stderr)
+        return 1
+    except Exception:
+        # An unexpected failure (a bug, a missing tool) must still land
+        # in status.json + apply.log as a clean failure, never as a bare
+        # traceback the shell cannot read.
+        import traceback
+        fields = {}
+        if current is not None:
+            fields["current"] = current
+        if staged is not None:
+            fields.update(latest=staged["version"], kind=staged["kind"],
+                          filename=staged["filename"])
+        log_line(caller, "unexpected failure:\n%s" % traceback.format_exc())
+        write_status(caller, "failed",
+                     reason="unexpected helper failure — see apply.log",
+                     **fields)
+        print("failed: unexpected helper failure — see apply.log",
+              file=sys.stderr)
+        return 1
+    write_status(caller, "applied", current=current, latest=staged["version"],
+                 kind=staged["kind"], filename=staged["filename"])
+    log_line(caller, "apply complete: %s -> %s" % (current, staged["version"]))
+    print("applied %s" % staged["version"])
+    return 0
+
+
+def _apply(caller, staged, current):
+    # 1. The tarball must be GitHub's, not the caller's word for it.
+    tag = verify_against_github(staged)
+    log_line(caller, "verified %s against GitHub release %s"
+             % (staged["filename"], tag))
+    # 2. No downgrades, no reinstalls of the same version.
+    if not is_newer(staged["version"], current):
+        raise HelperError("staged %s is not newer than installed %s"
+                          % (staged["version"], current))
+    # 3. Pre-checks that decide terminal-vs-background (before anything
+    #    is touched).
+    check_apps_choice()
+    tree = registered_tree(caller)
+    log_line(caller, "registered tree: %s" % tree)
+    # 4. Validate the staged tarball's layout (and, for a delta, that
+    #    rsync is here to apply it).
+    extract_dir = os.path.join(caller.update_dir, "extract")
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    try:
+        topdir = extract_staged(caller, staged, extract_dir)
+        check_deps(caller, staged, extract_dir)
+    except Exception:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise
+    # 5. Consume the apply-on-login flag NOW, before install.sh runs:
+    #    the restarted shell will see the flag otherwise and re-apply
+    #    the same update in a loop.
+    flag = os.path.join(caller.update_dir, FLAG_FILE_NAME)
+    try:
+        os.remove(flag)
+    except OSError:
+        pass
+    # 6. Bootstrap as the user: sync the tree into place, stop before
+    #    install.sh. bootstrap.sh refuses root, so this runs via runuser.
+    bootstrap = os.path.join(topdir, "bootstrap.sh")
+    if not os.path.isfile(bootstrap):
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise HelperError("staged tree has no bootstrap.sh")
+    argv = ["bash", bootstrap, "--local-file", staged["path"], staged["sha256"],
+            "--no-install"]
+    if staged["kind"] == "delta":
+        argv += ["--delta", staged["path"], staged["sha256"],
+                 "--full-name", "veltrix-%s.tar.gz" % staged["version"]]
+    rc = _run_as_user(caller, argv)
+    if rc != 0:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise HelperError("bootstrap --no-install failed (exit %d) — "
+                          "see %s" % (rc, os.path.join(caller.update_dir, LOG_FILE_NAME)))
+    # 7. Where bootstrap put the tree: the registered tree when one
+    #    existed (it syncs into it), else the fresh-install path.
+    work_dir = os.path.join(caller.home, "Downloads/veltrix-install")
+    src_dir = tree if os.path.isdir(tree) else os.path.join(
+        work_dir, "veltrix-%s" % staged["version"])
+    if not os.path.isfile(os.path.join(src_dir, "install.sh")):
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise HelperError("bootstrap placed no tree at %s" % src_dir)
+    log_line(caller, "tree ready at %s" % src_dir)
+    # 8. install.sh as root. SYNC_PACMAN=no skips the interactive
+    #    `pacman -Syu` — allowed only because step 3 proved the package
+    #    list is unchanged. SUDO_USER tells install.sh who the real user
+    #    is (it would otherwise think root is the user).
+    env_extra = {"SUDO_USER": caller.name, "SYNC_PACMAN": "no"}
+    rc = _run(caller, ["bash", os.path.join(src_dir, "install.sh"), "--dev"],
+              env_extra)
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    if rc != 0:
+        raise HelperError("install.sh --dev failed (exit %d) — see %s"
+                          % (rc, os.path.join(caller.update_dir, LOG_FILE_NAME)))
+    # 9. Record the release (install.sh --dev cleared .release; this is
+    #    the same write bootstrap.sh does at the end of a normal release
+    #    install — only on a PASS).
+    os.makedirs(caller.config_dir, exist_ok=True)
+    marker = os.path.join(caller.config_dir, ".release")
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write("%s\n" % staged["version"])
+    try:
+        os.chown(marker, caller.uid, caller.gid)
+    except OSError:
+        pass
+    # 10. Restart only the shell. Never the machine.
+    restart_shell(caller, current, staged["version"])
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="veltrix-update-helper",
+        description="Privileged apply side of the VELTRIX background updater.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("apply", help="install the staged, verified release")
+    args = parser.parse_args(argv)
+    if args.command == "apply":
+        if os.geteuid() != 0:
+            print("veltrix-update-helper must run as root (via pkexec)",
+                  file=sys.stderr)
+            return 1
+        try:
+            return cmd_apply()
+        except HelperError as e:
+            # resolve_caller() failed before any status could be written
+            # (no caller, so no home to write it in).
+            print("error: %s" % e, file=sys.stderr)
+            return e.exit_code
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

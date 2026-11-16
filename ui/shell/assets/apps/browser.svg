@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" version="1.1">
+  <!-- Browser — TEMPORARY neutral glyph (fix pass #1, Nov 13 2026, Adnan's
+       decision). Replaces the Papirus Firefox fox (animal in an icon).
+       A plain browser window with a globe; no animal, no brand mark.
+       TEMPORARY: Adnan is building his own browser with other agents and
+       will replace this icon with his browser's own mark when it lands.
+       Recorded as temporary in ATTRIBUTION.md — do not treat as final. -->
+  <rect x="4" y="7" width="56" height="50" rx="9" fill="#232936" stroke="#4a5468" stroke-width="1.5"/>
+  <rect x="4" y="7" width="56" height="13" rx="9" fill="#2e3648"/>
+  <rect x="4" y="15" width="56" height="5" fill="#2e3648"/>
+  <circle cx="12" cy="13.5" r="2.2" fill="#ff5f57"/>
+  <circle cx="20" cy="13.5" r="2.2" fill="#febc2e"/>
+  <circle cx="28" cy="13.5" r="2.2" fill="#28c840"/>
+  <g fill="none" stroke="#00e5ff" stroke-width="2">
+    <circle cx="32" cy="38" r="13"/>
+    <ellipse cx="32" cy="38" rx="6" ry="13"/>
+    <path d="M19 38h26"/>
+    <path d="M21.5 31.5h21M21.5 44.5h21"/>
+  </g>
+</svg>

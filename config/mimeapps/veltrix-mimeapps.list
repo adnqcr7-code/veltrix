@@ -1,0 +1,14 @@
+# Veltrix's default apps, read only in the Veltrix session (XDG_CURRENT_DESKTOP=Veltrix),
+# from /usr/share/applications/ (mime-apps spec, desktop-specific defaults).
+#
+# A SYSTEM default: the person's own ~/.config/mimeapps.list, which Settings → Default
+# Apps writes, always wins. Without it, the folder handler was whichever installed app
+# claimed inode/directory first: Amberol (a music player) on a machine that has it,
+# measured 2026-10-31 — so the dock's Files item and the Trash opened Amberol.
+#
+# ⚠️ The prefix is XDG_CURRENT_DESKTOP lowercased: "veltrix-", not "Veltrix-" (spec;
+# GIO and xdg-mime both read this name, measured).
+#
+# Nautilus until Veltrix has a file manager of its own; it is a dependency of the package.
+[Default Applications]
+inode/directory=org.gnome.Nautilus.desktop

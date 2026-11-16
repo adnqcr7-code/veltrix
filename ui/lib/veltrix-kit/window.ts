@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+import Gtk from "gi://Gtk?version=4.0"
+import Gio from "gi://Gio"
+import { VeltrixAppWindow, type VeltrixCloseMode } from "./app-window"
+import { VeltrixScrolled } from "./scrolled"
+import { VeltrixSplitView, type VeltrixSplitViewResult } from "./split-view"
+import { RADIUS, WINDOW_LAYOUT, collapseAtFor, minWindowWidthFor } from "./platform/tokens"
+import { attachWindowControls, controlsSlotWidget, normalWindowControls, readControlsSide, type WindowButton } from "./platform/window-controls"
+
+/**
+ * Chrome radii, named for what they dress: the window is `glass(floating)` =
+ * `RADIUS.lg`, the sidebar capsule is `material-card` = `RADIUS.md`. The numbers
+ * themselves live in `lib/veltrix-kit/platform/tokens.ts` (mirrored by `--veltrix-radius-*`), which is
+ * where the ladder is documented — these are aliases, not a second source.
+ */
+export const VELTRIX_WINDOW_RADIUS = RADIUS.lg
+export const VELTRIX_CARD_RADIUS = RADIUS.md
+
+/**
+ * The sidebar, and everything that only means anything WITH one.
+ *
+ * Grouped rather than flattened so the signature stays honest: a window without a
+ * sidebar has no sidebar options to ignore, and adding one later is filling in
+ * this object rather than migrating to a different component.
+ */
+export interface VeltrixWindowSidebar {
+    /** The navigation widget — e.g. `VeltrixSidebar(...).widget`, or a wizard's step list. */
+    widget: Gtk.Widget
+    /** Icon for the toggle button (passed in so the kit stays free of the app's icon set). */
+    toggleIcon: Gio.FileIcon
+    /**
+     * The toggle's accessible NAME, already translated — REQUIRED, not optional.
+     *
+     * An icon button announces itself as "button" and nothing else without one,
+     * and this particular one hides the navigation. It is required rather than
+     * defaulted because a default would be a string the kit had to hold, in one
+     * language, for a control every window shows (#454).
+     */
+    toggleLabel: string
+    /** Pinned at the top of the sidebar capsule, above the list (e.g. a search box). */
+    top?: Gtk.Widget
+    width?: number
+    /**
+     * The content pane's CONSTANT width (see WINDOW_LAYOUT). It is not a hint: it
+     * sets the sidebar's breakpoint and the width the window opens at, and the
+     * caller is expected to clamp its pages to the same number.
+     */
+    contentWidth?: number
+}
+
+export interface VeltrixWindowHeaderSlots {
+    /**
+     * The leading row. An ARRAY because a header start is a row of things — a nav
+     * capsule and a breadcrumb sit in ONE spacing-8 box, and wrapping them in a
+     * second one would double the gap. With a sidebar, the toggle button is
+     * prepended to whatever is here.
+     */
+    start?: Gtk.Widget | Gtk.Widget[]
+    center?: Gtk.Widget
+    /**
+     * No longer rendered. It used to be the window's own close button (a
+     * `VeltrixCircleButton`), the fallback where the compositor drew no controls —
+     * since the normal-buttons fallback the window's own buttons are the row
+     * `normalWindowControls` builds (close, minimize, maximize), on the side the
+     * user's `button-layout` says, and a second close at the other end would read
+     * as a bug beside it. Kept so existing callers keep compiling; do not put
+     * anything here expecting it to show.
+     */
+    end?: Gtk.Widget
+    cssClasses?: string[]
+}
+
+export interface VeltrixWindowOpts {
+    app: any
+    title: string
+    /** The main content (the caller swaps its children). */
+    content: Gtk.Widget
+    /**
+     * Give it a sidebar, or do not. **This is an option, not a different kind of
+     * window** — see the note on `VeltrixWindow` below.
+     */
+    sidebar?: VeltrixWindowSidebar
+    header?: VeltrixWindowHeaderSlots
+    /** Pinned below everything — a wizard's Back/Continue row. Spans the card,
+     *  under the sidebar and the content alike. */
+    footer?: Gtk.Widget
+
+    /** Hide or destroy on close. Default `"destroy"`; Settings wants `"hide"`. */
+    closeMode?: VeltrixCloseMode
+    /** Return `true` to REFUSE the close. See VeltrixAppWindow. */
+    onClose?: () => boolean | void
+    closeOnEscape?: boolean
+    resizable?: boolean
+
+    /** Only a floor for the OPENING size — with a sidebar, the window still opens
+     *  at least wide enough to dock it. The window's MINIMUM is the distress width. */
+    defaultWidth?: number
+    defaultHeight?: number
+    /** Overrides the distress floor. Rarely wanted with a sidebar. */
+    minWidth?: number
+    minHeight?: number
+
+    cssClasses?: string[]
+    /** Extra classes beside `veltrix-window-glass` on the card. */
+    glassClasses?: string[]
+    /** Gtk.Window name (for #id CSS / Hyprland matching). */
+    name?: string
+    /**
+     * The Wayland app-id this window declares for ITSELF, instead of inheriting
+     * the process-wide one. A real application window is one the compositor should
+     * file as one — see `ui/lib/veltrix-kit/platform/app-id.ts`.
+     */
+    appId?: string
+    // No tooltip opt for the toggle ON PURPOSE — native GTK tooltips are
+    // unthemeable. Attach the glass tooltip to the returned `sidebarToggle`.
+}
+
+export interface VeltrixWindowResult {
+    window: Gtk.Window
+    /** The glass card. */
+    glass: Gtk.Box
+    /** Show, or hide if already visible. */
+    toggle: () => void
+    /** Run the close policy — what a close button should call. */
+    close: () => void
+    /** Only when a `sidebar` was given. */
+    splitView?: VeltrixSplitViewResult
+    /** Only when a `sidebar` was given. */
+    sidebarToggle?: Gtk.Button
+    /**
+     * The header + content column, exposed for ONE purpose: measuring it.
+     *
+     * ⚠️ A window that wants to open at the height its content asks for cannot get
+     * that from the window. `VeltrixSplitView` hangs this column off a zero-minimum
+     * Overlay so that the pane's minimum WIDTH never reaches the window (see
+     * `clamp.ts`), and GTK4's Overlay measures only its base child — so the column
+     * is invisible to `win.measure()` in BOTH directions, height included. Ask the
+     * column, add `glass.measure()` for the footer and the card's own padding, and
+     * that sum is the window's honest natural height. The installer does exactly
+     * that; see WIZARD_LAYOUT.
+     *
+     * Only when a `sidebar` was given.
+     */
+    contentColumn?: Gtk.Widget
+}
+
+/**
+ * VeltrixWindow — the ONE window in this desktop, sidebar optional.
+ *
+ * Undecorated glass card, a draggable header, one close path, its own app-id;
+ * and, if you pass a `sidebar`, a full-height capsule beside the content with the
+ * split view and the breakpoint that docks it.
+ *
+ * ⚠️ **The sidebar is an OPTION, not a second component, and that was learned the
+ * hard way (2026-08-26).** For one afternoon there were two exported names — a
+ * base and a sidebar version — and the split looked principled because the two
+ * layouts really are different (with a sidebar the header sits over the CONTENT,
+ * beside a full-height capsule; without one it crosses the whole card). But
+ * "does this app have a sidebar" is a per-app choice, not a per-class one —
+ * Finder and System Settings differ on it, and the installer will want a step
+ * list the day it stops being a two-button wizard. With two names, adding a
+ * sidebar meant migrating a window to a different component; with one, it is
+ * filling in an object. The base still exists — `app-window.ts`, which builds the
+ * toplevel, the glass and the close policy — but it is INTERNAL. There is one
+ * name to choose.
+ *
+ * The header placement is DERIVED, not an option: a sidebar means the header goes
+ * over the content pane, because a full-height capsule is what that layout is. If
+ * a real case ever wants Finder's spanning toolbar with a sidebar, add the axis
+ * then — a parameter nobody uses today is a third way for two windows to drift.
+ */
+export function VeltrixWindow(opts: VeltrixWindowOpts): VeltrixWindowResult {
+    const {
+        app, title, content, sidebar, header, footer,
+        closeMode, onClose, closeOnEscape, resizable,
+        defaultWidth, defaultHeight, minWidth, minHeight,
+        cssClasses = [], glassClasses = [], name, appId,
+    } = opts
+
+    const headerStartWidgets = (): Gtk.Widget[] => {
+        const st = header?.start
+        return st ? (Array.isArray(st) ? st : [st]) : []
+    }
+
+    // ── The window controls (#708 point 5) ───────────────────────────────────
+    // On a compositor that draws them (Hyalo) the header leaves them room: on the right, the
+    // header's end, where the window's own close button is otherwise; on the left, its start
+    // — or, with a sidebar shown docked, the sidebar's top. The caller's `end` (the close
+    // button) is the FALLBACK, shown where the compositor draws none. platform/window-controls.ts.
+    //
+    // The fallback is the window's own NORMAL buttons (`normalWindowControls`: close,
+    // minimize, maximize — plain icon buttons, no colours, no circles), on the side the
+    // user's `button-layout` says: a row at the header's start AND one at its end, and
+    // only the one on the user's side shows (the `when` on each fallback, re-read when
+    // the key changes). The header's end row still holds the RIGHT slot, for a compositor
+    // whose controls go on the right.
+    const leftSlot = controlsSlotWidget()
+    // Leading the header, 12 from the window's left edge as from its top
+    // (`.veltrix-window-header`, #921): the header's 8 and the tools row's 4 make it. A widget margin,
+    // not a CSS one — a CSS margin is taken out of the size the slot requests, and the capsule
+    // the compositor draws in it ran 6 px into the toggle beside it (measured, 2026-10-04).
+    leftSlot.margin_start = 12 - 8 - 4
+    const rightSlot = controlsSlotWidget()
+    // The header's end row, captured so the fallback buttons can be appended to it once
+    // the window exists — the fallback needs the window for its wiring, and the row is
+    // built before it (the row is built inside `VeltrixAppWindow`'s header config).
+    let headerEndRow: Gtk.Box | null = null
+    const headerEnd = (): Gtk.Widget => {
+        const row = new Gtk.Box({ valign: Gtk.Align.CENTER, halign: Gtk.Align.END })
+        row.append(rightSlot)
+        headerEndRow = row
+        return row
+    }
+    // The fallback's buttons: no maximize on a window that cannot resize.
+    const fallbackButtons: WindowButton[] = resizable === false
+        ? ["close", "minimize"]
+        : ["close", "minimize", "maximize"]
+
+    // ── No sidebar: the header crosses the card, and the base is the whole thing ──
+    if (!sidebar) {
+        const start = header ? [leftSlot, ...headerStartWidgets()] : []
+        let startWidget: Gtk.Box | undefined
+        if (start.length > 0) {
+            const row = new Gtk.Box({ spacing: 8, valign: Gtk.Align.CENTER, css_classes: ["veltrix-window-tools"] })
+            for (const w of start) row.append(w)
+            startWidget = row
+        }
+        const base = VeltrixAppWindow({
+            app, title, content, footer,
+            header: header && {
+                start: startWidget, center: header.center, end: headerEnd(),
+                cssClasses: header.cssClasses,
+            },
+            closeMode, onClose, closeOnEscape, resizable,
+            defaultWidth, defaultHeight, minWidth, minHeight,
+            cssClasses, glassClasses, name, appId,
+        })
+        if (header) {
+            // The normal buttons, on the side the user chose: a row at the header's
+            // start and one at its end, and only the one on the user's side shows —
+            // the fallback where the compositor draws no controls (Hyprland), hidden
+            // where it draws its own (Hyalo). Their initial visibility is set here;
+            // `refresh` (on a `button-layout` change) re-reads the side after that.
+            const buttonsStart = normalWindowControls(base.window, fallbackButtons)
+            startWidget?.prepend(buttonsStart)
+            buttonsStart.visible = readControlsSide() === "left"
+            const buttonsEnd = normalWindowControls(base.window, fallbackButtons)
+            headerEndRow?.append(buttonsEnd)
+            buttonsEnd.visible = readControlsSide() === "right"
+            attachWindowControls(base.window, [
+                { widget: leftSlot, when: side => side === "left" },
+                { widget: rightSlot, when: side => side === "right" },
+            ], [
+                { widget: buttonsStart, when: () => readControlsSide() === "left" },
+                { widget: buttonsEnd, when: () => readControlsSide() === "right" },
+            ])
+        }
+        return { window: base.window, glass: base.glass, toggle: base.toggle, close: base.close }
+    }
+
+    // ── With a sidebar ────────────────────────────────────────────────────────
+    const sidebarWidth = sidebar.width ?? WINDOW_LAYOUT.sidebar
+    const contentWidth = sidebar.contentWidth ?? WINDOW_LAYOUT.content
+
+    // The window opens WIDE ENOUGH TO BE ITSELF: sidebar docked and the pane at its
+    // full width. A default below the breakpoint would greet every user with the
+    // narrow (floating-sidebar) layout, which is the fallback, not the design.
+    const minFloorWidth = minWindowWidthFor(WINDOW_LAYOUT.contentFloor)
+    const openWidth = Math.max(defaultWidth ?? 0, collapseAtFor(sidebarWidth, contentWidth) + WINDOW_LAYOUT.openGutter)
+
+    // ── The floor is the DISTRESS width, not the pane ─────────────────────────
+    //
+    // VeltrixSplitView's ZeroMinOverlay deliberately severs the content's minimum
+    // from the window (so the pane's width can never dictate how a compositor
+    // tiles), which also means nothing else would ever stop a resize: before this
+    // the window went to 250px with the page clipped at 403 (measured 2026-08-11).
+    // GTK forwards a size request as xdg_toplevel.set_min_size.
+    //
+    // ⚠️ It is a REQUEST, and a tiling compositor is not asking. Hyprland tiles at
+    // whatever the layout says; GTK then lays the window out at its own minimum
+    // anyway and the compositor CUTS the difference — measured in a 673px tile with
+    // the floor at the pane's 802: 129px gone off the right, taking a row's trailing
+    // button with it. Hiding a control is worse than tightening text, so the floor
+    // is the distress width and the pane yields into a window too small for it.
+    //
+    // ⚠️ And the floor CANNOT be conditional on being tiled, which was the first fix
+    // here: Hyprland never clears the `tiled` toplevel state. Measured on a window it
+    // had just floated and resized to 600×800, GTK still carried `tiled-top`,
+    // `tiled-left`, `tiled-right`, `tiled-bottom` AND `maximized`. As a signal for
+    // "someone else decides how wide I am" it is stuck on, so a floor that reads it
+    // is a floor that never comes back.
+
+    // ── Sidebar capsule (toolbar on top, scrolling list below) ────────────────
+    // VeltrixScrolled, like every other scroll view in the DE — a window's sidebar is
+    // not an exception to the rule (design-system.md, "Any ScrolledWindow — windows
+    // included"). It was the last GTK scrollbar left inside a Veltrix window, sitting
+    // two panes away from ours and looking like a different component.
+    // reserveLane: false because `.veltrix-sidebar` carries its own inset on BOTH sides and
+    // the lane lives inside it. Reserving here instead adds the lane to ONE side, so a
+    // row's hover/selected fill sits `lane` px further from the right wall than the left —
+    // the user spotted that immediately, and a sidebar is where it shows most (narrow
+    // capsule, high-contrast selection). The inset does not have to be as wide as the lane:
+    // these rows have no trailing control for the pill to reach.
+    const { widget: sidebarScrollWidget, scrolled: sidebarScroll } = VeltrixScrolled({
+        child: sidebar.widget,
+        reserveLane: false,
+        // Flush with the capsule's rounded bottom, so the pill stops short of it.
+        cornerRadius: VELTRIX_CARD_RADIUS,
+        cssClasses: ["veltrix-window-sidebar-scroll"],
+    })
+    sidebarScroll.vexpand = true
+    sidebarScrollWidget.vexpand = true
+    // Gap to the search slot above (when present).
+    sidebarScrollWidget.margin_top = sidebar.top ? 4 : 0
+
+    const sidebarColumn = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        css_classes: ["veltrix-sidebar-capsule"],
+        vexpand: true,
+    })
+    // Optional search box pinned above the navigation list.
+    if (sidebar.top) {
+        const topSlot = new Gtk.Box({ css_classes: ["veltrix-sidebar-top"] })
+        topSlot.append(sidebar.top)
+        sidebarColumn.append(topSlot)
+    }
+    sidebarColumn.append(sidebarScrollWidget)
+    // The controls' room at the sidebar's top, when they are on the left and the sidebar is
+    // shown docked: in the header they would sit after the sidebar, far from the corner. Its row
+    // is the header's row (`.veltrix-sidebar-controls`), so the capsule shares a centre with the
+    // toggle and the navigation beside it (measured 8 px high with a 4 px margin instead), and
+    // sits as far from the window's left edge as from its top.
+    //
+    // The normal-buttons row built below lives in this row too (`buttonsSidebar`, while
+    // the sidebar is docked) — so the row shows while EITHER its slot or its buttons show:
+    // on a compositor that draws no controls the slot never shows, and the row would take
+    // the buttons down with it. Assigned after the window exists; the handler reads the
+    // variable at call time.
+    let buttonsSidebar: Gtk.Widget | null = null
+    const sidebarSlot = controlsSlotWidget(Gtk.Align.START)
+    const sidebarSlotRow = new Gtk.Box({ css_classes: ["veltrix-sidebar-controls"] })
+    sidebarSlotRow.append(sidebarSlot)
+    sidebarColumn.prepend(sidebarSlotRow)
+    sidebarSlot.connect("notify::visible", () => { sidebarSlotRow.visible = sidebarSlot.visible || buttonsSidebar?.visible === true })
+    sidebarSlotRow.visible = false
+
+    // ── Sidebar toggle ────────────────────────────────────────────────────────
+    const sidebarToggle = new Gtk.Button({
+        child: new Gtk.Image({ gicon: sidebar.toggleIcon, pixel_size: 16, css_classes: ["nd-icon"] }),
+        css_classes: ["veltrix-icon-btn", "sidebar-toggle"],
+        valign: Gtk.Align.CENTER,
+        halign: Gtk.Align.CENTER,
+    })
+    sidebarToggle.update_property([Gtk.AccessibleProperty.LABEL], [sidebar.toggleLabel])
+
+    // ── Header over the CONTENT (draggable) ───────────────────────────────────
+    // Not across the card: the sidebar capsule is full height, so a header spanning
+    // the window would cross it. The toggle leads the row permanently (no
+    // reparenting) — it stays reachable whether the sidebar is docked, collapsed or
+    // hidden — and the caller's own widgets follow it in the same spacing-8 box.
+    const headerStart = new Gtk.Box({
+        spacing: 8,
+        valign: Gtk.Align.CENTER,
+        halign: Gtk.Align.START,
+        css_classes: ["veltrix-window-tools"],
+    })
+    headerStart.append(leftSlot)
+    headerStart.append(sidebarToggle)
+    for (const w of headerStartWidgets()) headerStart.append(w)
+
+    const contentHeader = new Gtk.CenterBox({
+        css_classes: ["veltrix-window-header", ...(header?.cssClasses ?? [])],
+    })
+    contentHeader.set_start_widget(headerStart)
+    if (header?.center) contentHeader.set_center_widget(header.center)
+    contentHeader.set_end_widget(headerEnd())
+
+    const headerHandle = new Gtk.WindowHandle()
+    headerHandle.set_child(contentHeader)
+
+    const contentColumn = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        hexpand: true, vexpand: true,
+        margin_top: 8,
+    })
+    contentColumn.append(headerHandle)
+    contentColumn.append(content)
+
+    let controls: { refresh: () => void } | null = null
+
+    // ── Split view (fixed breakpoint; popover in collapsed mode) ──────────────
+    // The breakpoint is exactly "sidebar + the content pane", so the sidebar docks
+    // precisely while there is room for it AND the pane at full width, and leaving
+    // it does not change the pane's width. See WINDOW_LAYOUT.
+    const splitView = VeltrixSplitView({
+        sidebar: sidebarColumn,
+        content: contentColumn,
+        sidebarWidth,
+        collapseAt: collapseAtFor(sidebarWidth, contentWidth),
+        cssClasses: ["veltrix-split-view"],
+        name: "veltrix-window-splitview",
+        // Shown, hidden, docked or floating: the controls may change slot.
+        onSidebarPresented: () => controls?.refresh(),
+    })
+
+    sidebarToggle.connect("clicked", () => {
+        splitView.setShowSidebar(!splitView.showSidebar)
+    })
+
+    // No `header` passed to the base: this layout's header is inside the content
+    // column above, which is the one thing the sidebar changes about the chrome.
+    const base = VeltrixAppWindow({
+        app, title, content: splitView.widget, footer,
+        closeMode, onClose, closeOnEscape, resizable,
+        defaultWidth: openWidth,
+        // 760 is the SIDEBAR layout's default, not every window's: a two-pane
+        // window that opens short looks broken, while About is 429 tall because
+        // that is its content. Defaulting it for everyone made About 760 the first
+        // time this component was unified (caught on screen, 2026-08-26).
+        defaultHeight: defaultHeight ?? 760,
+        minWidth: minWidth ?? minFloorWidth,
+        minHeight: minHeight ?? WINDOW_LAYOUT.heightFloor,
+        cssClasses, glassClasses, name, appId,
+    })
+    base.glass.set_name("veltrix-window-glass")
+    // The normal buttons in every place the compositor's controls can sit — the sidebar's
+    // top while it is docked and shown, the header's start otherwise, and the header's end
+    // when the user's side is right — the same places, the same conditions, as the slots,
+    // as fallbacks: shown only where the compositor draws no controls (Hyprland), hidden
+    // where it draws its own (Hyalo). Their initial visibility is set here because no
+    // layout ever arrives to set it on Hyprland; `refresh` re-reads the conditions when
+    // the sidebar presents or collapses, and when `button-layout` changes.
+    const sidebarDocked = !splitView.collapsed && splitView.showSidebar
+    const side = readControlsSide()
+    buttonsSidebar = normalWindowControls(base.window, fallbackButtons)
+    sidebarSlotRow.prepend(buttonsSidebar)
+    buttonsSidebar.visible = sidebarDocked && side === "left"
+    buttonsSidebar.connect("notify::visible", () => { sidebarSlotRow.visible = sidebarSlot.visible || buttonsSidebar?.visible === true })
+    sidebarSlotRow.visible = sidebarSlot.visible || buttonsSidebar.visible
+    const buttonsHeader = normalWindowControls(base.window, fallbackButtons)
+    headerStart.prepend(buttonsHeader)
+    buttonsHeader.visible = !sidebarDocked && side === "left"
+    const buttonsEnd = normalWindowControls(base.window, fallbackButtons)
+    headerEndRow?.append(buttonsEnd)
+    buttonsEnd.visible = side === "right"
+    controls = attachWindowControls(base.window, [
+        { widget: sidebarSlot, when: side => side === "left" && !splitView.collapsed && splitView.showSidebar },
+        { widget: leftSlot, when: side => side === "left" },
+        { widget: rightSlot, when: side => side === "right" },
+    ], [
+        { widget: buttonsSidebar, when: () => readControlsSide() === "left" && !splitView.collapsed && splitView.showSidebar },
+        { widget: buttonsHeader, when: () => readControlsSide() === "left" && (splitView.collapsed || !splitView.showSidebar) },
+        { widget: buttonsEnd, when: () => readControlsSide() === "right" },
+    ])
+
+    return {
+        window: base.window,
+        glass: base.glass,
+        toggle: base.toggle,
+        close: base.close,
+        splitView,
+        sidebarToggle,
+        contentColumn,
+    }
+}

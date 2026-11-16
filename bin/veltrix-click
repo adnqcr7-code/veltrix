@@ -1,0 +1,656 @@
+#!/usr/lib/veltrix/veltrix-click
+// ─────────────────────────────────────────────────────────────────────────────
+// veltrix-click — synthetic POINTER click on a third-party app (Phase 2b-ii).
+// The smart half of the pointer: it gates, verifies focus, resolves WHERE to
+// click (an AT-SPI node's centre, or a window-relative point), maps that to
+// output coordinates, and hands the final numbers to the dumb `veltrix-input`
+// C injector. Sibling of veltrix-act (AT-SPI) and veltrix-type (keyboard).
+//
+//   veltrix-click app        <app> <node> [role] [occurrence]        # left-click a control's centre
+//   veltrix-click at         <app> <x> <y>                           # left-click a window-relative point (canvas)
+//   veltrix-click rclick-app <app> <node> [role] [occurrence]        # right-click a control's centre
+//   veltrix-click rclick-at  <app> <x> <y>                           # right-click a window-relative point
+//   veltrix-click hover-app  <app> <node> [role] [occurrence]        # move the pointer over a control (no button)
+//   veltrix-click hover-at   <app> <x> <y>                           # move the pointer over a window-relative point
+//   veltrix-click scroll-app <app> <node> <dx> <dy> [role] [occ]     # scroll at a control's centre
+//   veltrix-click scroll-at  <app> <x> <y> <dx> <dy>                 # scroll at a window-relative point
+//   veltrix-click drag-app   <app> <from> <to> [fr] [fo] [tr] [to]   # drag between two controls' centres
+//   veltrix-click drag-at    <app> <x1> <y1> <x2> <y2>               # press at (x1,y1), drag to (x2,y2), release
+//   (<dx>/<dy> = signed wheel notches: dy>0 down, dx>0 right)
+//
+// Use this only when do_action / keyboard can't reach a control (canvas, no
+// activatable action, no a11y), or for right-click / hover / scroll / drag (DnD,
+// rubber-band selection). Pair with focus_window first.
+//
+// HOVER is not a lesser click — it is the only way to reach state the a11y tree
+// cannot show you, because it does not exist until the pointer is there:
+// tooltips, hover-revealed controls, submenus that open on hover. Read the tree
+// AFTER hovering, not before.
+//
+// SAFETY — clicking is position/stacking-dependent (even more than typing). So
+// <app> is REQUIRED and verified to be Hyprland's active window, and the window
+// geometry is read FRESH immediately before injecting; otherwise it refuses.
+// Same gate as the rest of computer-control: allowComputerControl &&
+// allowComputerUse (both default OFF). Indicator + kill switch from 2a apply.
+//
+// COORDINATE MAPPING (the fragile part — measure, don't trust):
+//   global_logical = window.at + node_or_point (AT-SPI window coords are logical)
+//   output_rel     = global_logical − monitor.xy
+//   extent_logical = monitor.{w,h} / monitor.scale   (monitor w/h are physical)
+// ─────────────────────────────────────────────────────────────────────────────
+
+import Atspi from "gi://Atspi"
+import GLib from "gi://GLib"
+import Gio from "gi://Gio"
+
+// The compositor's state — Hyprland's or Hyalo's — in Hyprland's JSON shapes, through ONE
+// CLI (bin/veltrix-wm, #682): PATH first, then a sibling of this script (dev checkout).
+// Never `hyprctl` directly: on Hyalo there is none.
+const WM = (() => {
+    const inPath = GLib.find_program_in_path("veltrix-wm")
+    if (inPath) return inPath
+    try {
+        const sib = `${GLib.path_get_dirname(GLib.filename_from_uri(import.meta.url)[0])}/veltrix-wm`
+        if (GLib.file_test(sib, GLib.FileTest.IS_EXECUTABLE)) return sib
+    } catch {}
+    return "veltrix-wm"
+})()
+
+// The Assistant's gates live in GSettings, `org.veltrix.ai` (#573) — the same keys
+// Settings → AI writes. No schema installed reads as `undefined`, which every gate
+// below treats exactly as it treated a missing ai.json. Each read is a fresh
+// Gio.Settings, so a gate flipped a moment ago is the one that answers.
+// ⚠️ Six copies of this function (veltrix-a11y/act/click/type/mcp/agent);
+// scripts/ci/same-app-check.mjs keeps them identical.
+function aiSetting(key) {
+    try {
+        const schema = Gio.SettingsSchemaSource.get_default()?.lookup("org.veltrix.ai", true)
+        if (!schema) return undefined
+        return new Gio.Settings({ settings_schema: schema }).get_value(key).recursiveUnpack()
+    } catch {
+        return undefined
+    }
+}
+const MAX_NODES = 4000
+const MAX_DEPTH = 40
+
+function emit(obj) { print(JSON.stringify(obj, null, 2)) }
+
+// Fire-and-forget: tell the shell an action just landed so the bar's AI-control
+// indicator shows its "active" pulse (decays back to "armed" after a few seconds).
+// Never blocks or fails the action if the shell isn't reachable. SILENCED stdio:
+// an async child inherits ours, so its "ok" response would pollute the JSON
+// contract on stdout (spawn_command_line_async can't redirect; Gio can).
+function pingShell() {
+    try {
+        Gio.Subprocess.new(["veltrix-ipc", "notifyComputerAction"],
+            Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE)
+    } catch {}
+}
+function safe(fn, fb) { try { const v = fn(); return v == null ? fb : v } catch { return fb } }
+
+function controlEnabled() {
+    return aiSetting("allow-computer-control") === true && aiSetting("allow-computer-use") === true
+}
+
+function runJson(cmd) {
+    try {
+        const [ok, out] = GLib.spawn_command_line_sync(cmd)
+        if (!ok) return null
+        return JSON.parse(new TextDecoder().decode(out))
+    } catch { return null }
+}
+
+// Physical cursor position (global logical px) via `veltrix-wm cursorpos` — the
+// baseline for the user-wins check AND the fake cursor's travel origin. null on
+// any failure (the caller then skips the check rather than break the action).
+function cursorPos() {
+    try {
+        const p = runJson(`${WM} cursorpos`)
+        return p && Number.isFinite(p.x) && Number.isFinite(p.y) ? { x: Math.round(p.x), y: Math.round(p.y) } : null
+    } catch { return null }
+}
+
+// Drive the shell's fake AI cursor (`veltrix-ipc agentPointer …`). PURELY
+// VISUAL — an enhancement, never a gate: any failure (shell down, old shell
+// without the command) is a silent no-op and the injection proceeds. `wait`
+// blocks until the fake cursor LANDS (the request resolves on landing);
+// `timeout 2` bounds a hung shell. The `--` is load-bearing: the IPC client
+// otherwise parses a negative coordinate (monitor left/above the origin) as a
+// flag and errors out (verified live 2026-07-12). The async path silences
+// stdio like pingShell (inherited stdout would pollute the JSON contract);
+// `wait` uses spawn_sync, which CAPTURES stdout, so it is equally safe.
+//
+// EVERY `cancel` MUST WAIT. An abort emits its JSON and returns, so the process
+// exits within microseconds — a fire-and-forget spawn does not survive that, the
+// request never reaches the shell, and the choreography only ends on the 3 s
+// orphan timeout. Measured 2026-07-27: an aborted action left the fake cursor up
+// (and, since the shell now hides the REAL pointer for the duration, the user
+// without a cursor) for **5.3 s after they moved the mouse**, against 343 ms once
+// the cancel is actually delivered. `confirm` survives async only because the
+// injection runs after it — if that order ever changes, make it wait too.
+function visual(cmd, wait = true) {
+    try {
+        if (wait) {
+            GLib.spawn_command_line_sync(`timeout 2 veltrix-ipc agentPointer ${cmd}`)
+        } else {
+            Gio.Subprocess.new(["veltrix-ipc", "agentPointer", ...cmd.split(" ")],
+                Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE)
+        }
+    } catch {}
+}
+
+// Ask the shell to step out of the way for this action, and hand the keyboard back
+// after. Unlike `visual` above this is NOT cosmetic. While one of Veltrix's own layer
+// surfaces holds an EXCLUSIVE keyboard grab — which the Assistant island does the
+// entire time the user is typing at it — Hyprland refuses to move window focus at
+// all (FocusState.cpp: "Refusing a keyboard focus to a window because of an exclusive
+// ls") AND routes the pointer to that surface regardless of its input region. So from
+// inside the Assistant the focus check below could never pass, and the click would
+// have been swallowed even if it had. `begin` answers only once the compositor has
+// APPLIED the release, so it is deliberately synchronous. A shell that is down, or
+// too old to know the command, is a silent no-op — exactly the behaviour that existed
+// before this; and if we die before `end`, the shell restores itself.
+//
+// `begin` also answers with the Activity Island's covered rect, which is why it is
+// worth reading the reply: the Assistant lives in that island and cannot see it, so
+// it happily resolves controls sitting UNDERNEATH its own panel. Those clicks land
+// (the yield makes the surface click-through) but they land where the user has no
+// way to watch, which is indistinguishable from the assistant acting behind their
+// back. Reported, not refused — the click is legitimate, it is the invisibility
+// that needs saying.
+function yieldInput(verb) {
+    try {
+        const [ok, out] = GLib.spawn_command_line_sync(`timeout 3 veltrix-ipc yieldInput ${verb}`)
+        if (!ok || !out) return null
+        return JSON.parse(new TextDecoder().decode(out).trim())
+    } catch { return null }
+}
+
+// Is an output-relative point inside the island's covered rect? Both are
+// monitor-LOCAL, so the monitor has to match or this compares across screens.
+function underIsland(bounds, outX, outY, monName) {
+    if (!bounds) return false
+    if (bounds.monitor && monName && bounds.monitor !== monName) return false
+    return outX >= bounds.x && outX < bounds.x + bounds.w
+        && outY >= bounds.y && outY < bounds.y + bounds.h
+}
+
+// veltrix-input: PATH first, then a sibling of this script (dev checkout).
+function findInjector() {
+    const inPath = GLib.find_program_in_path("veltrix-input")
+    if (inPath) return inPath
+    try {
+        const self = GLib.filename_from_uri(import.meta.url)[0]
+        const sib = `${GLib.path_get_dirname(self)}/veltrix-input`
+        if (GLib.file_test(sib, GLib.FileTest.IS_EXECUTABLE)) return sib
+    } catch {}
+    return null
+}
+
+// ── one name per app ───────────────────────────────────────────────────────────
+// KEEP IDENTICAL in veltrix-a11y, veltrix-act and veltrix-type — see the long comment
+// in veltrix-a11y for the why. Short version: one app wears three names (Hyprland
+// class / AT-SPI name / .desktop name), substrings cannot bridge them once a
+// version digit moves sides, and a live run on 2026-08-01 paid six steps because
+// query_app answered only to one of them and click_at only to another.
+const NAME_NOISE = new Set(["org", "com", "io", "net", "app", "desktop"])
+const nameTokens = (s) => (s || "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")   // camelCase  → "Widget Factory"
+    .replace(/([a-zA-Z])(\d)/g, "$1 $2")   // Factory4   → "Factory 4"
+    .replace(/(\d)([a-zA-Z])/g, "$1 $2")   // gtk4       → "gtk 4"
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(t => t && !NAME_NOISE.has(t))
+
+function sameApp(a, b) {
+    const la = (a || "").toLowerCase(), lb = (b || "").toLowerCase()
+    if (!la || !lb) return false
+    if (la === lb || la.includes(lb) || lb.includes(la)) return true
+    // Tokenize the ORIGINAL strings, never the lowercased ones: the word breaks of
+    // "WidgetFactory" live in its capitals, and lowercasing first is exactly the
+    // bug this function exists to kill (it fused "widgetfactory" into one token).
+    const ta = nameTokens(a), tb = nameTokens(b)
+    if (ta.length && tb.length) {
+        const [small, big] = ta.length <= tb.length ? [ta, tb] : [tb, ta]
+        const set = new Set(big)
+        if (small.every(t => set.has(t))) return true
+    }
+    // Last resort for a side that reaches us already lowercased — Hyprland's class
+    // does — where the camelCase seams are gone for good: drop digits and
+    // separators and compare bare letters. >2 chars so noise cannot match.
+    const bare = (s) => s.toLowerCase().replace(/[^a-z]/g, "")
+    const x = bare(a), y = bare(b)
+    return x.length > 2 && y.length > 2 && (x.includes(y) || y.includes(x))
+}
+
+// ── AT-SPI node resolution (window-relative centre) ──────────────────────────
+function children(acc) {
+    const n = safe(() => acc.get_child_count(), 0), out = []
+    for (let i = 0; i < n; i++) { const c = safe(() => acc.get_child_at_index(i), null); if (c) out.push(c) }
+    return out
+}
+function isShowing(acc) {
+    const s = safe(() => acc.get_state_set(), null)
+    return !!s && safe(() => s.contains(Atspi.StateType.SHOWING), false)
+}
+function nameOf(acc) { return safe(() => acc.get_name(), "") || "" }
+function roleOf(acc) { return safe(() => acc.get_role_name(), "?") }
+function centreOf(acc) {
+    const c = safe(() => acc.get_component_iface(), null)
+    if (!c) return null
+    const r = safe(() => c.get_extents(Atspi.CoordType.WINDOW), null)
+    if (!r) return null
+    // w/h ride along for `collapseContained` only; they are stripped before a
+    // candidate list is emitted, so the reported shape stays {x, y, role}.
+    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), role: roleOf(acc),
+             w: r.width, h: r.height }
+}
+// How many real node names a failed lookup reports back. A miss used to be a dead
+// end ("no showing node named X"), and the model's only recovery was to spend a
+// whole round trip on query_app — measured 2026-07-28 in a live run: two of eleven
+// calls were guesses ("page tab", "Start") that bought nothing. The names cost
+// NOTHING to collect: `nameOf(acc)` is already called for every node on this walk.
+const MAX_SUGGESTIONS = 40
+
+// …but ONLY the ones that could plausibly be a control. An accessible name is not a
+// label: in a chat app it is the ENTIRE MESSAGE (measured on Telegram — this is the
+// same thing that made a raw a11y dump 503 KB). A button label is short and
+// single-line; a content blob is neither. Filtering here rather than at emit time
+// also bounds what the walk accumulates, instead of holding a megabyte to print 40
+// items. A suggestion list that costs more than the round trip it saves is a
+// regression, so keep this filter honest if you widen it.
+const MAX_SUGGESTION_LEN = 48
+const isLabelish = nm => nm.length <= MAX_SUGGESTION_LEN && !nm.includes("\n")
+
+function getA11yBusAddress() {
+    let addr = GLib.getenv("AT_SPI_BUS_ADDRESS")
+    if (addr) return addr
+    try {
+        const res = Gio.DBus.session.call_sync(
+            "org.a11y.Bus",
+            "/org/a11y/bus",
+            "org.a11y.Bus",
+            "GetAddress",
+            null,
+            null,
+            Gio.DBusCallFlags.NONE,
+            1000,
+            null
+        )
+        const [busAddr] = res.deepUnpack()
+        return busAddr
+    } catch {
+        return null
+    }
+}
+
+// Find the registry child index for a given process ID without walking the desktop.
+// D-Bus queries to org.a11y.atspi.Registry and org.freedesktop.DBus are handled
+// by the daemons without contacting client applications, costing ZERO fds.
+function getA11yIndexForPid(targetPid) {
+    if (!targetPid) return null
+    const addr = getA11yBusAddress()
+    if (!addr) return null
+    try {
+        const conn = Gio.DBusConnection.new_for_address_sync(
+            addr,
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            null,
+            null
+        )
+        const res = conn.call_sync(
+            "org.a11y.atspi.Registry",
+            "/org/a11y/atspi/accessible/root",
+            "org.a11y.atspi.Accessible",
+            "GetChildren",
+            null,
+            null,
+            Gio.DBusCallFlags.NONE,
+            1000,
+            null
+        )
+        const [children] = res.deepUnpack()
+        for (let i = 0; i < children.length; i++) {
+            const [busName] = children[i]
+            try {
+                const pidRes = conn.call_sync(
+                    "org.freedesktop.DBus",
+                    "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus",
+                    "GetConnectionUnixProcessID",
+                    new GLib.Variant("(s)", [busName]),
+                    null,
+                    Gio.DBusCallFlags.NONE,
+                    1000,
+                    null
+                )
+                const [pid] = pidRes.deepUnpack()
+                if (pid === targetPid) {
+                    return i
+                }
+            } catch {}
+        }
+        return null
+    } catch {
+        return null
+    }
+}
+
+function findNodeCentres(appFilter, nodeName, roleFilter, targetPid) {
+    const want = nodeName.toLowerCase(), exact = [], partial = []
+    const seen = new Set()
+    let scanned = 0
+    const visit = (acc, depth) => {
+        if (scanned >= MAX_NODES || depth > MAX_DEPTH || !isShowing(acc)) return
+        scanned++
+        const nm = nameOf(acc)
+        if (nm) {
+            if (seen.size < MAX_SUGGESTIONS && isLabelish(nm)) seen.add(nm)
+            if (!roleFilter || roleOf(acc) === roleFilter) {
+                const low = nm.toLowerCase()
+                if (low === want) { const c = centreOf(acc); if (c) exact.push(c) }
+                else if (low.includes(want)) { const c = centreOf(acc); if (c) partial.push(c) }
+            }
+        }
+        for (const k of children(acc)) visit(k, depth + 1)
+    }
+
+    // Fast path: resolve ONLY the focused window's application via its PID.
+    // veltrix-click already ran `veltrix-wm activewindow` to verify focus, so targetPid
+    // is known. We query the registry for its child index via D-Bus (zero fds) and
+    // only resolve that single child in AT-SPI.
+    //
+    // Index assumption: atspi_accessible_get_child_at_index() sends GetChildAtIndex
+    // to the root accessible object in at-spi2-registryd, which indexes the exact same
+    // array returned by GetChildren.
+    // Race guard: if an app registers or dies between GetChildren and get_child_at_index,
+    // the index shifts. atspi_accessible_get_process_id() queries GetConnectionUnixProcessID
+    // on the bus daemon (NOT the target app, costing 0 fds). If resolvedPid !== targetPid,
+    // we abort the fast path and fall back to classic enumeration.
+    if (targetPid) {
+        const idx = getA11yIndexForPid(targetPid)
+        if (idx !== null) {
+            Atspi.init()
+            const desktop = safe(() => Atspi.get_desktop(0), null)
+            if (desktop) {
+                const app = safe(() => desktop.get_child_at_index(idx), null)
+                const resolvedPid = safe(() => app?.get_process_id(), 0)
+                if (app && resolvedPid === targetPid) {
+                    for (const win of children(app)) visit(win, 0)
+                    return { hits: exact.length ? exact : partial, seen: [...seen] }
+                }
+            }
+        }
+    }
+
+    // Fallback: traditional enumeration across all desktop children
+    Atspi.init()
+    const desktop = safe(() => Atspi.get_desktop(0), null)
+    if (!desktop) return { hits: [], seen: [] }
+
+    // Same two-pass app selection as veltrix-act: strict substring, then the
+    // tolerant rescue. Decided on names before walking, so the rescue is free.
+    const named = children(desktop).map(app => [app, nameOf(app) || "?"])
+    let targets = named.filter(([, n]) => n.toLowerCase().includes(appFilter))
+    if (!targets.length) targets = named.filter(([, n]) => sameApp(n, appFilter))
+    for (const [app] of targets)
+        for (const win of children(app)) visit(win, 0)
+    return { hits: exact.length ? exact : partial, seen: [...seen] }
+}
+
+// CLI mode → injector verb (`action`) + how the target position is resolved
+// (`target`): "app" = an AT-SPI node's centre, "at" = a window-relative point.
+// app/at stay exactly as the original left-click surface (backward compatible).
+// The mode name is the CLI's vocabulary and `action` is the injector's — they
+// differ where the user-facing verb is clearer (hover-* → the C verb `move`,
+// rclick-* → `rightclick`).
+const MODES = {
+    "app":        { action: "click",      target: "app" },
+    "at":         { action: "click",      target: "at" },
+    "rclick-app": { action: "rightclick", target: "app" },
+    "rclick-at":  { action: "rightclick", target: "at" },
+    "hover-app":  { action: "move",       target: "app" },
+    "hover-at":   { action: "move",       target: "at" },
+    "scroll-app": { action: "scroll",     target: "app" },
+    "scroll-at":  { action: "scroll",     target: "at" },
+    "drag-app":   { action: "drag",       target: "app" },
+    "drag-at":    { action: "drag",       target: "at" },
+}
+
+// Resolve one node name (+ optional role / occurrence) to its window-relative
+// centre. Emits the error itself and returns null — callers just bail. `label`
+// names WHICH end failed, which only matters for drag-app's two of them.
+// A GTK control and the label INSIDE it are two accessible nodes with the same
+// name in the same place — clicking either lands on the same pixel. Counting them
+// as two candidates made the OBVIOUS call fail: measured on the bench 2026-07-31,
+// every labelled key in gnome-calculator ("8", "×", "=") came back "ambiguous: 2
+// nodes" and cost a round trip to re-ask with a role, on a tree the model had
+// already read. Nothing is being chosen here — a hit whose centre falls INSIDE an
+// earlier hit is part of that hit, not an alternative to it. The walk is
+// parent-first, so the control is the one kept. Genuinely separate targets (the
+// "=" in the display vs the "=" key) do not contain one another and stay
+// ambiguous, which is the answer the caller needs.
+function collapseContained(hits) {
+    const out = []
+    for (const h of hits) {
+        const within = out.some(o =>
+            h.x >= o.x - o.w / 2 && h.x <= o.x + o.w / 2 &&
+            h.y >= o.y - o.h / 2 && h.y <= o.y + o.h / 2)
+        if (!within) out.push(h)
+    }
+    return out
+}
+
+const bare = h => ({ x: h.x, y: h.y, role: h.role })
+
+function resolveNode(appFilter, app, label, nodeName, role, occRaw, targetPid) {
+    const where = label ? `${label} node ` : "node "
+    const { hits: raw, seen } = findNodeCentres(appFilter, nodeName, role, targetPid)
+    const hits = collapseContained(raw)
+    if (!hits.length) {
+        // Answer the next question in the same breath. `showing` is what is on screen
+        // RIGHT NOW, which is also the honest reason a name can be correct and still
+        // missing (a control that only appears once something else is set).
+        emit({
+            error: `no showing ${where}named "${nodeName}" in "${app}"`
+                + (seen.length
+                    ? " — `showing` lists the short, single-line names on screen right now (control labels); pick one VERBATIM. Not there? The control may only appear once something else is set, or its name is long/multi-line — then use query_app with a match."
+                    : " — nothing label-like is showing; check the right window is focused, or use query_app to see the tree."),
+            showing: seen,
+        })
+        return null
+    }
+    if (hits.length > 1 && occRaw === "") {
+        emit({ error: `ambiguous: ${hits.length} nodes match the ${where}"${nodeName}" — pass a role and/or occurrence`,
+            candidates: hits.slice(0, 20).map(bare) })
+        return null
+    }
+    const t = occRaw === "" ? hits[0] : hits[parseInt(occRaw, 10)]
+    if (!t) { emit({ error: `${where}occurrence out of range (${hits.length} matches)` }); return null }
+    return bare(t)
+}
+
+// ── main ─────────────────────────────────────────────────────────────────────
+function main() {
+    if (!controlEnabled()) {
+        emit({ error: "computer-control is disabled — enable 'Allow Agents to Control Other Apps' in Settings → AI (it requires perception too; both default off)" })
+        return
+    }
+    const mode = (ARGV[0] ?? "").trim()
+    const app = (ARGV[1] ?? "").trim()
+    const spec = MODES[mode]
+    if (!spec || !app) {
+        emit({ error: "usage: veltrix-click app|rclick-app|hover-app <app> <node> [role] [occurrence] | at|rclick-at|hover-at <app> <x> <y> | scroll-app <app> <node> <dx> <dy> [role] [occurrence] | scroll-at <app> <x> <y> <dx> <dy> | drag-app <app> <from-node> <to-node> [from-role] [from-occurrence] [to-role] [to-occurrence] | drag-at <app> <x1> <y1> <x2> <y2>" })
+        return
+    }
+    // Past the guards, so this call is going to act: make room for it. The yield
+    // must wrap the FOCUS CHECK too, not just the injection — before the shell lets
+    // go, the check cannot pass by construction (see yieldInput).
+    const yielded = yieldInput("begin")
+    try {
+        return act(mode, app, spec, yielded?.islandBounds ?? null)
+    } finally {
+        yieldInput("end")
+    }
+}
+
+function act(mode, app, spec, islandBounds) {
+    const isScroll = spec.action === "scroll"
+    const isDrag = spec.action === "drag"
+
+    // Fresh geometry + focus check, immediately before acting.
+    const aw = runJson(`${WM} activewindow`)
+    const activeClass = (aw?.class ?? "").toLowerCase()
+    const focused = sameApp(activeClass, app)
+    if (!focused) {
+        // Hand back the address of the window that WAS meant, so recovery is one
+        // step instead of three (list_windows → focus_window → retry, measured in a
+        // live run 2026-07-28). Only on this path — the happy path must not pay for
+        // a second veltrix-wm call. Kept identical in veltrix-type.
+        const clients = runJson(`${WM} clients`) || []
+        const hit = clients.find(w => sameApp(w.class, app))
+        emit({
+            error: `refused: "${app}" is not the focused window (active: ${activeClass || "unknown"}) — focus the WINDOW first with focus_window`
+                // Say what we KNOW (no open window answers to that name), never what
+                // we inferred ("it is not open"): on 2026-08-01 that inference was
+                // false — the window was open AND focused under another of its names —
+                // and the model spent two steps chasing the wrong remedy.
+                + (hit ? ` (address ${hit.address}), then retry` : `; no open window answers to that name — run_action list_windows for the ones that are`),
+            active: activeClass,
+            ...(hit ? { focus: { address: hit.address, class: hit.class, title: hit.title } } : {}),
+        })
+        return
+    }
+
+    // Resolve window-relative target (relX, relY), scroll deltas (dx, dy notches),
+    // and drag drop point (relX2, relY2).
+    let relX, relY, relX2, relY2, dx = 0, dy = 0
+    if (spec.target === "app") {
+        const nodeName = (ARGV[2] ?? "").trim()
+        if (!nodeName) { emit({ error: `${mode} needs a node name` }); return }
+        Atspi.init()
+        const targetPid = aw?.pid || 0
+        if (isDrag) {
+            // drag-app: <from> <to> [from-role] [from-occ] [to-role] [to-occ].
+            // BOTH ends resolve before anything is injected — a half-resolved drag
+            // would press the button and have nowhere legitimate to release it.
+            const toName = (ARGV[3] ?? "").trim()
+            if (!toName) { emit({ error: "drag-app needs <from-node> <to-node>" }); return }
+            const from = resolveNode(app.toLowerCase(), app, "from", nodeName,
+                (ARGV[4] ?? "").trim() || null, (ARGV[5] ?? "").trim(), targetPid)
+            if (!from) return
+            const to = resolveNode(app.toLowerCase(), app, "to", toName,
+                (ARGV[6] ?? "").trim() || null, (ARGV[7] ?? "").trim(), targetPid)
+            if (!to) return
+            relX = from.x; relY = from.y
+            relX2 = to.x; relY2 = to.y
+        } else {
+            // scroll-app: <node> <dx> <dy> [role] [occurrence]; click/hover: <node> [role] [occurrence]
+            let role, occRaw
+            if (isScroll) {
+                dx = parseInt(ARGV[3] ?? "", 10); dy = parseInt(ARGV[4] ?? "", 10)
+                if (isNaN(dx) || isNaN(dy)) { emit({ error: "scroll-app needs numeric <dx> <dy>" }); return }
+                role = (ARGV[5] ?? "").trim() || null
+                occRaw = (ARGV[6] ?? "").trim()
+            } else {
+                role = (ARGV[3] ?? "").trim() || null
+                occRaw = (ARGV[4] ?? "").trim()
+            }
+            // `app.toLowerCase()` is the app FILTER (findNodeCentres compares it
+            // against already-lowercased AT-SPI application names), `app` is the
+            // original for error messages — same split as veltrix-act's findMatches.
+            const t = resolveNode(app.toLowerCase(), app, "", nodeName, role, occRaw, targetPid)
+            if (!t) return
+            relX = t.x; relY = t.y
+        }
+    } else {
+        relX = parseInt(ARGV[2] ?? "", 10); relY = parseInt(ARGV[3] ?? "", 10)
+        if (isNaN(relX) || isNaN(relY)) { emit({ error: `${mode} needs numeric <x> <y>` }); return }
+        if (isScroll) {
+            dx = parseInt(ARGV[4] ?? "", 10); dy = parseInt(ARGV[5] ?? "", 10)
+            if (isNaN(dx) || isNaN(dy)) { emit({ error: "scroll-at needs numeric <dx> <dy>" }); return }
+        }
+        if (isDrag) {
+            relX2 = parseInt(ARGV[4] ?? "", 10); relY2 = parseInt(ARGV[5] ?? "", 10)
+            if (isNaN(relX2) || isNaN(relY2)) { emit({ error: "drag-at needs numeric <x2> <y2>" }); return }
+        }
+    }
+
+    // Map: window-relative (logical) → global → output-relative + logical extent.
+    // SAME convention as the overview minimap (ui/shell/common/WorkspaceSchematic.ts:
+    // logicalW = monitor.width / scale; tile = (client − monitor.origin) * k) — that
+    // in-shell code is the battle-tested reference for this mapping, fractional scale
+    // included. Kept in sync here because this helper is a separate process and can't
+    // import the shell's modules.
+    const at = aw.at || [0, 0], monName = aw.monitor
+    const mons = runJson(`${WM} monitors`) || []
+    // aw.monitor is an index; match by id, else fall back to the focused monitor.
+    const mon = mons.find(m => m.id === monName) || mons.find(m => m.focused) || mons[0]
+    if (!mon) { emit({ error: "could not resolve the active monitor geometry" }); return }
+    const scale = mon.scale || 1
+    // Global logical target — what the fake-cursor overlay speaks (it converts
+    // to monitor-local itself); outX/outY below are the injector's output-relative.
+    const gx = Math.round(at[0] + relX), gy = Math.round(at[1] + relY)
+    const outX = gx - mon.x, outY = gy - mon.y
+    const extW = Math.round(mon.width / scale), extH = Math.round(mon.height / scale)
+    // Drag: map the drop point through the SAME monitor geometry as the start.
+    let gx2, gy2, outX2, outY2
+    if (isDrag) {
+        gx2 = Math.round(at[0] + relX2); gy2 = Math.round(at[1] + relY2)
+        outX2 = gx2 - mon.x; outY2 = gy2 - mon.y
+    }
+
+    const injector = findInjector()
+    if (!injector) { emit({ error: "veltrix-input not found — re-run install.sh (it compiles the pointer backend)" }); return }
+
+    // ── Visual choreography (land→confirm protocol; see surfaces/agent-pointer/).
+    // The fake AI cursor pops in at the baseline and travels to the target while
+    // we hold (~0.45-1.2 s, distance-scaled — inside visual()'s `timeout 2`); it
+    // only ripples AFTER the real injection is re-verified — the visual never lies.
+    const cursorBase = cursorPos()
+    visual(`${spec.action} ${gx} ${gy}`
+        + (isDrag ? ` ${gx2} ${gy2}` : "")
+        + (cursorBase ? ` from ${cursorBase.x} ${cursorBase.y}` : ""))
+    // Re-check the gate: the kill switch (bar indicator / Super+Shift+Esc /
+    // disableComputerControl) can fire DURING the travel animation — this is what
+    // lets it stop an injection inside that window.
+    if (!controlEnabled()) {
+        visual("cancel")
+        emit({ ok: false, error: "aborted: computer-control was revoked during the action animation (kill switch)" })
+        return
+    }
+    // The user always wins: if the physical mouse moved during the animation,
+    // abort the injection. Skipped (never blocking) if either read failed.
+    const cursorNow = cursorPos()
+    if (cursorBase && cursorNow &&
+            Math.hypot(cursorNow.x - cursorBase.x, cursorNow.y - cursorBase.y) > 10) {
+        visual("cancel")
+        emit({ ok: false, error: "aborted: the user moved the mouse during the action animation — user input takes priority; retry when the pointer is idle" })
+        return
+    }
+    // Ripple ≈ the real click (drag: the glide runs concurrently with the real drag).
+    visual("confirm", false)
+
+    // action maps 1:1 to the injector verb (click / rightclick / scroll / drag);
+    // scroll appends the notch deltas, drag the drop point.
+    const args = [injector, spec.action, String(outX), String(outY), String(extW), String(extH)]
+    if (isScroll) args.push(String(dx), String(dy))
+    if (isDrag) args.push(String(outX2), String(outY2))
+    const proc = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE)
+    const [, , err] = proc.communicate_utf8(null, null)
+    if (!proc.get_successful()) {
+        emit({ ok: false, error: `veltrix-input failed: ${(err || "").trim() || "no output"}` }); return
+    }
+    pingShell()
+    // The action SUCCEEDED — this is a visibility warning, not a failure. See
+    // yieldInput: the click lands, but under the Assistant's own panel the user
+    // cannot see it happen.
+    const hidden = underIsland(islandBounds, outX, outY, mon.name)
+    emit({ ok: true, app, mode, target: { outX, outY, extW, extH },
+        ...(isScroll ? { scroll: { dx, dy } } : {}),
+        ...(isDrag ? { drop: { outX2, outY2 } } : {}), window: { at, monitor: mon.name },
+        ...(hidden ? { warning: "this landed UNDER the Activity Island, where the user cannot see it — run `setIsland closed` before acting in that area, then reopen with `setIsland agent` when you are done", islandBounds } : {}) })
+}
+
+main()

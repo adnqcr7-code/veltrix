@@ -1,0 +1,33 @@
+[package]
+name = "veltrix-sessiond"
+description = "Veltrix session services: the notification server, the settings service (Config1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+veltrix-access = { path = "../../crates/veltrix-access" }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "net", "io-util", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+resvg = "0.45.1"
+png = "0.18"
+sha2 = "0.10"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# GSettings, the settings' home, on a GLib thread of its own (config/store.rs).
+gio = "0.22"
+glib = { version = "0.22", features = ["v2_66"] }
+futures-util = { version = "0.3", default-features = false }
+libc = "0.2"
+pipewire = { version = "0.10.1", features = ["v0_3_77"], optional = true }
+lewton = { version = "0.10.2", optional = true }
+hound = { version = "3.5.1", optional = true }
+
+[features]
+# The existing sessiond CI has no PipeWire headers; model/bus tests need none.
+# Release/development desktop builds opt in (the package already depends on PW).
+audio-native = ["dep:pipewire", "dep:lewton", "dep:hound"]

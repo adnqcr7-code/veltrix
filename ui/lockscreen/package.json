@@ -1,0 +1,9 @@
+{
+  "scripts": {
+    "build": "mkdir -p build && ../../scripts/bundle.sh app.ts build/veltrix-lock"
+  },
+  "prettier": {
+    "semi": false,
+    "tabWidth": 2
+  }
+}

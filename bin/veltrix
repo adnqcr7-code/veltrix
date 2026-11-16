@@ -1,0 +1,67 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix — Wayland session entry point
+# Installed to /usr/bin/veltrix
+# Launched by the display manager via /usr/share/wayland-sessions/veltrix.desktop
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Suppress stdout and stderr to prevent ASCII banner / early debug logs from leaking onto TTY
+exec 1>/dev/null 2>&1
+
+# Wayland environment
+export GDK_BACKEND=wayland,x11
+export XDG_SESSION_TYPE=wayland
+# Frozen Hyprland boot only. Hyalo selects Rust in its own session launcher.
+export VELTRIX_SESSION=ts
+export MOZ_ENABLE_WAYLAND=1
+export ELECTRON_OZONE_PLATFORM_HINT=auto
+export OZONE_PLATFORM=wayland
+# Qt theming — el diálogo de archivos del portal pesa más que el tema de iconos.
+# Razonamiento y mediciones en defaults/uwsm/env, que se sourcea después de esto y
+# debe llevar el mismo valor.
+export QT_QPA_PLATFORMTHEME=xdgdesktopportal
+export CLUTTER_BACKEND=wayland
+
+# ── Input method (fcitx5) ─────────────────────────────────────────────────────
+# These tell each TOOLKIT where to send keystrokes. fcitx5 itself needs none of
+# them — it finds the compositor through WAYLAND_DISPLAY.
+#
+# ⛔ `GTK_IM_MODULE` is missing ON PURPOSE, and it is the one everybody sets.
+# GTK4 speaks `zwp_text_input_v3` to the compositor natively (verified:
+# libgtk-4.so exports the protocol, and Hyprland answers both halves —
+# `zwp_text_input_manager_v3` for apps and `zwp_input_method_manager_v2` for the
+# IME). Setting the variable OVERRIDES that native path — GTK's own error string
+# is "IM Context is hardcoded by GTK_IM_MODULE" — and drops the whole desktop
+# onto the legacy module. Both the ArchWiki's Fcitx5 page and fcitx's own
+# "Using Fcitx 5 on Wayland" say to leave it unset; so does Omarchy's
+# environment.d drop-in, which sets exactly these four and not that one.
+#
+# XMODIFIERS is still needed: XWayland clients have no text-input protocol.
+export INPUT_METHOD=fcitx
+export QT_IM_MODULE=fcitx
+export XMODIFIERS=@im=fcitx
+export SDL_IM_MODULE=fcitx
+
+# GObject Introspection
+export GI_TYPELIB_PATH="/usr/lib/girepository-1.0:/usr/local/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+export LD_LIBRARY_PATH="/usr/lib:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# First-login bootstrap (issue #23): install-time setup seeds per-user config
+# only for the user who ran install.sh. A user created later (Settings → Users,
+# useradd, archinstall…) reaches their first session with no ~/.config/veltrix
+# at all — hyprland.lua then boots with a flood of lua errors and the shell
+# starts unthemed. Seed the same per-user defaults HERE, before Hyprland loads
+# its config; this covers every user-creation path and heals a deleted config
+# dir. Fail-soft: a seeding hiccup must never block the session (the shell
+# tolerates missing config), and no step in --user mode ever calls sudo.
+if [ ! -d "$HOME/.config/veltrix" ] && command -v veltrix-setup >/dev/null 2>&1; then
+    veltrix-setup --user > "${XDG_RUNTIME_DIR:-/tmp}/veltrix-first-login.log" 2>&1 || true
+fi
+
+# Load the shared config from /usr/share (NOT ~/.config/hypr). The double `--` is
+# deliberate: uwsm appends args after its `--` straight onto `start-hyprland`, and
+# `start-hyprland` only forwards args after ITS OWN `--` to Hyprland. So we need
+# `start-hyprland -- -c <path>` → which means `uwsm ... -- -- -c <path>` here.
+# A single `--` produces `start-hyprland -c <path>`, which start-hyprland swallows
+# and Hyprland then falls back to ~/.config/hypr/hyprland.lua. Don't remove the second `--`.
+exec uwsm start -e -D Hyprland hyprland.desktop -- -- -c /usr/share/veltrix/config/hypr/hyprland.lua

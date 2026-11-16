@@ -1,0 +1,607 @@
+---
+name: veltrix
+description: "Authoritative reference for working on the Veltrix desktop environment codebase — a full Wayland session for Arch Linux built with TypeScript/TSX → GJS on GTK4 + Hyprland (no AGS, no Astal). Use this skill whenever the user mentions Veltrix, adnqcr7-code, the shell bar, dock, control center, notification center, prism/search, app grid, overview, system menu, settings window, lockscreen, or greeter; asks to edit files under `ui/shell/`, `ui/greeter/`, `ui/lockscreen/`, or `ui/lib/veltrix-kit/`; wants to modify `hyprland.lua`, SCSS in `styles/`, a `core/` service, or run `install.sh`. Also trigger on questions about reloading the UI (Super+Shift+R), `veltrix-ipc` IPC, `Status.ts`, the five build bundles, or the Veltrix design system. ALWAYS consult this skill BEFORE editing files in this repo — strict conventions (no `Adw.OverlaySplitView`, no transform scale on clickables, no hardcoded colors, scoped CSS only, IPC via `ShellActions` not `globalThis`) are easy to violate without it."
+---
+
+# Veltrix
+
+> Repo: `github.com/adnqcr7-code/veltrix` · License: GPL-3.0-or-later, except `ui/lib/veltrix-kit/` = LGPL-3.0-or-later (every kit file carries the SPDX line; CI checks it) · Version: read `VERSION` at the repo root (do not restate it here — this line said 0.1.0 while the file said 0.7.2).
+
+## What this project is
+
+Veltrix is a **full Wayland desktop environment** for Arch Linux — not a theme, not a set of scripts. It registers as a proper Wayland session (like GNOME/KDE) and is launched by the display manager. The compositor is **Hyprland**; the UI is **TypeScript → GJS** on **GTK4 + gtk4-layer-shell** (libadwaita fully removed), hosted by **our own `Gtk.Application` in `ui/lib/veltrix-kit/platform/host.ts`** and bundled by **our own `scripts/bundle.sh`** (esbuild), styled with **SCSS** and painted with **Cairo** where shapes get custom (dock squircles, workspace dots, resource rings, schematic).
+
+⚠️ **The compositor is changing: Hyprland → Hyalo** (owner's decision, 2026-10-01). Hyalo is
+Veltrix's own Wayland compositor, on Smithay (Rust), in `hyalo/`. The plan, with the parity table,
+is issue #680; the evidence, #679. 🔑 **Since 2026-10-02 Hyprland is FROZEN and Hyalo is the only
+target** (owner's decision): no new work on Hyprland, fixes included, and a change no longer has to
+work on both compositors — the one floor until the switch (#685) is that the shell still BOOTS on
+Hyprland, because that is what 0.13 ships. Work follows #680's WAVES (safe and usable daily →
+what the switch lost → the system → the switch), and Hyalo is built for this desktop alone: where
+the desktop was shaped around a Hyprland limit, #708 decides the structural change. Anything that
+talks to the compositor still goes through `CompositorState`. Released packages run Hyprland until
+#685, and much of this skill still describes it.
+
+⚠️ **AGS is GONE, entirely, since 2026-08-18** — runtime first (`ui/lib/{host,process,file,app-id}.ts` replaced its four modules), toolchain the same day:
+
+| was | is | what it actually was |
+|---|---|---|
+| `ags bundle` | `scripts/bundle.sh` | esbuild with a fixed flag set (the JS API, `scripts/bundle.mjs`, since #108 phase 3) + a bash wrapper around the JS. `--kit-external=<dir>` makes the app LOAD veltrix-kit from `<dir>` instead of bundling it — the shell, greeter and lock ship that way (`architecture.md` → "The kit's CODE is loaded, not bundled") |
+| `ags run` | `scripts/run.sh` | the same bundle; shell uses its native libgjs host, other entries use `gjs` |
+| `ags types -d .` | `scripts/gen-types.sh` | one `npx @ts-for-gir/cli generate` call |
+| `ags request` | `veltrix-ipc` | a D-Bus call to `io.Astal.ags`, now `org.veltrix.Shell` |
+
+The flags in `bundle.sh` are AGS's, transcribed and **verified**: all three bundles come out
+byte-identical to what `ags bundle` produced. Two of them are load-bearing and their comments say
+so — `--tsconfig` (via `target: ES2020` it turns `useDefineForClassFields` OFF, and define-semantics
+on a GObject subclass would shadow the property accessors) and the wrapper's `LD_PRELOAD` (no
+gtk4-layer-shell ⇒ no bar, no dock, nothing in the log). See `references/architecture.md` →
+"The application host is OURS" and `references/dev-workflow.md` → "The toolchain is ours".
+
+⚠️ **Hyalo starts the Rust shell by default** (#1017, owner 2026-11-05):
+`veltrix-rust-shell.service` runs `veltrix-shell --bar` after the full session daemon.
+No TS shell or separate dock in Hyalo; `veltrix-ipc` defaults to native routes.
+B2.3 is implemented with private validation; installed MCP transition/acceptance remains a gap. B2.2 details are
+implemented with private validation, not installed acceptance. See
+`toolkit/shell/SESSION.md`. B3.1 banners use the bar surface and one hub stack;
+read `toolkit/shell/B3.1.md` before changing notification timers, actions or cards.
+B3.2 adds the NC/calendar, `nc` route and journal; read `toolkit/shell/B3.2.md`
+before changing history, hydration, bulk dismissal, restoration or retention.
+History snapshots have a sequence barrier; never replay them as fresh banners.
+Notification store errors must not stop sessiond or live delivery/dismissal.
+Preserve damaged input, log write outages once and compact the live model on recovery.
+Only viewport cards are built. The NC is drawn by `nc_view.rs` on nk-view: one
+pane per card, so each card has Hyalo's eight washes to itself (#1048).
+Notification ownership is signal-driven; do not add idle GetNameOwner polling.
+Sender expiry is presentation-only for ordinary records; transient records expire with their banner. Token actions are
+revision checked and directed to the sender. App/place/tray/banner artwork uses one process-wide
+`toolkit/shell/src/icon_memory.rs`; surfaces keep shared references and never
+start their own GetIcon worker or decoded cache (#1041). Interface glyphs and
+album/window pictures are separate resources. Read `toolkit/shell/ICONS.md` and
+`session/design/APPLICATIONS1-DOCK.md` before adding an app-icon consumer; use its
+readiness API, invalidation and Busy retry rather than a surface-local loader.
+Daemon icon reads validate against `session/daemon/src/applications/icon_view.rs`,
+the atomically published icon metadata; do not put their pre/post-decode checks
+back on `Store::call`, behind synchronous catalogue refresh. Actor effects publish
+before reply; override writes withdraw/re-publish, and actor exit retires the view.
+The TS conventions below still apply to the remaining
+TS applications and frozen Hyprland source.
+
+⚠️ **Widgets are built imperatively — there is no JSX in this repo** and none of Gnim's reactive
+primitives are used, despite the `.tsx` extensions. Read `references/architecture.md` ("There is no
+JSX in this repo") before writing a widget; a JSX-shaped contribution will not match anything here.
+
+The aesthetic is "Veltrix literal": heavy-blur glass capsules with a 1px inner white edge, soft outer shadow, top sheen; the accent color is used **only for active/selected state** — with one exception, MENUS: the shell's menus and every dropdown's list, whose row under the pointer is filled with it (design-system.md → "Context menus").
+
+It is also **AI-native by design**: this skill ships *inside* the repo so that any user's agent — whichever it is: `AGENTS.md` is every agent's entry, `CLAUDE.md` only imports it, and `.agents/skills/veltrix` is a symlink here; edit only `.claude/skills/veltrix/` — can extend, customize, and fix their own desktop — and propose globally-useful improvements back upstream. If you're helping a user with their installed copy rather than the project itself, start at `references/agent-contribution.md`.
+
+## The repo is FIVE separate bundles, not one app
+
+This is the single most important fact to internalize before touching anything:
+
+| Bundle | Source | Output binary | Role |
+|---|---|---|---|
+| **Shell** | `ui/shell/` | `build/veltrix` | Desktop: bar, dock, overlays |
+| **Settings** | `ui/settings/` | `build/veltrix-settings` | Independent settings application (#571) |
+| **Greeter** | `ui/greeter/` | `build/veltrix-greeter` | Login (greetd, spoken directly — no AstalGreet) |
+| **Lockscreen** | `ui/lockscreen/` | `build/veltrix-lock` | Lock via `Gtk4SessionLock` (OVERLAY-layer fallback) |
+| **Installer** | `ui/installer/` | `build/veltrix-installer` | The live medium's installer — a GTK4 front-end over `archinstall` |
+
+Each has its own `app.ts`, its own `package.json`, its own `scripts/bundle.sh` invocation. Code shared between the greeter and the lockscreen is currently duplicated (see `references/tech-debt.md`).
+
+⚠️ **The installer does not ship with the desktop.** `packaging/veltrix/PKGBUILD` is a SPLIT
+package (since 2026-08-25): it builds `veltrix`, `veltrix-kit` (the platform library the
+desktop depends on and outside apps can too — since 2026-09-23, `architecture.md` → "The kit's own
+package") and `veltrix-installer`, and only nidara-iso's `packages.x86_64` ever names the last — a
+system somebody is using must not carry a program whose job is to erase a disk. Two consequences
+that bite silently:
+
+- anything picking "the package makepkg just built" has to say WHICH. `install.sh` installs
+  `veltrix` + `veltrix-kit` by name, in one `pacman -U`; veltrix-repo's `build-repo.sh` copies
+  every package produced instead of the newest one. The old `ls -t … | head -1` would have
+  installed an installer onto somebody's Arch.
+- `install=` and `backup=` live INSIDE `package_veltrix()`. At the top level of a split PKGBUILD
+  they apply to every package.
+
+The installer is a bundle of the desktop's toolkit, but **what it installs is not in this repo**:
+its base archinstall config is airootfs content in nidara-iso
+(`/usr/share/veltrix-installer/base.json`), so the product's package list changes without
+rebuilding anything here. `nidara-iso/INSTALLER.md` is the decision record — including why it is
+not Calamares.
+
+⚠️ **archinstall owns the disk, in both modes.** Between 2026-08-28 and 2026-09-04 `steps/run.ts`
+ran `sgdisk`/`mkfs.*`/`mount` itself; #310 gave partitioning back, and `lib/disk-config.ts` now
+only EMITS the `disk_config` archinstall carries out. What the bundle still writes itself is the
+boot side, after archinstall: `lib/bootloader.ts` edits the loader entries, the kernel cmdline
+and the mkinitcpio hook. Read `references/dev-workflow.md` → "Who owns the disk — archinstall, in
+both modes" and "The installer runs in a VM, or it does not run" (the arming rule) before
+touching either file.
+
+⚠️ **Every refusal belongs on the page that asked, never on the run page.** `assemblePlan` is
+first called after Install is pressed, so a rule that lives only there refuses a disk the person
+already confirmed erasing. The size floor was that bug until 2026-09-17: the disk page now asks
+`entireDiskFits` (and `manualProblems` holds a manual `/` to the same `MIN_ROOT_MIB`), and the
+throw inside `entireDiskConfig` is the last word, not the first.
+
+## The twelve inviolable commandments
+
+These are non-negotiable. Violating them produces bugs that are hard to debug because the symptoms don't point at the cause.
+
+1. **Never use `Adw.OverlaySplitView` in Settings** — use `VeltrixSplitView` from `ui/lib/veltrix-kit/`. Adw's version breaks capsule margins.
+2. **Never write unscoped global CSS** — a surface's CSS goes inside its window's selector
+   (`#veltrix-bar, .veltrix-bar-window` — every panel, island and app grid included / `#veltrix-dock …` /
+   `window.veltrix-settings-window`). The design system's global layer is the sole exception:
+   `_base.scss` tokens, the TWO `_components.scss` (`ui/lib/veltrix-kit/styles/` = the kit's, shared with the
+   other bundles; `ui/shell/styles/` = the shell's half), `_reset.scss`, `@keyframes`. Scope table and
+   the two traps in `references/design-system.md`.
+3. **Kill zombies before debugging.** A stuck terminal or "styles won't refresh" almost always means a zombie GJS is still drawing the dead UI. Run `killall veltrix-shell` before changing code in a loop.
+4. **`core/` never touches the UI.** All visibility changes flow through `Status.ts`. Widgets never flip each other directly.
+5. **Every panel lives inside the Bar's window** via `Gtk.Overlay` — the Control Center, the Notification Center, Prism, the system menu, the Activity Island (capsule, chips AND every mode) and the app grid. **No exceptions** since #708 point 3 (owner, 2026-10-06: the bar is the one surface every panel hangs from; the dock stays a surface of its own). Show/hide animations are GTK-side (`common/ScaleRevealer.ts`, `common/MorphRevealer.ts`); on Hyalo the compositor paints their glass from the shapes they declare.
+   - **Why one surface.** Hyalo draws each surface's glass on its own, under ALL of that surface's content, so pieces can only melt into one silhouette (capsule ↔ panel morphs, fusion, #705) within one surface — and a panel on its own surface over the bar would be glass on glass, which the reference material avoids.
+   - **The rule that replaces the island's old reason** (it had a layer of its own so its modes could blur the bar's capsules under them): a panel that grows over the bar's row takes the groups it covers OUT of the way — they fade with the capsule's content (`MorphRevealer` companions, `ActivityIsland` → `coveredBy`). Never stack glass on glass. Today only the overview is that wide.
+   - **The app grid's old reason** (Hyprland charging a layer's blur by its BOX) does not exist on Hyalo, which charges per declared shape. Over a fullscreen window the grid still opens: the bar's surface rises to OVERLAY for as long as it is up, with the row hidden (`liftForGrid` in `Bar.tsx`).
+   - A further surface of its own needs a reason of this kind, decided with the owner — not convenience. The agent pointer (a click-through cursor overlay, not a panel) is the one other shell layer. See `architecture.md`.
+6. **IPC goes through `veltrix-ipc` + `core/ShellActions`** — never reintroduce `globalThis` coupling.
+7. **A window that is an APPLICATION window declares its own app-id.** Veltrix's regular windows (Settings, About, Settings' modal dialogs) call `setWindowAppId(win, "veltrix-settings")` from `ui/lib/veltrix-kit/platform/app-id.ts` — or pass `appId` to `VeltrixWindow` — so Hyprland files them under a name the desktop registry actually has. Do NOT go back to remapping a class in `AppService`: that remap existed only because AGS forced the app-id to `io.Astal.ags`, and it is deleted. Two silent traps live in `app-id.ts` (the `GdkWayland` import, and `map` vs `realize`) — read its header before touching it. *(This commandment used to say the opposite; the AGS host went on 2026-08-18.)*
+8. **`AboutWindow` is create+destroy, not hide. Settings exits on close** since #571: it is a separate application, relaunched on demand. Its page cache lives only while it is open.
+9. **No CSS `transform: scale` or `transform: translate` on clickable widgets.** GTK respects them but they break hit-testing. Use `margin`, scale in Cairo, or `common/ScaleRevealer.ts` for transient show/hide grow animations (snapshot-time, ends at identity — see `references/design-system.md`).
+10. **No hardcoded colors. No emoji as iconography.** Resolve against `--veltrix-*` tokens; use SVGs in `assets/veltrix/assets/scalable/` or the `nd-*-symbolic` icon set — interface icons are asked for ONLY by `nd-` names of the Veltrix icon spec (`ui/shell/assets/icons/veltrix/SPEC.md`), never by freedesktop names; those are for APP icons.
+
+11. **We use GTK, with OUR styles. Nothing by default.** (Owner's decision, 2026-09-20 —
+    tech-debt #107, a STANDING DECISION.) A GTK widget that enters this codebase arrives WITH its
+    rules in one of our stylesheets, or it does not ship. The old habit — drop the widget in, see
+    GTK's default, patch it afterwards — is what produced a toggle that looked like Veltrix in the
+    shell and like GNOME in the installer, and a "blank theme" hack to paper over the difference.
+    Our own processes run on **no GTK theme at all** — `GTK_THEME=Empty`, which GTK itself ships in
+    its gresource, selected through `useNoGtkTheme()` in `ui/lib/veltrix-kit/platform/gtk-theme.ts` — so whatever our
+    CSS does not draw is drawn by nothing. Never name a theme instead: one that resolves to nothing
+    loads GTK's FULL built-in theme, silently (measured).
+    🔴 **And it must never reach a CHILD.** `GTK_THEME` is inherited, and GTK re-reads it at
+    every theme update, so it cannot be unset once we are up (measured: unset it, flip dark
+    mode, and the shell loads Adwaita). Until 2026-09-27 every app the dock, the app grid or
+    Prism launched therefore came up with NO theme. Every child process starts through
+    `spawn()` in `ui/lib/process.ts` (`exec`/`execAsync` use it), which leaves it behind;
+    `scripts/ci/child-env-check.mjs` fails on any other way of starting one in the desktop
+    bundles (`Gio.Subprocess.new`, `GLib.spawn_*`, `Gio.AppInfo.launch*`…).
+    ✅ **The original four bundles are there since 2026-09-23** — the shell was the last (tech-debt #107
+    step 5). What is under a node none of our classes reach is the **base layer**,
+    `ui/lib/veltrix-kit/styles/_base-layer.scss`: GTK's own GEOMETRY for each node (read out of libgtk's
+    gresource) with OUR paint. Copy GTK's box, never invent one — shell widgets that declare
+    colours but not padding had been taking their box from the theme, and a base `button` with
+    10px more padding truncated a Control Center label. Read the file's header before adding a rule.
+    ⚠️ This is about OUR processes. Third-party applications keep following gsettings
+    `gtk-theme`, a different lever entirely. **And the other half of the same decision, taken the
+    same day: a Veltrix APPLICATION is never reskinned by a foreign GTK theme either.** `veltrix-kit`
+    is the platform library — what libadwaita is to a GNOME app — so Settings, the installer and any
+    app we publish outside this repo carry our look as a dependency, and the user's customisation
+    axis is the appearance portal (accent, colour scheme, contrast, font), which reaches ours AND
+    everybody else's apps. A Veltrix GTK theme for THEIR apps is a separate artefact we do intend to
+    ship, and its body is the base layer of tech-debt #107. The lever table — who moves what, and how
+    far it reaches — is canonical in `references/design-system.md` ("Who may change each layer").
+    `scripts/ci/style-ownership-check.mjs` is the gate.
+
+12. **Never imitate the compositor in an app.** On Hyalo, the glass and the states of what is
+    made of glass (hover, press, the destructive red, the ink) are Hyalo's, declared through
+    `veltrix-material-v1`; the window controls are Hyalo's entirely (`veltrix-window-controls-v1`).
+    The app draws content and owns input, focus and accessibility; it paints glass or a wash
+    itself only as the fallback when the protocol is absent. Missing a capability → extend the
+    protocol, never copy it in the client (owner, 2026-10-26). Full rule and the known
+    departures: `references/design-system.md`, "Who draws what on glass".
+
+## Quick orientation: where to start
+
+Before doing anything that touches code:
+
+- **Writing or changing a WIDGET** (a bar pill / CC tile) → `references/writing-a-widget.md` is the
+  whole thing on one page: the file, the vocabulary, and the boundary CI enforces.
+- **Working on independent Settings** → `references/architecture.md` → "Settings is its own application" (process role, portal paint, IPC, rollback). Start it with `bin/veltrix-settings`, not a bare `gjs` invocation.
+- **Editing TSX widgets, adding overlays, changing dock/bar/CC behaviour** → read `references/architecture.md` first, then `references/state-and-ipc.md`.
+- **Editing SCSS, restyling anything, working on the design tokens** → read `references/design-system.md`.
+- **Anything about how the glass behaves** (its kinds, shadows, veil, a control's answer to its backdrop) → `references/design-system.md` → "The glass material": the ONE base and its exceptions. Do not give a piece behaviour of its own.
+- **Adding a new core service or modifying state** → read `references/architecture.md` (core/ section) and `references/state-and-ipc.md` (Status.ts).
+- **Working on the installer, build, or session boot** → read `references/dev-workflow.md`.
+- **Touching the Assistant** (`bin/veltrix-agent`, a wire lane, or what it can perceive) → read `references/dev-workflow.md`: the fake-brain walk, the wire-lane re-sync procedure, and the terminal bench for perception claims (a model that answers from a stale read looks identical in the island — only the log tells you).
+- **Debugging something weird, or considering a refactor** → check `references/tech-debt.md` first — it might already be a known issue, or a **standing decision** telling you not to do what you were about to do. It holds only what is still owed; the bodies of resolved items live beside it in `references/tech-debt-resolved.md` (same numbers, never reused, indexed at the bottom of the live file).
+- **Working on Hyalo** (`hyalo/`, the compositor of our own — a preview session until #685),
+  or on anything in the shell that must work on BOTH compositors → `references/hyalo.md`.
+- **Adding an event a user's scripts can react to, or asked "can I run something when X happens?"** → `references/user-hooks.md`. The event table lives in `bin/veltrix-hook` and nowhere else.
+- **Helping a user customize their OWN installed copy** (not the canonical repo) → read `references/agent-contribution.md` FIRST. It tells you whether a change is personal (→ config layer), should become a Setting, or is a global improvement worth proposing back upstream as a PR.
+
+The references are short and load-on-demand. Don't try to hold the whole project in context; read the specific reference you need.
+
+## The dev loop in one screen
+
+```bash
+./install.sh --dev                       # one-time setup: system binaries + ~/.config/veltrix/.dev
+# ... edit TSX/SCSS in ui/shell/ ...
+# In a graphical session:
+Super+Shift+R                            # reload the UI (re-runs veltrix-ui → scripts/run.sh)
+# ⚠️ run.sh re-bundles the TS but does NOT compile SCSS: after a .scss edit, first
+#    cd ui/shell && npx sass --no-charset style.scss style.css && sed -i '/@charset/d' style.css
+#    (else the reload paints the OLD style.css and the change "did nothing" — owner-caught 2026-09-25)
+tail -f "$XDG_RUNTIME_DIR/veltrix-ui.log"  # logs (per-user; falls back to /tmp)
+killall veltrix-shell                              # nuke stuck old UI when reload misbehaves
+cd ui/shell && npm run typecheck        # local typecheck (needs the git-ignored @girs/)
+cd ui/shell && npm run build            # SCSS compile + scripts/bundle.sh (needs the `esbuild` package)
+veltrix-ipc listActions                  # discover the shell's IPC surface (JSON)
+veltrix-ipc dumpState                    # live shell state as JSON (overlays, version, effective compositor layout `compositorLayout`…)
+veltrix-ipc describeConfig               # agent-facing settings: schema + current values (JSON)
+veltrix-ipc setConfig <key> <value>      # change a setting officially (validated; gated by Settings → AI)
+veltrix-ipc screenshot [path]            # capture the focused monitor → PNG path (visual verification; gated)
+veltrix-a11y [app]                       # computer-use perception: a THIRD-PARTY app's UI via AT-SPI, same shape as queryUI (read-only; gated by allowComputerUse, default OFF)
+veltrix-act <app> <node> <action>        # computer-use action: invoke a named AT-SPI action on a named control (deterministic, no synthetic input; gated by allowComputerControl, default OFF, requires perception)
+veltrix-type text|key <app> <payload>    # computer-use synthetic keyboard via wtype (focus-verified: <app> must be the active window); same allowComputerControl gate. Focus the WINDOW with focusWindow — NOT with veltrix-act … SetFocus (a control-level action GTK4 mostly does not expose; a refusal hands back the target's address in `focus`). A number goes in with veltrix-act … set-value=N, no keyboard at all
+veltrix-click <mode> <app> …            # computer-use synthetic POINTER. EVERY verb has both forms — *-app names an AT-SPI node, *-at takes a window-relative point: app/at = left-click; rclick-app/rclick-at = right-click; hover-app/hover-at = pointer move, NO button; scroll-app/scroll-at = wheel scroll (signed dx/dy notches); drag-app/drag-at = press→glide→release between two nodes / two points (DnD / rubber-band / sliders). veltrix-input.c (zwlr_virtual_pointer, compiled by install.sh) is the injector; the CLI mode is the wrapper's vocabulary and MODES[mode].action the injector's (hover-* → the C verb `move`). Focus-verified; same gate. HOVER is not a lesser click: it is the only way to reach state that does not exist until the pointer is there (tooltips, hover-revealed controls, submenus) — read the a11y tree AFTER hovering. Every action plays the fake-AI-cursor visual (accent arrow + AI badge, `agentPointer` IPC, land→confirm; a hover lingers and does NOT ripple — it pressed nothing) and ABORTS if the user moves the mouse >10 px or the kill switch fires during the animation — the user always wins; the visual is an enhancement, never a gate (shell down = silent no-op)
+veltrix-ipc listWindows                  # window/workspace mgmt (UNGATED — shell driving its own compositor, not computer-use): open windows as JSON [{address,class,title,workspace,floating,…}]
+veltrix-ipc listWorkspaces               # workspaces as JSON [{id,name,windows,active,special}]; focusWorkspace <id|±1|name>/focusDirection <l|r|u|d>/focusWindow/closeWindow/moveWindowToWorkspace/getWorkspaceMode <id>/setWorkspaceMode <id> <floating|tiling>/toggleWorkspaceMode [id]/toggleFloat|Fullscreen/…/setLayout act on them (window arg = address from listWindows OR class/title); each = one HyprlandState dispatch method. movewindow-directional + resize deliberately NOT added (active-window-only/focus-dependent + unverified Lua)
+veltrix-ipc focusWindow <window>         # raise/focus a window by address or class — a WM op (UNGATED, like a dock click); also the precondition for the synthetic keyboard (which stays gated)
+veltrix-ipc disableComputerControl       # kill switch: revoke AI control instantly (also: click the bar indicator, or Super+Shift+Esc)
+veltrix-hook --list                # the desktop events a user's own scripts can react to, and what each passes (~/.config/veltrix/hooks/<event>.d/*). `veltrix-hook <event> [args]` fires one by hand — that is how a hook gets tested. The table in bin/veltrix-hook is the ONLY list; CI checks it against the call sites
+veltrix-doctor                     # Markdown diagnostic report (bug/PR evidence)
+veltrix-doctor --log               # the shell log's CRITICAL/WARNINGs since the shell last started, one line per KIND with its count — read this after a reload, not a tail (a tail shows what fired last, a count shows what is broken). In dev mode you are also TOLD: a CRITICAL in the shell log raises a critical notification (`core/DevLogWatch.ts`)
+veltrix-agent                      # the built-in Assistant's BRAIN: a LOCAL Ollama LLM tool-use loop (OpenAI-compatible via curl-SSE) whose desktop tools ARE `veltrix-ipc` — so for those the assistant is just another client of the gated surface. A stdio child of the shell (spawned by core/AgentService; the island Agent mode / Super+A is its face), NOT run by hand; NO API key anywhere (local Ollama only, endpoint fixed to http://localhost:11434/v1), brain config in GSettings org.veltrix.ai (brain-backend/brain-model/brain-endpoint). Test with scripts/dev/fake-brain.py
+                                  # ALSO reaches THIRD-PARTY apps through the same four computer-use helpers as veltrix-mcp, with the same tool names — but only while the matching gate is on (`query_app` behind allowComputerUse; the ten action tools behind allowComputerControl), because the schemas cost ~2.2k tokens per step and a model told about a tool it cannot use promises what it cannot deliver. Gate re-read at the TURN boundary (grants mid-conversation take effect); a helper refusal is reported as a FAILED tool result, not an "ok" containing an error
+                                  # ALSO owns a DAEMON-LOCAL file layer ("tier 1", 2026-07-27) that does NOT go through `veltrix-ipc` — read_file/list_dir/search_files/edit_file/write_file/load_skill, implemented with GLib/Gio (no subprocess; only search_files spawns grep, fixed argv, never a shell). Deliberate exception to the IPC rule: MCP clients bring their own file tools, and file contents through the IPC socket would put blocking I/O on the shell's main loop. Two frontiers in the daemon — READ = prefix roots (~/.config/{veltrix,uwsm,hypr}, /usr/share/veltrix, the shell log), WRITE = an EXACT 3-file allowlist. Gated by allowFileRead (default OFF since the Phase 0 fix — every agent gate is opt-in) / allowFileWrite (default OFF; write implies read). Paths are canonicalised before the prefix check; writes refuse symlinks and refuse to touch the @autostart block; write_file refuses a file not read this session; every write commits to a git repo auto-created in ~/.config/veltrix (baseline BEFORE the first write — see references/state-and-ipc.md)
+veltrix-mcp                        # all of the above as MCP tools over stdio (incl. list_windows/list_workspaces (reads), focus_window (ungated WM op), query_app → veltrix-a11y, do_app_action → veltrix-act, type_text/press_key → veltrix-type, click_app/click_at (left + button:"right") / hover_app/hover_at / scroll_app/scroll_at / drag_app/drag_at → veltrix-click; WM action verbs via run_action; .mcp.json: repo root for dev; installer-managed copy in ~/.config/veltrix/ for users)
+```
+
+The CI jobs stand in for a test runner (`.github/workflows/ci.yml`, every
+one with a `timeout-minutes`):
+
+| job | gates |
+|---|---|
+| `styles` | the SCSS of the shell, Settings, the greeter/lock sheet, the installer and the kit's own sheet (`kit.scss` → `kit.css`, loaded at runtime by the others: #108) compiles — **and the token contract holds in BOTH directions**: every bundle defines the `--veltrix-*` its rules paint with (`token-contract-check.mjs`; an undefined custom property is silently dropped by GTK4, never an error), every token a bundle defines is read by something (`token-orphan-check.mjs`, with a control — an orphan is a value that drifts from the one on screen, which is how `--veltrix-edge` was retuned in #600 and changed no pixel: tech-debt #106), and **the kit draws what the kit builds** (`style-ownership-check.mjs`, two controls — a kit component styled only in `ui/shell/styles/` is INVISIBLE in every other bundle, because those bundles load no GTK theme at all: tech-debt #59, commandment 11). **And the client-painted glass's model holds its numbers** (`scripts/dev/glass-legibility-probe.ts`, with a control that moves a tooltip floor — the least glass whose text reads 4.5:1 over any backdrop) |
+| `typecheck` | `tsc --noEmit` over all five bundles (installer, greeter and lock in full since 2026-09-22 — their one shim is `ui/lib/veltrix-kit/gi-cairo.d.ts`, which must be FIRST in `include` or it is silently ignored), against a compressed `@girs/` snapshot pulled from the repo's `ci-assets` release (`@girs/` itself stays git-ignored, ≈58 MB generated; a maintainer refreshes the snapshot when it goes stale) |
+| `widgets-gen` | the generated widget registry matches `widgets/` — **and the widget boundary holds**: `widgets/` imports nothing from `surfaces/`, and `common/widget-kit/` stays a leaf. Neither is a compile error (28 widget→surface imports type-checked on 2026-09-01) and the second one crashes the shell at BOOT, which `tsc` cannot see. **Also the Settings import closure** (`settings-closure-check.mjs`, #571): what Settings.tsx reaches transitively may not include another surface, a widget or a shell-only module beyond a shrink-only allowlist. **And the kit is a package** (`kit-boundary-check.mjs`, #108): nothing under `ui/lib/veltrix-kit/` imports from outside it — an app outside this repo has the kit and nothing else. **And a child process never inherits our `GTK_THEME=Empty`** (`child-env-check.mjs`, with a control: every process starts through `spawn()`, commandment 11) |
+| `smoke` | **a real headless boot** — official Arch packages in a container, build both C libraries (`libveltrix-wl`, `libveltrix-auth` + its eight signals), bundle the shell, boot it on real Hyprland over a virtual display (kernel vkms + llvmpipe); fails on death, silent IPC, JS errors or **a toolkit CRITICAL** (Gtk/Gdk/Gsk/GLib/Gjs — a failed assertion is a bug that draws nothing wrong on the spot; only a missing accessibility bus is exempt, that is the container), prints the grouped warning summary every run, and uploads screenshots as artifacts |
+| `i18n` | translation parity + the ledger (`scripts/ci/i18n-check.mjs --check`) — see `dev-workflow.md` — **and the export the native Settings reads** — its tokens too: `scripts/export-tokens.mjs` (styles job) runs the token ENGINE itself over all 120 inputs (ten accents × mode × reduce/window transparency) over `_base.scss` COMPILED, plus `_tokens.scss`'s variables (`meta.module-variables`) and `tokens.ts`'s data; a `gi://` stub loader runs the frozen kit untouched; `settings-tokens-check.py` requires every `var(--veltrix-*)` of the Settings/kit sheets in every set; and `tokens/glass.json`, the kit's glass material ASKED through its own source (`registerGlassMaterial` with a stub host; `./material` and `gi://GLib`/`Gtk` stubbed in the loader): tone/ink/shadow by pane side as steps, per dark/light × reduce transparency (a dropped-`panel` copy must fail) — (`scripts/export-settings-data.mjs` → `build/settings-data/{manifest.json,i18n/*.json}`, from the same `manifest.ts`/`locales/*.ts`; `settings-data-check.py` compares it with a pattern reading of the sources, and a dropped-key copy must fail). Locales stay `.ts`: edit them as always, never the JSON |
+| `skill-docs` | seven prose/consistency checks: no repeated headings anywhere under `.claude/skills` (a duplicated section is how a reference comes to contradict itself) — and ONE copy of the skill: `.agents/skills/veltrix` must be a symlink to it, `AGENTS.md` must exist and `CLAUDE.md` must only import it (`@AGENTS.md`), so every agent, Claude Code or not, starts from the same text (until 2026-10-12 another agent read a hand-made copy weeks behind); `wrapping-prose-check` (a wrapping `GtkLabel` must FILL its column — documented, then violated six times, because the failure only appears in someone else's locale), `same-app-check` (the four `bin/veltrix-{a11y,act,click,type}` copies of `sameApp`/`nameTokens` must not drift from `core/app-search.ts`, or perception and action disagree about what an app is called), `blur-threshold-check`, `chrome-scope-check`, `hook-events-check` (the user-hook event table in `bin/veltrix-hook` and the `fireHook(…)` call sites must be the same set — an event fired but undeclared is refused by the runner, one declared but never fired is a directory that can only stay empty), and `icon-registry-check` (every name in `core/Icons.ts` is an `nd-` name with its shipped drawing, no drawing is orphaned, and `ui/shell/assets/icons/veltrix/SPEC.md` — the Veltrix icon spec theme authors build against — lists exactly those names at the same spec version as the code and the theme generator; a missing glyph is never an error, just a hole on screen) |
+| `pkgbuild` | `bash -n` on the PKGBUILD + `depends=()` still sources as an array of ≥40 (v0.6.0 shipped with an unquoted `hyprland>=0.56` that bash read as a redirection and silently truncated the array) + **config migrations are valid bash, no-op on a fresh install and idempotent with the marker cleared** (`migrations-check.mjs`; a migration mutates a user's config once, on a machine nobody can inspect afterwards) |
+| `hypr-config` | `luac -p config/hypr/hyprland.lua` (one syntax error = the session boots with NO Veltrix config at all) + **game mode's session is undone** (`scripts/dev/game-session-probe.ts` drives `core/game-session-logic.ts` against a fake world, with a control) + **every window rule names something the source declares** — Hyprland's and Hyalo's (`hypr-rule-check.mjs`: a rule is a string matched against a string a GTK window announces, and our windows change class at MAP — a STATIC effect sees only the birth class, a DYNAMIC one only the current one, and both traps are silent) + **the Lua the shell GENERATES parses** (`hypr-lua-check.mjs`: `veltrix-settings.lua` and `veltrix-monitor.lua` are built from TypeScript strings, so `tsc` sees a string and `luac` never sees what it produced — and `hyprland.lua` requires both at every login) |
+| `sessiond` | `session/`: locked Rust build, clippy `-D warnings`, unit tests and a private D-Bus integration with the real GJS notification client. A prior step disables `replaces_id` adoption and requires the integration to catch it. Tests history compatibility, sender signals/history retention/actions, images, and shell/daemon restart without banner replay. |
+| `toolkit` | `toolkit/`: font preflight (`fc-match` must not substitute a required family), locked build and clippy `-D warnings` for the whole workspace, then nk-text's corpus on Parley and nk-render's pixel tests. The native Settings' tests read the real exports (`NK_REQUIRE_EXPORT`, generated in the job) and run a `Config1` on a private `dbus-daemon`. Two prior steps break a rule and require it caught: backspace by scalar (`combining-marks`, `scripts/ci/nk-text-control.py`) and a renderer that drops glyph runs (`scripts/ci/nk-render-control.py`). The window itself is checked in the `hyalo` job (`scripts/ci/nk-phase0-check.py`: mapped, committed glass, virtual keyboard, preedit, clipboard, at scale 1 and 1.25, each with its control). **Not required** yet |
+| `agent-loop` | drives `bin/veltrix-agent` against a mock provider (`scripts/ci/agent-loop-test.py`) |
+| `hyalo` | Hyalo (`hyalo/`, the compositor of our own): clippy `-D warnings` and unit tests, then **the package** — `packaging/veltrix/PKGBUILD` built by `makepkg -e` in the checkout and installed with `pacman -U` (desktop, kit, Hyalo) — and a boot of its tty backend (DRM/KMS through seatd) on the same vkms with the INSTALLED shell on it (`veltrix-ui`, `XDG_CURRENT_DESKTOP=Veltrix`); a file the package lacks fails here, not at release; held to the smoke's log bar; screenshots over Hyalo's IPC. **Not required** while Hyalo is a preview (`scripts/ci/hyalo-smoke.sh`, `references/hyalo.md`). Its Rust builds are cached in `hyalo/target`, `session/target` and `toolkit/target`; a PR can only restore its own branch's cache or main's, and `ci.yml` has no push trigger, so `hyalo-cache.yml` warms main's on every push that touches `hyalo/`, `session/`, `toolkit/` or `crates/` — it tests nothing. The job's own toolkit build takes makepkg's `RUSTFLAGS` (`makepkg_rustflags`): with other flags, it and the package's build threw each other's crates away, the toolkit compiling twice per run |
+| `installer-logic` | the installer's rules as pure functions — no disk, no window, no GTK. The `disk_config` it emits and the layouts `manualProblems` must REFUSE (`disk-config-probe.ts`); what the account form accepts and refuses (`account-rules-probe.ts`), whose rules are all that stand between a capitalised username and a `useradd` failure inside the chroot; and what we may touch on an EFI partition that is **not only ours** (`bootloader-rules-probe.ts`) — a shared ESP is the one case whose damage lands on somebody else's operating system, and it is unreachable from this repo. And what the run page COUNTS (`run-progress-probe.ts`), fed lines from a real install — a bar that fell back to the start would read as the install starting over. ⚠️ Each probe is preceded by a step that deletes one of its rules and requires the probe to CATCH it — a probe that has only ever printed "ok" has been run, not tested, and both of these exited 0 while printing `N FAILURE(S)` until 2026-09-05 |
+
+⚠️ A REQUIRED check skipped by a path filter never reports, and that **stalls the merge queue** —
+skip the *work* inside a job, never the job. A job skipped by its `if:` DOES report (as a pass),
+which is how `scope` (`scripts/ci/ci-scope.sh`, its own self-test first) gates the long jobs:
+`code=false` (every changed path a `.md`) skips smoke/hyalo/toolkit/sessiond. `gates=true` runs
+the Hyalo job's real fcitx5/Orca matrices (~35 of its ~45 min) ONLY when a changed path is one
+they use — `needs_gates()`, a list of what RUNS them: Hyalo's input, focus, a11y, handlers,
+shortcuts, binds, control, layers and focus-grab files and its Cargo files; the toolkit (not the
+Settings slice); the layers protocol; Hyalo's config; the matrix checks. `full=true` adds their
+controls (each assertion re-run with a fault) and scale 1.25, and the AT-SPI check's controls
+(`nk-a11y-check.py`, ~2 of its ~3 min; `NK_A11Y_CONTROLS=0` otherwise) — only when the checks or the test
+window's faults change (`needs_full()`; `NK_REAL_FULL=false` → `NK_FCITX5_SCALES=1
+NK_REAL_CONTROLS=0`). Until 2026-10-19 `gates` was a SKIP list and almost every Hyalo PR ran
+the 35 minutes (owner: "we can't lose an hour on tests that give the same result"). What a skip
+lets through, the **nightly** full run on main finds (`schedule`, no base, so everything runs);
+`nightly-report` opens/updates the issue "Nightly CI failed", and closes it when green. A file
+the matrices start depending on? Add it to `needs_gates()` with a self-test line.
+
+🔑 **The PR budget** (owner, 2026-10-19: "we keep adding tests and have more and more CI
+problems"). A PR's CI aims at **15 minutes**. A NEW check goes to the nightly run by default;
+it runs on PRs only scoped to the paths it can catch (a `ci-scope.sh` output with self-test
+lines), and only if its result does not depend on the runner's speed — CI's GL is software,
+and a check that races an animation, a capture or a `gjs` start against the clock fails on a
+correct change and teaches everyone to re-run. Such a check is fixed (read the moment from
+Hyalo — a capture's `capture.json` says where moving windows were in it) or removed, never
+retried. A check's CONTROLS prove it can fail: they belong with the check's own changes and
+the nightly run, not every PR. **The checks that watch an animation on screen** — minimize, motion, layer
+motion (Hyalo's and the toolkit's) — run only nightly (`HYALO_ANIMATION_CHECKS`, true on
+`schedule`/`workflow_dispatch` and in a local run): CI's software GL draws a frame in 2-4 s at
+times, and they failed correct PRs for a whole day (owner: "I want to work on the project, not
+on the CI"). A PR touching animation is checked locally (the headless cage) and by the night.
+
+⚠️ **`apt-get` in CI only through `scripts/ci/apt.sh install …`.** A bare `apt-get update` waits
+forever on a stalled Ubuntu mirror: twice on 2026-10-01 a job sat silent for 45 minutes until
+Actions cancelled it, and the merge queue threw the entry out. The script sets apt's network
+timeouts, caps each attempt and tries three times. Details in `references/dev-workflow.md`. vkms is loaded by `scripts/ci/load-vkms.sh`: the module if the kernel
+already has it, else `linux-modules-extra-$(uname -r)`, else a plain error — on 2026-10-19 some
+runners booted a kernel (7.0.0-1017-azure) with no such package in the archive at all, which
+apt.sh used to report as "the mirror is not answering" while every retry was doomed.
+
+## When in doubt
+
+- **The TypeScript kit (`ui/lib/veltrix-kit/`) is FROZEN** (owner, 2026-10-15, #818): fixes only, no new components, no new features. Veltrix is getting its own toolkit, in Rust, designed together with Hyalo, starting with Settings. Anything added to the TS kit now would only be rewritten. If a task seems to need a new kit component, say so and point at #818 instead of building it here. The kit's design rules (measurements, tokens, the measured glass) stay valid: they are the new kit's specification. The new kit lives in `toolkit/` (its own Cargo workspace); what each of its pieces offers the others is `toolkit/CONTRACT.md`, changed before the code that depends on it. Its text layout is **Parley** (owner, 2026-10-15, after phase 0's corpus against Pango, #824): `toolkit/crates/nk-text`, whose README says why and how to run the corpus. The first native window is `toolkit/phase0` (`nk-phase0`, #826): `nk-render` paints nk-text's glyph runs with `vello_cpu`, `nk-wayland` is the Wayland transport (xdg-shell, shm, seat/xkb, text-input-v3, clipboard, `veltrix-material-v1`). `nk-wayland` carries NO look: the app hands it the `Material` (glass, tone, shadow, shapes) with each frame. It is the ONE transport — the Settings slice runs on it too, with its own app-id (`Options`) and the window background of D6 (`Application::window_background`) — and it runs on any compositor (`capabilities()`, PHASE1.md D5: four protocols required, every other one has a fallback, unit-tested; `Options::require_material` for an app that needs Hyalo). Never give an app a Wayland host of its own: add what it lacks to `nk-wayland`. Its README has the owner's live fcitx5 steps; it needs Hyalo (the glass is Hyalo's). Accessibility is `toolkit/crates/nk-a11y`: a semantic tree the app owns (`TextInfo` is plain byte-offset data the app fills from `Editor`/`Layout`; nk-a11y converts to characters and depends on nothing of ours) projected by a **direct AT-SPI provider over zbus** (owner, 2026-10-15, #830 — AccessKit lost the comparison). A password's text is redacted in the tree before the provider sees it. Text extents come from the painted Layout as plain `TextInfo.geometry`; see `references/architecture.md` → "Native toolkit text geometry" for Unicode, coordinate and flat-review rules. The `hyalo` job drives the form through libatspi as Orca would (`scripts/ci/nk-a11y-check.py`, 18 checks each with its control — `active` included: Orca ignores focus inside a window that is not active; and a combo box's value goes through AT-SPI `Selection`, its change through `selection-changed`). Motion is Hyalo's: a layer is a synchronized `wl_subsurface` the app hands over through `veltrix-layers-v1` (`Window::create_layer`, `set_position/scale/opacity`, `set_transition`, all landing with ONE parent commit); Hyalo animates it and hit-tests it where it is SEEN, even while the app is blocked (test 5, #831, `scripts/ci/nk-layer-motion-check.py`). A text field inside a layer names its layer for the IME cursor (`set_layer_text_input`): text-input-v3 focus stays on the root, and Hyalo maps the rectangle every frame. The native Settings is `toolkit/settings` (`nk-settings`, #915, split Claude/Sol there): its data layer — `session.rs` holds every `Config1` ordering rule of PHASE1.md [A3] as a pure state machine (no bus, unit-tested), `client.rs` is only the transport; the portal picks the token set, never `Config1`; the manifest parser refuses a field it does not know. What a builder may read and call is `CONTRACT.md` → "The native Settings"; `examples/data-report.rs` prints Appearance's rows against the live session, read-only.
+- The codebase is intentionally **pure GTK4 + Cairo** for anything custom-painted (Dock, Bar, dots, rings, schematic) and **GTK + custom CSS** for floating overlays. **libadwaita has been fully removed** — windows are `Gtk.Window`, `Adw.AlertDialog` → `showVeltrixAlert`, `Adw.Clamp` → `VeltrixClamp`, and dark/light is driven by `Gtk.Settings.gtk_application_prefer_dark_theme` in the shell (no `Adw.init()`). Every OTHER process — installer, lock screen, any app — learns the accent, the mode and the opacities from the **Settings portal and only from it**; the greeter, outside any session, reads the mirror. That is the appearance contract in `references/architecture.md` — read it before a new window needs a colour. Don't reintroduce any `Adw.*`. See `references/design-system.md`.
+- The state model is **one central GObject (`Status.ts`)** with mutually-exclusive overlay setters. Subscribe via `notify::prop`. See `references/state-and-ipc.md`.
+- The dock H/V split is **already deduplicated**: `DockHorizontal.tsx` and `DockVertical.tsx` are 7-line wrappers; shared logic lives in `DockCore.tsx` with axis differences isolated in `DockAxis.ts`. Edit those, not the wrappers — see `references/tech-debt.md`.
+- Dock click is a **minimize/restore toggle, never a close**: clicking an app's icon while its one shown window is already focused HIDES it (Hyalo: `minimizeWindow`; Hyprland, which has no minimize: to the dock's own special workspace `special:veltrix-dock` — never the user's `special:magic` scratchpad), and clicking again brings it back (Hyalo: `focusWindow`; Hyprland: back onto the focused workspace, then focus). The app keeps running; nothing is quit or killed. With several shown windows the click keeps cycling to the next one instead — the toggle only fires when exactly one window is shown and focused. See `DockItem.tsx` (`hideAppWindow` / `restoreAppWindow`).
+- Dock springs integrate via `stepSpring` in `DockPhysics.ts`, which **substeps internally (≤1/60 s per substep)**. Never integrate a spring with a raw frame `dt`: semi-implicit Euler diverges when `damping·dt > 2`, and the frame clock can stall/fall back to ~60 Hz (e.g. a fullscreen window occludes the dock) pushing `dt` to the `MAX_DT` clamp — that exact combination exploded the auto-hide slide to 1e+68 px (2026-07-18). Stability comes from the substep, not from `MAX_DT`.
+- Dock pinning is a **real GTK DnD, not the dock's dragBus**: the app grid lives in the bar's window and the dock is its own layer-shell surface, so only a `Gtk.DragSource` (grid, `AppGrid.tsx`) → `Gtk.DropTarget` (dock window, `DockCore.tsx`) crosses between them. The source sets `dragBus` (external) on drag-begin; the target's `motion` drives the same insert preview the reorder path uses (the window's own motion controller gets nothing during a DnD) and its `drop` arms the commit — the drag-end subscriber pins only when `droppedOnDock` is set, so a release anywhere else pins nothing. In-dock reorder still uses the long-press `GestureDrag` + `dragBus`. **Overflow is scrolling, not shrinking**: when pins + running apps outgrow the monitor, the dock wheel-scrolls one slot per notch (`scrollOffset` in `DockCore.tsx`, applied to the layout origin and the bar/shim margins via `centerBar`/`updateSize`'s scroll param; `AxisAdapter.visibleMain` is the fittable extent). Icon size, magnification and reorder are untouched, so a fitting dock behaves exactly as before.
+- **The shell's skin is DARK** (white ink) whatever the system mode and whatever the wallpaper, since 2026-09-30, except where a surface follows the mode (the dock, the app grid); a light skin is to come back as a Setting, not defined yet. A Cairo painter on shell chrome therefore asks `chromeIsDarkFor(itsArea)` / `glassAlphaFor(itsArea, role)` / `glassTintFor(itsArea)` from `common/ShellGlass.ts` — never the global `Theme.chromeIsDark` / `Theme.overlayOpacity` or a bare `GLASS_TINT.dark` (`references/design-system.md` → "The shell's glass, as a painter asks for it"). The ADAPTIVE glass (#673: measure the backdrop, thicken the tint) went with #762. **On Hyalo the compositor paints the glass itself**: a glass painter registers its shapes with `trackGlass` and, while `compositorPaintsGlass(itsArea)` is true, paints only content and state (it is false for glass inside glass, `nested`, and for the greeter, still on Hyprland) — see `references/hyalo.md` → "The shell's glass is declared". And there the TEXT is white and turns dark per pane only where Hyalo measured the whole backdrop under it white (the ink): `chromeIsDarkFor` already answers it, CSS follows `INK_DARK_CLASS` — `references/hyalo.md` → "The ink". Not every pane takes it (owner, 2026-10-08, after measuring the reference): the Control Center and the notifications stay white (`trackNoInk`), the dock follows the system MODE (`trackModeGlass` + `skinFromMode`), glass buttons follow the backdrop, the bar row is undecided — "WHO takes the ink" there. What the glass does to the backdrop is each pane's TONE — the reference's own filter, stage by stage as it was measured (ceiling, levels, saturation, wash, ambient), with each kind of pane's values (`trackGlassPiece`: control, panel, controlCenter, dock; the table is `TONES` in `glass-material.ts`); the BLUR is the reference's, measured: one capture, three blurs mixed per pane by its size, small to large on the reference's own ramp (`BlurMix`, `references/hyalo.md` → "The blur"); there is no adaptive tint and no shadow under the glass any more, only the CC/NC's FIXED veil (`trackVeilRegion`) — and each pane's own shadow OUTSIDE its glass, measured, by size (`set_shadow`, `references/hyalo.md` → "Each pane's shadow") — `references/hyalo.md` → "The tone".
+- Sliders are **one component**: `makeSlider` (Cairo) in `ui/lib/veltrix-kit/slider.ts` — horizontal or vertical, optional thumb, custom non-warp input. There is no native `Gtk.Scale`. It lives in the KIT, so it gets its accent and its surface mode from the **appearance seam** (`veltrix-kit/appearance.ts`) that each bundle registers once in `app.ts` — never by importing `ThemeManager`. See `references/design-system.md`.
+
+### Native structural widgets
+
+The Rust structural layer is `toolkit/crates/nk-widgets` (#873): retained tree,
+measure/place, focus/capture and derived AT-SPI, with the D7 sidebar/title layers
+and D5 opaque fallback. D7 collapse reflows the inset; narrow windows use an
+overlay, and the sidebar scrolls independently. Start at its README and `references/architecture.md` →
+"Native toolkit structural widgets" before building on it. Apps use nk-wayland;
+phase0 stays independent. The fixed-data demo and libatspi controls live in
+`toolkit/widgets-demo` and `scripts/ci/nk-widgets-check.py`. Builds, evidence and
+logs for this work belong in target/ or ~/Veltrix/ChatGPT/, never /tmp.
+
+### Appearance for a native program (nk-platform)
+
+Any Rust program of ours learns its appearance from `toolkit/crates/nk-platform` (#1072): the
+portal, the exported tokens and strings, the `nk-widgets` styles and the glass readers. Never
+depend on `nk-settings` for that — it is an application, and the shell compiled it in until
+#1072. Settings adds its pages and its header/wallpaper looks on top, through wrappers that
+dereference to the platform's `Exports` and `Styles`. `toolkit/CONTRACT.md` → "The platform".
+
+### Shell views (nk-view)
+
+New shell surfaces and ports are built on `toolkit/crates/nk-view` (#1048), not by placing,
+hit-testing and painting by hand. Its contract is `toolkit/VIEW.md` and its README covers the
+API. Gaps, corners and motion are tokens read from `tokens/static.json` (`Space`, `Radius`, the
+kit's curves and durations). Hover, press and focus are derived by key. A `Reveal` opens and
+closes in place, moved panes slide, and a `swipe(action)` control is swiped off and reported by
+`tick` when it is gone; the surface calls `tick` while `animating()`. A `Scroll` region builds
+only the rows inside `window(key)` (placeholders for the rest), keeps what is read in place on a
+rebuild, and draws the kit's one scroll bar (`nk-widgets` `ScrollBar`, shared with Settings). An `Overlay` places layers (a card's floating close) over a base without changing its size. Panes are declared whole,
+with their clip and their content's opacity. A pane never declares more than Hyalo's eight lit
+washes, and every other shown control is declared at rest so its hover fades in. `layout_in`
+lays a view in part of its surface; `semantic_keys` + `request` answer a reader; `cascade` flings
+several cards off in turn and reports once. The NC is the first consumer and the only NC:
+`toolkit/shell/src/nc_view.rs` (#1048), separate glass cards with the calendar as one more;
+`nc.rs` keeps only the month shown, the bulk-dismissal targets and the age and group names.
+`Node::slider` is the Settings slider's rules (one `ValueRange`); `Node::field` only SHOWS a
+field (the owner edits it, and a secret reaches the view as bullets, never its text);
+`Node::slot` is room the surface paints itself (`VIEW.md` §12). The CC's detail pages are the
+second consumer: `ccdetail.rs` keeps the model and ccauth's secret editing, and its rows act on
+release, like every nk-view control (`toolkit/shell/CC.md`). The CC's grid is the third:
+`Node::grid` places tiles on cells the editor computes; a control can be `on` (white, content
+in the accent), a `surface` well, or `keys_only` (Tab and readers, no pointer); `Slider::fill`
+is the 1×2 tile slider. The editor still places and scrolls the tiles' glass, so that view
+calls `set_slides(false)`: a moved pane must not slide away from glass it does not move.
+
+### Applications1 catalogue and native dock pins
+
+`veltrix-sessiond --applications` opts into A1's catalogue, search, full-colour app
+icons/overrides and typed app/folder pin layout. Start at
+`session/daemon/src/applications/README.md` and `session/design/APPLICATIONS1-DOCK.md`.
+A2 adds launch/actions/open/default-directory and XDG autostart preferences;
+read `session/daemon/src/applications/A2.md`. Exec uses systemd transient services
+with literal argv, per-launch token and explicit environment; D-Bus activation
+never falls back to Exec. Admission/dispatch never confirms a window or focus.
+`LaunchAvailable` is distinct from Unity's `LauncherAvailable`. A3 consumes H1's
+snapshot barrier and focus_transition for usage/matching/correlation; never use
+coalesced focus_changed for accounting. Read `session/daemon/src/applications/A3.md`.
+#998's only window-identity resolver lives in Applications1 (`WINDOW-IDENTITY.md`): token,
+sandbox, package ownership, launch unit, names and parent, with bounded set
+narrowing. The dock consumes WindowMatches for the current Hyalo run; never add
+a local matcher. Proc/pacman reads run outside GLib/H1 and painting, cached per
+window identity and invalidated by package monitors. HTTP-handler packages are
+excluded to preserve PWA identity. Inherited environment and executable
+substrings never choose an app. A token can identify several windows while its
+foreground activation grant remains single-use and reuse is confined to the first
+presenting Wayland client. X11 startup IDs stay single-use. Packages belong to the
+window PID's own exe; a unit requires matching recorded Exec/main-process exe,
+so a child cannot inherit the dock-launched terminal's identity.
+Keep tentative watch time out of persistence so idle caps watch-start +30 s. Unity
+is a signal on arbitrary object paths, never an Update method; retire its actual
+sender and use one ordered stream so a queued signal cannot resurrect a dead owner.
+Autostart changes preferences only; the existing session runner executes them, never a second daemon startup loop.
+The ordinary session and TS UI remain unchanged. Native pins use separate
+`org.veltrix.dock layout`/`layout-version`; legacy `pinned` is read once, never
+written by Rust (the TS orphan-pruner would erase typed tokens). A blocking
+GLib MainLoop handles bounded jobs/monitors, coalesces events for 100 ms and retries
+only failed scans/monitors with 1–60 s backoff; no healthy rescan or portal polling.
+Portal theme follows ReadOne + current-owner SettingChanged. Only a complete healthy catalogue may
+prune a missing app, including migrated pins. Known export-root/mount loss must
+survive restart as degraded state, never uninstall. Desktop Generation, icon
+revision and layout CAS are independent; do not use an icon refresh to overwrite
+another client's order. App art uses the full-colour resolver, not nk-icons'
+symbolic-shape parser. All mutations retain original kernel sender identity and
+scoped veltrix-access policy; Launcher gains no general Shell privileges and its
+installed path becomes active only when D4 ships veltrix-apps.
+
+### Rust shell IPC client
+
+`session/ipc` builds the installed Rust `veltrix-ipc` (#959 B); default TS Request
+compatibility is unchanged. `VELTRIX_SESSION=rust` / `--session=rust` routes directly
+to Config1, Hyalo and the typed contract in `crates/veltrix-shell-ipc`; there is no
+fallback, broker or TS bridge. B runs no Shell1 renderer: visual actions are
+Unavailable until their renderer exists (C is OSD only). A2 routes listApps/launchApp
+to Applications1 as External and waits only for dispatch. Wallpaper preview remains
+Unavailable. Start at `references/state-and-ipc.md` → "The native Rust
+routes" and `session/ipc/README.md` before extending a route. The CLI grants no
+privilege; owners retain the shared consent policy. No OSD over ext-session-lock.
+
+### Shell surfaces (the Rust dock and bar)
+
+`nk-wayland` hosts layer-shell roots too (#959 T1): `run_layer(app, options, LayerSpec,
+wake, start)`, with `run` unchanged. Read `toolkit/SHELL-SURFACES.md` before building a
+dock or bar. Its gotchas:
+- A `wl_output` global number is NOT identity. Hyalo reuses freed numbers, so a removed
+  and re-added screen can get the same one. Use `OutputId`, from `OutputWatch`.
+- A dock on one screen gets that exact instance with `OutputWatch::bind_output`. The
+  `LayerOutput` it returns is single-use and brings the dock's own connection.
+- Another thread reaches the loop only through `wake_channel()` (`Event::Wake`), never
+  by blocking it.
+- Every wait in it has a deadline.
+- Drops from other apps reach the ROOT surface only (`Event::DragEnter`…`Drop`), never a
+  layer or a popup; nothing is taken until the app calls `accept_drop`.
+- Hyalo closes a layer surface whose named output is gone; it never moves it to the
+  output under the pointer.
+
+The checks are nested, not in CI: `toolkit/crates/nk-wayland/check-layer-headless.sh`
+with `NK_LAYER_CHECK`. Before acting, they wait for Hyalo's "Xwayland ready".
+
+The Rust dock is `toolkit/shell` (binary `veltrix-shell`, D1–D2 of #959). Read
+`toolkit/shell/DOCK.md` first: what each step of the series owns, and what is not there yet.
+The Rust bar (B1) is the same process, started with `--bar`: `toolkit/shell/BAR.md`. Its
+check is `toolkit/shell/check-bar-headless.sh` (the dock's check plus the bar).
+Its Control Center (B2) is `toolkit/shell/CC.md`.
+B2.2 details replace the grid on this same surface. Read CC.md before editing:
+row identities pin service owners/epochs (seek also pins its track); stale replies
+belong only to their issuing view; slider writes coalesce per destination. Wi-Fi
+owns a private Network1 secrets-renderer connection only while its detail exists.
+Never put a password in Debug, accessibility text or IME surrounding text. The
+capture controller owns its recorder child, signals only that child and preserves
+recording preferences; screenshot and Stop use independent lanes. The extended
+private check is check-cc-headless.sh; export settings **and** tokens for it.
+B2.3 editing uses pure cclayout operations, a write barrier released by echo or
+acknowledgement (including concurrent external changes), and
+parent-space clipping appended into unpublished layers v1 (update both ends together).
+Membership and geometry use two ordered
+schema applies, never a claimed cross-schema transaction. Clipboard children and
+visible thumbnail decoding run off the surface/control lanes; CPU reads stop
+when its grid tile is unmapped. Read CC.md before modifying any of these. The
+private edit/widget walk is check-cc-edit-headless.sh. Stable Named action IDs
+stay in English; Node::action_labels supplies localized reader names/descriptions.
+Layout write diagnostics stay in the log, with translated messages in the view.
+Out-of-grid moves are no-op/rollback; only capacity refusals use cc.menu.size-full.
+
+- A tray item that registers with a SYNCHRONOUS call blocks its own main loop while the
+  watcher reads its properties back: the registration fails with "No such interface".
+  Apps register asynchronously; a fake must too (`TRAY_ITEM` in `dock-check.py`).
+- Software Hyalo draws a state change a beat late: wait ~1.5 s before a screenshot, or it
+  shows the previous frame (the reader tree is already right).
+- A reader list read while it updates carries rows without names yet: wait for a settled
+  one (every name non-empty), not just a shorter one.
+- The bar's readers (`status.rs`, `tray.rs`) log one line per failure, "the bar shows no
+  …": start there when a widget or the tray is missing.
+- Look at it with `scripts/dev/rust-session.sh --applications veltrix-shell`. Check it with
+  `toolkit/shell/check-dock-headless.sh`; other scales take
+  `NK_WIDGETS_HYALO_CONFIG` = a Hyalo config with `[outputs.winit] scale = 1.25`.
+- A private schema overlay must link `*.enums.xml` too. Without them, every schema that
+  names an enum is silently dropped, `org.gnome.desktop.interface` among them, and the
+  icon theme reads as none (hicolor only). This cost two rounds.
+- In the headless harness Hyalo refuses `msg do …` from an unidentified caller
+  (AccessDenied). A check makes the client act itself, e.g. a window that minimizes itself.
+- Window pictures come from each dock's own layer root (`capture_window`, id in hex); the
+  pixels are wiped on lock (`Raster::wipe`).
+- With magnification on, measure an item AT REST: move the pointer away and wait for an
+  item's extent to equal its rest one before reading where anything is. Read under the
+  pointer, the strip is magnified around it, and the click lands on a neighbour (the
+  separator menu and the chooser steps each cost a round to this).
+- A popup the compositor dismisses (Done) must still be closed by the client
+  (`close_menu_popup`); a stale overlay makes the next menu fail with "menu parent must
+  be the active popup". The tooltip is a passive popup (`open_passive_popup`): no grab,
+  and only while no other popup is open.
+- Modal menus filter root motion/leave delivery. On close, sample
+  `Window::root_pointer_position()` before destroying the popup and reconcile
+  presence/auto-hide/hover; a retired popup's local coordinates are not the root's
+  (#1030). The dock shares its ordinary leave cleanup and adds no timer.
+- File drops use Applications1 `SupportsFileDrop` plus `MimeTypes`, never `%U`
+  alone or the broader `SupportsOpen`. All GIO types must match (directory =
+  `inode/directory`); scheme handlers do not authorize local files. The transport
+  pre-reads once, with byte/time bounds and no finish until Drop; UI classification
+  is off-loop and a late result belongs only to its original offer. See DOCK.md.
+  Pin/Open both negotiate Copy. Optional `veltrix-drag-feedback-v1` conveys only
+  cursor intent (Alias/Copy/Default), scoped to the destination surface and its
+  current drag-enter serial; unsupported compositors keep standard Copy.
+- `check-dock-popup-headless.sh` shares the full bar check's popup assertions.
+  Its outside click uses blank space below the bar: `(10,10)` opens the System
+  menu and legitimately prevents dock re-entry while its grab remains (#1040).
+  A screenshot showing that menu is not evidence of a magnification regression.
+  See `toolkit/shell/POPUP-REENTRY.md`; CI inclusion is only a nightly proposal.
+- Never build while the headless check runs: on this machine the load alone makes
+  `veltrix-hyalo msg` time out and the check fail for no reason of its own.
+- The fonts have no bold and the text engine refuses to fake one: a figure that must
+  stand out (a count) uses the menus' weight.
+- `NK_SETTINGS_BIN` adds the native Settings' Dock page to the check. Settings paints from
+  the portal's Settings, so the check serves a stand-in for it on the private bus.
+
+## Keep this skill current (part of "done", not a follow-up)
+
+This skill is only useful if it matches reality. **When a change introduces or alters
+something that needs explanation** — a new mechanism, a non-obvious pattern, a "why is it
+done this way", a new shared component, or a gotcha that bit you — **update the skill in the
+same change**:
+
+- Put the *how/why* in the right `references/` file (architecture / design-system /
+  state-and-ipc / dev-workflow), not just in the commit message. If a contributor's agent
+  would need it to work correctly, it belongs here.
+- Keep `references/tech-debt.md` honest: **add new debt or deferred work** you created or
+  found, and when you resolve an item **move its body to `references/tech-debt-resolved.md`**,
+  keeping its number and leaving its line in the live file's index. Do not renumber, and do not
+  delete outright — several resolved items still carry a rule that binds. The live file must
+  read as what is still owed.
+- Fix any statement in `SKILL.md`/references that your change made wrong.
+
+### Native dock drag hold expiry (#1024)
+
+In `toolkit/shell/src/dock.rs`, expiring a local `held`/`gone`/`dropped` hold uses
+`reslot`, even when Applications1 has sent no new frame: presentation can add or
+remove slots. `present` + `reshape` leaves the resting layout stale and can panic
+when painting the restored last pin. Keep frame and geometry together through
+`present_layout`; missing drawing geometry is skipped defensively. See
+`toolkit/shell/DOCK.md`, Reorder, and `hold_expiry_tests` for the regression.
+
+### Native dock sections (#1026)
+
+The three groups are pinned apps | running apps | minimized + folders/files + Trash.
+Only two boundaries, no internal right-hand separators. `present()` normalizes after
+all previews/holds/suppression; stable boundary keys keep the surviving separator on
+the icon spring, without a ghost line. Places are found by kind, not separators.
+Dropping an app pin among running apps removes the pin and puts its surviving group
+at the dropped position in the hub's shared session order; no windows means it goes.
+Folders/files dropped over apps return. Keep count changes on relayout (#1024),
+including hold expiry, and check Rust alone. See `toolkit/shell/DOCK.md` §4/Reorder.
+
+### Prayer lock (60 s, shell-independent)
+
+At each prayer time the shell shows a full-screen overlay naming the prayer
+("Go pray — Fajr", …) and locks for 60 seconds, then unlocks automatically.
+The split is load-bearing: `ui/shell/core/PrayerLock.ts` is ONLY a scheduler
+(minute poll of `bin/veltrix-prayer-times --due`, then fire-and-forget spawn
+through `spawn()`), and `bin/veltrix-prayer-lock` OWNS the lock — it calls
+`os.setsid()` at start, owns a wall-clock deadline AND a monotonic deadline
+(`remaining()` is the min of both, so a backward clock jump cannot stretch it),
+enforces a hard 300 s cap (`--duration` > 300 or `--ends-at` > now+300 → exit 2),
+owns a forked watchdog that SIGTERMs then SIGKILLs it at the deadline, and has
+exactly ONE deliberate escape: hold Escape for 3 continuous seconds (a tap or a
+1 s hold does nothing; the hint is printed on the overlay). No button, no click
+handler, no IPC; only the deadline, the watchdog, the Esc hold, or a signal ends
+it. Stuck-overlay recovery: Ctrl+Alt+F2, log in, `killall veltrix-prayer-lock`,
+Ctrl+Alt+F1/F7 back. Killing the shell mid-lock must NOT strand the user;
+killing the lock must fail OPEN. The state file is validated before it can refuse
+a fresh lock (corrupt file, dead pid, live non-lock pid, or an `exec -a` spoof with
+a stale start time are all stale; identity is /proc cmdline AND field-22 start
+time — and a pid the caller cannot signal is NOT trusted on that alone: on
+PermissionError the check falls through to /proc, live only if /proc is also
+unreadable, so a planted state file naming pid 1 cannot block locks — fix
+pass #2, security N1), and only ONE ladder rung is ever active (session-lock OR layer-shell OR
+fullscreen — `on_failed` destroys the session-lock windows before building
+fullscreen). Session-lock guard (fix pass #2): if no `monitor` signal arrives
+within 5 s of `lock.lock()`, the lock logs LOUDLY to stderr (the timer still
+ends it — the failure is made visible, not fixed by waiting), and `on_monitor`
+ignores a late signal once `on_failed` has run, so it cannot append a
+session-lock window on top of the fullscreen fallback. Prayer times come from `al-falak==1.2.1` (ISNA 15°/15°, Shafi'i Asr)
+in the same per-user venv as `hijridate` (`bin/veltrix-prayer-times` re-execs like
+`bin/veltrix-hijri-date`); `bin/veltrix-setup` and `install.sh` create that venv
+(hash-pinned, `defaults/python-venv-requirements.txt`) so a packaged install gets
+the lock, not a helper that exits 3. The venv block in `veltrix-setup` sits ABOVE
+the fatal WhiteSur/icon-theme gates (fix pass #2) so the `veltrix-setup --user`
+first-login bootstrap in `bin/veltrix` reaches it on a machine where full setup
+never ran, and `post_upgrade` tells upgraders to re-run `veltrix-setup` (or
+`veltrix-update`) so the venv gets created on upgrade too. Method/madhab/offsets come from
+`~/.config/veltrix/prayer.json` (ISNA / Shafi'i / Asr +2 defaults, Dhuhr −1 only
+under methods whose al-falak preset carries dhuhr=+1 — ISNA, MWL, Egypt,
+Singapore; 0 under Umm al-Qura, Kuwait, Qatar, Turkey — fix pass #2, halal #1;
+user-set offsets always win). The Dhuhr −1 / Asr +2 is mosque calibration vs ICSWO, not a computation fix: al-falak
+rounds half-up; its NORTH_AMERICA preset adds +1 to solar transit, and its Asr uses
+declination frozen at 0h UT; see docs/prayer-lock-fix-report-1.md §1). Config
+offsets are bounded to ±120 min and unknown top-level keys in prayer.json are
+refused (exit 2) — a typo must never be silently ignored (fix pass #2). The full
+Settings UI for method/madhab/offsets and the opt-out toggle lands in v0.14.
+The overlay's strings are embedded EN/AR/ES tables GENERATED from the `prayerlock.*`
+locale keys by `scripts/dev/gen-prayer-lock-strings.py` (harness T7 fails on drift),
+because the lock must run with the shell dead; the overlay shows the real wallpaper
+dimmed + blurred, the prayer name leading in the active locale's language, a big
+numeric countdown, and the Esc hint. There is no disable switch and no skip in v1
+(Adnan's call). Verification lives in `scripts/dev/prayer-lock-test.py` (times vs
+ICSWO + searchtruth + timesprayer Nov 12–18, selector boundaries, 5 s + real 60 s
+timing, shell-death + SIGKILL recovery, no-dismiss grep, generator check, Esc-hold
+unit, cap, monotonic fake-clock, state validation, config override, plural
+countdown, N1 as-nobody plant, config bounds + unknown-key refusal, Dhuhr under
+all 8 methods) — the GUI ladder (session-lock → layer-shell → fullscreen) is Dell-gated,
+never claimed from a headless run. See `docs/prayer-lock-report.md` and
+`docs/prayer-lock-fix-report-1.md`.

@@ -1,0 +1,39 @@
+[Unit]
+Description=Veltrix UI (bar, dock, overlays)
+Documentation=https://github.com/adnqcr7-code/veltrix
+PartOf=graphical-session.target
+Wants=veltrix-sessiond-legacy.service
+After=graphical-session.target veltrix-sessiond-legacy.service
+# Crash-loop guard: if the shell dies more than 5 times in 30s (e.g. a broken
+# build or a config that crashes on startup), stop retrying instead of respawning
+# forever in a flickering loop — drop to a TTY and fix it. Re-arm with
+# `systemctl --user reset-failed veltrix.service`.
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Pending config migrations, once each, as this user. HERE rather than only in
+# veltrix-setup because `veltrix.install` merely PRINTS on post_upgrade — a plain
+# `pacman -Syu` never runs setup — and because this is the one moment the shell
+# is provably not yet reading the files being migrated. It always exits 0: a
+# broken migration must cost a log line, never the session.
+ExecStartPre=/usr/bin/veltrix-migrate
+ExecStart=/usr/bin/veltrix-ui
+Environment=VELTRIX_SESSION=ts
+# Respawn on crash (segfault / non-zero exit / signal). A clean exit is NOT
+# restarted, so quitting on purpose stays quit.
+Restart=on-failure
+RestartSec=1
+# Keep restarts snappy: SIGKILL the cgroup quickly if it doesn't exit on SIGTERM.
+TimeoutStopSec=3
+Slice=session-graphical.slice
+
+# NOTE: intentionally NO [Install]/WantedBy=graphical-session.target. The Veltrix
+# session and a plain uwsm-managed Hyprland session are indistinguishable at the
+# systemd-target level (both are compositor "Hyprland" reaching the same generic
+# graphical-session.target), so binding here would start the Veltrix UI in ANY
+# Hyprland session — leaking the bar/dock into sessions that aren't ours. Instead
+# this service is started explicitly from the Veltrix Hyprland config
+# (config/hypr/hyprland.lua → `systemctl --user start veltrix.service`),
+# which only loads in the Veltrix session. PartOf= still stops it cleanly on logout.

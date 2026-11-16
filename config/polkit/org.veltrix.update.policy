@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  VELTRIX background updater — privileged apply action.
+
+  What this authorises: running /usr/bin/veltrix-update-helper (the
+  apply half of the background updater) as root, WITHOUT a password,
+  for the active local session. The helper is deliberately narrow: it
+  can ONLY install the release the unprivileged downloader staged, and
+  only after re-verifying that tarball's SHA-256 against the pinned
+  GitHub API itself. It takes no URL, no path, no version and no hash
+  from its caller, it cannot downgrade, and there is no credential
+  anywhere for a compromised updater to steal — no sudo password is
+  saved, in any file, keyring or environment variable, not even briefly.
+  That is why this action needs no password prompt: there is no secret
+  to protect, and the action itself can only install a release GitHub
+  already published.
+
+  Why polkit + pkexec, and not a D-Bus system service: the existing
+  precedent in this tree is the Content Safety action
+  (org.veltrix.content-safety.*), which already authorises a narrow
+  root helper through pkexec with the same allow_active=yes shape.
+  A D-Bus system service would add an always-on root daemon, a bus
+  policy, and a second IPC surface for a job that runs once per
+  update; pkexec spawns the helper on demand and exits. The polkit
+  policy is the whole authorisation surface, and it is one file.
+
+  allow_active=yes: the user sitting at the machine (the active local
+  session) applies an update without a password — that is the point of
+  the background updater (no terminal, no prompt, no yes/no).
+  allow_any / allow_inactive=auth_admin: a remote or inactive session
+  still needs an admin password, so an update cannot be triggered
+  from anywhere but the machine itself.
+
+  The org.freedesktop.policykit.exec.path annotation pins the action to
+  this one binary. pkexec refuses to run anything else under it.
+-->
+<policyconfig>
+  <action id="org.veltrix.update.apply">
+    <description>Install a verified VELTRIX update</description>
+    <message>Authentication is required to install a VELTRIX update</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/veltrix-update-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">apply</annotate>
+  </action>
+</policyconfig>

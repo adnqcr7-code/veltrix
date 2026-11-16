@@ -1,0 +1,13 @@
+[package]
+name = "nk-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nk-text = { path = "../nk-text" }
+nk-icons = { path = "../nk-icons" }
+vello_cpu = "0.3"
+veltrix-corner = { path = "../../../crates/veltrix-corner" }

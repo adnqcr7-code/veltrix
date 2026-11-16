@@ -1,0 +1,1325 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# veltrix-setup — first-time (and safe-to-re-run) setup for a Veltrix install.
+#
+# The veltrix pacman package ships FILES (bundles, binaries, shared config) and
+# deliberately mutates nothing else. This script is the other half — everything
+# a first login needs that packaging can't do:
+#   • GI_TYPELIB_PATH in /etc/environment (GJS finds the Astal typelibs)
+#   • per-user config seeding under ~/.config/veltrix (never overwrites)
+#   • uwsm env files + NVIDIA GPU autodetection
+#   • display manager: greetd config + enable (only when ours, or none active)
+#   • services: pipewire/wireplumber (user), power-profiles-daemon, bluetooth
+#
+# Payloads are read from /usr/share/veltrix/{defaults,config} — shipped both by
+# the veltrix package and by install.sh §5, so this script behaves identically
+# after `pacman -S veltrix` and after a script install. install.sh (§7) and
+# veltrix-update call it; a pacman-only user runs it by hand once:
+#
+#     sudo pacman -S veltrix && veltrix-setup
+#
+# Idempotent by design: every step no-ops when already done or refreshes a
+# Veltrix-owned file; user-owned files are NEVER overwritten. Run as your normal
+# user — it sudo-escalates for the system steps (and, when invoked via sudo,
+# drops back to $SUDO_USER for the per-user ones).
+#
+# --user: per-user steps ONLY (config seeding, uwsm env + NVIDIA, user
+# services) — never touches sudo, so it can run unattended inside a session.
+# This is the first-login bootstrap: bin/veltrix calls it at session start when
+# ~/.config/veltrix is missing (a user created after install time — Settings →
+# Users, useradd, archinstall — gets no seeding otherwise; issue #23). The
+# system-level steps were already done at install time and are skipped.
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -e
+
+SHARE=/usr/share/veltrix
+
+# When run via sudo, $HOME is /root. Use SUDO_USER's home instead.
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+CONFIG_DIR="${REAL_HOME}/.config/veltrix"
+
+USER_ONLY=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        # --dev-repo (removed 2026-07-10): it symlinked hypridle.conf into the
+        # dev repo as "live-editable shipped config", but the Settings → Power
+        # page WRITES that file now — it's user state, and every UI change was
+        # landing in the repo working tree. Accepted as a no-op so an older
+        # install.sh calling a newer veltrix-setup doesn't break mid-update.
+        --dev-repo) shift 2 ;;
+        --user)     USER_ONLY=yes; shift ;;
+        --help)     echo "Usage: veltrix-setup [--user]"; exit 0 ;;
+        *)          echo "veltrix-setup: unknown option '$1'" >&2; exit 1 ;;
+    esac
+done
+
+if [ ! -d "$SHARE/defaults" ] || [ ! -d "$SHARE/config/greetd" ]; then
+    echo "  [ERR] $SHARE/{defaults,config/greetd} not found — install the veltrix" >&2
+    echo "        package (or run install.sh) first; veltrix-setup only applies payloads." >&2
+    exit 1
+fi
+
+# Run a command as the unprivileged user (this script may be invoked via sudo).
+run_user() {
+    if [ "$(id -u)" -eq 0 ]; then sudo -u "$REAL_USER" -H "$@"; else "$@"; fi
+}
+
+# gsettings writes are dconf writes, and dconf commits through dconf-service on
+# the USER's session bus — with no bus reachable the write is simply lost, and
+# under sudo it is lost QUIETLY. Point at the live bus when the user has one;
+# otherwise spin a throwaway session just for the write. dconf-service on any bus
+# writes the same ~/.config/dconf/user, which is what lets an account be seeded
+# before it has ever logged in.
+run_user_dconf() {
+    local uid bus; uid="$(id -u "$REAL_USER")"; bus="/run/user/$uid/bus"
+    if [ -S "$bus" ]; then
+        run_user env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" "$@"
+    elif command -v dbus-run-session >/dev/null 2>&1; then
+        run_user env XDG_RUNTIME_DIR="/run/user/$uid" dbus-run-session -- "$@"
+    else
+        run_user "$@"
+    fi
+}
+
+# `systemctl --user` must reach the USER's manager, not root's, when invoked
+# via sudo. Point it at the user's runtime dir; best-effort like every service
+# step below (a TTY-only session without a user manager just skips).
+user_systemctl() {
+    if [ "$(id -u)" -eq 0 ]; then
+        local uid; uid="$(id -u "$REAL_USER")"
+        sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@"
+    else
+        systemctl --user "$@"
+    fi
+}
+
+echo ""
+echo "  Veltrix setup (user: $REAL_USER)"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# System environment detection
+# Reads values the user already set during Arch installation — never asks.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Keyboard layout ─────────────────────────────────────────────────────────────
+# TWO sources, in this order, and the order is the whole point (#498).
+#
+# 1. /etc/X11/xorg.conf.d/00-keyboard.conf — the system's GRAPHICAL keyboard, in
+#    xkb's own vocabulary, with the variant. Written by `systemd-localed` on any
+#    systemd machine (so `localectl set-x11-keymap` on an existing install lands
+#    here too), by Calamares, and by the Veltrix installer since #498.
+#
+# 2. KEYMAP= in /etc/vconsole.conf — the CONSOLE keymap, a different namespace
+#    with no variants. Only consulted when there is no file above, i.e. a machine
+#    set up by hand or by an installer that never recorded the pair.
+#
+# ⚠️ Deriving the layout from KEYMAP was the ONLY source until #498, and it is
+# wrong for most of the catalogue: `sv-latin1`, `jp106`, `it2`, `pl2`, `cf`,
+# `de-latin1-nodeadkeys` are console keymap names, not xkb layouts, and
+# `xkbcli compile-keymap` refuses all of them. A machine installed in Swedish
+# ended up with `kb_layout = "sv-latin1"`, which Hyprland cannot apply. Hence the
+# three-name table below AND the existence check under it: a name with no symbols
+# file is not a layout, and `us` is a better answer than a string that cannot load.
+_vconsole_to_xkb() {
+    case "$1" in
+        uk)          echo "gb"    ;;  # British: vconsole=uk, XKB=gb
+        us-acentos)  echo "us"    ;;  # Latin US variant → plain us
+        br-abnt2)    echo "br"    ;;
+        *)           echo "$1"    ;;  # All others match directly
+    esac
+}
+
+# Is this the name of a real xkb layout? `/usr/share/X11/xkb` is a symlink to
+# `/usr/share/xkeyboard-config-2` since xkeyboard-config 2.48, so both are tried.
+_is_xkb_layout() {
+    [ -n "$1" ] && { [ -f "/usr/share/X11/xkb/symbols/$1" ] \
+                  || [ -f "/usr/share/xkeyboard-config-2/symbols/$1" ]; }
+}
+
+_xkb_option() {
+    grep -E "^[[:space:]]*Option[[:space:]]+\"$1\"" "$X11_KB_CONF" 2>/dev/null \
+        | head -1 | sed -E 's/.*"'"$1"'"[[:space:]]*"([^"]*)".*/\1/'
+}
+
+X11_KB_CONF="/etc/X11/xorg.conf.d/00-keyboard.conf"
+SYS_KB_LAYOUT=""
+SYS_KB_VARIANT=""
+
+if [ -f "$X11_KB_CONF" ]; then
+    SYS_KB_LAYOUT=$(_xkb_option XkbLayout)
+    SYS_KB_VARIANT=$(_xkb_option XkbVariant)
+    # A comma-separated list is a multi-layout setup; we configure one, and the
+    # first is the active one at login.
+    SYS_KB_LAYOUT=${SYS_KB_LAYOUT%%,*}
+    SYS_KB_VARIANT=${SYS_KB_VARIANT%%,*}
+fi
+
+if [ -z "$SYS_KB_LAYOUT" ] && [ -f /etc/vconsole.conf ]; then
+    _keymap=$(grep -E "^KEYMAP=" /etc/vconsole.conf | head -1 | cut -d= -f2 | tr -d '"' | tr -d "'")
+    [ -n "$_keymap" ] && SYS_KB_LAYOUT=$(_vconsole_to_xkb "$_keymap")
+    SYS_KB_VARIANT=""
+fi
+
+if ! _is_xkb_layout "$SYS_KB_LAYOUT"; then
+    [ -n "$SYS_KB_LAYOUT" ] && echo "  [Init] '$SYS_KB_LAYOUT' is not an xkb layout, using 'us'"
+    SYS_KB_LAYOUT="us"
+    SYS_KB_VARIANT=""
+fi
+
+# Timezone ────────────────────────────────────────────────────────────────────
+SYS_TIMEZONE="UTC"
+if [ -L /etc/localtime ]; then
+    _tz=$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')
+    [ -n "$_tz" ] && SYS_TIMEZONE="$_tz"
+fi
+
+# Locale ──────────────────────────────────────────────────────────────────────
+SYS_LOCALE="en_US"
+if [ -f /etc/locale.conf ]; then
+    _lang=$(grep -E "^LANG=" /etc/locale.conf | head -1 | cut -d= -f2 | cut -d. -f1 | tr -d '"' | tr -d "'")
+    [ -n "$_lang" ] && SYS_LOCALE="$_lang"
+fi
+
+echo "  Detected: layout=$SYS_KB_LAYOUT  timezone=$SYS_TIMEZONE  locale=$SYS_LOCALE"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GObject Introspection environment (system — skipped by --user)
+# ─────────────────────────────────────────────────────────────────────────────
+if [ -z "$USER_ONLY" ] && ! grep -q "GI_TYPELIB_PATH" /etc/environment 2>/dev/null; then
+    echo "  Configuring GI_TYPELIB_PATH in /etc/environment..."
+    echo 'GI_TYPELIB_PATH="/usr/lib/girepository-1.0"' | sudo tee -a /etc/environment
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generated locales (system — skipped by --user)
+# The UI ships in 13 languages, but Settings → Language can only offer
+# GENERATED locales (`localectl list-locales` reads the uncommented entries of
+# /etc/locale.gen) and LC_TIME date names need the locale compiled — a stock
+# Arch typically generates just en_US plus the installer's pick. Uncomment the
+# shipped set and run locale-gen once, only when something was missing
+# (idempotent; costs a few MB in /usr/lib/locale/locale-archive).
+# ─────────────────────────────────────────────────────────────────────────────
+if [ -z "$USER_ONLY" ] && [ -f /etc/locale.gen ]; then
+    VELTRIX_LOCALES="en_US es_ES fr_FR de_DE it_IT pt_BR pt_PT pl_PL nl_NL ru_RU zh_CN ja_JP ar_SA"
+    _locales_missing=""
+    for _loc in $VELTRIX_LOCALES; do
+        grep -qE "^${_loc}\.UTF-8" /etc/locale.gen || _locales_missing="$_locales_missing $_loc"
+    done
+    if [ -n "$_locales_missing" ]; then
+        echo "  Generating locales:$_locales_missing"
+        for _loc in $_locales_missing; do
+            if grep -qE "^#\s*${_loc}\.UTF-8 UTF-8" /etc/locale.gen; then
+                # Standard Arch locale.gen: the line exists commented — uncomment it.
+                sudo sed -i -E "s|^#\s*(${_loc}\.UTF-8 UTF-8)|\1|" /etc/locale.gen
+            else
+                echo "${_loc}.UTF-8 UTF-8" | sudo tee -a /etc/locale.gen >/dev/null
+            fi
+        done
+        sudo locale-gen
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The system language's input engine (system — skipped by --user)
+# A Chinese system needs fcitx5-chinese-addons to be typable, and since #703 that
+# is no longer a dependency of veltrix (it costs ~540 MiB). This is where
+# the INSTALLER gets it — archinstall wrote /etc/locale.conf before the plan's
+# custom_commands run this script in the target — and where an install that was
+# already Chinese keeps it on `veltrix-update`. The map lives in veltrix-language.
+# Best-effort: a failed download must not cost the rest of the setup.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ -z "$USER_ONLY" ] && command -v veltrix-language >/dev/null 2>&1; then
+    if ! sudo veltrix-language ensure-engine; then
+        echo "  [WARN] the input engine for this language could not be installed;"
+        echo "         run 'sudo veltrix-language ensure-engine' once you are online"
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-user configuration (first run only, never overwrites)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "  Initializing user configuration..."
+mkdir -p "$CONFIG_DIR"
+# Running under sudo, `mkdir -p` creates ~/.config ITSELF as root when it doesn't
+# exist yet. A root-owned ~/.config silently breaks the whole user session: the
+# shell (running as $REAL_USER) then can't create ~/.config/gtk-{3,4}.0 (icon theme
+# + dark never reach GTK apps), dconf can't create ~/.config/dconf (gsettings writes
+# vanish → libadwaita apps stay light), and xdg-user-dirs-update can't write
+# ~/.config/user-dirs.dirs (nautilus "No Home Directory") — clean-install bugs 1/2/4,
+# VM 06-22. Own the parent too, not just our dir.
+#
+# ⚠️ The trailing colon in every `chown "$REAL_USER:"` below is load-bearing, not a
+# typo: `chown user file` sets the OWNER and leaves the group alone, so a file this
+# script creates under sudo stayed group-`root` while everything the user's own
+# session writes is group-`<their login group>`. `user:` sets the group to that
+# login group, which is what makes the two match. Harmless while the owner has
+# write access — and invisible until something ever reads the group.
+chown "$REAL_USER:" "${REAL_HOME}/.config" "$CONFIG_DIR"
+
+# ~/.cache has the SAME hazard, and it bit us the same way (VM sweep 08-10): the
+# installer's package build cache lives at ~/.cache/veltrix/pkgbuild, and every
+# `mkdir -p` of it under sudo creates ~/.cache and ~/.cache/veltrix as root when
+# they don't exist yet. Three things the user's own session writes there then
+# fail, and all three fail QUIETLY: Astal's frequents cache (`cannot cache
+# frequents: … Permission denied`, so dock/app-grid usage ordering never
+# persists), MediaService's album art (~/.cache/veltrix/media-art), and
+# `veltrix-update`, whose work dir is an mktemp INSIDE ~/.cache/veltrix — the
+# update path itself broken on a fresh install.
+#
+# This runs on every install, package hook and update, so it also REPAIRS an
+# install already poisoned before this existed. Non-recursive on ~/.cache (other
+# apps' caches are none of our business, and the dir is what matters), recursive
+# on ~/.cache/veltrix, which is ours whole.
+[ -d "${REAL_HOME}/.cache" ] && chown "$REAL_USER:" "${REAL_HOME}/.cache"
+[ -d "${REAL_HOME}/.cache/veltrix" ] && chown -R "$REAL_USER:" "${REAL_HOME}/.cache/veltrix"
+
+# No settings file is seeded here any more. The last one, appearance.json, moved to
+# GSettings (#573): its GNOME-homed keys get their defaults from the system dconf
+# database below, and Veltrix's own from the org.veltrix.appearance schema. A file
+# copied here would be read by nothing — and, created after the migration marker, it
+# would sit there forever. Bar/CC widget placement + CC tile layout come from the
+# shell's code defaults (DEFAULT_PLACEMENT + CC_DEFAULT_LAYOUT in widgets/index.ts).
+
+# ── Per-user Python venv: Hijri date + prayer times data ─────────────────
+# ORDER MATTERS (fix pass #2, code #1): this block MUST sit above the
+# fatal gates below (WhiteSur install failure, icon-theme directory
+# missing). bin/veltrix runs `veltrix-setup --user` as the first-login
+# bootstrap on a machine where full setup never ran — if the icon gate
+# fires first, the bootstrap dies before the venv exists, the prayer
+# lock never fires, and the bootstrap retries and fails at every login.
+# The WhiteSur gate is skipped in --user mode, but the icon-theme gate
+# is not, so the venv block goes above BOTH. It needs nothing from the
+# sections in between (only SHARE / REAL_HOME / run_user, all defined
+# at the top), so moving it is safe.
+# (fix pass #1, code #11): a pure `pacman -S veltrix` install never created
+# this venv — only install.sh (the dev path) did — so the prayer lock silently
+# never fired there (the helper exits 3, "no data, no lock"). veltrix-setup is
+# the first-boot setup a packaged user runs (the install scriptlet tells them
+# to), so it owns venv creation now. Idempotent and fail-soft, like
+# install.sh: `python3 -m venv` no-ops when the venv exists; pip installs
+# hijridate + al-falak from the shipped, hash-pinned requirements file
+# (defaults/python-venv-requirements.txt). Without network the setup still
+# succeeds and the features degrade until the venv exists (the bar shows the
+# Gregorian clock only; the prayer lock never fires). Runs as the user
+# (run_user), never root. If the requirements file is absent (a package built
+# before it shipped), fall back to the version-pinned install so the feature
+# still works.
+VENV_DIR="${REAL_HOME}/.local/share/veltrix/venv"
+VENV_REQ="$SHARE/defaults/python-venv-requirements.txt"
+if run_user "$VENV_DIR/bin/python" -c "import hijridate, alfalak" 2>/dev/null; then
+    echo "  [OK] Python venv already has hijridate + al-falak → $VENV_DIR"
+elif run_user python3 -m venv "$VENV_DIR" 2>/dev/null; then
+    if [ -f "$VENV_REQ" ]; then
+        if run_user "$VENV_DIR/bin/pip" install --quiet --require-hashes -r "$VENV_REQ"; then
+            echo "  [OK] Python venv: hijridate + al-falak installed (hash-pinned) → $VENV_DIR"
+        else
+            echo "  [WARN] hijridate/al-falak did not install — the Hijri date will be absent and the prayer lock will not fire until the venv is created. Check the network, then re-run veltrix-setup." >&2
+        fi
+    elif run_user "$VENV_DIR/bin/pip" install --quiet "hijridate==2.6.0" "al-falak==1.2.1"; then
+        echo "  [OK] Python venv: hijridate + al-falak installed → $VENV_DIR"
+    else
+        echo "  [WARN] hijridate/al-falak did not install — the Hijri date will be absent and the prayer lock will not fire until the venv is created. Check the network, then re-run veltrix-setup." >&2
+    fi
+else
+    echo "  [WARN] could not create $VENV_DIR — the Hijri date will be absent and the prayer lock will not fire until the venv is created. Check the disk, then re-run veltrix-setup." >&2
+fi
+
+# ── WhiteSur icon theme: install it, don't just name it ──────────────────────
+# defaults/appearance.json names "WhiteSur" as the system icon theme, but no
+# package delivers it: it is not in the Arch repos, and no AUR package name for
+# it could be verified against a live source (2026-11-12), so it is deliberately
+# NOT a PKGBUILD dep — a guessed dep would break `pacman -S veltrix` on an
+# unresolvable name. Instead this step installs it from upstream, pinned to one
+# commit, the way the project's own README documents (`./install.sh -d <dest>`):
+#   https://github.com/vinceliuice/WhiteSur-icon-theme (GPL-3.0)
+# Pinned commit 73d8040da51a9ed74e47c7366e7e9ff437601a5c (master HEAD, 2026-11-12).
+# Bump the pin when upstream moves; the fetch below fails LOUD rather than
+# silently installing whatever HEAD happens to be that day.
+# `-t default` is load-bearing, not a no-op: it pins the DEFAULT (blue) variant,
+# whose folders are blue (#46a2d7, verified at this commit). The other variants
+# install WhiteSur-<colour> directories whose folders are that colour — `-t
+# purple` would paint purple folders — and the bare `WhiteSur` name the system
+# default points at is only the default variant's directory.
+# System step (writes /usr/share/icons), skipped by --user: a first-login
+# bootstrap inside a session never calls sudo, and the install-time run already
+# did this — if the theme is still missing then, the check below fails loud
+# (and bin/veltrix's `|| true` keeps that from blocking the session).
+if [ -z "$USER_ONLY" ] && [ ! -f /usr/share/icons/WhiteSur/index.theme ]; then
+    echo "  Installing WhiteSur icon theme (upstream, pinned commit)..."
+    _ws_tmp="$(mktemp -d)"
+    _ws_ok=no
+    if command -v git >/dev/null 2>&1; then
+        git init --quiet "$_ws_tmp/whitesur" 2>/dev/null \
+            && git -C "$_ws_tmp/whitesur" remote add origin https://github.com/vinceliuice/WhiteSur-icon-theme.git 2>/dev/null \
+            && git -C "$_ws_tmp/whitesur" fetch --quiet --depth 1 origin 73d8040da51a9ed74e47c7366e7e9ff437601a5c 2>/dev/null \
+            && git -C "$_ws_tmp/whitesur" checkout --quiet 73d8040da51a9ed74e47c7366e7e9ff437601a5c 2>/dev/null \
+            && sudo "$_ws_tmp/whitesur/install.sh" -d /usr/share/icons -t default >/dev/null 2>&1 \
+            && [ -f /usr/share/icons/WhiteSur/index.theme ] && _ws_ok=yes
+    fi
+    if [ "$_ws_ok" = yes ]; then
+        echo "  [OK] WhiteSur icon theme installed → /usr/share/icons/WhiteSur"
+    else
+        echo "  [FAIL] WhiteSur icon theme could not be installed." >&2
+        echo "         The desktop defaults to WhiteSur icons; without it the first" >&2
+        echo "         session paints Adwaita. Check the network, then re-run veltrix-setup." >&2
+        rm -rf "$_ws_tmp"
+        exit 1
+    fi
+    rm -rf "$_ws_tmp"
+fi
+
+# The icon theme has to be in gsettings BEFORE the shell's first frame, not after.
+# GTK reads that value while it builds the first window, while ThemeManager only
+# applied the icon theme once it was already running — about two
+# seconds in. On a virgin account those two seconds are the whole first session:
+# everything rasterized before them keeps the schema default (Adwaita), and the
+# dock, which caches its icons as pixbufs, kept it until the shell was restarted.
+#
+# ⚠️ THIS NO LONGER WRITES ANYTHING. It used to seed the USER's dconf here, and
+# that had two defects, both measured on a real install (2026-08-30):
+#
+#   1. It did not work on the path that matters. The installer runs this inside
+#      arch-chroot for an account that has never logged in, so /run/user/$uid
+#      does not exist and dconf cannot commit — `~/.config/dconf` was born at
+#      FIRST LOGIN, not at install.
+#   2. It said it had worked. `gsettings set` exits 0 while failing and reports
+#      the failure only on stderr, which this script discarded with 2>/dev/null.
+#      So the success line printed and nothing was written — for months. A check
+#      whose command cannot fail is not a check.
+#
+# The default is now a SYSTEM one, shipped by the package: /etc/dconf/db/local.d/
+# (generated from the same defaults/appearance.json) compiled by a pacman hook,
+# and named by /etc/dconf/profile/user. No session, no runtime dir, nothing for a
+# chroot to withhold — and `user-db:user` comes first in that profile, so a person
+# who chose Adwaita keeps Adwaita without us having to guess at "never set".
+#
+# What is left here is the VERIFICATION, which is what was missing. Reading it
+# back through a profile that names ONLY the system database answers the question
+# the old code got wrong — "is the default actually in effect?" — without a user's
+# own override masking the answer either way.
+if command -v dconf >/dev/null 2>&1; then
+    _icon_theme="$(sed -n 's/.*"iconTheme"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$SHARE/defaults/appearance.json" 2>/dev/null | head -1)"
+    if [ -n "$_icon_theme" ]; then
+        # The hook runs at package install, which is before this script. If the
+        # database is missing anyway (a source install, a hook that did not fire),
+        # compiling it here costs one call and removes the failure mode.
+        [ -f /etc/dconf/db/local ] || dconf update 2>/dev/null || true
+
+        # TWO conditions, because either one alone is blind to the other's
+        # failure — which this check learned the hard way. Reading through a
+        # profile that names only the system database proves the VALUE is
+        # compiled, and it deliberately ignores /etc/dconf/profile/user, so with
+        # that file missing the read still says WhiteSur while every real account
+        # sees Adwaita. The value being right and the value being REACHABLE are
+        # different claims and both have to be made.
+        _p="$(mktemp)"; echo "system-db:local" > "$_p"
+        _seen="$(DCONF_PROFILE="$_p" dconf read /org/gnome/desktop/interface/icon-theme 2>/dev/null | tr -d "'")"
+        rm -f "$_p"
+        _reachable=no
+        grep -qx "system-db:local" /etc/dconf/profile/user 2>/dev/null && _reachable=yes
+
+        if [ "$_seen" = "$_icon_theme" ] && [ "$_reachable" = yes ]; then
+            echo "  [OK] Icon theme default → $_icon_theme (system dconf database)"
+        else
+            echo "  [WARN] the system icon-theme default is not in effect."
+            echo "         The first session will paint Adwaita until the shell catches up."
+            if [ "$_seen" != "$_icon_theme" ]; then
+                echo "         The database says '${_seen:-nothing}', not '$_icon_theme' —"
+                echo "         /etc/dconf/db/local.d/00-veltrix-appearance is missing or stale;"
+                echo "         run 'dconf update'."
+            fi
+            if [ "$_reachable" != yes ]; then
+                echo "         /etc/dconf/profile/user does not name 'system-db:local', so"
+                echo "         nothing reads that database at all, whatever it contains."
+            fi
+        fi
+        # The VALUE being right is not enough: the theme directory itself has to
+        # exist, or GTK falls back to Adwaita whatever dconf says. The install
+        # step above creates it (system runs); a --user run cannot, so a missing
+        # directory here means the install-time run failed or was skipped.
+        if [ ! -f "/usr/share/icons/$_icon_theme/index.theme" ]; then
+            echo "  [FAIL] icon theme '$_icon_theme' is the default but" >&2
+            echo "         /usr/share/icons/$_icon_theme/index.theme is missing —" >&2
+            echo "         the first session will paint Adwaita. Re-run veltrix-setup" >&2
+            echo "         (not --user) while online to install it." >&2
+            exit 1
+        fi
+    fi
+fi
+
+# ── Effective accent + icon theme: repair stale USER values (Files, 2026-11-13) ──
+# The system-default check above deliberately ignores the user's own dconf —
+# and user-db is read FIRST, so it is exactly the value Nautilus sees. A machine
+# installed before WhiteSur became the default (the old default was Papirus) or
+# before the cyan-only fix can hold icon-theme != WhiteSur and accent-color
+# 'purple' (or the invalid raw 'cyan') in the user db forever: no system default
+# can override it, and the shell's per-session repair (AppearanceSync
+# seedAndRepair) is the other half of this — this block is the setup-time half,
+# for a machine whose shell has not yet run the new code. There is no user
+# choice to preserve: the accent picker is gone and the published GNOME name for
+# cyan is 'blue' (GNOME's accent enum has no cyan; a write of 'cyan' is refused,
+# which is why a stored 'purple' survived). Fail-soft throughout: a dconf hiccup
+# here must not abort the rest of setup (this also runs unattended at first
+# login via --user, and in a chroot where no bus exists yet).
+if command -v gsettings >/dev/null 2>&1; then
+    _eff_accent="$(run_user_dconf gsettings get org.gnome.desktop.interface accent-color 2>/dev/null || true)"
+    _eff_accent="${_eff_accent//\'/}"
+    if [ -n "$_eff_accent" ] && [ "$_eff_accent" != "blue" ]; then
+        if run_user_dconf gsettings set org.gnome.desktop.interface accent-color blue 2>/dev/null; then
+            echo "  [Repair] accent-color: '$_eff_accent' → 'blue' (stale user value; GNOME has no cyan, purple is banned)"
+        else
+            echo "  [WARN] accent-color is '$_eff_accent' and could not be reset to 'blue' — Nautilus may still select purple." >&2
+        fi
+    fi
+    _eff_icons="$(run_user_dconf gsettings get org.gnome.desktop.interface icon-theme 2>/dev/null || true)"
+    _eff_icons="${_eff_icons//\'/}"
+    if [ -n "$_eff_icons" ] && [ "$_eff_icons" != "WhiteSur" ] && [ -f /usr/share/icons/WhiteSur/index.theme ]; then
+        if run_user_dconf gsettings set org.gnome.desktop.interface icon-theme WhiteSur 2>/dev/null; then
+            echo "  [Repair] icon-theme: '$_eff_icons' → 'WhiteSur' (stale user value; WhiteSur's folders are blue)"
+        else
+            echo "  [WARN] icon-theme is '$_eff_icons' and could not be reset to 'WhiteSur'." >&2
+        fi
+    fi
+    # A stale ~/.config/gtk-4.0/gtk.css can override the accent for every GTK4 app
+    # including Nautilus — libadwaita reads it at startup — e.g. one written by an
+    # old WhiteSur-GTK-theme install with a purple accent, or by Gradience. This only
+    # WARNS about a stale purple accent; it is never deleted silently. (The old
+    # traffic-light CSS, if present, is removed by the cleanup block below.)
+    _gtk_css="${REAL_HOME}/.config/gtk-4.0/gtk.css"
+    if [ -f "$_gtk_css" ] && grep -qiE "accent.*(purple|#9141ac|#6D4AFF|#7764d8)" "$_gtk_css"; then
+        echo "  [WARN] $_gtk_css sets a purple accent — libadwaita reads it at startup and it overrides the portal." >&2
+        echo "         Move it aside (mv $_gtk_css ${_gtk_css}.veltrix-bak) and reopen Files." >&2
+    fi
+fi
+
+# ── Remove the old macOS traffic-light CSS (added 2026-11-13, removed 2026-11-13) ──
+# The traffic-light circles are gone: the window buttons are normal buttons now, and
+# GTK apps draw their own default buttons. But a machine that installed v4–v6 still
+# carries the old CSS appended to its gtk.css — it would keep painting the circles on
+# Files and every GTK app. Remove that block, once. The block is identified by its
+# marker ("VELTRIX traffic lights") and verified by SHA-256 against the exact file
+# that was shipped (line count + hash hardcoded below — the shipped files are deleted,
+# so nothing can re-install them). A block that does not match exactly (edited by hand,
+# or glued to the user's own last line) is left alone with a warning, never deleted
+# silently. Runs as the real user, never as root.
+for _pair in "4.0 89 f9c006f4d9389b31de094e43a34e69c6076df21a7c38f6e9450453fbf7a0550f" "3.0 58 c9a787a41cd7429bc00ea4ff2716fc4be29e984e16f4e2fdff88035ff9511c2f"; do
+    _ver="${_pair%% *}"; _rest="${_pair#* }"; _n="${_rest%% *}"; _hash="${_rest##* }"
+    _dst="$REAL_HOME/.config/gtk-$_ver/gtk.css"
+    [ -f "$_dst" ] || continue
+    _start=$(run_user grep -n -F "VELTRIX traffic lights" "$_dst" 2>/dev/null | head -1 | cut -d: -f1) || continue
+    [ -n "$_start" ] || continue
+    _end=$((_start + _n - 1))
+    # Verify the block is exactly the shipped CSS before deleting anything.
+    _got=$(run_user sed -n "${_start},${_end}p" "$_dst" 2>/dev/null | sha256sum | cut -d' ' -f1) || _got=""
+    if [ "$_got" = "$_hash" ]; then
+        if run_user sed -i "${_start},${_end}d" "$_dst"; then
+            echo "  [OK] removed old traffic-light CSS from $_dst"
+        else
+            echo "  [WARN] could not remove old traffic-light CSS from $_dst." >&2
+        fi
+    else
+        echo "  [WARN] $_dst has a traffic-light block that does not match the shipped file — left alone." >&2
+    fi
+done
+unset _pair _ver _rest _n _hash _dst _start _end _got
+
+# Default file manager: `xdg-open <folder>` (the dock's Files item, apps' "open
+# containing folder", …) needs inode/directory to point at nautilus. A fresh Arch
+# has no association — BUT kitty ships `kitty-open.desktop`, which auto-claims
+# inode/directory, so the Files item would open the TERMINAL (clean-install bug,
+# VM 06-22). Seed nautilus when there's no association yet OR when it's that kitty
+# default; never override a real user choice.
+# (fail-soft under set -e: this also runs unattended at session start via
+# --user, where an xdg-mime hiccup must not abort the rest of the seeding)
+_fm_default="$(run_user xdg-mime query default inode/directory 2>/dev/null || true)"
+if [ -z "$_fm_default" ] || [ "$_fm_default" = "kitty-open.desktop" ]; then
+    run_user xdg-mime default org.gnome.Nautilus.desktop inode/directory 2>/dev/null \
+        && echo "  [Init] Default file manager → nautilus (inode/directory, was: ${_fm_default:-none})" \
+        || echo "  [WARN] could not set default file manager (xdg-mime failed)"
+fi
+
+# Default kitty config — kitty ships no config file, and without window_padding
+# the first/last rows of text get clipped by Hyprland's 24px rounded corners.
+# Also names the JetBrains Mono we ship (kitty doesn't read the gsettings
+# monospace preference), pins the Nerd Font pictogram ranges to the separate
+# symbols font, and carries a DARK palette that deliberately does not follow the
+# Appearance toggle — the file says why, with the numbers. Seeded ONLY when the
+# user has no kitty.conf at all; an existing kitty setup is never touched.
+KITTY_DIR="${REAL_HOME}/.config/kitty"
+if [ ! -f "$KITTY_DIR/kitty.conf" ] && [ -d "$SHARE/defaults/kitty" ]; then
+    mkdir -p "$KITTY_DIR"
+    cp "$SHARE/defaults/kitty/"*.conf "$KITTY_DIR/"
+    chown -R "$REAL_USER:" "$KITTY_DIR"
+    echo "  [Init] $KITTY_DIR (padding, JetBrains Mono + Nerd symbols, glass, dark palette)"
+fi
+
+# Files' "Move to Trash…" row — the Nautilus extension that makes deleting
+# discoverable (defaults/nautilus-python/extensions/veltrix-delete.py). Seeded
+# ONLY when the user has no file of that name; an existing extension there is
+# never touched.
+NAUTILUS_EXT_DIR="${REAL_HOME}/.local/share/nautilus-python/extensions"
+if [ ! -f "$NAUTILUS_EXT_DIR/veltrix-delete.py" ] && [ -f "$SHARE/defaults/nautilus-python/extensions/veltrix-delete.py" ]; then
+    mkdir -p "$NAUTILUS_EXT_DIR"
+    cp "$SHARE/defaults/nautilus-python/extensions/veltrix-delete.py" "$NAUTILUS_EXT_DIR/"
+    chown -R "$REAL_USER:" "$NAUTILUS_EXT_DIR"
+    echo "  [Init] $NAUTILUS_EXT_DIR/veltrix-delete.py (Files right-click → Move to Trash…, with confirmation)"
+fi
+# Nautilus loads extensions ONLY at startup — and it stays resident after its
+# windows close, so a session where Files was already running never picks a
+# newly seeded extension up: no restart, no row, no matter how many updates
+# run. That is why the row was missing on machines that updated to the version
+# that first shipped the extension. Restart Files once, the first time the
+# extension is present, and record it in a marker so later runs never close
+# the user's open Files windows again. Best-effort and fail-soft: with no
+# live session bus there is no Nautilus to restart (a TTY install — Files
+# starts fresh at next login and loads it then), and a missing `nautilus`
+# binary means there is nothing to restart either. A marker write that
+# fails only retries next run; it never aborts setup.
+NAUTILUS_EXT_RESTARTED="${CONFIG_DIR}/.nautilus-ext-restarted"
+if [ -f "$NAUTILUS_EXT_DIR/veltrix-delete.py" ] && [ ! -f "$NAUTILUS_EXT_RESTARTED" ]; then
+    if command -v nautilus >/dev/null 2>&1; then
+        _nautilus_uid="$(id -u "$REAL_USER")"
+        _nautilus_bus="/run/user/$_nautilus_uid/bus"
+        if [ -S "$_nautilus_bus" ]; then
+            run_user env XDG_RUNTIME_DIR="/run/user/$_nautilus_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$_nautilus_bus" nautilus -q 2>/dev/null || true
+        fi
+        unset _nautilus_uid _nautilus_bus
+    fi
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    touch "$NAUTILUS_EXT_RESTARTED" 2>/dev/null || true
+    chown "$REAL_USER:" "$NAUTILUS_EXT_RESTARTED" 2>/dev/null || true
+    echo "  [Init] Files restarted once so the Move to Trash… row appears (reopen Files to see it)"
+fi
+
+# fcitx5 — the input method's own config dir. Seeded ONLY when the user has none,
+# like kitty's above; an existing fcitx5 setup is never touched.
+#
+# One file today, and it is a GUARD rather than a preference: fcitx5's X11 addon
+# can push its own keyboard layout onto X, and its default group is hardcoded to
+# `us` (it does not read the locale), so leaving it on would quietly undo the
+# layout the installer chose — for every XWayland app.
+#
+# The input-method PROFILE is deliberately NOT seeded, and the VM pass of
+# 2026-09-08 is why: on a `zh_CN.UTF-8` install fcitx5 builds the right group by
+# itself. `InputMethodGroupInfo` answered `('us', [('keyboard-us', ''),
+# ('pinyin', '')])` on a machine where nobody had opened fcitx5-configtool, and
+# ~/.config/fcitx5/profile did not exist at all — it derives the group from the
+# locale at startup and only writes the file once somebody changes something.
+# Ctrl+Space then `nihao` gave 你好 in kitty and in our own Settings window.
+#
+# So the earlier plan here — copy back a profile captured from a configured VM —
+# would have frozen a guess on top of an answer fcitx5 already gets right, and
+# would have been WRONG for every locale but the one it was captured in.
+# (Measured for zh_CN. ja_JP goes through the same locale-derived path and is
+# assumed, not measured.)
+#
+# ⚠️ What does NOT work yet is typing Chinese into our LAYER-SHELL surfaces —
+# the search overlay takes the raw latin. That is #503, and no profile would
+# have fixed it.
+FCITX_DIR="${REAL_HOME}/.config/fcitx5"
+if [ ! -d "$FCITX_DIR" ] && [ -d "$SHARE/defaults/fcitx5" ]; then
+    mkdir -p "$FCITX_DIR/conf"
+    cp "$SHARE/defaults/fcitx5/conf/"*.conf "$FCITX_DIR/conf/"
+    chown -R "$REAL_USER:" "$FCITX_DIR"
+    echo "  [Init] $FCITX_DIR (keyboard layout stays the compositor's)"
+fi
+
+# .mcp.json — MCP manifest for the user's AI agent (Claude Code et al). Points at
+# the installed binary via PATH. Always (re)written: it's a runtime-managed pointer,
+# not user data. Opening an agent inside ~/.config/veltrix discovers it
+# automatically; any other agent can be pointed at it ("register the MCP server
+# described in ~/.config/veltrix/.mcp.json").
+cat > "$CONFIG_DIR/.mcp.json" <<'JSON'
+{
+  "mcpServers": {
+    "veltrix": {
+      "command": "veltrix-mcp"
+    }
+  }
+}
+JSON
+chown "$REAL_USER:" "$CONFIG_DIR/.mcp.json"
+echo "  [Init] $CONFIG_DIR/.mcp.json (agent interface manifest)"
+
+# No region.json any more (#573): the clock format lives in GSettings
+# org.veltrix.region (default "short" since 2026-09-28; this block used to seed "long"),
+# and the timezone is the system's — never a copy.
+
+# Hyprland user overrides (created once, never overwritten)
+if [ ! -f "$CONFIG_DIR/hyprland-user.lua" ]; then
+    cat > "$CONFIG_DIR/hyprland-user.lua" <<LUA
+-- ── hyprland-user.lua ────────────────────────────────────────────────────────
+-- Your personal Hyprland overrides. Veltrix updates will never touch this.
+-- Add monitor setup, startup apps, custom keybinds, etc.
+--
+-- Note: environment variables go in ~/.config/uwsm/env (toolkit/NVIDIA)
+-- or ~/.config/uwsm/env-hyprland (HYPR* / AQ_* variables) — not here.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- @autostart start
+hl.on("hyprland.start", function()
+end)
+-- @autostart end
+LUA
+    chown "$REAL_USER:" "$CONFIG_DIR/hyprland-user.lua"
+    echo "  [Init] $CONFIG_DIR/hyprland-user.lua"
+fi
+
+# User hooks — one directory per shell event, plus a README. Idempotent: existing
+# directories and hook scripts are never touched, and a new event added upstream
+# gets its directory on the next setup run.
+#
+# The event list is NOT written out here. It is asked of `veltrix-hook --list`, so
+# this file cannot drift from the runner that actually dispatches them — the only
+# place the events are declared.
+HOOKS_DIR="$CONFIG_DIR/hooks"
+if command -v veltrix-hook >/dev/null 2>&1; then
+    mkdir -p "$HOOKS_DIR"
+    chown "$REAL_USER:" "$HOOKS_DIR"
+    # Non-indented lines of --list are "<event> <args…>"; the indented ones are prose.
+    veltrix-hook --list | grep -E '^[a-z]' | cut -d' ' -f1 | while read -r _ev; do
+        [ -n "$_ev" ] || continue
+        if [ ! -d "$HOOKS_DIR/$_ev.d" ]; then
+            mkdir -p "$HOOKS_DIR/$_ev.d"
+            echo "  [Init] $HOOKS_DIR/$_ev.d/"
+        fi
+        # Outside the branch above on purpose: it makes this run a repair pass for
+        # a directory an earlier version created with the wrong group. A chown that
+        # only ever runs at creation cannot fix anything already on disk.
+        chown "$REAL_USER:" "$HOOKS_DIR/$_ev.d"
+    done
+    # Rewritten every run on purpose (unlike hyprland-user.lua): it holds no user
+    # content, and it is the pointer that stays correct when the events change.
+    cat > "$HOOKS_DIR/README" <<'HOOKS'
+Drop an executable file in one of the directories beside this file and Veltrix
+runs it when that event happens. That is the whole contract.
+
+    ~/.config/veltrix/hooks/accent-changed.d/50-my-script     ← chmod +x it
+
+  · Files run in name order, so 10- comes before 50-. Not executable = not run,
+    which is how you disable one without moving it.
+  · The event's arguments arrive as $1, $2, … and the event's own name is in
+    $VELTRIX_EVENT.
+  · Anything your script prints goes to the shell's log.
+
+The events, what each one passes, and when it fires:
+
+    veltrix-hook --list
+
+To try a hook without waiting for the real thing, fire the event by hand:
+
+    veltrix-hook accent-changed cyan
+
+A hook that starts something long-lived should hand it to `systemd-run --user`:
+hooks fired by the shell die with the shell, and a UI reload restarts it.
+HOOKS
+    chown "$REAL_USER:" "$HOOKS_DIR/README"
+fi
+
+# Veltrix generated config (Hyprland settings from UI)
+# Seeded with the detected system keyboard layout on first install.
+if [ ! -f "$CONFIG_DIR/veltrix-settings.lua" ]; then
+    cat > "$CONFIG_DIR/veltrix-settings.lua" <<LUA
+-- VELTRIX SHELL SETTINGS
+-- Auto-generated by the Veltrix Settings UI. Do not edit manually.
+hl.config({
+    input = {
+        sensitivity        = 0.00,
+        accel_profile      = "adaptive",
+        natural_scroll     = false,
+        numlock_by_default = false,
+        kb_layout          = "$SYS_KB_LAYOUT",
+        kb_variant         = "$SYS_KB_VARIANT",
+        repeat_delay       = 600,
+        repeat_rate        = 25,
+        touchpad = {
+            natural_scroll = false,
+            tap_to_click   = true,
+        },
+    },
+})
+LUA
+    chown "$REAL_USER:" "$CONFIG_DIR/veltrix-settings.lua"
+    echo "  [Init] $CONFIG_DIR/veltrix-settings.lua (kb_layout=$SYS_KB_LAYOUT${SYS_KB_VARIANT:+ kb_variant=$SYS_KB_VARIANT})"
+fi
+
+# Monitor config — generated by Display settings page
+if [ ! -f "$CONFIG_DIR/veltrix-monitor.lua" ]; then
+    if systemd-detect-virt -q 2>/dev/null; then
+        cat > "$CONFIG_DIR/veltrix-monitor.lua" << 'EOF'
+-- VELTRIX SHELL MONITOR SETTINGS
+-- Default virtual display profile
+hl.monitor({ output = "Virtual-1", mode = "1920x1080@60", position = "auto", scale = 1 })
+hl.monitor({ output = "Virtual-0", mode = "1920x1080@60", position = "auto", scale = 1 })
+hl.monitor({ output = "Virtual1",  mode = "1920x1080@60", position = "auto", scale = 1 })
+EOF
+    else
+        touch "$CONFIG_DIR/veltrix-monitor.lua"
+    fi
+    chown "$REAL_USER:" "$CONFIG_DIR/veltrix-monitor.lua"
+    echo "  [Init] $CONFIG_DIR/veltrix-monitor.lua"
+fi
+
+# Pre-rename installs seeded the .lua files above with "Crystal Shell" headers,
+# and they are created-once (never overwritten), so the old branding sticks
+# until someone rewrites it. Migrate comment lines only — user content in
+# hyprland-user.lua is never touched.
+for f in "$CONFIG_DIR/veltrix-settings.lua" "$CONFIG_DIR/veltrix-monitor.lua" "$CONFIG_DIR/hyprland-user.lua"; do
+    if [ -f "$f" ] && grep -qi "crystal shell" "$f"; then
+        sed -i '/^[[:space:]]*--/ { s/CRYSTAL SHELL/VELTRIX SHELL/g; s/the Crystal Shell Settings UI/the Veltrix Settings UI/g; s/Crystal Shell Settings UI/Veltrix Settings UI/g; s/Crystal Shell/Veltrix/g; }' "$f"
+        echo "  [Migrate] ${f##*/}: Crystal Shell headers → Veltrix"
+    fi
+done
+
+# Hypridle config — per-user copy in $CONFIG_DIR (never overwritten), symlink
+# from ~/.config/hypr. This is USER STATE (Settings → Power writes it), never a
+# dev-repo symlink — that old mode routed UI writes into the repo working tree.
+mkdir -p "${REAL_HOME}/.config/hypr"
+chown "$REAL_USER:" "${REAL_HOME}/.config/hypr"   # created under sudo; keep it user-owned
+
+for daemon in hypridle; do
+    LINK="${REAL_HOME}/.config/hypr/${daemon}.conf"
+    TARGET="$CONFIG_DIR/${daemon}.conf"
+    if [ ! -f "$TARGET" ]; then
+        # Migrate a pre-07-10 dev install: LINK pointed into the dev repo and
+        # carries the user's live (UI-written) settings — preserve them.
+        _old="$(readlink -f "$LINK" 2>/dev/null || true)"
+        if [ -n "$_old" ] && [ "$_old" != "$TARGET" ] && [ -f "$_old" ]; then
+            cp "$_old" "$TARGET"
+            echo "  [Migrate] $TARGET (from $_old)"
+        else
+            cp "$SHARE/config/hypr/${daemon}.conf" "$TARGET"
+            # Idle-suspend default: 30 min on laptops (battery present), never
+            # on desktops — auto-suspending a desktop kills downloads/remote
+            # sessions (GNOME/KDE draw the same line). Settings → Power is the
+            # explicit override either way.
+            if [ "$daemon" = hypridle ] && compgen -G "/sys/class/power_supply/BAT*" > /dev/null; then
+                cat >> "$TARGET" <<'CONF'
+
+# 3. Suspend after 30 min idle — seeded by veltrix-setup (battery detected)
+listener {
+    timeout = 1800
+    on-timeout = systemctl suspend
+}
+CONF
+                echo "  [Init] idle-suspend 30 min enabled (battery detected)"
+            fi
+            echo "  [Init] $TARGET"
+        fi
+        chown "$REAL_USER:" "$TARGET"
+    fi
+    ln -sf "$TARGET" "$LINK"
+    # -h, and on the LINK: a plain chown follows the symlink and re-owns the target
+    # instead, leaving the link itself root:root — which is what `ln -sf` under sudo
+    # makes it. Unconditional, so it repairs links an earlier run left that way.
+    chown -h "$REAL_USER:" "$LINK"
+    echo "  [Symlink] $LINK -> $TARGET"
+done
+
+# hyprland-user.lua — symlink into ~/.config/hypr/ so Autostart settings page
+# can read/write it from a predictable location regardless of install mode
+USERCONF_LINK="${REAL_HOME}/.config/hypr/hyprland-user.lua"
+USERCONF_TARGET="$CONFIG_DIR/hyprland-user.lua"
+ln -sf "$USERCONF_TARGET" "$USERCONF_LINK"
+chown -h "$REAL_USER:" "$USERCONF_LINK"   # the LINK, not its target — see the note above
+echo "  [Symlink] $USERCONF_LINK -> $USERCONF_TARGET"
+
+# uwsm environment files (created once, never overwritten)
+UWSM_DIR="${REAL_HOME}/.config/uwsm"
+mkdir -p "$UWSM_DIR"
+chown "$REAL_USER:" "$UWSM_DIR"
+for f in env env-hyprland; do
+    if [ ! -f "$UWSM_DIR/$f" ]; then
+        cp "$SHARE/defaults/uwsm/$f" "$UWSM_DIR/$f"
+        chown "$REAL_USER:" "$UWSM_DIR/$f"
+        echo "  [Init] $UWSM_DIR/$f"
+    fi
+done
+
+ENVFILE="$UWSM_DIR/env"
+
+# Migrate two objectively-broken shipped defaults in pre-0.1 env files. These match
+# the exact bad lines only, so a user's own edits are never touched. uwsm SOURCES
+# this file as shell:
+#   - QT_QPA_PLATFORM=wayland;xcb  → the bare ';' ran 'xcb' as a command, truncating
+#     the var to just 'wayland'. Quote it.
+#   - QT_QPA_PLATFORMTHEME=qt6ct or =gtk3 → both are stale. Since the env file is
+#     sourced AFTER the launcher it wins, so either value overrides the
+#     `xdgdesktopportal` the launcher sets. `gtk3` was tried on 2026-09-20 and
+#     reverted: it hands Qt our icon theme but takes the portal's out-of-process file
+#     chooser away from every Qt app (see defaults/uwsm/env).
+# sed -i recreates the file as root when we run under sudo, so chown it back after.
+sed -i \
+    -e 's|^export QT_QPA_PLATFORM=wayland;xcb$|export QT_QPA_PLATFORM="wayland;xcb"|' \
+    -e 's|^export QT_QPA_PLATFORMTHEME=qt6ct$|export QT_QPA_PLATFORMTHEME=xdgdesktopportal|' \
+    -e 's|^export QT_QPA_PLATFORMTHEME=gtk3$|export QT_QPA_PLATFORMTHEME=xdgdesktopportal|' \
+    "$ENVFILE"
+chown "$REAL_USER:" "$ENVFILE"
+
+# ── Hybrid graphics: make the NVIDIA card's outputs visible to Hyprland ──────
+# Why: aquamarine (Hyprland's DRM backend) opens only the FIRST DRM device
+# unless AQ_DRM_DEVICES lists more. On a hybrid laptop the HDMI port is often
+# wired to the NVIDIA card, so without this the HDMI output never appears as
+# a Hyprland monitor at all — no monitor rule or Settings control can enable
+# what the compositor never sees. Intel-only machines (e.g. the Dell 7400)
+# are unaffected: all their outputs live on the one card aquamarine opens.
+# The value is written to ~/.config/uwsm/env-hyprland, idempotently: an
+# existing AQ_DRM_DEVICES line (commented or not) is replaced, never duplicated.
+# Card nodes are resolved by their bound driver, iGPU first:
+#   i915/amdgpu/radeon -> the internal GPU, nvidia_drm/nouveau -> the dGPU.
+# If the dGPU node does not exist yet (driver package installed for a new
+# kernel while the old one is still running, so the module is not loaded),
+# the node lands on the next card number — deterministic on a two-GPU laptop —
+# so the expected value is written now and re-resolved on the next re-run.
+# The dGPU node alone is never written: card1 alone would drop the iGPU and
+# with it the laptop panel. Nothing here touches /etc/modprobe.d or initramfs.
+_set_hybrid_aq_devices() {
+    local hypr_env="$UWSM_DIR/env-hyprland"
+    local igpu="" dgpu="" card drv base n max=-1
+    for card in /sys/class/drm/card[0-9]*; do
+        [ -e "$card" ] || continue
+        base=${card##*/}
+        [[ "$base" =~ ^card[0-9]+$ ]] || continue
+        [ -e "$card/device/driver" ] || continue
+        drv=$(basename "$(readlink -f "$card/device/driver" 2>/dev/null)" 2>/dev/null || true)
+        case "$drv" in
+            i915|amdgpu|radeon) [ -z "$igpu" ] && igpu="/dev/dri/${card##*/}" ;;
+            nvidia_drm|nouveau) [ -z "$dgpu" ] && dgpu="/dev/dri/${card##*/}" ;;
+        esac
+    done
+    if [ -z "$dgpu" ]; then
+        if ! pacman -Qq nvidia-dkms nvidia-open-dkms nvidia-390xx-dkms 2>/dev/null | grep -q .; then
+            echo "  [GPU] Hybrid graphics, but no NVIDIA driver package installed — skipping AQ_DRM_DEVICES."
+            echo "        Install the driver, then re-run veltrix-setup."
+            return 0
+        fi
+        for card in /sys/class/drm/card[0-9]*; do
+            [ -e "$card" ] || continue
+            base=${card##*/}
+            [[ "$base" =~ ^card[0-9]+$ ]] || continue
+            n=${base#card}
+            [ "$n" -gt "$max" ] && max=$n
+        done
+        dgpu="/dev/dri/card$((max + 1))"
+        echo "  [GPU] NVIDIA driver installed but its DRM node is not up yet — expecting $dgpu after reboot."
+    fi
+    if [ -z "$igpu" ]; then
+        echo "  [GPU] No iGPU DRM node found — skipping AQ_DRM_DEVICES."
+        return 0
+    fi
+    local line="export AQ_DRM_DEVICES=$igpu:$dgpu"
+    if grep -q '^# *export AQ_DRM_DEVICES=' "$hypr_env" 2>/dev/null; then
+        sed -i "s|^# *export AQ_DRM_DEVICES=.*|$line|" "$hypr_env"
+    elif grep -q '^export AQ_DRM_DEVICES=' "$hypr_env" 2>/dev/null; then
+        sed -i "s|^export AQ_DRM_DEVICES=.*|$line|" "$hypr_env"
+    else
+        printf '%s\n' "$line" >> "$hypr_env"
+    fi
+    chown "$REAL_USER:" "$hypr_env"
+    echo "  [GPU] Hybrid graphics: $line (iGPU first, so the NVIDIA outputs appear in Hyprland)."
+}
+
+# ── NVIDIA GPU autodetection ──────────────────────────────────────────────────
+# A fresh NVIDIA user otherwise gets a black screen / glitches until they manually
+# uncomment the GPU vars. Detect the hardware AND the active driver: the nvidia-drm
+# GBM backend vars apply ONLY to the proprietary/open driver — under nouveau they
+# break the session (nouveau uses the standard mesa GBM path). Idempotent: only flips
+# the commented hint lines to active, so it's safe to re-run (e.g. after installing
+# the driver later).
+if command -v lspci >/dev/null 2>&1 \
+   && lspci -nn 2>/dev/null | grep -iE 'VGA|3D|Display' | grep -qi nvidia; then
+    echo "  [GPU] NVIDIA hardware detected."
+    if lsmod 2>/dev/null | grep -q '^nouveau'; then
+        echo "  [GPU] nouveau driver in use — leaving NVIDIA env vars commented (nouveau uses mesa/GBM)."
+    elif ! lsmod 2>/dev/null | grep -q '^nvidia'; then
+        echo "  [GPU] NVIDIA card present but no nvidia kernel module loaded."
+        echo "        Install nvidia-dkms (or nvidia-open-dkms) + nvidia-utils + egl-wayland, then re-run."
+    else
+        echo "  [GPU] Proprietary/open driver active — enabling Wayland GPU env vars in $ENVFILE."
+        sed -i \
+            -e 's|^# *export LIBVA_DRIVER_NAME=nvidia|export LIBVA_DRIVER_NAME=nvidia|' \
+            -e 's|^# *export GBM_BACKEND=nvidia-drm|export GBM_BACKEND=nvidia-drm|' \
+            -e 's|^# *export __GLX_VENDOR_LIBRARY_NAME=nvidia|export __GLX_VENDOR_LIBRARY_NAME=nvidia|' \
+            "$ENVFILE"
+        if pacman -Qq libva-nvidia-driver >/dev/null 2>&1; then
+            sed -i 's|^# *export NVD_BACKEND=direct|export NVD_BACKEND=direct|' "$ENVFILE"
+            echo "  [GPU] libva-nvidia-driver found — enabled NVD_BACKEND=direct (VA-API)."
+        else
+            echo "  [GPU] (optional) install libva-nvidia-driver for hardware video acceleration."
+        fi
+        chown "$REAL_USER:" "$ENVFILE"
+
+        # DRM modeset must be ON for Wayland. Arch enables it by default; only warn.
+        # Never edit /etc/modprobe.d or rebuild initramfs silently — that touches boot.
+        if [ -r /sys/module/nvidia_drm/parameters/modeset ] \
+           && [ "$(cat /sys/module/nvidia_drm/parameters/modeset)" != "Y" ]; then
+            echo "  [GPU] WARNING: nvidia_drm modeset is OFF — Wayland needs it ON."
+            echo "        Add 'options nvidia_drm modeset=1' to /etc/modprobe.d/nvidia.conf,"
+            echo "        then run 'sudo mkinitcpio -P' and reboot."
+        fi
+    fi
+
+    # Hybrid graphics (iGPU + NVIDIA): expose the dGPU's outputs (usually the
+    # HDMI port) to Hyprland. Runs for nouveau and proprietary alike, and when
+    # the driver package is installed but its module is not loaded yet.
+    if lspci -nn 2>/dev/null | grep -iE 'VGA|3D|Display' | grep -qiE 'intel|amd|radeon|ati'; then
+        _set_hybrid_aq_devices
+    fi
+fi
+
+# ── Display manager (system — skipped by --user) ─────────────────────────────
+# Only install and enable greetd if no other display manager is already active.
+# If the user already has sddm/gdm/lightdm/etc. enabled we leave it untouched.
+if [ -z "$USER_ONLY" ]; then
+_detect_dm() {
+    for dm in sddm gdm lightdm lxdm xdm slim ly greetd; do
+        if systemctl is-enabled "$dm" 2>/dev/null | grep -qE "^enabled"; then
+            echo "$dm"; return 0
+        fi
+    done
+    echo "none"
+}
+
+ACTIVE_DM=$(_detect_dm)
+# /etc/greetd is (re)written only when it is recognizably OURS, or when there is
+# no DM at all. A bare "greetd is enabled" is NOT enough: greetd is the go-to
+# minimal DM for Wayland users running a different greeter (tuigreet/gtkgreet/
+# ReGreet), and clobbering their config would break their login. But never
+# refreshing it is how tech-debt #16 happened: a renamed greeter binary left
+# /etc/greetd pointing at a deleted executable and the greeter died on boot.
+# Fingerprints (both unmistakably Veltrix's): our config.toml points greetd at
+# hyprland-greeter.lua; our greeter .lua launches veltrix-greeter.
+_greetd_is_ours() {
+    grep -q 'hyprland-greeter.lua' /etc/greetd/config.toml 2>/dev/null && return 0
+    grep -q 'veltrix-greeter' /etc/greetd/hyprland-greeter.lua 2>/dev/null && return 0
+    return 1
+}
+if [ "$ACTIVE_DM" = "none" ] || { [ "$ACTIVE_DM" = "greetd" ] && _greetd_is_ours; }; then
+    if [ "$ACTIVE_DM" = "none" ]; then
+        echo "  No display manager detected — installing greetd..."
+    else
+        echo "  greetd (Veltrix) detected — refreshing /etc/greetd..."
+    fi
+
+    # Install greetd config files.
+    #
+    # ⚠️ This used to pipe the greeter's config through
+    # `sed 's/kb_layout = "us"/…/'` to inject $SYS_KB_LAYOUT. The literal it
+    # looked for left that file on 2026-05-19, when the greeter got its own
+    # keyboard picker — seven days after the sed was written — and a sed that
+    # matches nothing succeeds, so for four months every installed machine
+    # greeted in `us` whatever the person had chosen (#434). The file now reads
+    # /etc/vconsole.conf itself, which also covers the machines that are already
+    # installed and the `install.sh`-onto-somebody's-Arch path, where nothing
+    # ever ran an installer to inject anything.
+    sudo mkdir -p /etc/greetd
+    sudo cp "$SHARE/config/greetd/config.toml" /etc/greetd/config.toml
+    sudo cp "$SHARE/config/greetd/hyprland-greeter.lua" /etc/greetd/hyprland-greeter.lua
+    sudo chmod 644 /etc/greetd/config.toml /etc/greetd/hyprland-greeter.lua
+
+    # The greeter session runs with HOME/XDG_CONFIG_HOME overridden to
+    # /var/lib/greeter (hyprland-greeter.lua), where it persists locale/kb
+    # prefs (greeter-prefs.json). Arch's greetd sysusers gives the greeter
+    # user home "/" and creates no dir, and the greeter can't mkdir under
+    # root-owned /var/lib — so without this, saving prefs silently fails on
+    # every boot and the language picker never sticks.
+    sudo mkdir -p /var/lib/greeter/.config/veltrix
+    sudo chown -R greeter:greeter /var/lib/greeter
+    sudo chmod 755 /var/lib/greeter
+
+    # Align the passwd home too: with home "/" the greeter's stray artifacts
+    # (Hyprland's own config discovery, D-Bus-activated services like dconf —
+    # which inherit the LOGIN env, not the .lua's hl.env) land as dotfiles in
+    # the filesystem root. One home for everything: /var/lib/greeter.
+    _greeter_home=$(getent passwd greeter | cut -d: -f6)
+    if [ -n "$_greeter_home" ] && [ "$_greeter_home" != "/var/lib/greeter" ]; then
+        if sudo usermod -d /var/lib/greeter greeter 2>/dev/null; then
+            echo "  [Migrate] greeter home: $_greeter_home → /var/lib/greeter"
+        else
+            # usermod refuses while the greeter has live processes (rare: only
+            # when setup runs with the login screen up); next run converges.
+            echo "  [WARN] could not move greeter home (greeter busy?) — will retry on next update."
+        fi
+    fi
+    # Sweep the stray dotfiles from the old "/" home (ours only if greeter-owned).
+    if [ -d /.config ] && [ "$(stat -c %U /.config 2>/dev/null)" = "greeter" ]; then
+        sudo rm -rf /.config
+        echo "  [Migrate] removed stray greeter-owned /.config (home was /)"
+    fi
+
+    # Symlink greeter Hyprland config to the greeter user's default location
+    # (HYPRLAND_CONFIG in config.toml already points here; symlink is a fallback)
+    GREETER_HOME=$(getent passwd greeter | cut -d: -f6)
+    if [ -n "$GREETER_HOME" ]; then
+        sudo mkdir -p "$GREETER_HOME/.config/hypr"
+        sudo ln -sf /etc/greetd/hyprland-greeter.lua "$GREETER_HOME/.config/hypr/hyprland.lua"
+        sudo chown -R greeter:greeter "$GREETER_HOME/.config"
+        echo "  [OK] Greeter Hyprland config symlinked to $GREETER_HOME/.config/hypr/hyprland.lua"
+    fi
+
+    sudo systemctl enable greetd
+    echo "  [OK] greetd enabled."
+
+    # Auto-unlock the GNOME keyring at greetd login, so the DE offers a Secret
+    # Service (org.freedesktop.secrets) without a separate prompt — the built-in
+    # Assistant's API key lives there, and git/VS Code/browsers get it for free.
+    # Uses the login password greetd already collected. Idempotent (guarded on the
+    # module name). The keyring daemon's secrets component is launched per-session
+    # from hyprland.lua; these PAM lines are what unlock it. /etc/pam.d/greetd is
+    # shipped by the greetd package, present by the time deps are installed.
+    if [ -f /etc/pam.d/greetd ] && ! grep -q 'pam_gnome_keyring' /etc/pam.d/greetd; then
+        printf '%s\n' \
+            'auth       optional  pam_gnome_keyring.so' \
+            'session    optional  pam_gnome_keyring.so auto_start' \
+            | sudo tee -a /etc/pam.d/greetd > /dev/null
+        echo "  [OK] gnome-keyring PAM auto-unlock added to /etc/pam.d/greetd"
+    fi
+elif [ "$ACTIVE_DM" = "greetd" ]; then
+    echo "  greetd is enabled but set up with a different greeter — leaving it untouched."
+    echo "  To use Veltrix's greeter, point /etc/greetd/config.toml at the files in"
+    echo "  $SHARE/config/greetd/ and re-run veltrix-setup."
+else
+    echo "  Display manager '$ACTIVE_DM' already enabled — skipping greetd setup."
+fi
+fi  # USER_ONLY
+
+# ── Veltrix unit ────────────────────────────────────────────────────────
+# Deliberately NOT enabled via graphical-session.target — that would start the
+# Veltrix UI in every uwsm-managed Hyprland session, not just ours. The Veltrix
+# Hyprland config starts it (config/hypr/hyprland.lua → systemctl --user start),
+# which only loads in the Veltrix session. Restart=on-failure still respawns it
+# on crash. Migration: disable any enablement left by older installs.
+echo "  Refreshing veltrix.service (started by the Veltrix session, not enabled)..."
+user_systemctl daemon-reload 2>/dev/null || true
+user_systemctl disable veltrix.service 2>/dev/null || true
+
+# ── Config migrations ─────────────────────────────────────────────────────────
+# Per-user, once each, marker-guarded. Also wired as ExecStartPre= on
+# veltrix.service — that is the load-bearing trigger, because `veltrix.install`
+# only PRINTS on post_upgrade and a plain `pacman -Syu` never reaches here.
+# Running it in both places is free: the marker makes the second call a no-op.
+#
+# ⚠️ As the REAL user, never as root: the files are under their ~/.config, and a
+# root run would create root-owned state under their home.
+if command -v veltrix-migrate >/dev/null 2>&1; then
+    echo "  Applying pending config migrations..."
+    run_user veltrix-migrate || true
+fi
+
+# ── Audio services ────────────────────────────────────────────────────────────
+echo "  Enabling audio services..."
+user_systemctl enable --now wireplumber pipewire pipewire-pulse 2>/dev/null || true
+
+# ── GNOME keyring: let PAM own the daemon ─────────────────────────────────────
+# Without this the login keyring is NEVER unlocked, and the first thing to want a
+# secret (browser, Assistant) prompts for a password the user already typed at login.
+#
+# pam_gnome_keyring starts `gnome-keyring-daemon --login --daemonize` holding the
+# login password; that daemon deliberately does not finish initializing, waiting for
+# the session's `--start` (hyprland.lua) to complete it. But first it probes
+# $XDG_RUNTIME_DIR/keyring/control to check whether a daemon is already running — and
+# on Arch that exact path is gnome-keyring-daemon.socket, enabled by preset. Probing
+# it IS what starts the rival daemon, so discovery always "succeeds": the PAM daemon
+# logs `discover_other_daemon: 1`, prints its environment and exits WITHOUT reaching
+# gkd_login_unlock(). The socket-activated daemon that survives never saw the
+# password, so the keyring stays locked (and is never created on first login).
+#
+# Taking the socket out leaves the PAM daemon alone, which is the flow hyprland.lua's
+# `--start` was written for. It cannot leave a session without a Secret Service:
+# `--start` starts a daemon when it finds none (that is what /etc/xdg/autostart uses),
+# and org.freedesktop.secrets stays D-Bus activatable on top of that (its .service file
+# has a plain Exec=, no SystemdService=, so masking the unit does not reach it).
+#
+# It must be `mask`, not `disable`: the socket is commonly enabled in GLOBAL scope
+# (/etc/systemd/user/sockets.target.wants/), where a user-scope disable is a silent
+# no-op — systemd even says so and starts it anyway. Mask wins in user scope, and it
+# also survives `systemctl --user preset-all` (the Arch preset is `enabled`). Only the
+# socket: the .service is reachable only through it, and masking that too would break
+# other desktops on the same account that start it deliberately.
+#
+# The mask alone is NOT enough, and this is the part that reads as the fix having failed:
+# masking never touches a unit that is already running, and user@$UID.service outlives the
+# session whenever lingering is on (`loginctl enable-linger` — plenty of tooling sets it).
+# A daemon socket-started before the mask then survives logout after logout still owning
+# $XDG_RUNTIME_DIR/keyring/control, every later login repeats `discover_other_daemon: 1`,
+# and the mask looks inert until a full reboot. So stop it too — the socket FIRST, because
+# the .service `Requires=` it and follows it down, whereas stopping the service alone
+# leaves the socket listening and the next probe re-activates it. This still cannot leave
+# a session without a Secret Service (org.freedesktop.secrets stays D-Bus activatable, as
+# above); what the stop buys is the NEXT login, the only moment PAM can hand a daemon the
+# password.
+# To undo: systemctl --user unmask gnome-keyring-daemon.socket
+echo "  Letting PAM own the GNOME keyring daemon (login keyring auto-unlock)..."
+user_systemctl mask gnome-keyring-daemon.socket 2>/dev/null || true
+user_systemctl stop gnome-keyring-daemon.socket gnome-keyring-daemon.service 2>/dev/null || true
+# Still alive => D-Bus activation re-spawned it (something asked for a secret in between).
+# With lingering that one survives into the next session and wins the race again, so this
+# case needs a reboot, not a logout — say so instead of reporting success.
+#
+# ⚠️ "Still alive" cannot be `pgrep -f gnome-keyring-daemon`. That was wrong twice, and the
+# first way made this warning fire on every healthy install from 2026-08-23 until it was
+# finally read:
+#
+#   - PAM's own daemon is `gnome-keyring-daemon --daemonize --login`, started at THIS
+#     session's login, long before this script runs. It is the daemon the whole change
+#     exists to hand ownership to — so matching it means announcing failure at the exact
+#     moment we succeeded, and telling the user to reboot, forever.
+#   - `-f` matches the entire command line, so any unrelated process that merely MENTIONS
+#     the string matched too: a shell running this check, a grep, an editor with the file open.
+#
+# `--login` is the discriminator and it is exhaustive — PAM is the only starter that passes
+# it. D-Bus activation runs `--start --foreground --components=secrets`
+# (/usr/share/dbus-1/services/org.freedesktop.secrets.service) and the systemd unit runs
+# `--foreground --components=… --control-directory=…`; neither carries it. Anchoring the
+# pattern fixes the second bug. `pgrep -x` is NOT the alternative: comm is truncated to
+# `gnome-keyring-d` at 15 characters and pgrep refuses to match a longer name at all.
+#
+# ⚠️ And NOT inside a chroot, which is how the installer runs this. /proc there is the
+# LIVE medium's: `pgrep -u $REAL_USER` asks for uid 1000, which on the medium is the
+# `live` user, whose own D-Bus-activated daemon matches — so every install printed this
+# warning about a process that does not exist on the installed system. Unseen until
+# 2026-09-22, when the installer started keeping what this script prints (#101). An
+# account that has never logged in has no daemon to be stale, so there is nothing to
+# check. `--chroot` needs root; run as a user it fails, and the check runs as before.
+_stale_keyring=""
+systemd-detect-virt -q --chroot 2>/dev/null ||
+for _p in $(pgrep -u "$REAL_USER" -f '^(/usr/bin/)?gnome-keyring-daemon' 2>/dev/null); do
+    tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -q -- "--login" || _stale_keyring="$_stale_keyring $_p"
+done
+if [ -n "$_stale_keyring" ]; then
+    echo "  [WARN] A gnome-keyring-daemon from before this change is still running (PID$_stale_keyring)."
+    echo "         Reboot (not just log out) before trusting the login keyring: it can"
+    echo "         outlive the session, and PAM's daemon defers to whatever it finds."
+fi
+
+if [ -z "$USER_ONLY" ]; then
+# ── Power profiles (system — skipped by --user) ───────────────────────────────
+# power-profiles-daemon provides the performance/balanced profiles.
+echo "  Enabling power-profiles-daemon..."
+sudo systemctl enable --now power-profiles-daemon 2>/dev/null || true
+
+# ── Bluetooth (system — skipped by --user) ────────────────────────────────────
+# AstalBluetooth talks to BlueZ (org.bluez) over the system bus; the bluez daemon
+# provides that name. bluez-libs alone (the client library) is not enough — without
+# the daemon enabled there's no org.bluez, so the Bluetooth page reports "no adapter"
+# even on machines that DO have Bluetooth. Idle and harmless where there's no adapter.
+# rfkill is a SECOND gate the daemon does not clear: a soft-blocked radio (Dell
+# laptops ship this way) stays blocked after bluetooth.service starts, and the
+# shell then shows an adapter whose power toggle silently does nothing. Unblock
+# first — rfkill(8) is in util-linux, present on every Arch install.
+echo "  Enabling bluetooth..."
+if command -v rfkill >/dev/null 2>&1; then
+    sudo rfkill unblock bluetooth 2>/dev/null || true
+fi
+sudo systemctl enable --now bluetooth.service 2>/dev/null || true
+if ! systemctl is-active --quiet bluetooth.service 2>/dev/null; then
+    echo "  [WARN] bluetooth.service is not active after enable --now."
+    echo "         Check 'systemctl status bluetooth.service' — the Bluetooth"
+    echo "         page shows 'no adapter' until the daemon is running."
+fi
+
+fi  # USER_ONLY
+
+if [ -z "$USER_ONLY" ]; then
+# ── Retired dependencies (system — skipped by --user) ─────────────────────────
+# Veltrix used to be built on AGS + the Astal libraries; both left in August 2026
+# (the shell hosts and bundles itself, and every service is ours now). `install.sh`
+# simply stopped installing them, which leaves an UPDATED machine carrying the
+# whole stack forever: pacman recorded them as explicitly installed, so
+# `pacman -Qdt` does not list them and nothing else will ever mention them again.
+# ~15 MiB, most of it the `ags` binary — small, but it is dead code with a
+# `/usr/bin` entry, and the user is the only one who can decide to remove it.
+# Say so, list exactly what is there, and let them run it. Never remove packages
+# on someone's behalf.
+_retired=""
+for p in aylurs-gtk-shell astal-gjs astal-quarrel appmenu-glib-translator \
+         libastal-io libastal-gtk3 libastal-gtk4 libastal-apps libastal-battery \
+         libastal-bluetooth libastal-greet libastal-hyprland libastal-mpris \
+         libastal-network libastal-notifd libastal-tray libastal-wireplumber \
+         libastal-auth; do
+    pacman -Qq "$p" >/dev/null 2>&1 && _retired="$_retired $p"
+done
+if [ -n "$_retired" ]; then
+    echo ""
+    echo "  Note: Veltrix no longer uses AGS or the Astal libraries, but this machine"
+    echo "  still has them from an earlier install. Nothing depends on them now; to"
+    echo "  reclaim the space (and drop /usr/bin/ags), you can remove them with:"
+    echo ""
+    echo "      sudo pacman -Rns$_retired"
+    echo ""
+fi
+
+# ── Superseded font (system — skipped by --user) ─────────────────────────────
+# Exactly the shape of the block above, with a much bigger number. 0.8.1 swapped
+# ttf-jetbrains-mono-nerd (232 MiB: the typeface with ~10k pictograms patched
+# into every weight and style) for the plain typeface plus a 2.4 MiB symbols
+# font that fontconfig falls back to. install.sh's list simply stopped naming
+# it, so an UPDATED machine keeps carrying it forever — pacman recorded it as
+# explicitly installed, and `pacman -Qdt` will never mention it.
+#
+# Unlike the Astal stack this is not dead code: it is a perfectly good font, and
+# someone may have pointed an editor or another terminal at it. So say what it
+# is, say what it costs, and leave the decision where it belongs. Never remove
+# packages on someone's behalf.
+if pacman -Qq ttf-jetbrains-mono-nerd >/dev/null 2>&1; then
+    # LC_ALL=C, or this reads nothing on a translated system: pacman -Qi prints
+    # "Tamaño instalado" in Spanish, "Größe" in German, and the fallback literal
+    # would quietly hide that the number was never read. Caught by running the
+    # block on a Spanish machine instead of trusting it.
+    _nerd_size=$(LC_ALL=C pacman -Qi ttf-jetbrains-mono-nerd 2>/dev/null \
+                 | awk -F': *' '/^Installed Size/{print $2; exit}')
+    _nerd_size="${_nerd_size:-232 MiB}"
+
+    # ⚠️ Never say "you can remove it" without checking whether this machine still
+    # ASKS for it. An install that updated from 0.8.0 keeps its own kitty.conf
+    # (Veltrix seeds that file once and never rewrites it) and its own
+    # monospace-font-name gsetting — both of which name the patched family. On
+    # such a machine the old font is still doing the work, and removing it would
+    # swap the terminal's typeface for whatever fontconfig picks next. Caught in
+    # a VM sweep: the note shipped one revision earlier claimed "your terminal is
+    # already using those", which was true of a fresh install and false of every
+    # update.
+    # The kitty.conf half is the load-bearing one and is verified in a VM, both
+    # ways round. The gsettings half is best effort: read from a TTY with no
+    # session bus it may come back empty even on a machine that has the value
+    # set, so treat a miss as "don't know", never as "nothing names it".
+    _still_named=""
+    grep -qs "JetBrainsMono Nerd Font" "${REAL_HOME}/.config/kitty/kitty.conf" \
+        && _still_named="your kitty.conf"
+    if run_user gsettings get org.gnome.desktop.interface monospace-font-name 2>/dev/null \
+        | grep -q "JetBrainsMono Nerd Font"; then
+        [ -n "$_still_named" ] && _still_named="$_still_named and the desktop's monospace font setting" \
+                               || _still_named="the desktop's monospace font setting"
+    fi
+
+    echo ""
+    if [ -n "$_still_named" ]; then
+        echo "  Note: Veltrix now ships JetBrains Mono as the plain typeface plus a small"
+        echo "  symbols font (9.8 MiB together) instead of the patched \"Nerd Font\" build"
+        echo "  ($_nerd_size). Your setup predates that: $_still_named still asks"
+        echo "  for the family \"JetBrainsMono Nerd Font\", so the old font is still doing"
+        echo "  the work here and removing it would change how your terminal looks."
+        echo "  To move over, point them at \"JetBrains Mono\" and copy the symbol_map"
+        echo "  block from /usr/share/veltrix/defaults/kitty/kitty.conf — then"
+        echo "  \`sudo pacman -Rns ttf-jetbrains-mono-nerd\` reclaims the $_nerd_size."
+    else
+        echo "  Note: Veltrix no longer uses the patched \"Nerd Font\" build of JetBrains Mono"
+        echo "  ($_nerd_size) — it ships the plain typeface plus a small symbols font, and"
+        echo "  nothing here still asks for the old family. It is installed from an earlier"
+        echo "  version; to reclaim the space:"
+        echo ""
+        echo "      sudo pacman -Rns ttf-jetbrains-mono-nerd"
+    fi
+    echo ""
+fi
+fi  # USER_ONLY
+
+echo ""
+echo "  ✓ Veltrix setup complete."
+echo "    Select 'Veltrix' at the login screen."
+echo ""

@@ -1,0 +1,334 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// =============================================================================
+// VELTRIX — THE BASE LAYER: the nodes no class of ours can ever reach
+// =============================================================================
+//
+// tech-debt #107 step 5, and the owner's framing of 2026-09-20: **the stylesheet
+// of a process that loads no GTK theme IS that process's theme.** Everything else
+// we write is the VARIATION layer — `.veltrix-*`, `#veltrix-bar …`,
+// `window.veltrix-settings-window …` — and all of it dresses widgets we built
+// ourselves. This file dresses the ones GTK builds: the font dialog, the file
+// dialog, and whatever a future widget arrives carrying.
+//
+// ── Why element selectors, and why they are not a leak ──────────────────────
+// A `Gtk.CssProvider` added with `add_provider_for_display` reaches every widget
+// in OUR process and nothing outside it. Third-party applications are separate
+// processes, so an unscoped rule of ours has never been able to touch one. What
+// commandment 2's scoping buys is one surface of ours not repainting another —
+// an organisation concern. And a toplevel GTK builds itself can never carry one
+// of our classes, so an element selector is the ONLY lever that reaches it.
+//
+// ── The contract: this layer always loses ───────────────────────────────────
+// Every selector here is (0,0,1), the lowest specificity there is, so ANY class
+// of ours outranks it. That is deliberate: the base layer is what shows when
+// nothing of ours has spoken, never something a component has to fight.
+//
+// ⚠️ Element selectors are this repo's sharp edge and it has already paid once —
+// `_components.scss` records `entry` and `dropdown > button` arriving without a
+// class and reaching two controls nobody intended. So a rule lands here only
+// after the node has been LOOKED at with no theme under it, and only with the A/B
+// that proves it changed nothing else:
+//
+//   ./scripts/bundle.sh scripts/dev/kit-gallery-probe.ts /tmp/gallery
+//   ./scripts/bundle.sh scripts/dev/installer-pages-probe.ts /tmp/pages
+//   gtk4-broadwayd :5 &
+//   GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 FONT_DIALOG=1 SHOT=/tmp/fd /tmp/gallery
+//   GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 SHOT=/tmp/gal /tmp/gallery
+//   for p in welcome region disk account system summary; do \
+//     GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 PAGE=$p SHOT=/tmp/pg /tmp/pages; done
+//   magick compare -metric AE before.png after.png null:      # must be 0
+//
+// The dialog is expected to CHANGE. The gallery and the six pages are the control
+// and must not move a pixel — if one does, the rule reached something of ours
+// that had been relying on saying nothing.
+
+@use './tokens' as *;
+@use './mixins' as *;
+
+/* ── The surface GTK's own toplevels have none of ────────────────────────────
+   Measured 2026-09-20 through `FONT_DIALOG=1`: with no theme, the toplevel
+   `Gtk.FontDialog` opens renders **151 711 of 192 400 pixels at alpha 0**. It is
+   not "undressed", it has NO BACKGROUND — the search entry, the font list, the
+   preview and the two action buttons hang on whatever happens to be behind the
+   window. Mean alpha 0.048 against 0.71 for the same dialog under a platform
+   theme. (An earlier note in #107 called it "legible and undressed"; that
+   reading came from a capture flattened onto white, which is the artefact
+   `feedback_screenshot_masks_render_artifacts` warns about.)
+
+   ⚠️ This rule reaches EVERY toplevel that does not declare its own background —
+   ours included. "Every Veltrix window declares `background: transparent`" was
+   written here as checked, and was not: the APP GRID's window declared nothing,
+   and the day the shell went themeless (#107 step 5) the whole monitor-sized
+   window took this fill, clipped by its input region into a translucent box
+   around the panel (owner-caught 2026-09-23). A new toplevel of ours declares
+   its background in its own sheet — the glass is painted by its content
+   (`.veltrix-window-glass`, the panel, Cairo) and the chrome by Hyprland.
+   It lands only on a toplevel carrying no class of ours, which is exactly the set
+   GTK builds itself.
+
+   `--veltrix-popover-bg` and not `--veltrix-bg`: a dialog is a FLOATING surface,
+   like a popover, and that token already carries the legibility floor
+   (`max(windowOpacity, 0.38)`) that `--veltrix-bg` deliberately does not — a
+   dialog the user cannot read is not WYSIWYG, it is a bug. */
+window {
+    background-color: var(--veltrix-popover-bg);
+    color: var(--veltrix-text);
+}
+
+/* ── `button`: the node that read as broken ──────────────────────────────────
+   Same capture, and it is the one difference a person would call a bug rather
+   than a plainness: the font dialog's two action buttons render as *bare words*
+   with no chrome and no gap — "CancelarSeleccionar", one run-on string. GTK's
+   button node carries no drawing of its own; the theme is the entire button.
+
+   This is `button.veltrix-btn`'s secondary variant, minus everything that is a
+   VARIATION (the size ramp, the four variants, the transition). A button GTK
+   built for us should look like a button we built, because in our process there
+   is no other kind.
+
+   Specificity, checked before writing: `button.veltrix-btn` is (0,1,1) and every
+   other button of ours carries a class too, so all of them outrank this (0,0,1)
+   rule property by property. The kit's button additionally "wipes GTK defaults
+   completely", so nothing here can reach it even where the values differ. The
+   control for that claim is the gallery + the six installer pages at 0 pixels.
+
+   ⚠️ The GEOMETRY is GTK's own, on purpose — `min-height: 24px; min-width: 16px;
+   padding: 4px 9px; border: 1px` is the built-in theme's `button` rule, read out of
+   libgtk's gresource (theme/Default/Default-dark.css). It was `5px 14px` / 20px
+   until the shell went themeless (#107 step 5), and the live A/B caught what that
+   cost: shell buttons that declare colours but not padding — a CC tile among them —
+   had been taking their box from the theme, and 10px more padding truncated
+   "Luz nocturna" to "Luz noctu…". A base layer that REPLACES a theme must replace
+   its box too; only the paint is ours. */
+button {
+    background-color: var(--veltrix-surface);
+    border: 1px solid var(--veltrix-border);
+    border-radius: $veltrix-radius-sm;
+    color: var(--veltrix-text);
+    padding: 4px 9px;
+    min-height: 24px;
+    min-width: 16px;
+    background-image: none;
+    box-shadow: none;
+
+    &:hover    { background-color: var(--veltrix-surface-hover); }
+    &:active   { background-color: var(--veltrix-surface-active); }
+    &:disabled { opacity: 0.45; }
+    &:focus-visible { @include veltrix-focus-ring; }
+}
+
+/* ── `placeholder`: a hint that read as a value ──────────────────────────────
+   The label GtkText shows in an empty field. GTK's built-in theme dims it
+   (`entry > text > placeholder { opacity: 0.55 }`, Default-dark.css); with no
+   theme it is drawn in the text's own ink, so an EMPTY field looked filled in.
+   Found 2026-09-28 on Settings → Network → Ethernet: the DNS field, empty on
+   purpose ("the network's own"), showed the network's servers as its hint and
+   read as servers typed in by hand. `--veltrix-text-dim` is the same 55%. Only
+   GtkText builds this node, so the element selector reaches nothing else. */
+placeholder {
+    color: var(--veltrix-text-dim);
+}
+
+/* ── `list > row`: GTK's 2px, which the shell was standing on ────────────────
+   The built-in theme pads every list row by 2px (`listview > row, list > row`).
+   Rows of ours that declare their own padding (`.veltrix-row` sets 0 on purpose,
+   and says why) never saw it; the ones that do not had been using it without
+   saying so. The live A/B of #107 step 5 found one: Settings → Users, where the
+   avatar row lost 4px and the "Change…" button rose into the picture. Geometry
+   only — a row has no paint of its own in the base layer. */
+list > row,
+listview > row { padding: 2px; }
+
+/* ── `arrow`: the chevron the theme drew, now ours ───────────────────────────
+   `arrow` is a BUILTIN-ICON node: no content of its own, it draws whatever
+   `-gtk-icon-source` names, and that comes from the theme (`dropdown arrow {
+   -gtk-icon-source: -gtk-icontheme("pan-down-symbolic") }` in libgtk's
+   Default). With no theme every GtkDropDown lost its chevron — Settings'
+   resolution/refresh/scale/rotation pickers in the shell's live A/B, and the
+   installer's keyboard picker, which has had none since it went themeless.
+
+   OUR glyph, by PATH (commandment 10 — a chevron is an interface icon, and a
+   name would resolve against whatever icon theme the process has). The path is
+   relative to the COMPILED sheet, so it is `$chevron-dir`: the KIT's own copies
+   (`ui/lib/veltrix-kit/assets/`, installed to `/usr/share/veltrix-kit/assets/`)
+   next to `kit.css`, by default. ⚠️ It was `../shell/assets/…`, which held while
+   each app compiled this layer into its own sheet — and broke without a sound
+   when #108 phase 2 (#636) moved it into `kit.css`, one folder over: from there
+   it named `ui/lib/shell/assets`, which does not exist, so no dropdown or menu
+   button had a chevron and GTK logged ~16 CRITICALs (a null texture) each time
+   one was drawn — 2821 in one day's log (found 2026-09-27). The kit is a
+   package of its own; it ships what it draws. The installer, which still
+   compiles this layer into its own sheet, passes its own `$chevron-dir`.
+   `-gtk-recolor()` so the symbolic glyph takes the node's `color`, in both
+   modes; the greeter's older rule uses an invert filter because it is always
+   dark, and keeps its own. No `min-width`/`min-height`, although GTK's theme
+   sets 16px: an arrow's box is its `-gtk-icon-size`, which defaults to 16px
+   anyway, and a floor here overrode the greeter's deliberate 10px chevron
+   (caught by shooting the greeter before and after). */
+// GTK's gap between a dropdown's label and its chevron — without it the glyph
+// sits flush against the last letter and reads as part of the word.
+dropdown > button > box { border-spacing: 6px; }
+// GtkComboBox — deprecated, but libnma's Wi-Fi forms are built of it (security, the
+// hidden network's form). Its button drew as a bare field with NO chevron, so nothing
+// said it opens (owner, 2026-09-28). Same gap and glyph as a dropdown's.
+combobox button > box { border-spacing: 6px; }
+
+$chevron-dir: "assets/" !default;
+
+dropdown arrow,
+combobox arrow,
+menubutton arrow.down {
+    -gtk-icon-source: -gtk-recolor(url("#{$chevron-dir}nd-pan-down-symbolic.svg"));
+}
+menubutton arrow.up    { -gtk-icon-source: -gtk-recolor(url("#{$chevron-dir}nd-pan-up-symbolic.svg")); }
+menubutton arrow.left  { -gtk-icon-source: -gtk-recolor(url("#{$chevron-dir}nd-pan-start-symbolic.svg")); }
+menubutton arrow.right { -gtk-icon-source: -gtk-recolor(url("#{$chevron-dir}nd-pan-end-symbolic.svg")); }
+
+/* ── `combobox > popover`: the list a GtkComboBox opens ───────────────────────
+   libnma's forms are built of GtkComboBox (Wi-Fi security, the hidden network's
+   form), and with no theme its list opened as bare words on nothing, overlapping
+   the dialog's buttons (seen live, 2026-09-28). GTK's geometry (theme/Default:
+   `popover.menu > contents` 5px, `popover.menu modelbutton` 30px tall, a combo's
+   rows 9px aside, 5px radius), our floating-surface paint and row states.
+   Scoped to `combobox`, not to every `popover`: our own menus ARE popovers
+   (the kit's menu, tooltip, split view), and none of them is a combo's — nothing
+   of ours builds a GtkComboBox, so this reaches only lists GTK builds itself. */
+combobox > popover {
+    background-color: transparent;
+}
+combobox > popover > contents {
+    padding: 5px;
+    border-radius: $veltrix-radius-sm;
+    background-color: var(--veltrix-popover-bg);
+    border: 1px solid var(--veltrix-popover-border);
+    box-shadow: var(--veltrix-shadow-md);
+    color: var(--veltrix-text);
+}
+combobox > popover modelbutton {
+    min-height: 30px;
+    min-width: 40px;
+    padding: 0 9px;
+    border-radius: 5px;
+}
+combobox > popover modelbutton:selected        { background-color: var(--veltrix-surface-hover); }
+combobox > popover modelbutton:selected:active { background-color: var(--veltrix-surface-active); }
+
+/* ── `tooltip`: GTK's native one ─────────────────────────────────────────────
+   Our own tooltips are `attachTooltip` (the kit's Cairo bubble). This is the
+   OTHER kind — a widget's `tooltip_text`, which GTK draws in its own popup
+   surface: two shell buttons still set one, and GTK's dialogs do. With no theme
+   it is bare text on nothing. GTK's geometry (6px 10px, 6px spacing), our
+   floating-surface paint — the same tokens a dialog uses above. */
+tooltip {
+    padding: 6px 10px;
+    border-radius: $veltrix-radius-sm;
+    box-shadow: none;
+    background-color: var(--veltrix-popover-bg);
+    border: 1px solid var(--veltrix-border);
+    color: var(--veltrix-text);
+
+    > box { border-spacing: 6px; }
+}
+
+/* ── `calendar`: GTK's structure, our paint ──────────────────────────────────
+   The Notification Center builds a `Gtk.Calendar` and styles its island, but the
+   header and the day grid took part of their box from the theme. With the shell
+   themeless (#107 step 5) the live A/B showed the header shifting ~4px, and the
+   cause was not the arrows (the NC strips their border itself) but
+   `font-feature-settings: "tnum"`: GTK's theme sets TABULAR digits on the
+   calendar, which changes the width of "2026". With it back: 65 px of 196 000,
+   noise. These are the built-in theme's calendar rules (libgtk gresource,
+   theme/Default), geometry kept, colours ours — `other-month` at 0.3 alpha of the
+   text, exactly GTK's ratio, and the selected day in the accent. */
+calendar {
+    color: var(--veltrix-text);
+    font-feature-settings: "tnum";
+
+    > header > button {
+        border: none;
+        box-shadow: none;
+        background: none;
+        border-radius: 0;
+    }
+
+    > grid > label.day-number { padding: 4px; }
+    > grid > label.day-number:selected {
+        border-radius: $veltrix-radius-sm;
+        background-color: var(--veltrix-accent);
+        color: var(--veltrix-accent-fg);
+    }
+    > grid > label.day-number.other-month { opacity: 0.3; }
+}
+
+/* ── `scale`: a slider with no trough is a number with a gap beside it ───────
+   The third thing the capture showed: the font dialog's size slider draws
+   nothing at all between its label and its value. GtkScale is like GtkSpinner and
+   like the expander's arrow — the theme IS the widget.
+
+   This is the safest rule in the file and that was verified, not assumed: **the
+   repo never constructs a `Gtk.Scale`.** Every mention of the name is a comment
+   saying so (`veltrix-kit/index.ts`, `slider.ts`, `core/UITree.ts`); the one slider
+   is `makeSlider`, a `Gtk.DrawingArea` painted in Cairo, which no CSS reaches. So
+   a `scale` node in a Veltrix process can only be one GTK built itself.
+
+   The shape deliberately echoes the Cairo slider — pill trough, accent fill,
+   white thumb (`--veltrix-thumb`, white in both modes for the same reason it is
+   there: it has to stay legible against the accent and against the empty
+   track) — so the one slider a person meets inside a GTK dialog is not a
+   different instrument from the ones in Settings. */
+scale {
+    > trough {
+        background-color: var(--veltrix-surface-raised);
+        border-radius: $veltrix-radius-pill;
+        min-height: 4px;
+
+        > highlight {
+            background-color: var(--veltrix-accent);
+            border-radius: $veltrix-radius-pill;
+        }
+
+        > slider {
+            background-color: var(--veltrix-thumb);
+            border-radius: $veltrix-radius-pill;
+            min-width: 14px;
+            min-height: 14px;
+            margin: -6px;
+            box-shadow: var(--veltrix-shadow-sm);
+        }
+    }
+}
+
+/* ── `spinner`: the theme IS the widget, and ours has been blank since August ──
+   `GtkSpinner` paints NOTHING in C. GTK's own rule is an `-gtk-icon-source` plus a
+   rotation on `:checked`, so with no theme there is no source and nothing to
+   rotate. Three sites build one; `ui/lib/auth-card.ts` is the one that matters,
+   because it is shown while a password is being checked on a screen that has
+   forced a themeless GTK since 2026-08-24 — the login screen's only piece of
+   progress feedback, blank ever since (tech-debt #107).
+
+   Drawn in CSS rather than with an icon: a ring whose track is `--veltrix-surface-raised`
+   and whose head is the accent, turning once a second. It needs no asset, so no
+   `nd-` name, no registry entry and no SPEC bump — and the accent is doing what
+   the design system reserves it for, marking the one thing that is active.
+   `@keyframes` cannot be scoped (CSS has no mechanism), which is why the design
+   system lists them with the global layer; this one is named for us. */
+@keyframes veltrix-spin {
+    to { transform: rotate(360deg); }
+}
+
+spinner {
+    min-width: 16px;
+    min-height: 16px;
+    border: 2px solid var(--veltrix-surface-raised);
+    border-top-color: var(--veltrix-accent);
+    border-radius: $veltrix-radius-pill;
+    background: none;
+    opacity: 0;
+
+    /* GtkSpinner sets :checked while it is spinning — a stopped one must not be a
+       static ring sitting on the page pretending to work. */
+    &:checked {
+        opacity: 1;
+        animation: veltrix-spin 1s linear infinite;
+    }
+}

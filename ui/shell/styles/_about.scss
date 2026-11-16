@@ -1,0 +1,73 @@
+@use 'base' as *;
+
+/* ==========================================================================
+   ABOUT WINDOW
+   ==========================================================================
+
+   Its own toplevel (`AboutWindow.tsx`: Gtk.Window, name "veltrix-about", class
+   "about-floating-window"), create+destroy rather than hide — commandment 8.
+   These rules lived unscoped at the bottom of _bar.scss until 2026-08-10, which
+   read as "the About window is part of the bar". It never was: nothing here is
+   reachable from `#veltrix-bar`, and scoping them there would have silently
+   unstyled the whole window.
+
+   The window node is transparent; the glass surface lives on its direct child
+   (.veltrix-window-glass in _components.scss, same chrome as Settings). Do NOT
+   re-add a `> *` transparent reset here — it would override the glass
+   background.
+   ========================================================================== */
+window#veltrix-about,
+.about-floating-window {
+    background: transparent;
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+
+    // ⚠️ EVERY label here needs the token EXPLICITLY. This window was the one
+    // surface of the shell whose text was left to GTK's default colour, and in
+    // LIGHT mode that default is white — so the card went white-on-near-white and
+    // could not be read at all. It survived because the failure is invisible in
+    // dark mode (white is what you wanted anyway) and because the neighbouring
+    // window hides it: Settings colours every string it draws, so nobody looking
+    // at the two side by side would guess the difference is in the sheet.
+    //
+    // 🔑 The tell, if it happens again on another surface: the LOGO flipped
+    // correctly to black while the text stayed white. `.about-logo` is the only
+    // node here that named `var(--veltrix-text)`, which is the proof the token was
+    // right and the labels simply were not asking for it.
+    color: var(--veltrix-text);
+    label { color: inherit; }
+
+    .about-logo {
+        margin-bottom: 8px;
+        color: var(--veltrix-text);   /* no longer recolours the mark: the two-tone V (2026-11-14) carries fixed navy/blue */
+        -gtk-icon-filter: drop-shadow(0 2px 8px rgba(0,0,0,0.4));
+    }
+
+    .about-shell-name {
+        font-size: $fs-title-3;
+        font-weight: $fw-bold;
+        letter-spacing: 0.02em;
+    }
+
+    .about-spec-key {
+        font-size: $fs-caption;
+        font-weight: $fw-medium;
+        opacity: 0.55;
+        // FLOOR only. The real width comes from a Gtk.SizeGroup in
+        // AboutWindow.tsx (the widest key in the running locale — 53px in
+        // Chinese, 150px in French); this keeps the shortest columns from
+        // crowding their values.
+        min-width: 80px;
+    }
+
+    .about-spec-val {
+        font-size: $fs-caption;
+        font-weight: $fw-regular;
+    }
+
+    .about-sep {
+        background: var(--veltrix-surface);
+        min-height: 1px;
+    }
+}

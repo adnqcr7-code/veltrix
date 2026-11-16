@@ -1,0 +1,526 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+import Gtk from "gi://Gtk?version=4.0"
+import Gdk from "gi://Gdk?version=4.0"
+import GObject from "gi://GObject"
+import Graphene from "gi://Graphene"
+import Gsk from "gi://Gsk"
+import cairo from "gi://cairo"
+import { GLASS_TINT, LOCK_GLASS } from "./tokens"
+import { glassRimGradient, drawShadowFromPath, GLASS_SHADOW } from "./glass-paint"
+import { kitAppearance } from "../appearance"
+import { compositorPaintsGlass, trackGlass } from "./material"
+
+// The glass capsule of the greeter and the lockscreen — painted, not CSS-drawn.
+//
+// WHY PAINTED AT ALL. A CSS pill has two failure modes and nothing in between.
+// At a radius of exactly half the height GTK's border rendering leaves one
+// brighter pixel in the middle of each cap; one pixel under half, the two arcs
+// are joined by a straight segment you can see at 1:1 (both reproduced offscreen,
+// 2026-08-09, after the second was shipped believing it was invisible). Drawing
+// the rim as a FILL between two rounded paths has neither: there is no border
+// primitive to seam, and the radius can be exactly half.
+//
+// WHY THE BACKDROP IS OPTIONAL, AND WHY THAT IS THE WHOLE DIFFERENCE BETWEEN THE
+// TWO SURFACES:
+//
+//   - The GREETER is a transparent layer over awww's wallpaper, with
+//     `blur = true, ignore_alpha = 0.3` (config/greetd/hyprland-greeter.lua). Its
+//     capsule is translucent (the fill is alpha 0.55, well above the threshold),
+//     so the COMPOSITOR blurs the wallpaper behind it. Nothing to paint: call
+//     this with no backdrop source and the body is fill-only.
+//   - The LOCKSCREEN cannot be helped. Under ext-session-lock-v1 the compositor
+//     draws NOTHING behind the lock surface, so it paints its own wallpaper and
+//     must blur its own copy — verified against Hyprland 0.56 sources and measured
+//     in a VM, so it stops being re-litigated:
+//       * `renderAllClientsForWorkspace` returns before drawing ANY layer once the
+//         lock client confirms, and `renderSessionLockPrimer` then paints opaque
+//         black over everything already drawn — wallpaper layer included.
+//       * `misc:session_lock_blur` exists but the renderer gates it:
+//         `renderdata.blur = PSESSIONLOCKBLUR && PSESSIONLOCKXRAY`. And xray brings
+//         the entire desktop back with it, not just the wallpaper.
+//       * An `above_lock = 2` layer renders and takes the pointer, but
+//         `CFocusState::rawSurfaceFocus` refuses keyboard focus to any surface that
+//         is not the lock surface. Measured: zero keys. A password field there is
+//         dead.
+//     hyprlock, swaylock and gtklock all blur their own copy for this reason.
+//
+//   - On HYALO (our own compositor) neither applies: it draws the wallpaper under the lock
+//     surface and paints the glass itself. The capsule declares its pill (`trackGlass`) and,
+//     while `compositorPaintsGlass`, paints only the focus ring — the edge is the compositor's,
+//     drop shadow included (owner, 2026-10-06)
+//     (hyalo/compositor/src/lock.rs, references/hyalo.md → "The lock screen").
+//
+// So: ONE painter, one shape, and the only thing that differs is where the pixels
+// behind the glass come from. That asymmetry is a property of the compositor, not
+// a design difference, and it must not become one.
+//
+// The blur pipeline mirrors the compositor's so the glass MATCHES the rest of the
+// desktop rather than merely resembling it: gaussian (`blur { size, passes }`)
+// followed by the colour trim (`contrast`, `brightness`, `vibrancy`) as a colour
+// matrix. Hyprland's `noise 0.01` is dropped — invisible at that amplitude and it
+// would cost a tiled texture.
+//
+// The blurred image is rendered ONCE into a texture and reused. Blurring inside
+// the snapshot would re-blur the whole wallpaper on every clock tick, for a
+// backdrop that never changes.
+
+// Kept in lockstep with `blur { … }` in config/hypr/hyprland.lua.
+const BLUR_SIZE = 2
+const BLUR_PASSES = 2
+// ⚠️ `brightness` was 0.8 → 1.0 on 2026-08-24. The comment above says these are "kept
+// in lockstep with `blur { … }` in config/hypr/hyprland.lua" — and that sentence had
+// been FALSE since #235 raised the shell's brightness a day earlier and did not reach
+// this file. A lockstep that nothing enforces is a claim, not a mechanism; the
+// reasoning for 1.0 lives beside the shell's copy.
+//
+// EXPORTED since `backdrop-skin.ts` needed to model what is actually behind the glass
+// — the wallpaper AFTER this trim, not the file on disk. That module went with the
+// login skin on 2026-09-21 (#613); the export stays because the next thing that has to
+// reason about what a viewer actually sees through the glass must read these numbers
+// rather than copy them, which is the drift the paragraph above is about.
+export const BACKDROP_TRIM = { contrast: 1.2, brightness: 1.0, vibrancy: 0.4 } as const
+const CONTRAST = BACKDROP_TRIM.contrast
+const BRIGHTNESS = BACKDROP_TRIM.brightness
+const VIBRANCY = BACKDROP_TRIM.vibrancy
+
+// GSK takes a single gaussian radius; Hyprland runs dual-Kawase, where every
+// pass HALVES the resolution — so its reach grows with 2^passes, not √passes.
+// Kawase sigma ≈ size · 2^passes, and GSK's radius is ≈ 2σ, giving 16 px for
+// our `size 2, passes 2`.
+//
+// This is an approximation between two different algorithms, not an identity:
+// if the lock's glass ever reads heavier or lighter than the bar's, THIS is the
+// single number to trim, by eye, side by side.
+const BLUR_RADIUS = BLUR_SIZE * Math.pow(2, BLUR_PASSES) * 2
+
+// The capsule is painted here, not by CSS. A CSS `border-radius` of half the
+// height makes GTK's border seam at the middle of each cap (see
+// design-system.md), and dodging it with a smaller radius leaves a visible
+// straight segment. Drawing fill and rim on ONE rounded path removes the whole
+// class of problem — the same reason the shell paints its glass in Cairo
+// (common/GlassBubble.ts) instead of using CSS boxes.
+//
+// The glass palette comes from ui/lib/veltrix-kit/platform/tokens.ts, which is the numeric half of
+// the mirror whose CSS half is --veltrix-glass / --veltrix-glass-border(-sm) in
+// ui/greeter/style.scss. These used to be three literals typed out right here,
+// tied to the stylesheet by nothing but a comment. The lock has no theme engine
+// (fixed dark palette; the accent only reaches the rim on focus), so they stay
+// constants — but shared ones.
+const { fill: GLASS_FILL, rimStrong: RIM_STRONG, rimSubtle: RIM_SUBTLE } = LOCK_GLASS
+
+// The body's TINT is fixed, and so is its alpha.
+//
+// It used to follow a "skin" chosen by measuring the wallpaper (tech-debt #82's login
+// half, 2026-08-25 — removed 2026-09-21 by the owner's decision, see #613: a login
+// screen that analyses its backdrop to pick an ink is a mechanism nobody can inspect,
+// and no comparable system ships one. The veil does that work now).
+//
+// ⚠️ THE ALPHA IS NOT A TONE CHOICE. It is paired with the greeter layer's
+// `ignore_alpha` (0.23, config/greetd/hyprland-greeter.lua): glass under that number is
+// not blurred by the compositor AT ALL — no error, no crash, just a flat login screen.
+// `scripts/ci/blur-threshold-check.mjs` reads both.
+//
+// ⚠️ The RIM is a specular — the colour of the light, not of the surface — which is why
+// the shell's light mode keeps a white edge too, and a stronger one. Making it dark
+// would paint a hairline where a highlight belongs.
+const glassFill = GLASS_FILL
+
+// Focus. The CSS used to draw TWO things on focus: a soft outer ring
+// (box-shadow, still CSS — it lives outside the capsule) and a solid accent
+// EDGE (border-color). The edge is what made focus read as bright; now that we
+// own the rim, we own that half of the state too, or the ring looks dim and
+// sunken with nothing crisp to sit against.
+let accentRim = { r: 0, g: 229 / 255, b: 1, a: 1 } // --veltrix-accent default (cyan)
+
+/** Follow the user's accent, resolved the same way app.ts resolves it. */
+export function setAccentRim(hex: string | null | undefined) {
+  if (!hex || !/^#[0-9a-fA-F]{6}$/.test(hex)) return
+  accentRim = {
+    r: parseInt(hex.slice(1, 3), 16) / 255,
+    g: parseInt(hex.slice(3, 5), 16) / 255,
+    b: parseInt(hex.slice(5, 7), 16) / 255,
+    a: 1,
+  }
+}
+
+export type RimWeight = "strong" | "subtle"
+
+/** The rim WEIGHTS, as a multiplier on the one Fresnel ramp (`glassRimGradient`).
+ *
+ *  Derived from the two tokens rather than typed: `strong` IS the canonical ramp, and
+ *  `subtle` is the ratio `rimSubtle.a / rimStrong.a` those two have always expressed
+ *  (0.14 / 0.22 = 0.64). Keeping the arithmetic here rather than writing 0.64 is what
+ *  stops the two halves from drifting the day someone retints the CSS mirror.
+ *
+ *  ⚠️ These two used to be the rim ITSELF — a flat white at .22 / .14 — because until
+ *  2026-08-24 this painter could not reach the shell's ramp. A flat rim has no key
+ *  light and no flank, so over a pale wallpaper the capsule had nothing to separate it
+ *  from the backdrop and read as a grey slab; that, plus the missing shadow, is what
+ *  made the login screen look like a different product from the desktop. */
+const RIM_SCALE: Record<RimWeight, number> = {
+  strong: 1,
+  subtle: RIM_SUBTLE.a / RIM_STRONG.a,
+}
+
+const RIM_W = 1
+
+/** A stadium/rounded-rect path — four arcs, no straight-segment fudge. */
+function pillPath(cr: any, x: number, y: number, w: number, h: number, r: number) {
+  const rr = Math.min(r, w / 2, h / 2)
+  cr.newSubPath()
+  cr.arc(x + w - rr, y + rr, rr, -Math.PI / 2, 0)
+  cr.arc(x + w - rr, y + h - rr, rr, 0, Math.PI / 2)
+  cr.arc(x + rr, y + h - rr, rr, Math.PI / 2, Math.PI)
+  cr.arc(x + rr, y + rr, rr, Math.PI, 1.5 * Math.PI)
+  cr.closePath()
+}
+
+const rgba = (c: { r: number; g: number; b: number; a: number }) =>
+  new Gdk.RGBA({ red: c.r, green: c.g, blue: c.b, alpha: c.a })
+
+let sourcePath: string | null = null
+let cache: { texture: Gdk.Texture; w: number; h: number } | null = null
+
+/**
+ * The image the glass shows through, blurred here. Set it before any capsule is
+ * drawn — or DON'T: leaving it null is the greeter's case, where the compositor
+ * supplies the blur and the body is fill-only. Only the lockscreen sets it.
+ */
+export function setCapsuleBackdrop(path: string | null) {
+  sourcePath = path
+  cache = null
+}
+
+// Both of these are plain structs with init-style constructors — the shape that
+// has broken across GJS releases before (see common/WindowThumbnail.ts). Built
+// ONCE here, outside any snapshot: degrading to a plain blur, or to square
+// corners, beats throwing mid-frame with an unbalanced push/pop.
+
+// Luminance-preserving saturation, with brightness and contrast folded into the
+// same matrix: out = (in - 0.5) · contrast · brightness + 0.5 · brightness.
+const COLOUR_TRIM = (() => {
+  try {
+    const s = 1 + VIBRANCY
+    const lr = 0.2126, lg = 0.7152, lb = 0.0722
+    const k = CONTRAST * BRIGHTNESS
+
+    // Column-major, as Graphene expects.
+    const m = [
+      (lr + (1 - lr) * s) * k, lr * (1 - s) * k, lr * (1 - s) * k, 0,
+      lg * (1 - s) * k, (lg + (1 - lg) * s) * k, lg * (1 - s) * k, 0,
+      lb * (1 - s) * k, lb * (1 - s) * k, (lb + (1 - lb) * s) * k, 0,
+      0, 0, 0, 1,
+    ]
+    const off = 0.5 * BRIGHTNESS - 0.5 * CONTRAST * BRIGHTNESS
+
+    const matrix = Graphene.Matrix.alloc()
+    matrix.init_from_float(m)
+    const offset = Graphene.Vec4.alloc()
+    offset.init(off, off, off, 0)
+    return { matrix, offset }
+  } catch (e) {
+    console.warn(`[GlassCapsule] no colour matrix, blur only: ${e}`)
+    return null
+  }
+})()
+
+const ROUNDED_CLIP_OK = (() => {
+  try {
+    const probe = new Gsk.RoundedRect()
+    const rect = new Graphene.Rect()
+    rect.init(0, 0, 1, 1)
+    probe.init_from_rect(rect, 1)
+    return true
+  } catch (e) {
+    console.warn(`[GlassCapsule] no rounded clip available: ${e}`)
+    return false
+  }
+})()
+
+/** Render the wallpaper blurred + trimmed into a texture, once per window size. */
+function backdropTexture(widget: Gtk.Widget, w: number, h: number): Gdk.Texture | null {
+  if (!sourcePath || w < 1 || h < 1) return null
+  if (cache && cache.w === w && cache.h === h) return cache.texture
+
+  const renderer = widget.get_native()?.get_renderer()
+  if (!renderer) return null
+
+  let src: Gdk.Texture
+  try {
+    src = Gdk.Texture.new_from_filename(sourcePath)
+  } catch (e) {
+    console.error("[GlassCapsule] cannot load wallpaper:", e)
+    return null
+  }
+
+  // COVER fit (same as the Gtk.Picture behind us), then overscan by the blur
+  // radius: without it the gaussian samples past the image and fades the screen
+  // edges into transparency.
+  const scale = Math.max(w / src.get_width(), h / src.get_height())
+  const dw = src.get_width() * scale
+  const dh = src.get_height() * scale
+  const pad = BLUR_RADIUS * 2
+
+  const rect = new Graphene.Rect()
+  rect.init((w - dw) / 2 - pad, (h - dh) / 2 - pad, dw + pad * 2, dh + pad * 2)
+
+  const viewport = new Graphene.Rect()
+  viewport.init(0, 0, w, h)
+
+  try {
+    const snapshot = new Gtk.Snapshot()
+    if (COLOUR_TRIM) snapshot.push_color_matrix(COLOUR_TRIM.matrix, COLOUR_TRIM.offset)
+    snapshot.push_blur(BLUR_RADIUS)
+    snapshot.append_texture(src, rect)
+    snapshot.pop()
+    if (COLOUR_TRIM) snapshot.pop()
+
+    const node = snapshot.to_node()
+    if (!node) return null
+
+    const texture = renderer.render_texture(node, viewport)
+    cache = { texture, w, h }
+    return texture
+  } catch (e) {
+    console.error("[GlassCapsule] backdrop render failed:", e)
+    return null
+  }
+}
+
+// Declaration merging: the ambient `ags/gtk4` typing exposes Gtk as `any` in
+// value position but as the real @girs namespace in type position, so tsc can't
+// see that this class extends Gtk.Widget (same trick as common/ScaleRevealer).
+export interface GlassCapsule extends Gtk.Box {}
+
+/**
+ * Single-child container painting the glass capsule around its child: the rim as
+ * a fill between two rounded paths, then the body — blurred backdrop first (when
+ * one is set) and the glass tint over it.
+ *
+ * The backdrop is sampled in WINDOW coordinates, so what shows through is the
+ * piece of wallpaper actually behind the capsule, registered with the sharp copy
+ * around it rather than a floating crop.
+ *
+ * 🔑 IT EXTENDS Gtk.Box, AND THAT IS A LIFECYCLE DECISION, NOT A LAYOUT ONE.
+ * The first version extended `Gtk.Widget` and parented the child by hand
+ * (`child.set_parent(this)`), which in GTK4 obliges you to unparent it on
+ * disposal. Nothing did, so every capsule logged one line per surface teardown:
+ *
+ *     Gtk-WARNING: Finalizing VeltrixGlassCapsule 0x…, but it still has
+ *     children left: - GtkPasswordEntry 0x…
+ *
+ * The documented answer is a `dispose` override, and it is genuinely unavailable
+ * here — measured 2026-08-09, not assumed: GJS refuses to run a JS vfunc during
+ * garbage collection and says so, `"Attempting to run a JS callback during
+ * garbage collection … The offending callback was dispose(), a vfunc … it has
+ * been blocked"`. A `destroyCapsule()` had been added as the manual escape hatch
+ * and never acquired a caller.
+ *
+ * So the fix is not to clean up better — it is to stop hand-parenting. A
+ * `Gtk.Box` owns its children's lifetime, which also deletes `vfunc_measure` and
+ * `vfunc_size_allocate`: a one-child box already measures and allocates to the
+ * child. `vfunc_snapshot` is untouched, so the painting is identical. Verified
+ * offscreen both ways — hand-parented, one warning per capsule; as a Box, none.
+ *
+ * ⚠️ The CSS node becomes `box`. Nothing in `ui/greeter/style.scss` selects a
+ * bare `box` (checked), but a rule added there later would now reach inside every
+ * capsule on both screens.
+ */
+export class GlassCapsule extends Gtk.Box {
+  static {
+    GObject.registerClass({ GTypeName: "VeltrixGlassCapsule" }, this)
+  }
+
+  child: Gtk.Widget
+  rim: RimWeight
+  followFocus: boolean
+
+  constructor(child: Gtk.Widget, rim: RimWeight = "subtle", followFocus = false) {
+    super()
+    this.child = child
+    this.rim = rim
+    // Only for capsules that ARE the focusable control. A CONTAINER (the power
+    // bar) reports FOCUS_WITHIN whenever any of its buttons has focus, so
+    // following it there paints the whole bar accent — which reads as "the bar
+    // is focused" when what is focused is one button inside it.
+    this.followFocus = followFocus
+    // `append`, not `set_parent`: GTK owns the child from here on. `child` is
+    // kept as a field only so hasFocus() and the painter can reach it.
+    this.append(child)
+
+    if (followFocus) child.connect("state-flags-changed", () => this.queue_draw())
+
+    // On a compositor of our own the pill's glass is the compositor's — the real wallpaper
+    // behind it, refracted, not a blurred copy (lock.rs in Hyalo, #683). A no-op elsewhere.
+    trackGlass(this, () => {
+      const w = this.get_width(), h = this.get_height()
+      return [{ x: 0, y: 0, w, h, radius: Math.min(w, h) / 2, exponent: 2 }]
+    })
+  }
+
+  isFocused(): boolean {
+    if (!this.followFocus) return false
+    // FOCUS_WITHIN as well as FOCUSED: in a GTK4 composite entry the focus
+    // lands on the inner `text` node, so the outer widget is never :focus.
+    const flags = this.child.get_state_flags()
+    return (flags & Gtk.StateFlags.FOCUS_WITHIN) !== 0 || (flags & Gtk.StateFlags.FOCUSED) !== 0
+  }
+
+  vfunc_snapshot(snapshot: Gtk.Snapshot) {
+    const w = this.get_width()
+    const h = this.get_height()
+    const root = this.get_root() as unknown as Gtk.Widget | null
+
+    if (ROUNDED_CLIP_OK && root && w > 0 && h > 0) {
+      const [ok, bounds] = this.compute_bounds(root)
+      // Everything that can throw happens BEFORE the first push, so a failure
+      // costs the capsule, never a half-pushed snapshot.
+      // Reduce transparency (#674): the body is the tint, solid, and there is no backdrop
+      // to blur under it — the lock skips its own blur pass entirely.
+      const solid = kitAppearance().reduceTransparency?.() === true
+      // The compositor paints the body and the rim: what is left here is state (the focus
+      // ring) — no shadow, the shell's SquircleContainer says why.
+      const compositors = compositorPaintsGlass(this)
+      const texture = ok && !solid && !compositors ? backdropTexture(this, root.get_width(), root.get_height()) : null
+
+      if (ok) {
+        // A TRUE pill: our own path, so the radius can be exactly half the
+        // height. GSK's rounded clip is clean at that radius — it is GTK's CSS
+        // border, not the clip, that seams (both verified offscreen).
+        const radius = Math.min(w, h) / 2
+
+        const outerBox = new Graphene.Rect()
+        outerBox.init(0, 0, w, h)
+        const outer = new Gsk.RoundedRect()
+        outer.init_from_rect(outerBox, radius)
+
+        // 0) The DROP SHADOW, outside the silhouette and under everything else.
+        //
+        // The rim is a MATERIAL highlight, not a delimiter: its top and bottom stops
+        // are white, so over a bright wallpaper they vanish and only the dark flank
+        // survives — the capsule reads as two vertical lines. The desktop's glass got
+        // this on 2026-08-23 (#243/#244) and these two screens did not, which is the
+        // defect this whole change exists for.
+        //
+        // ⚠️ IT MUST NOT MAKE THE COMPOSITOR BLUR BEHIND IT. Hyprland blurs a layer
+        // wherever alpha clears `ignore_alpha`, and a shadow is by definition a band of
+        // low alpha OUTSIDE the glass — that is debt #237, the dock smearing behind its
+        // icon shadows. Checked, not assumed: `GLASS_SHADOW.alpha` is 0.18 at the
+        // silhouette and falls off outward, against the greeter layer's `ignore_alpha`
+        // (`config/greetd/hyprland-greeter.lua`), so it never reaches the threshold.
+        // ⚠️ That threshold moved 0.3 → 0.23 later the same day, when this layer was put
+        // on the shell's numbers: the margin went 30.6 → 12.8 levels of 255. Still clear,
+        // and it is exactly the margin the dock has lived on since #237 — but it is now
+        // the tight configuration, not the roomy one. Re-measure if either number moves. The
+        // LOCKSCREEN cannot be affected at all — it gets no compositor blur, it paints
+        // its own. Re-check this line if either number moves.
+        //
+        // Room comes from the snapshot, not from an inset: the cairo node is bigger than
+        // the widget and GTK4 does not clip a widget to its allocation, so the falloff
+        // costs the capsule no painted glass — unlike the shell's SquircleContainer, whose
+        // box has to make room for it.
+        // Not on the compositor's glass (SquircleContainer says why).
+        if (!compositors) {
+          const m = GLASS_SHADOW.spread + 2
+          const shadowBox = new Graphene.Rect()
+          shadowBox.init(-m, -m, w + m * 2, h + m * 2)
+          const scr = snapshot.append_cairo(shadowBox)
+          drawShadowFromPath(
+            scr,
+            (offset, dy) => pillPath(
+              scr, -offset, -offset + dy,
+              w + offset * 2, h + offset * 2, radius + offset,
+            ),
+            -m, -m, w + m * 2, h + m * 2,
+            GLASS_SHADOW.spread, GLASS_SHADOW.alpha, GLASS_SHADOW.drop,
+          )
+          scr.$dispose()
+        }
+
+        // 1) The BODY, filling the whole pill: blurred wallpaper first when
+        //    there is one, then the glass tint over it — the order the CSS had.
+        if (!compositors) snapshot.push_rounded_clip(outer)
+        if (texture) {
+          // Sampled in WINDOW coordinates: the child sits at `bounds`, so the
+          // texture is offset by -bounds and the piece showing through is the
+          // one actually behind it.
+          const src = new Graphene.Rect()
+          src.init(-bounds.get_x(), -bounds.get_y(), texture.get_width(), texture.get_height())
+          snapshot.append_texture(texture, src)
+        }
+        if (!compositors) {
+          snapshot.append_color(rgba(solid ? { ...glassFill, a: 1 } : glassFill), outerBox)
+          snapshot.pop()
+        }
+
+        // 2) The RIM, on top: a 1px ring, filled through an even-odd Cairo path
+        //    (outer pill minus inner pill) rather than stroked or drawn as a
+        //    border primitive — a border is what seams at the caps, which is the
+        //    whole reason this painter exists.
+        //
+        // ⚠️ IT HAS TO BE A RING, not the outer pill filled with the rim colour
+        // and the body painted over it. That is what this did until 2026-08-09
+        // and it was invisible for as long as there was a texture: the LOCK
+        // paints an opaque blurred wallpaper over the rim, so the bleed-through
+        // never showed. The GREETER paints no texture — its body is a 55 %
+        // tint — so the rim colour came straight through and the whole capsule
+        // rendered ACCENT BLUE the moment it took focus. Caught on the first
+        // offscreen render of the textureless case, and it could not have been
+        // caught any other way.
+        // FOCUS stays a FLAT accent, and that is deliberate. The Fresnel ramp describes
+        // a physical edge lit from above; focus is not a material, it is a state, and it
+        // has to read as one crisp bright ring at a glance. Running the accent through
+        // the ramp would dim it at exactly the mid-height where the eye lands.
+        const cr = snapshot.append_cairo(outerBox)
+        cr.setFillRule(cairo.FillRule.EVEN_ODD)
+        pillPath(cr, 0, 0, w, h, radius)
+        pillPath(cr, RIM_W, RIM_W, Math.max(0, w - RIM_W * 2), Math.max(0, h - RIM_W * 2),
+                 Math.max(0, radius - RIM_W))
+        if (this.isFocused()) {
+          cr.setSourceRGBA(accentRim.r, accentRim.g, accentRim.b, accentRim.a)
+        } else if (compositors) {
+          cr.setSourceRGBA(0, 0, 0, 0)
+        } else {
+          // The shell's ONE ramp, scaled to this capsule's weight — see RIM_SCALE. The
+          // gradient is vertical, so its x only fixes the axis; any x on the shape does.
+          cr.setSource(glassRimGradient(w / 2, 0, h, radius, RIM_SCALE[this.rim]))
+        }
+        cr.fill()
+        cr.$dispose()
+      }
+    }
+
+    // The child, drawn by Gtk.Box on top of everything above.
+    super.vfunc_snapshot(snapshot)
+  }
+}
+
+/**
+ * Wrap a translucent widget in the painted capsule. Layout properties move to the
+ * wrapper and the child fills it, so the box the child occupies and the pill we
+ * paint are the same rectangle — which is also why the child's CSS must stop
+ * drawing its own background and border (see `ui/greeter/style.scss`).
+ */
+export function withGlassCapsule(
+  child: Gtk.Widget,
+  rim: RimWeight = "subtle",
+  followFocus = false,
+): Gtk.Widget {
+  const wrapper = new GlassCapsule(child, rim, followFocus)
+
+  wrapper.halign = child.halign
+  wrapper.valign = child.valign
+  wrapper.margin_top = child.margin_top
+  wrapper.margin_bottom = child.margin_bottom
+  wrapper.margin_start = child.margin_start
+  wrapper.margin_end = child.margin_end
+
+  child.margin_top = 0
+  child.margin_bottom = 0
+  child.margin_start = 0
+  child.margin_end = 0
+  child.halign = Gtk.Align.FILL
+  child.valign = Gtk.Align.FILL
+
+  return wrapper
+}

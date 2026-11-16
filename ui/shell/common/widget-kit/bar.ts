@@ -1,0 +1,178 @@
+// The BAR half of the widget vocabulary — what a widget's pill looks like in the
+// bar, as opposed to its tile in the Control Centre (tile.ts) or the room a panel
+// opens for it (panel.ts).
+//
+// It lived in `widgets/bar-helpers.ts`, the ONE non-widget file the registry codegen
+// had to grandfather past its own "widgets/ is a widgets-only directory" rule. With
+// the kit in place there is nowhere else it should be, and the codegen has no
+// exceptions left.
+//
+// Leaf module — no shell imports. See panel.ts for the cycle that crashes the boot.
+import Gtk from "gi://Gtk?version=4.0"
+import GLib from "gi://GLib"
+import Gio from "gi://Gio"
+
+function setIcon(img: Gtk.Image, icon: Gio.FileIcon | string) {
+    if (typeof icon === "string") img.icon_name = icon
+    else img.gicon = icon
+}
+
+const AUTO_HIDE_MS = 3000
+
+/** What a bar icon DOES, for the keyboard. The icons below take their click through a
+ *  GestureClick on an image or a box — nothing a key can reach — so each registers
+ *  the same action here, and the bar's item (surfaces/bar/capsule.ts) runs it on
+ *  Enter/Space/↓. A WeakMap, not a property: the widget goes, its entry goes. */
+const keyActions = new WeakMap<Gtk.Widget, () => void>()
+export const barKeyAction = (w: Gtk.Widget): (() => void) | undefined => keyActions.get(w)
+
+/** The air on each side of a STANDALONE bar capsule's content, from its glass — an
+ *  icon-only pill is PAD + 16 + PAD = 44 wide (16 from the box until #762, whose glass
+ *  was painted 2 px inside it). Since 2026-09-26 that is only the island's compact
+ *  forms: everything else in the bar is an ITEM inside a group (BAR_ITEM_PAD). On the
+ *  4px scale with the rest of the bar's geometry (surfaces/bar/capsule.ts). */
+export const BAR_PILL_PAD = 14
+
+/** The air on each side of an ICON in a bar item — an icon-only item is
+ *  7 + 18 + 7 = 32 wide (on the 4px scale; owner, 2026-10-06), and its hover/open
+ *  pill is exactly that wide, 24 tall. Every widget's bar content carries it (and so
+ *  do search, the CC, the `»`, the tray), because the item draws its pill round
+ *  whatever the content measures: the widget owns its air, the group owns none. The
+ *  bar's groups: surfaces/bar/capsule.ts (barGroup / barItem). */
+export const BAR_ITEM_PAD = 7
+
+/** The air on each side of TEXT in a bar item (the window title, the clock, a
+ *  widget's revealed label). More than an icon's: the pill's ends are half-circles of
+ *  radius 12, so text with less air than that runs its first and last letter into
+ *  the curve — the window title did, at 8 (owner, 2026-10-06). */
+export const BAR_TEXT_PAD = 12
+
+/** The size of every icon IN THE BAR — the widgets' bar content, search, the CC,
+ *  the `»`, the tray. 18, not the 16 it was until 2026-09-27: the owner found them
+ *  slightly small, and the reference agreed on is a 24 pt menu bar with 16 pt
+ *  icons, with our CAPSULE as its whole bar (the air above the capsule is ours
+ *  alone): the visible glass was 28 px then (32 since 2026-10-06), and
+ *  16 × 28/24 ≈ 18.7. Against the hover pill it comes out the same: 16 in a ~22
+ *  highlight is 73 %, and 73 % of our 24 px pill is 17.5. An 18 px icon sits in the
+ *  24 px pill with 3 px above and below. Every icon in the bar is this size — the
+ *  system menu's mark and the island's chips too (they were 20 and 16 until
+ *  2026-10-06). */
+export const BAR_ICON_SIZE = 18
+
+/**
+ * Icon-only bar widget that expands to show a label on click, then auto-hides.
+ * Uses the same structure as fixed bar items: Gtk.Image + margin_start/end: BAR_ITEM_PAD.
+ * The Revealer slides in the label to the right of the icon.
+ */
+export function makeBarExpandable(opts: {
+    getIcon: () => Gio.FileIcon | string
+    getText: () => string
+    onAction?: () => void
+    autoHideMs?: number
+}): Gtk.Widget {
+    const { getIcon, getText, onAction, autoHideMs = AUTO_HIDE_MS } = opts
+
+    // Identical to fixed bar pill structure — Gtk.Image as anchor
+    const icon = new Gtk.Image({ pixel_size: BAR_ICON_SIZE, margin_start: BAR_ITEM_PAD, css_classes: ["nd-icon"] })
+    setIcon(icon, getIcon())
+
+    const label = new Gtk.Label({
+        label: "",
+        css_classes: ["bar-widget-label"],
+        max_width_chars: 14,
+        ellipsize: 3,
+    })
+
+    const revealer = new Gtk.Revealer({
+        transition_type: Gtk.RevealerTransitionType.SLIDE_RIGHT,
+        transition_duration: 180,
+        reveal_child: false,
+    })
+    revealer.set_child(label)
+
+    // Box only to host the revealer alongside the icon — no extra sizing
+    const box = new Gtk.Box({ spacing: 8 })
+    box.append(icon)
+    box.append(revealer)
+
+    // Right margin lives on the box so it adjusts with the revealer: collapsed the item
+    // is an icon (BAR_ITEM_PAD at both ends), revealed it ends in text, which wants
+    // BAR_TEXT_PAD — the difference rides on the label, inside the revealer.
+    box.margin_end = BAR_ITEM_PAD
+    label.margin_end = BAR_TEXT_PAD - BAR_ITEM_PAD
+
+    let hideTimer: number | null = null
+    let expanded = false
+
+    const collapse = () => {
+        expanded = false
+        revealer.reveal_child = false
+    }
+
+    const act = () => {
+        if (hideTimer) { GLib.source_remove(hideTimer); hideTimer = null }
+        if (expanded) {
+            collapse()
+        } else {
+            label.label = getText()
+            setIcon(icon, getIcon())
+            expanded = true
+            revealer.reveal_child = true
+            hideTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, autoHideMs, () => {
+                collapse()
+                hideTimer = null
+                return GLib.SOURCE_REMOVE
+            })
+        }
+        onAction?.()
+    }
+    const gesture = new Gtk.GestureClick()
+    gesture.connect("pressed", act)
+    box.add_controller(gesture)
+    keyActions.set(box, act)
+
+    box.connect("unrealize", () => {
+        if (hideTimer) { GLib.source_remove(hideTimer); hideTimer = null }
+    })
+
+    return box
+}
+
+/**
+ * Pure icon action button — identical structure to fixed bar pills.
+ * Returns a Gtk.Image with a GestureClick attached.
+ */
+export function makeBarIcon(opts: {
+    getIcon: () => Gio.FileIcon | string
+    onAction: () => void
+    activeClass?: string
+    getActive?: () => boolean
+    subscribe?: (sync: () => void) => () => void
+}): Gtk.Widget {
+    const { getIcon, onAction, activeClass, getActive, subscribe } = opts
+
+    const image = new Gtk.Image({ pixel_size: BAR_ICON_SIZE, margin_start: BAR_ITEM_PAD, margin_end: BAR_ITEM_PAD, css_classes: ["nd-icon"] })
+    setIcon(image, getIcon())
+
+    const syncState = () => {
+        setIcon(image, getIcon())
+        if (activeClass && getActive) {
+            if (getActive()) image.add_css_class(activeClass)
+            else image.remove_css_class(activeClass)
+        }
+    }
+
+    const act = () => { onAction(); syncState() }
+    const gesture = new Gtk.GestureClick()
+    gesture.connect("pressed", act)
+    image.add_controller(gesture)
+    keyActions.set(image, act)
+
+    if (subscribe) {
+        const cleanup = subscribe(syncState)
+        image.connect("unrealize", cleanup)
+    }
+
+    syncState()
+    return image
+}

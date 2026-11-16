@@ -1,0 +1,1273 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// =============================================================================
+// VELTRIX KIT — the components' own stylesheet, shared by all bundles
+// =============================================================================
+//
+// `ui/lib/veltrix-kit/` has been importable from any bundle for a long time; its
+// LOOK was not. Every rule below lived in `ui/shell/styles/_components.scss`,
+// which only the shell compiles, so a greeter that imported `VeltrixButton` would
+// have rendered it with GTK's defaults: `.veltrix-btn` appeared 16 times in the
+// shell's compiled sheet and 0 times in the greeter's. The kit's code was shared
+// and its appearance was not — that is what this file fixes.
+//
+// ── WHAT BELONGS HERE ───────────────────────────────────────────────────────
+// One mechanical test, not a judgement call: **a rule moves here iff the widget
+// that wears it is built in `ui/lib/`.** Grep the class in `ui/lib/` and the
+// answer is the same for everyone. It is why `.veltrix-tooltip` and
+// `.veltrix-circle-btn` did NOT come along despite the `veltrix-` prefix —
+// `common/Tooltip.ts` and `common/IconButton.ts` are the shell's — and why the
+// bare-element halves of `entry, .veltrix-input` and the whole `Gtk.DropDown`
+// block did: `alert-dialog.ts` builds a `Gtk.Entry` and `scrolled.ts` exports
+// `VeltrixDropDown`.
+//
+// A `veltrix-*` class still sitting in the shell's sheet is not a mistake, it is
+// the same legitimate mismatch documented for `veltrix-media-*`: the PREFIX says
+// who owns the class, the SHEET says which bundles compile it. They converge as
+// components move, not before.
+//
+// ── THIS IS THE GLOBAL LAYER, ON PURPOSE ────────────────────────────────────
+// Commandment 2 (all surface CSS scoped to its window) does not apply: the kit
+// is the design system's global layer, exactly like `_base` and `_reset`. A kit
+// component is worn by whatever window imports it, so scoping it to one would
+// be the bug rather than the fix.
+//
+// ── WHO IMPORTS IT: ALL THREE BUNDLES (greeter + lock since 2026-08-10) ─────
+// `ui/greeter/style.scss` — the sheet the greeter AND the lockscreen compile —
+// `@use`s this file. What earned it was migrating those screens' three raw
+// `Gtk.DropDown`s to `VeltrixDropDown`: that turned two of the three known
+// bare-element collisions (`dropdown > button`, `dropdown popover`) from a
+// problem into the payload. Read design-system.md "The greeter wears the kit"
+// before adding a fourth bundle or a bare-element rule here.
+//
+// ⚠️ THREE THINGS THAT SHEET RELIES ON, so do not break them from this side:
+//
+// 1. SOURCE ORDER. Sass emits this module BEFORE the file that loads it, so a
+//    consumer's own rules out-rank these at equal specificity. That is the only
+//    thing keeping the login screens' ghost-pill triggers from becoming the
+//    input-styled trigger below. Nothing here may rely on being last.
+// 2. THE TOKEN CONTRACT. These rules read 22 `--veltrix-*` custom properties. An
+//    undefined one does NOT warn — GTK drops the declaration — so a consumer
+//    that has not defined them fails SILENTLY, and the greeter/lock have no dev
+//    mode to notice in (fixed /usr/share path). **Adding a `var(--veltrix-…)`
+//    here is a change to every consumer's palette block.** The greeter's list is
+//    verified by grepping the compiled sheet, not by hand; the two commands are
+//    in the comment above that block.
+// 3. THE BARE-ELEMENT RULES ARE THE SHARP EDGE. `entry`, `selection`,
+//    `dropdown > button`, `dropdown popover` match with no class at all. What
+//    they cost was measured on the greeter: two properties reached controls
+//    nobody intended — `> box > label { margin-left }` and `font-weight` on the
+//    trigger — and only the first was findable by reading the cascade. A new
+//    bare-element rule needs the pixel diff in design-system.md run against the
+//    login screens, not just a look at the shell.
+//    (The `entry` collision that was PREDICTED here did not happen: the greeter's
+//    password field has its CSS box off and shows focus as the capsule's painted
+//    rim, not an outline, so this file's `border-radius` lands on an invisible
+//    box. The real one was `entry > text { caret-color }`, which reaches the
+//    inner node directly and beats what the class above it inherits.)
+
+// ── The base layer is NOT wired from here, and that was measured ────────────
+// `ui/lib/veltrix-kit/styles/_base-layer.scss` holds the element-selector rules that dress the
+// nodes GTK builds itself (tech-debt #107 step 5). It was `@use`d from this file
+// for exactly one afternoon, which put it in every bundle that compiles the kit —
+// including the SHELL, which on that day still wore the user's GTK theme.
+//
+// `scripts/dev/shell-gallery-probe.ts` priced that on its first run: **~35 000
+// changed pixels** across the bar, the alert dialog and Settings, and the shape of
+// the diff was a whole column shifted DOWN — the base `button` rule's `padding` and
+// `min-height` reaching shell buttons that had been taking their geometry from the
+// theme (`accent-circle-btn`, `destructive-action`, `flat` are the first three).
+//
+// So the layer is wired from the sheets of the bundles that HAVE no theme —
+// `ui/installer/style.scss` and `ui/greeter/style.scss` (the lock shares it) — and,
+// since the shell flipped on 2026-09-23, `ui/shell/style.scss` too, in the same
+// change that made it themeless. It is still `@use`d per BUNDLE rather than from
+// here, so that the substrate and the layer that replaces it always move together:
+// a layer meant to replace a theme, added under a process that still has one, is
+// the two-substrate bug this repo already paid for.
+
+@use './tokens' as *;
+@use './mixins' as *;
+
+/* --- Base text input -------------------------------------------------------
+   Every plain Gtk.Entry (and anything with .veltrix-input) gets the veltrix
+   look out of the box — no per-widget CSS, no GTK default-theme blue. This is
+   the single place text fields are themed. Custom inputs (the settings search
+   box, Prism) are Gtk.Text under their own class and override this. Accent
+   appears ONLY on focus + text selection, per the design system. */
+entry,
+.veltrix-input {
+    background: var(--veltrix-surface-back);
+    // 2px border kept at constant width (transparent at rest → accent on focus)
+    // with background-clip: padding-box so the visual thickness never changes the
+    // real geometry — no layout shift, and no thin 1px line that reads badly on the
+    // rounded corners / lighter backgrounds.
+    background-clip: padding-box;
+    border: 2px solid transparent;
+    border-radius: $veltrix-radius-sm;
+    padding: 6px 10px;
+    min-height: 0;
+    color: var(--veltrix-text);
+    caret-color: var(--veltrix-accent);
+    box-shadow: none;
+    outline: none;
+    transition: border-color 0.15s ease;
+
+    &:focus, &:focus-within {
+        border-color: var(--veltrix-accent);
+        box-shadow: none;
+        outline: none;
+    }
+    &:disabled { opacity: 0.5; }
+
+    > text {
+        background: transparent;
+        color: var(--veltrix-text);
+        caret-color: var(--veltrix-accent);
+    }
+}
+
+/* Selected text — accent tint everywhere (entries and labels alike). */
+selection {
+    background-color: rgba(var(--veltrix-accent-rgb), 0.30);
+    color: var(--veltrix-text);
+}
+
+/* --- CheckButton & RadioButton --------------------------------------------
+   GTK4 blank theme resets: check and radio subnodes.
+   Styled in surface colors, turning accent when checked. */
+checkbutton {
+    @include veltrix-reset;
+    padding: 2px;
+    min-height: 20px;
+    min-width: 20px;
+    outline: none;
+    box-shadow: none;
+
+    > label {
+        margin-left: $space-2;
+        color: var(--veltrix-text);
+        font-size: $fs-small;
+    }
+}
+
+check,
+radio,
+checkbutton check,
+checkbutton radio {
+    @include veltrix-reset;
+    min-width: 18px;
+    min-height: 18px;
+    background-color: var(--veltrix-surface);
+    border: 1.5px solid var(--veltrix-border);
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+    margin: 0;
+    padding: 0;
+}
+
+check,
+checkbutton check {
+    border-radius: $veltrix-radius-xs;
+}
+
+radio,
+checkbutton radio {
+    border-radius: var(--veltrix-radius-pill);
+}
+
+checkbutton:hover check,
+checkbutton:hover radio,
+check:hover,
+radio:hover {
+    background-color: var(--veltrix-surface-hover);
+    border-color: var(--veltrix-surface-strong);
+}
+
+checkbutton:active check,
+checkbutton:active radio,
+check:active,
+radio:active {
+    background-color: var(--veltrix-surface-active);
+}
+
+checkbutton:checked check,
+check:checked {
+    background-color: var(--veltrix-accent);
+    border-color: var(--veltrix-accent);
+    color: var(--veltrix-accent-fg);
+    -gtk-icon-source: -gtk-icontheme("object-select-symbolic");
+}
+
+checkbutton:checked radio,
+radio:checked {
+    background-color: var(--veltrix-accent);
+    border-color: var(--veltrix-accent);
+    box-shadow: inset 0 0 0 4px var(--veltrix-bg);
+}
+
+checkbutton:focus-visible check,
+checkbutton:focus-visible radio,
+check:focus-visible,
+radio:focus-visible {
+    @include veltrix-focus-ring;
+}
+
+checkbutton:disabled {
+    opacity: 0.45;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   UNIVERSAL INTERACTIVE COMPONENTS
+   Reusable building blocks for ANY surface (settings, CC, bar, future windows).
+   Add these classes from TSX (or via the lib/veltrix-kit factories) — never
+   reinvent a per-surface row/list/tile. Only geometry lives here; the interaction
+   model is the single source in _base.scss (veltrix-row-states / -tile-states,
+   both mode-aware so the hover is visible on any wallpaper). See
+   feedback_universal_components in memory.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* Clickable text row in a list/menu (settings rows, CC rows, menu items). */
+.veltrix-row {
+    @include veltrix-reset;
+    // `veltrix-reset` clears background/border/shadow/outline but NOT padding, and
+    // Adwaita gives every `list > row` 2px of it. That 2px is invisible on its own
+    // and shifts the row's whole text column: measured 2026-08-03, a row title sat
+    // 18px inside a row whose content margin is 16, which is why the group header
+    // above the card could never be lined up with it by any round number.
+    padding: 0;
+    border-radius: $veltrix-radius-sm;
+    margin: 1px 0;
+    @include veltrix-row-states;
+}
+
+/* The kit row's DECLARED height — 48 one text line, 72 two. Applied by VeltrixRow /
+   VeltrixStackedRow only (see rowHeightClass in veltrix-kit/row.ts for why it is NOT on
+   `.veltrix-row` itself: dense bar/CC panel rows wear that class with their own tighter
+   padding). `min-height`, not a size request — the row's own 1px margin would eat it.
+   Both are floors: a wrapping subtitle or a preview row grows past them. */
+.veltrix-row--single { min-height: 48px; }
+.veltrix-row--double { min-height: 72px; }
+
+/* Stacked form row (VeltrixStackedRow, VeltrixFieldRow): layout container holding
+   controls underneath. Inert container — must NOT react to hover, active, selection
+   or focus, so only the inner control (entry, switch, dropdown) receives focus and
+   selection states. */
+.veltrix-row.veltrix-row--stacked {
+    background: transparent;
+    background-color: transparent;
+    outline: none;
+    box-shadow: none;
+
+    &:hover,
+    &:active,
+    &:selected,
+    &.is-selected,
+    &:focus,
+    &:focus-visible,
+    &:focus-within {
+        background: transparent;
+        background-color: transparent;
+        outline: none;
+        box-shadow: none;
+    }
+
+    &.veltrix-row--warning {
+        background-color: var(--veltrix-surface-hover);
+        &:hover { background-color: var(--veltrix-surface-hover); }
+    }
+
+    &.veltrix-row--error {
+        background-color: var(--veltrix-surface-raised);
+        &:hover { background-color: var(--veltrix-surface-raised); }
+    }
+}
+
+// (`.veltrix-tile` deleted 2026-08-10. It was declared in `69cce101 refactor(ui):
+// universal CrystalRow/CrystalList` as a placeholder for that plan's Increments
+// 2-3 — its own message says so — and the tile migration never happened while
+// every sibling in the plan shipped. `git log -S` over the whole history, under
+// this name and the pre-rename `.crystal-tile`, finds NO commit that ever
+// applied it from code: it was never used, as opposed to used and then dropped.
+//
+// The reusable unit was always the `veltrix-tile-states` MIXIN, which stays and
+// is adopted by `.app-grid-button`, `.cc-split-icon-btn`
+// and `.bar-popover-icon-btn`. What could not be shared is the packaging: those
+// three take radius `md` / `sm` / `xs` and their own padding, so absorbing
+// them would need size variants. Rows universalised cleanly because they share
+// one geometry; tiles do not. Bring the class back WITH variants if that
+// migration is ever attempted — do not restore it bare.)
+
+/* VeltrixBadge — a neutral status pill beside a row's text (veltrix-kit/badge.ts).
+   A fact, not a control: no hover, no accent (the accent marks selection). */
+.veltrix-badge {
+    padding: 3px 10px;
+    border-radius: $veltrix-radius-pill;
+    background: var(--veltrix-surface);
+    border: 1px solid var(--veltrix-border);
+
+    .veltrix-badge-label {
+        font-size: $fse-caption;
+        font-weight: $fw-medium;
+        color: var(--veltrix-text-dim);
+    }
+    .veltrix-badge-icon {
+        color: var(--veltrix-text-dim);
+    }
+}
+
+/* Title + label typography for the list/row components. */
+.veltrix-list-title {
+    font-size: $fse-caption;
+    font-weight: $fw-bold;
+    color: var(--veltrix-text-dim);
+    letter-spacing: 0.08em;
+    margin-left: 4px;
+    // The ONLY gap between a section header and its card (VeltrixList box is
+    // spacing:0). Deliberately tight so the header binds to the card below it;
+    // the larger group↔group gap is the page spacing (settings-page, 24px).
+    margin-bottom: 8px;
+}
+// Group footer: the scope a title can't carry (who a group applies to). Same left
+// edge as .veltrix-list-title, mirroring its margin-bottom above the card so the
+// footer binds to the card it explains rather than to the next group's header.
+.veltrix-list-footer {
+    font-size: $fse-caption;
+    color: var(--veltrix-text-dim);
+    margin-left: 4px;
+    margin-top: 8px;
+}
+.veltrix-row-title {
+    font-size: $fse-small;
+    font-weight: $fw-medium;
+    color: var(--veltrix-text);
+}
+.veltrix-row-subtitle {
+    font-size: $fse-small;
+    color: var(--veltrix-text-dim);
+}
+
+/* A per-field error line underneath a control in a validated form row (#400, #466).
+   One step DOWN the type scale ($fse-small, matching .veltrix-row-subtitle beside it).
+   Full-strength ink at weight 500 ($fw-medium) makes it the loudest line on the card
+   without spending the red this DE reserves for recording and for failure. */
+.veltrix-field-error {
+    font-size: $fse-small;
+    font-weight: $fw-medium;
+    color: var(--veltrix-text);
+}
+
+/* ── Table: the same card and rows, in aligned columns under headings ───────
+   Geometry only, as everywhere else here: the row chrome is `.veltrix-row` above
+   and the interaction model is _base.scss. Built by `veltrix-kit/table.ts`, which
+   owns the column widths (one Gtk.SizeGroup per column) — CSS cannot align
+   columns across sibling rows, so do not try to help it here. */
+
+/* A column heading. Caption size and dimmed like .veltrix-list-title, and
+   deliberately NOT its uppercase micro-caps: those are a GROUP header, said once
+   over a card, where the extra weight is structure. Six of them across one line
+   are a second row of text competing with the data under them — and they are not
+   free, because uppercase plus letter-spacing is ~25% wider in every locale, on
+   the one page whose width is derived from what its columns measure. Measured
+   2026-09-03, es: the Filesystem column asked for 165px of heading over a 60px
+   value; sentence case brings the table from 758 to 700.
+   The margin-bottom is the ONLY gap between the headings and the card, for the
+   reason spelled out on .veltrix-list-title. */
+.veltrix-table-header {
+    transition: opacity 0.15s ease;
+
+    &.veltrix-table-header--dim {
+        opacity: 0.45;
+    }
+}
+
+.veltrix-table-heading {
+    font-size: $fse-caption;
+    font-weight: $fw-medium;
+    color: var(--veltrix-text-dim);
+    margin-bottom: 8px;
+}
+
+/* A group heading INSIDE the list — the disk a run of rows belongs to.
+   Reads as a heading and not as data: same dim colour and weight as the column
+   headings above, so the eye files it with them rather than with the rows it
+   sits among. It carries no hover and no min-height, which is what stops it
+   looking like a row somebody could act on. */
+.veltrix-table-section-row {
+    min-height: 0;
+    background: none;
+}
+
+.veltrix-table-section {
+    font-size: $fse-caption;
+    font-weight: $fw-medium;
+    color: var(--veltrix-text-dim);
+    margin: 10px 0 4px;
+}
+
+/* A text cell. Matches .veltrix-row-title, because that is what it is — the row's
+   text, split across columns. */
+.veltrix-table-cell {
+    font-size: $fse-small;
+    color: var(--veltrix-text);
+}
+/* Secondary column (a size, a current filesystem): present, not competing. */
+.veltrix-table-cell--dim { color: var(--veltrix-text-dim); }
+
+/* Row validation states (no red: this repo reserves red for recording and failure) — #466.
+   Used by VeltrixTable and validated form rows like VeltrixFieldRow (#400).
+   A warning/error row lifts the background with mode-aware surface tokens and strengthens
+   dimmed cells to full-contrast ink with medium weight (500), mirroring installer-prose--warning. */
+.veltrix-table-row--warning,
+.veltrix-row--warning {
+    background-color: var(--veltrix-surface-hover);
+    &:hover { background-color: var(--veltrix-surface-active); }
+    .veltrix-table-cell {
+        font-weight: $fw-medium;
+        color: var(--veltrix-text);
+    }
+}
+
+/* A FIELD row in error still lifts: its message is printed inside the row, under the
+   control, and a form has no selected row for the fill to be confused with. */
+.veltrix-row--error {
+    background-color: var(--veltrix-surface-raised);
+    &:hover { background-color: var(--veltrix-surface-strong); }
+}
+
+/* A TABLE row in error does NOT change its fill (2026-09-22, the owner's call): in the
+   installer's partition table `--veltrix-surface-raised` is also what the SELECTED row
+   wears, so a failing row and the clicked one looked identical. It shows the table's
+   error mark instead — `.veltrix-table-mark`, an icon in the text's own ink, never red
+   (see "the red BUDGET" in design-system.md) — and the sentence stays under the table. */
+.veltrix-table-mark {
+    color: var(--veltrix-text);
+}
+
+/* Boxed list container — dense frosted card holding .veltrix-row children. */
+.veltrix-list {
+    @include material-card;
+    /* ⚠️ Load-bearing: a row sits 5px inside this card (1px border + this 3px + 1px row
+       margin), and radius-sm 10 is DERIVED from that inset against the card's radius-md
+       16. Change this 3 and `sm` has to be re-derived in ui/lib/veltrix-kit/platform/tokens.ts. */
+    padding: 3px;
+    box-shadow: none;
+}
+
+/* Actions at the foot of a list card (VeltrixListActions): inside the card, under a
+   divider that stops at the rows' text inset, the buttons on the right. Inert — no
+   hover or press fill, only its buttons take input. */
+.veltrix-list > row.veltrix-list-actions {
+    @include veltrix-reset;
+    padding: 0;
+    margin: 0;
+    background: transparent;
+    &:hover, &:active, &:selected { background: transparent; }
+}
+.veltrix-list-actions-divider {
+    min-height: 1px;
+    background: var(--veltrix-border);
+    margin: $space-1 $space-3 0;
+}
+.veltrix-list-actions-bar {
+    padding: $space-2 $space-3;
+}
+
+/* Navigation sidebar list (icon+label rows, single-select → accent). */
+.veltrix-sidebar {
+    background: transparent;
+    // The row-fill halo, same as every other list of rows (rowInsetFor in tokens.ts).
+    // It used to be 12 on the sides to hold the VeltrixScrolled lane; the lane does not
+    // need that — what has to clear the lane is a row's trailing CONTROL, and these rows
+    // have none (icon + label, both leading). The pill floats over the fill's last pixels
+    // the way every overlay scrollbar does. `window.ts` still passes reserveLane: false,
+    // so the bar stays inside this box instead of widening the capsule.
+    padding: 6px;
+
+    > row {
+        @include veltrix-reset;
+        padding: 0;
+        border-radius: $veltrix-radius-sm;
+        margin: 1px 0;
+        min-height: 36px;
+        @include veltrix-row-states;
+
+        // The row content (icon+label) tints with the row state: dim at rest,
+        // full text colour on hover/selected.
+        &:hover, &:selected, &:active {
+            .veltrix-sidebar-item { color: var(--veltrix-text); }
+        }
+
+        // The page you are on is the ACCENT, at full strength, with the accent's ink
+        // (owner, 2026-10-06). It was `--veltrix-state-selected`, the accent at 22 %,
+        // which over the dark sidebar read as a muddy blue, nearly grey. Declared
+        // after `veltrix-row-states`, so the pointer over the chosen row does not grey it.
+        &:selected {
+            background-color: var(--veltrix-accent);
+            .veltrix-sidebar-item { color: var(--veltrix-accent-fg); }
+        }
+        // The accent ring would vanish on the accent fill: in the accent's ink instead.
+        &:selected:focus-visible { outline-color: var(--veltrix-accent-fg); }
+    }
+
+    // A window that is not the one you are typing into keeps its place, in GREY: the
+    // accent on the chosen row is for the active window. GTK sets :backdrop on every
+    // widget of an inactive toplevel, so this needs no signal of ours.
+    &:backdrop > row:selected {
+        background-color: var(--veltrix-surface-active);
+        .veltrix-sidebar-item { color: var(--veltrix-text); }
+    }
+
+    // Thematic divider: a thin title-less line between groups.
+    // Override the row interaction model — it must be inert.
+    > row.sidebar-divider {
+        min-height: 0;
+        // Spans exactly the row width now that the list carries the 12px inset — a
+        // separator that stops short of the rows it separates reads as a third margin.
+        margin: $space-2 0;
+        padding: 0;
+        background: transparent;
+        box-shadow: none;
+        &:hover, &:selected, &:active { background: transparent; box-shadow: none; }
+
+        .sidebar-divider-line {
+            min-height: 1px;
+            background: var(--veltrix-border);
+        }
+    }
+}
+
+/* Sidebar row content — a single CSS color drives both the label and the
+   symbolic icon tint (no hardcoded opacity on the icon widget). */
+.veltrix-sidebar-item {
+    color: var(--veltrix-text-dim);
+    transition: color 0.15s ease;
+}
+
+/* Menu — shared by the tray menu (renderMenuModel), the bar system menu and the
+   CC context menu. A flat list of .veltrix-menu-row buttons, not a Gtk.Popover. */
+.veltrix-menu {
+    @include veltrix-reset;
+    color: var(--veltrix-text);
+    // Semantic parts of a symbolic icon keep their meaning, and anything else follows the
+    // ink — never a fixed white, which vanished on a light menu (see _bar.scss, #676).
+    -gtk-icon-palette: success var(--veltrix-text), warning var(--veltrix-warning), error var(--veltrix-danger);
+}
+
+/* Glass menu popover — the Gtk.Popover surface that hosts a Cairo glass bubble
+   (common/GlassBubble) + the .veltrix-menu rows above. Shared by the dock context
+   menu and the app-grid context menu so every glass menu speaks one language.
+   Reset the native popover chrome to transparent (exactly like .veltrix-tooltip) so
+   only our glass shows; the popover is its own surface and blurs on its layer
+   (blur_popups). */
+.veltrix-menu-popover {
+    @include veltrix-reset;
+
+    > contents {
+        @include veltrix-reset;
+        padding: 0;
+        min-width: 0;
+        min-height: 0;
+    }
+}
+
+/* --- Toggles (Switches) --- */
+switch,
+.veltrix-switch {
+    border-radius: $veltrix-radius-pill;
+    min-width: 44px;
+    min-height: 24px;
+    padding: 0;
+    margin: 0;
+    border: 1px solid var(--veltrix-border);
+    background-color: var(--veltrix-surface);
+    background-image: none;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.2);
+    transition: background-color 0.3s #{$ease}, border-color 0.3s #{$ease}, box-shadow 0.3s #{$ease};
+
+    &:checked {
+        background-color: var(--veltrix-accent);
+        border-color: rgba(0, 0, 0, 0.1);
+        box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.1), 0 0 12px rgba(var(--veltrix-accent-rgb), 0.3);
+    }
+
+    slider {
+        margin: 3px;
+        min-width: 18px;
+        min-height: 18px;
+        background-color: var(--veltrix-thumb);
+        background-image: none;
+        border: none;
+        border-radius: $veltrix-radius-pill;
+        box-shadow: var(--veltrix-shadow-sm);
+        transition: box-shadow 0.25s #{$ease};
+    }
+
+    &:hover slider {
+        box-shadow: var(--veltrix-shadow-md);
+    }
+
+    // A switch that cannot be flipped says so — the kit's 0.45, as a disabled
+    // checkbutton or button. Without it (we run on no GTK theme) an insensitive
+    // switch looked exactly like a live one: a fixed CC control's Center switch
+    // (always on) was indistinguishable from the others (2026-09-28).
+    &:disabled {
+        opacity: 0.45;
+        box-shadow: none;
+    }
+    &:disabled slider { box-shadow: none; }
+}
+
+/* ── Window shell (VeltrixWindow) ──────────────────────────────────────────────
+   Chrome for any Veltrix application window. The compositor owns the window
+   border (border_size = 1), rounding (squircle 3.2), shadows, the blur behind
+   it, and tiling — Hyprland's config, and Hyalo's render/window.rs (corners and
+   blur; border and shadow still owed there, #680 wave 2). The GTK toplevel stays transparent, and .veltrix-window-glass fills
+   the window area with the translucent glass background without inner borders
+   or inner radii that would conflict with Hyprland. */
+window.veltrix-app-window {
+    background: transparent;
+    background-color: transparent;
+    box-shadow: none;
+    border: none;
+}
+
+.veltrix-window-glass {
+    @include glass(floating);
+}
+// The window's top (owner, 2026-10-23, #921): the header row is 32, 8 below the window's top
+// edge (window.ts `contentColumn`) — so its 32 px buttons sit 8 from the edge, as the sidebar's
+// floating card does — and its centre line is 24 from the top. The window controls' capsule
+// (Hyalo's, 24 high) is centred on that line, so it sits 12 from the top, and padding-right 12
+// puts it 12 from the side: the same gap on both edges of the corner, 4 inside the card's, so
+// it is concentric with the card's radius of 16 (on the left: `.veltrix-sidebar-controls`, or
+// window.ts `leftSlot` when the sidebar is not docked). The divider under it is 48 from the
+// window's top. Until #921 the row was 48 and the capsule 32, 16 from both edges.
+.veltrix-window-header {
+    background: transparent;
+    border-bottom: 1px solid var(--veltrix-border);
+    padding: 0 12px 8px 8px;
+    min-height: 32px;
+}
+
+.veltrix-window-tools {
+    // Header start group: sidebar toggle + nav capsule + title/breadcrumb.
+    min-height: 32px;
+    padding: 0 4px;
+}
+
+/* --- Split view & Sidebar Capsule (VeltrixWindow with sidebar) ------------- */
+.veltrix-split-view {
+    @include veltrix-reset;
+}
+
+.veltrix-sidebar-capsule {
+    @include material-card;
+    margin: 8px 0 8px 8px;
+    min-width: 210px;
+
+    viewport, list { @include veltrix-reset; }
+}
+
+.veltrix-sidebar-top {
+    padding: $space-2 $space-2 $space-1;
+}
+
+// The window controls' row at the top of a docked sidebar (window.ts `sidebarSlotRow`): the
+// header's row, so the capsule is centred where the toggle and the navigation are. The header's
+// content box starts with the card (both 8 px from the window's top) and is 32 high; the card's
+// inside starts 1 px lower, under its border — so a row 2 px shorter has the same centre. And
+// 12 from the window's left edge, as from its top: the card's 8 margin and 1 border, then this.
+.veltrix-sidebar-controls {
+    min-height: 32px - 2px;
+    margin-left: 12px - 8px - 1px;
+}
+
+popover.veltrix-sidebar-popup {
+    @include veltrix-reset;
+    padding: 0;
+    margin: 0;
+    font-weight: $fw-regular;
+
+    > contents {
+        background: var(--veltrix-popover-bg, rgba(22, 22, 34, 0.85));
+        border: 1px solid var(--veltrix-popover-border, rgba(255, 255, 255, 0.14));
+        border-radius: $veltrix-radius-md;
+        box-shadow: none;
+        margin: 0;
+        padding: 0;
+        min-width: 0;
+    }
+
+    .veltrix-sidebar-capsule {
+        background: transparent;
+        border: none;
+        border-radius: 0;
+        margin: 0;
+        box-shadow: none;
+    }
+}
+
+/* --- Icon buttons in window chrome (Sidebar toggle, nav buttons, etc.) ----- */
+button.veltrix-icon-btn {
+    @include veltrix-reset;
+    padding: 7px;
+    min-width: 0;
+    min-height: 0;
+    border-radius: $veltrix-radius-pill;
+    color: var(--veltrix-text-dim);
+
+    // The desktop's one hover and press of an icon button (owner, 2026-10-06): the bar's
+    // pills and the window controls Hyalo draws beside these show the same.
+    &:hover {
+        background: var(--veltrix-state-hover);
+        background-image: none;
+        box-shadow: none;
+        color: var(--veltrix-text);
+    }
+    &:active {
+        background: var(--veltrix-state-pressed);
+        background-image: none;
+        box-shadow: none;
+    }
+    &:disabled    { color: var(--veltrix-text-disabled); }
+    &:focus-visible { @include veltrix-focus-ring; }
+}
+
+button.veltrix-icon-btn.sidebar-toggle {
+    // 16 px glyph + 7 + 7 + the 1 px border = 32: 8 from the header row's edges.
+    padding: 7px;
+    background: var(--veltrix-surface);
+    border: 1px solid var(--veltrix-border);
+    &:hover { background: var(--veltrix-surface-hover); }
+}
+
+// The window's own controls (`normalWindowControls`, platform/window-controls.ts):
+// the kit's icon button, but with a SMALL radius — a normal rectangular button,
+// not a circle. The icon is always visible, and there is no colour on any of
+// them: close, minimize and maximize all read the same.
+button.veltrix-window-control {
+    border-radius: $veltrix-radius-xs;
+}
+
+// .veltrix-window-sidebar-scroll has no rules on purpose: the sidebar is a
+// VeltrixScrolled, whose bar lives on the wrapping overlay, so its gap to the search
+// slot is set on that overlay in window.ts — CSS here would move the view out from
+// under its own scroll lane.
+
+/* VeltrixScrolled's bar (lib/veltrix-kit/scrolled.ts). A single DrawingArea spanning
+   the full height: the whole lane is the hit area (constant width — that is the fix
+   for tech-debt #15, since GTK's slider grew toward whatever the pointer approached
+   and ate the ✕ next to it), and the thin pill is PAINTED inside it. It is painted
+   rather than laid out because a scroll position is not a layout property: moving a
+   box by margin made the drag lag behind the pointer and made the view re-allocate
+   on every step. `color` here is the pill's fill, read back in Cairo via
+   get_style_context().get_color() — veltrix-kit is self-contained and cannot import
+   ThemeManager, so this is how it stays token-driven.
+   The lane WIDTH must never become state-dependent: growing on hover IS the bug. */
+.veltrix-scroll-bar {
+    background: transparent;
+    color: var(--veltrix-surface-raised);
+    transition: opacity 0.25s ease, color 0.15s ease;
+
+    &:hover,
+    &.dragging { color: var(--veltrix-text-dim); }
+}
+
+// =============================================================================
+// VELTRIX BUTTON SYSTEM
+// =============================================================================
+// Single source of truth for all VeltrixButton variants.
+// Use the VeltrixButton() function from veltrix-kit — never Adwaita classes
+// (suggested-action, destructive-action, pill, flat) directly in page code.
+//
+// Variants (veltrix-btn--<variant>):
+//   secondary  default  surface + border
+//   primary             accent fill
+//   danger              danger tint + danger text/border
+//   ghost               transparent, dim text
+//
+// Shape modifiers:
+//   veltrix-btn--pill   fully rounded, slightly wider padding
+//   veltrix-btn--icon   square-ish icon-only footprint
+//
+// Size axis (orthogonal to variant AND to the shape modifiers):
+//   (none)             default   ~32px tall, $fs-small
+//   veltrix-btn--compact          ~24px tall, $fs-caption — one step down the ramp,
+//                                for dense rows where a default button would
+//                                out-weigh the row's own text.
+
+button.veltrix-btn {
+    // Wipe Adwaita/GTK defaults completely
+    background-image: none;
+    box-shadow: none;
+    outline: none;
+
+    // Geometry
+    padding: 5px 14px;
+    // Shared content min-height so EVERY veltrix-btn is the same height regardless of
+    // content — a labelled button (13px text, ~18px line) and an icon-only one (16px
+    // glyph) end up identical, so icon buttons (details/forget) don't render shorter
+    // than the Connect button next to them.
+    min-height: 20px;
+    border-radius: $veltrix-radius-sm;
+    font-size: $fs-small;
+    font-weight: $fw-medium;
+    transition: background 0.15s ease;
+
+    // ── secondary (default) ───────────────────────────────────────────────────
+    background-color: var(--veltrix-surface);
+    border: 1px solid var(--veltrix-border);
+    color: var(--veltrix-text);
+
+    &:hover   { background-color: var(--veltrix-surface-hover);   background-image: none; box-shadow: none; }
+    &:active  { background-color: var(--veltrix-surface-active); background-image: none; box-shadow: none; }
+    &:disabled { opacity: 0.45; }
+    &:focus-visible { @include veltrix-focus-ring; }
+
+    // ── primary ───────────────────────────────────────────────────────────────
+    &.veltrix-btn--primary {
+        background-color: var(--veltrix-accent);
+        border-color: transparent;
+        color: var(--veltrix-accent-fg);
+
+        &:hover  { background-color: color-mix(in srgb, var(--veltrix-accent) 85%, white 15%); background-image: none; box-shadow: none; }
+        &:active { background-color: color-mix(in srgb, var(--veltrix-accent) 70%, black 30%); background-image: none; }
+        &:focus-visible { outline-color: var(--veltrix-accent); }
+    }
+
+    // ── danger ────────────────────────────────────────────────────────────────
+    &.veltrix-btn--danger {
+        background-color: rgba(var(--veltrix-danger-rgb), 0.10);
+        border-color:     rgba(var(--veltrix-danger-rgb), 0.25);
+        color: var(--veltrix-danger);
+
+        &:hover  { background-color: rgba(var(--veltrix-danger-rgb), 0.20); background-image: none; box-shadow: none; }
+        &:active { background-color: rgba(var(--veltrix-danger-rgb), 0.30); background-image: none; }
+        &:focus-visible { outline-color: var(--veltrix-danger); }
+    }
+
+    // ── ghost ─────────────────────────────────────────────────────────────────
+    &.veltrix-btn--ghost {
+        background-color: transparent;
+        border-color: transparent;
+        color: var(--veltrix-text-dim);
+
+        &:hover  { background-color: var(--veltrix-surface-hover); background-image: none; box-shadow: none; color: var(--veltrix-text); }
+        &:active { background-color: var(--veltrix-surface-active); background-image: none; }
+    }
+
+    // ── pill shape modifier ───────────────────────────────────────────────────
+    &.veltrix-btn--pill {
+        border-radius: $veltrix-radius-pill;
+        padding: 5px 18px;
+    }
+
+    // ── icon-only modifier ────────────────────────────────────────────────────
+    // Compact, uniform square-ish footprint so an icon button matches the height
+    // of a labelled one in a cluster (e.g. details/forget next to Connect).
+    // Defined after --pill so its tighter horizontal padding wins.
+    &.veltrix-btn--icon {
+        padding: 5px 8px;
+        min-width: 0;
+    }
+
+    // ── compact size modifier ─────────────────────────────────────────────────
+    // One step down the ramp: caption text, tighter box (~24px tall vs ~32px).
+    // Declared LAST on purpose — it is a size, not a shape, so it must win the
+    // padding fight against --pill/--icon while leaving their border-radius and
+    // min-width alone. Keep it that way if you add modifiers below.
+    &.veltrix-btn--compact {
+        font-size: $fs-caption;
+        min-height: 16px;
+        padding: 3px 10px;
+
+        &.veltrix-btn--pill { padding: 3px 12px; }
+        &.veltrix-btn--icon { padding: 3px 6px; }
+    }
+}
+
+/* --- Round glass icon button (VeltrixCircleButton) --------------------------
+   The single source of truth for close/remove/collapse controls, in every
+   bundle. MOVED here from `ui/shell/styles/_components.scss` when the widget
+   moved to `veltrix-kit/button.ts` — the mechanical test at the top of this file
+   (a rule lives here iff its widget is built in `ui/lib/`) flipped for it, and
+   the shell's copy went in the same change. Two copies of one class in one
+   process is how the shell's version and the installer's start to disagree.
+
+   Size is set inline per use; shape/icon/hover are identical everywhere.
+   Padding (not set_size_request) sizes the button to its glyph — crisp icon,
+   circle centred on it. NB: named -circle- to avoid the existing
+   .veltrix-icon-btn in the shell's _settings.scss (the sidebar toggle), whose
+   `button.` specificity would win. */
+.veltrix-circle-btn {
+    padding: 4px;
+    min-width: 0;
+    min-height: 0;
+    /* Same fill as the count badge (nc-badge-header): simple, unified, no special tokens. */
+    background: var(--veltrix-surface-raised);
+    border: none;
+    border-radius: var(--veltrix-radius-pill);
+    transition: background-color 0.15s #{$ease};
+
+    image { margin: 0; }
+
+    /* Neutral hover (e.g. the collapse chevron): brighter fill — no border (it left corner dots). */
+    &:hover { background: var(--veltrix-surface-strong); }
+
+    /* ⛔ NO `&.is-danger:hover { background: var(--veltrix-danger) }`. The variant
+       class is still emitted (`is-${variant}`) and still carries the INTENT, but
+       both variants hover the same neutral grey — owner's call, 2026-08-26.
+       A red wash on the control you use to leave a window spends the red this DE
+       reserves for recording and for failure, on the most routine click there is.
+       The rule did exist until 2026-06-23, when the orphan sweep in d87e5e0a
+       deleted it for having "no consumer" — it grepped the literal `is-danger`
+       while the consumer assembles the class by interpolation, the same
+       dynamic-class trap that commit lists for `.accent-*`. It was proposed back
+       on 2026-08-26 and declined on the merits, so this is a DECISION now, not an
+       oversight: do not restore it, and fix `IconButton`'s prose instead if it
+       still promises red. */
+}
+
+// ── Gtk.DropDown ─────────────────────────────────────────────────────────────
+// GTK4 native dropdown — auto-positions above/below available space, and its popover
+// is a real Wayland surface, so the compositor's popup blur frosts it. The in-window
+// overlay list this replaced could do neither; it was deleted with its manager.
+
+// Trigger button
+// Trigger button styled like the base text input (.veltrix-input): surface-back
+// fill + constant 2px border (transparent at rest → accent on focus, via
+// background-clip: padding-box so there's no jump).
+dropdown > button {
+    @include veltrix-reset;
+    background: var(--veltrix-surface-back);
+    background-clip: padding-box;
+    border: 2px solid transparent;
+    border-radius: $veltrix-radius-sm;
+    // Match the VeltrixButton box height: a button is 5px padding + 1px border;
+    // this trigger carries a 2px border (input look), so 4px padding lands at the
+    // same outer height instead of reading 2px shorter and cramped. Horizontal
+    // 14px gives the same breathing room as a secondary button.
+    padding: 4px 14px;
+    // Same 20px content floor as button.veltrix-btn, for the same reason: without it
+    // the box is whatever the text line happens to measure, and it came out 31px
+    // against the button's 32 — measured live, `queryUI dropdown` 2026-08-03. The
+    // padding above was already chosen to match the button; this is the other half.
+    min-height: 20px;
+    transition: border-color 0.15s ease, background 0.15s ease;
+    // Same text as VeltrixButton (size + weight). Set on the button — NOT the inner
+    // label — so the Settings-only `$fse-*` em re-anchor (in _settings.scss, which
+    // targets `dropdown > button`) is inherited by the label. A font-size on the
+    // label itself would out-specify that override and pin the text to fixed px.
+    font-size: $fs-small;
+    font-weight: $fw-medium;
+
+    // GTK4 CSS has no `spacing` property (that was GTK3-only).
+    // Add a left margin on the label so icon and label have a gap.
+    > box > label { margin-left: $space-2; }
+
+    label {
+        color: var(--veltrix-text);
+    }
+    image {
+        color: var(--veltrix-text-dim);
+    }
+
+    &:hover  { background-color: var(--veltrix-surface-hover); background-image: none; box-shadow: none; }
+    &:active { background-color: var(--veltrix-surface-active); background-image: none; }
+    // Accent only on KEYBOARD focus — :focus alone flashes the accent border on
+    // every mouse click and when the popover closes (focus returns to the button).
+    &:focus-visible { border-color: var(--veltrix-accent); box-shadow: none; outline: none; }
+    &:disabled { opacity: 0.45; }
+}
+
+// Popover list (auto-flips above when near bottom of screen).
+// `dropdown popover` is REQUIRED: GTK4 puts the `.combo` class on the dropdown's
+// button but NOT on its popover, so `popover.combo` alone never matched it and the
+// list fell back to GTK4's opaque default popover. Match it structurally instead.
+popover.combo,
+dropdown popover {
+    @include veltrix-reset;
+
+    // --veltrix-popover-bg now shares the WINDOW tone (VeltrixTheme: popoverBg=baseBg)
+    // and floors its alpha so compositor blur applies (popups_ignorealpha=0.30) — a
+    // frosted glass that follows the opacity slider down to that floor, instead of a
+    // lighter always-opaque block. (`dropdown popover` is REQUIRED: GTK4 puts `.combo`
+    // on the dropdown's button but NOT its popover, so popover.combo never matched.)
+    > contents {
+        background-color: var(--veltrix-popover-bg, rgba(22, 22, 34, 0.85));
+        border: 1px solid var(--veltrix-popover-border, rgba(255, 255, 255, 0.14));
+        border-radius: $veltrix-radius-md;
+        // ⚠️ margin 0 + no shadow, TOGETHER. GTK gives `popover > contents` a ~17px margin
+        // per side purely as room for its own drop shadow to render unclipped, and the
+        // popup SURFACE is sized to include it — measured live 2026-08-03 with `queryUI`:
+        // the list sat 41px inside the popover against the 7 this stylesheet accounts for,
+        // and the whole thing read as "this popover has more padding" through four rounds
+        // of chasing the wrong number. `.veltrix-sidebar-popup` in _settings.scss hit this
+        // first and fixed it the same way; keep the two in step. The definition here is
+        // the compositor's blur plus the 1px border, not a drop shadow.
+        margin: 0;
+        box-shadow: none;
+        // NOTHING here. Padding on this box sits OUTSIDE the scroll: it pushes the viewport
+        // in, and the scroll bar rides the viewport's trailing edge, so the pill ended up
+        // 10px from the card wall (6 + EDGE_CLEAR) against 4 on every flush surface. The
+        // shell rule is that a viewport reaches its own visible inner edge.
+        // The whole inset lives on the LIST below, all four sides from ONE declaration.
+        // ⚠️ The "7px at the sides, 13 at the top" this file used to blame on splitting
+        // the inset was a stale-stylesheet reading: 13 = 1 border + 6 of card padding
+        // + 6 of list margin, i.e. BOTH declarations live at once, which is what a
+        // half-recompiled style.css had. Reproduced exactly offscreen
+        // (`scripts/dev/gtk-probe.js`, EXTRA_CSS='… > contents { padding: 6px 0 }'),
+        // and with this `0` the same probe reads 7 left and 7 top. Either declaration
+        // ALONE is symmetric; it is having both that is not.
+        padding: 0;
+        // overflow: hidden not supported in GTK4 CSS — clipping is handled by border-radius
+    }
+
+    > arrow {
+        background-color: var(--veltrix-popover-bg, rgba(22, 22, 34, 0.85));
+        border-color: var(--veltrix-popover-border, rgba(255, 255, 255, 0.14));
+    }
+
+    scrolledwindow { @include veltrix-reset; }
+    viewport       { @include veltrix-reset; }
+
+    listview {
+        @include veltrix-reset;
+        // The row-fill halo — 6px on all sides ensures breathing room and concentricity
+        // with the popover's border radius ($veltrix-radius-md: 16px) across top, bottom and sides.
+        margin: 6px;
+
+        // GTK's own item node carries NOTHING: no padding, no fill, no radius. The fill
+        // lives on `.veltrix-dropdown-item`, a box `VeltrixDropDown` hands the factory,
+        // which hexpands into it — the same shape as every other list in the shell.
+        // ⚠️ The reason first written here — that GTK's item box is inset inside the list
+        // by 6/24 and is always 30px narrower — does NOT reproduce. Offscreen, with GTK's
+        // factory AND with ours, the item is exactly the ListView's content rect
+        // (`FACTORY=gtk scripts/dev/gtk-probe.js`). What the swap does buy is real and
+        // measured: GTK's default factory puts a CHECKMARK in every item (18px icon +
+        // 4 spacing) and a fill of ours cannot sit on a node that also carries that.
+        > row {
+            @include veltrix-reset;
+            padding: 0;
+            margin: 0;
+            min-height: 0;
+            color: var(--veltrix-text);
+            font-size: $fs-small;
+        }
+
+        // The row we own. 9, not 10, on the horizontal: it is the second term of the
+        // alignment axis above (1 + 6 + 9 = the trigger's 16).
+        .veltrix-dropdown-item {
+            border-radius: $veltrix-radius-sm;
+            padding: 6px 9px;
+            @include veltrix-row-states;
+        }
+
+        // The row about to be chosen takes the ACCENT, at full strength, with the
+        // accent's ink — the same as the shell's menus (`.veltrix-menu-row`, owner
+        // 2026-10-06): an open dropdown IS a menu, and it was the one menu left on the
+        // neutral hover. GTK marks the pointed item with :selected on ITS node
+        // (hover-select), so that is a hover here too, never the chosen value — the
+        // chosen value is the check at the row's end (`VeltrixDropDown`).
+        > row:selected .veltrix-dropdown-item,
+        > row:hover .veltrix-dropdown-item {
+            background-color: var(--veltrix-accent);
+            color: var(--veltrix-accent-fg);
+            label { color: var(--veltrix-accent-fg); }
+        }
+        > row:active .veltrix-dropdown-item {
+            background-color: color-mix(in srgb, var(--veltrix-accent) 85%, black 15%);
+        }
+
+        // ONE focus ring, on the box we own. Tabbing through the list drew TWO concentric
+        // accent rings (user-caught 2026-08-03) — GTK's item node and the box inside it
+        // each took one, and the gap between them is a direct picture of the inset this
+        // whole hunt was about. `veltrix-reset` above kills the outer one; this puts the
+        // survivor on the same rectangle as the hover fill, negative offset so it sits
+        // INSIDE the row instead of bleeding into its neighbour.
+        > row:focus-visible {
+            outline: none;
+            box-shadow: none;
+
+            .veltrix-dropdown-item { @include veltrix-focus-ring(-2px); }
+        }
+    }
+}
+
+/* --- Slider readout --------------------------------------------------------
+   The number beside a horizontal slider ("72%", "4500K"), built by the kit's
+   `VeltrixSliderRow` — which is why it is here since 2026-08-16 and not in the
+   shell's sheet, where it started. It has consumers on BOTH sides now (the shell
+   builds six of these by hand: `control-center/Sliders.tsx`, the brightness /
+   night-light / volume widgets, Settings → Audio / Appearance) and that is fine:
+   the shell compiles this sheet too. What would NOT be fine is the reverse — a
+   greeter that used the kit's slider row and got a default-sized readout with the
+   digits jittering as they count, which is exactly the shape of the bug this rule
+   was written to fix in the first place (2026-08-10, when it was scoped inside
+   `#veltrix-bar .veltrix-detail-panel` and unstyled everywhere else).
+
+   `tabular-nums` is the load-bearing property, not the colour: without it the
+   glyph advances change as the value counts and the row's right edge shivers. */
+.slider-value-label {
+    color: var(--veltrix-text-dim);
+    font-size: $fs-small;
+    font-variant-numeric: tabular-nums;
+}
+
+/* --- Slider ----------------------------------------------------------------
+   `veltrix-kit/slider.ts` is Cairo end to end — track, fill and thumb are drawn,
+   not styled — so the ONE rule it brings here is for the only real GTK widget it
+   builds: the percentage label that `makeVerticalFillTile` overlays on the 1×2
+   volume/brightness gauge. It sits ON the fill, which is accent under it and glass
+   above it, so the shadow is what keeps it legible either way.
+
+   `.slider-text-endpoint` (the small/large "A"s on the text-size slider) did NOT come
+   along: Settings' Accessibility page builds those, not the component. `.slider-value-label`
+   did not either, until the slider ROW followed on 2026-08-16 and brought it (see above).
+   Same mechanical test throughout — grep the class in `ui/lib/` and the answer is the
+   same for everyone; when a class ends up built on BOTH sides, the kit's sheet is where
+   it has to live, because the shell compiles both and a lone bundle does not. */
+.slider-fill-value {
+    font-size: $fs-small;
+    font-weight: $fw-bold;
+    font-variant-numeric: tabular-nums;
+    color: var(--veltrix-text);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+}
+
+
+// ── VeltrixAlertDialog moved here 2026-09-05 ─────────────────────────────────
+// It was `ui/shell/styles/_alert.scss`, which only the shell compiles, and the
+// installer has been calling `showVeltrixAlert` since #405: its quit dialog and,
+// as of #436, its "start the installation?" confirmation both rendered as
+// unstyled GTK — the two response buttons plain text, side by side, with nothing
+// telling the destructive one from the safe one. On a modal whose entire job is
+// to make an irreversible click look different from a reversible one, that is
+// the failure rather than a blemish.
+//
+// It is the same bug this file's header was written about, one file later: the
+// kit's CODE was importable and its LOOK was not. The mechanical test above puts
+// it here without a judgement call — `alert-dialog.ts` is built in `ui/lib/`.
+//
+// ── VeltrixAlertDialog (ui/lib/veltrix-kit/alert-dialog.ts) ────────────────────
+// Undecorated Gtk.Window, glass surface, fully rounded. Our replacement for
+// Adw.AlertDialog: Bluetooth pairing (PIN / passkey), the Display "keep this
+// resolution?" confirm, deleting a user.
+//
+// ⚠️ THIS IS ITS OWN TOPLEVEL WINDOW, and that is the whole reason this file
+// exists. `showVeltrixAlert` builds a `new Gtk.Window` and only sets
+// `transient_for` — a transient is a SIBLING root, never a descendant, so no
+// selector rooted at another window can reach it.
+//
+// These rules lived at column 0 in `_settings.scss` from 2026-05-24 and worked.
+// Scoping that sheet (`fd66184e`, 2026-08-07, #97) swept them inside
+// `window.veltrix-settings-window`, where they compiled to
+// `window.veltrix-settings-window window.veltrix-alert-dialog` — a window inside a
+// window — and the whole family stopped matching. Every dialog above rendered
+// with GTK defaults for three days. Proven with a 37px sentinel on the exact
+// tree the component builds: unscoped 37, scoped 0.
+//
+// It is the same accident as `.about-*`, which was in `_bar.scss` "only by
+// position" and got its own sheet in the same sweep. The difference is that this
+// one looked legitimate — Settings is the only caller today — and THAT is the
+// trap: the caller's window is not the widget's window.
+//
+// `scripts/dev/scope-audit.mjs` now carries a second pass that catches this
+// shape directly (a window scope root in non-initial position is impossible by
+// construction), because the first pass could not: it knows the six surfaces and
+// attributes every `veltrix-kit` class to Settings, so it read the dead rule as
+// reachable and passed.
+window.veltrix-alert-dialog {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+
+    > box {
+        @include glass(floating);
+        // overflow: hidden not supported in GTK4 CSS
+    }
+
+    // The $fse-* em ramp is deliberate and survives the move. It resolves
+    // against the interface font (`gtk-font-name`, ThemeManager), which is
+    // display-wide — not against anything the Settings window sets — so a dialog
+    // opened from anywhere scales with the user's font exactly as it did here.
+    // A dialog is body copy, not shell chrome: it is the one place outside
+    // Settings where scaling with the picker is the right behaviour rather than
+    // a layout hazard.
+    .veltrix-alert-heading {
+        font-size: $fse-body;
+        font-weight: $fw-semibold;
+        color: var(--veltrix-text);
+    }
+
+    // Who is asking (the XDG portal's consent dialogs). The app's own icon, not
+    // tinted: it is the app's identity, not a symbol of ours.
+    .veltrix-alert-icon {
+        -gtk-icon-shadow: none;
+    }
+
+    .veltrix-alert-choices checkbutton {
+        font-size: $fse-small;
+        color: var(--veltrix-text);
+    }
+
+    .veltrix-alert-body {
+        font-size: $fse-small;
+        color: var(--veltrix-text-dim);
+        margin-bottom: 0;
+    }
+
+    // Single-line input (PIN / passkey prompts).
+    // ⚠️ Needs to keep out-specifying the global `entry, .veltrix-input` rule in
+    // _components.scss (0,0,1) — which is what has actually been painting this
+    // field while the block was dead, so the entry is the one part of the dialog
+    // that did NOT look raw.
+    entry.veltrix-alert-entry {
+        background: var(--veltrix-surface-back);
+        border: 1px solid var(--veltrix-border);
+        border-radius: $veltrix-radius-pill;
+        padding: 6px 14px;
+        font-size: $fse-body;
+        color: var(--veltrix-text);
+        caret-color: var(--veltrix-text);
+        outline: none;
+        box-shadow: none;
+
+        &:focus, &:focus-within {
+            border-color: var(--veltrix-surface-raised);
+            box-shadow: none;
+        }
+    }
+
+    // The response row (veltrix-kit/dialog-buttons.ts): VeltrixButtons, equal widths,
+    // inset from the glass edge. Replaced the flat full-bleed cells split by a
+    // hairline (2026-09-13) — an alert idiom nothing else in the desktop used.
+    .veltrix-dialog-buttons {
+        margin: $space-6 $space-6 $space-6;
+    }
+}
+
+// ── Tooltip (veltrix-kit/tooltip.ts — attachTooltip) ───────────────────────────
+.veltrix-tooltip {
+    @include veltrix-reset;          // strip the default popover chrome on the root
+
+    > contents {
+        @include veltrix-reset;      // fully transparent — the bubble is Cairo-painted
+        padding: 0;
+        min-width: 0;
+        min-height: 0;
+    }
+
+    .veltrix-tooltip-label {
+        color: var(--veltrix-text);
+        font-size: $fs-small;       // fixed px ramp — chrome must NOT reflow with the font picker
+    }
+
+    &.dark .veltrix-tooltip-label {
+        color: #ffffff;
+    }
+
+    &.light .veltrix-tooltip-label {
+        color: #111116;
+    }
+}
+
